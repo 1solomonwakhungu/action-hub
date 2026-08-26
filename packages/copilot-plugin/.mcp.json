@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "action-hub": {
+      "type": "local",
+      "command": "node",
+      "args": ["server/dist/index.js"],
+      "env": {
+        "ACTION_HUB_CONFIG": "${HOME}/.config/action-hub/servers.json"
+      },
+      "tools": ["*"]
+    }
+  }
+}

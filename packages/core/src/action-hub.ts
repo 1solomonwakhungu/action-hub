@@ -1,0 +1,298 @@
+import { Catalog } from "./catalog/catalog.js";
+import { SearchEngine, type SemanticScorer } from "./search/search.js";
+import { ConnectionManager } from "./servers/connection-manager.js";
+import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
+import { validateArguments } from "./router/validate.js";
+import type {
+  ActionRecord,
+  ExecuteResult,
+  InvocationRecord,
+  LoadedAction,
+  McpClientFactory,
+  SearchHit,
+  SearchOptions,
+  ServerConfig,
+  ServerState,
+} from "./types.js";
+
+export interface ActionHubOptions {
+  servers?: readonly ServerConfig[];
+  clientFactory: McpClientFactory;
+  policy?: PolicyOptions;
+  semanticScorer?: SemanticScorer;
+  /** Ring-buffer size for invocation history. */
+  historyLimit?: number;
+  /**
+   * When true, an action whose policy decision requires approval is refused
+   * instead of executed. Hosts that can prompt the user should set this false
+   * and surface `requiresApproval` themselves.
+   */
+  denyOnApprovalRequired?: boolean;
+}
+
+export interface IndexResult {
+  serverId: string;
+  indexed: number;
+  error?: string;
+}
+
+export interface HubSnapshot {
+  indexedAt: string;
+  servers: Record<string, ServerState>;
+  skills: number;
+  context: { actions: number; eagerTokensEstimate: number; hubTokensEstimate: number };
+  history: InvocationRecord[];
+}
+
+const DEFAULT_HISTORY_LIMIT = 200;
+
+/**
+ * The façade the host integration talks to.
+ *
+ * Exposes exactly three operations — search, load, execute — mirroring the
+ * single tool surface presented to the model.
+ */
+export class ActionHub {
+  readonly #catalog = new Catalog();
+  readonly #search: SearchEngine;
+  readonly #connections: ConnectionManager;
+  readonly #policy: PermissionPolicy;
+  readonly #history: InvocationRecord[] = [];
+  readonly #historyLimit: number;
+  readonly #denyOnApprovalRequired: boolean;
+
+  constructor(options: ActionHubOptions) {
+    this.#connections = new ConnectionManager(options.clientFactory, options.servers ?? []);
+    this.#search = new SearchEngine(this.#catalog);
+    this.#search.setSemanticScorer(options.semanticScorer);
+    this.#policy = new PermissionPolicy(options.policy ?? {});
+    this.#historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
+    this.#denyOnApprovalRequired = options.denyOnApprovalRequired ?? false;
+  }
+
+  get catalog(): Catalog {
+    return this.#catalog;
+  }
+
+  get connections(): ConnectionManager {
+    return this.#connections;
+  }
+
+  /**
+   * Connects to each enabled server once, reads its tool list, and indexes it.
+   *
+   * Indexing is the one place a server must be contacted eagerly. Failures are
+   * captured per-server so one broken integration cannot prevent the rest of
+   * the catalog from being built.
+   */
+  async indexAll(): Promise<IndexResult[]> {
+    const configs = this.#connections.configs().filter((config) => config.enabled !== false);
+    return Promise.all(configs.map((config) => this.indexServer(config.id)));
+  }
+
+  async indexServer(serverId: string): Promise<IndexResult> {
+    const config = this.#connections.getConfig(serverId);
+    if (!config) return { serverId, indexed: 0, error: `Unknown server "${serverId}"` };
+
+    try {
+      const client = await this.#connections.activate(serverId);
+      const tools = await client.listTools();
+      const trust = this.#connections.trustOf(serverId);
+
+      const records: ActionRecord[] = tools
+        .filter((tool) => isToolPermitted(config, tool.name))
+        .map((tool) => ({
+          id: Catalog.actionId(serverId, tool.name),
+          kind: "tool" as const,
+          serverId,
+          name: tool.name,
+          summary: summarize(tool.description ?? tool.name),
+          description: tool.description,
+          inputSchema: tool.inputSchema ?? {},
+          trust,
+        }));
+
+      this.#catalog.removeServer(serverId);
+      this.#catalog.addAll(records);
+      this.#connections.recordToolCount(serverId, records.length);
+      return { serverId, indexed: records.length };
+    } catch (cause) {
+      const error = cause instanceof Error ? cause.message : String(cause);
+      return { serverId, indexed: 0, error };
+    }
+  }
+
+  /**
+   * Registers skills into the same catalog as tools.
+   *
+   * Only the summary is indexed — skill bodies are deliberately never injected
+   * into context, which is the whole reason skills are indexed rather than
+   * loaded up front.
+   */
+  registerSkills(records: readonly Omit<ActionRecord, "kind">[]): void {
+    this.#catalog.addAll(records.map((record) => ({ ...record, kind: "skill" as const })));
+  }
+
+  /** Cheap, schema-free retrieval. */
+  async search(query: string, options?: SearchOptions): Promise<SearchHit[]> {
+    return this.#search.search(query, options);
+  }
+
+  /** The only path that returns a full JSON Schema. */
+  load(actionId: string): LoadedAction {
+    const record = this.#catalog.get(actionId);
+    if (!record) throw new ActionHubError(`Unknown action "${actionId}"`, "unknown_action");
+    return {
+      id: record.id,
+      kind: record.kind,
+      serverId: record.serverId,
+      name: record.name,
+      summary: record.summary,
+      description: record.description,
+      inputSchema: record.inputSchema ?? {},
+      trust: record.trust,
+    };
+  }
+
+  async execute(actionId: string, args: Record<string, unknown> = {}): Promise<ExecuteResult> {
+    const startedAt = new Date().toISOString();
+    const start = Date.now();
+
+    const record = this.#catalog.get(actionId);
+    if (!record) {
+      return this.#fail(actionId, "unknown", `Unknown action "${actionId}"`, startedAt, start);
+    }
+
+    // Checked before policy: a skill has no downstream server to evaluate
+    // against, and it can never be dispatched regardless of trust.
+    if (record.kind === "skill") {
+      return this.#fail(
+        actionId,
+        record.serverId,
+        `"${actionId}" is a skill and must be loaded, not executed`,
+        startedAt,
+        start,
+      );
+    }
+
+    const decision = this.#policy.evaluate(record, this.#connections.getConfig(record.serverId));
+    if (!decision.allowed) {
+      return this.#fail(actionId, record.serverId, decision.reason ?? "Denied by policy", startedAt, start);
+    }
+    if (decision.requiresApproval && this.#denyOnApprovalRequired) {
+      return this.#fail(
+        actionId,
+        record.serverId,
+        `Approval required: ${decision.reason ?? "untrusted server"}`,
+        startedAt,
+        start,
+      );
+    }
+
+    const validation = validateArguments(record.inputSchema, args);
+    if (!validation.valid) {
+      return this.#fail(
+        actionId,
+        record.serverId,
+        `Invalid arguments: ${validation.errors.join("; ")}`,
+        startedAt,
+        start,
+      );
+    }
+
+    try {
+      const client = await this.#connections.activate(record.serverId);
+      const content = await client.callTool(record.name, args);
+      const durationMs = Date.now() - start;
+      this.#record({ actionId, serverId: record.serverId, startedAt, durationMs, ok: true });
+      return { ok: true, actionId, content, durationMs };
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      return this.#fail(actionId, record.serverId, message, startedAt, start);
+    }
+  }
+
+  serverStates(): ServerState[] {
+    return this.#connections.states();
+  }
+
+  history(): readonly InvocationRecord[] {
+    return this.#history;
+  }
+
+  /**
+   * Approximate context saved versus injecting every schema on every turn.
+   * Uses a 4-characters-per-token heuristic, which is close enough for the
+   * diagnostics surface and avoids a tokenizer dependency in the core.
+   */
+  contextStats(): { actions: number; eagerTokensEstimate: number; hubTokensEstimate: number } {
+    const actions = this.#catalog.all();
+    const eagerChars = actions.reduce((sum, record) => {
+      const schema = record.inputSchema ? JSON.stringify(record.inputSchema).length : 0;
+      return sum + record.name.length + (record.description?.length ?? 0) + schema;
+    }, 0);
+    return {
+      actions: actions.length,
+      eagerTokensEstimate: Math.ceil(eagerChars / 4),
+      hubTokensEstimate: HUB_TOOL_TOKENS,
+    };
+  }
+
+  /**
+   * A serializable view of everything a diagnostics surface needs. The core
+   * builds it but never persists it — where a snapshot goes is a host concern.
+   */
+  snapshot(): HubSnapshot {
+    return {
+      indexedAt: new Date().toISOString(),
+      servers: Object.fromEntries(this.#connections.states().map((state) => [state.id, state])),
+      skills: this.#catalog.filter({ kind: "skill" }).length,
+      context: this.contextStats(),
+      history: [...this.#history],
+    };
+  }
+
+  async close(): Promise<void> {
+    await this.#connections.closeAll();
+  }
+
+  #fail(
+    actionId: string,
+    serverId: string,
+    error: string,
+    startedAt: string,
+    start: number,
+  ): ExecuteResult {
+    const durationMs = Date.now() - start;
+    this.#record({ actionId, serverId, startedAt, durationMs, ok: false, error });
+    return { ok: false, actionId, error, durationMs };
+  }
+
+  #record(entry: InvocationRecord): void {
+    this.#history.push(entry);
+    if (this.#history.length > this.#historyLimit) {
+      this.#history.splice(0, this.#history.length - this.#historyLimit);
+    }
+  }
+}
+
+/** Rough token cost of the single `action_hub` schema the model always sees. */
+const HUB_TOOL_TOKENS = 600;
+
+export class ActionHubError extends Error {
+  readonly code: string;
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "ActionHubError";
+    this.code = code;
+  }
+}
+
+const SUMMARY_MAX = 160;
+
+/** Search results carry a single line; full text is reserved for `load`. */
+function summarize(text: string): string {
+  const firstLine = text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? text.trim();
+  if (firstLine.length <= SUMMARY_MAX) return firstLine;
+  return `${firstLine.slice(0, SUMMARY_MAX - 1).trimEnd()}…`;
+}

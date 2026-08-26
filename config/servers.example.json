@@ -1,0 +1,49 @@
+{
+  "autoApproveAtOrAbove": "trusted",
+  "servers": [
+    {
+      "id": "github",
+      "displayName": "GitHub",
+      "trust": "trusted",
+      "transport": {
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": {
+          "Authorization": "Bearer ${GITHUB_TOKEN}"
+        }
+      }
+    },
+    {
+      "id": "linear",
+      "displayName": "Linear",
+      "trust": "trusted",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "mcp-remote", "https://mcp.linear.app/mcp"]
+      }
+    },
+    {
+      "id": "filesystem",
+      "displayName": "Local filesystem",
+      "trust": "untrusted",
+      "denyTools": ["write_file", "move_file"],
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "~/Projects"]
+      }
+    },
+    {
+      "id": "chrome-devtools",
+      "displayName": "Chrome DevTools",
+      "trust": "untrusted",
+      "enabled": false,
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "chrome-devtools-mcp@latest"]
+      }
+    }
+  ]
+}
