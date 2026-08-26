@@ -1,5 +1,6 @@
 import { Catalog } from "../dist/catalog/catalog.js";
 import { SearchEngine } from "../dist/search/search.js";
+import { LocalSemanticIndex } from "../dist/search/semantic.js";
 import { EVAL_CORPUS } from "./corpus.ts";
 import { EVAL_QUERIES } from "./queries.ts";
 import type { EvalCase, EvalDifficulty } from "./queries.ts";
@@ -56,7 +57,28 @@ export async function runEval(
 ): Promise<EvalReport> {
   const catalog = buildEvalCatalog();
   const engine = new SearchEngine(catalog);
+  return evaluate(engine, catalog, cases, limit);
+}
 
+/** Runs the same corpus through the built-in semantic scorer and default blend. */
+export async function runSemanticEval(
+  cases: readonly EvalCase[] = EVAL_QUERIES,
+  limit: number = EVAL_LIMIT,
+): Promise<EvalReport> {
+  const catalog = buildEvalCatalog();
+  const semantic = new LocalSemanticIndex();
+  semantic.index(catalog.all());
+  const engine = new SearchEngine(catalog);
+  engine.setSemanticScorer(semantic.asScorer());
+  return evaluate(engine, catalog, cases, limit);
+}
+
+async function evaluate(
+  engine: SearchEngine,
+  catalog: Catalog,
+  cases: readonly EvalCase[],
+  limit: number,
+): Promise<EvalReport> {
   assertLabelsResolve(catalog, cases);
 
   const outcomes: CaseOutcome[] = [];

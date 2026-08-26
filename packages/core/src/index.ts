@@ -10,8 +10,10 @@ export {
 export type { CatalogCacheOptions, PersistedCatalog } from "./catalog/persistence.js";
 export { bootstrapCatalog } from "./catalog/bootstrap.js";
 export type { BootstrapOptions, BootstrapResult } from "./catalog/bootstrap.js";
-export { SearchEngine, tokenize } from "./search/search.js";
+export { SearchEngine, tokenize, DEFAULT_SEMANTIC_WEIGHT } from "./search/search.js";
 export type { SemanticScorer } from "./search/search.js";
+export { LocalSemanticIndex, createLocalSemanticScorer } from "./search/semantic.js";
+export type { LocalSemanticOptions, SemanticIndexStats } from "./search/semantic.js";
 export { ConnectionManager } from "./servers/connection-manager.js";
 export { PermissionPolicy, isToolPermitted } from "./permissions/policy.js";
 export type { PolicyDecision, PolicyOptions } from "./permissions/policy.js";

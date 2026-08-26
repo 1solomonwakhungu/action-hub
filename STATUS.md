@@ -23,9 +23,9 @@ downstream server.
 
 ## What is done
 
-- `packages/core` — catalog, catalog persistence, BM25 search, connection
-  manager, permission policy, argument validator, bundles, and the `ActionHub`
-  façade
+- `packages/core` — catalog persistence, BM25 search, dependency-free local
+  semantic scoring, connection manager, permission policy, argument validator,
+  bundles, and the `ActionHub` façade
 - `packages/copilot-plugin` — plugin manifest, `.mcp.json`, skill, meta-MCP
   server, and the Capability Manager canvas
 - `docs/architecture.md`, `docs/roadmap.md`, README, MIT license
@@ -34,8 +34,7 @@ downstream server.
 
 In priority order, with rationale in `docs/roadmap.md`:
 
-1. Semantic scoring — improve paraphrase retrieval beyond the lexical baseline
-2. Interactive canvas controls — the canvas is read-only today
+1. Interactive canvas controls — the canvas is read-only today
 
 Catalog persistence is done: the catalog is cached to
 `$XDG_CACHE_HOME/action-hub/catalog.json` (falling back to `~/.cache`), keyed
@@ -47,6 +46,10 @@ snapshot, so both stay in sync from one atomic, per-instance-serialised write
 The approval flow is done: untrusted actions are gated behind single-use,
 short-lived approval tokens bound to the exact arguments, surfaced by the MCP
 server as an `approval_required` response.
+
+Semantic scoring is done: `LocalSemanticIndex` is enabled by default at weight
+0.2 and guarded against the 91-action evaluation corpus without regressing exact
+matches.
 
 ## Notes for future sessions
 

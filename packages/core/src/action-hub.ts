@@ -1,6 +1,7 @@
 import { Catalog } from "./catalog/catalog.js";
 import { CATALOG_CACHE_VERSION, type PersistedCatalog } from "./catalog/persistence.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
+import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
 import { ConnectionManager } from "./servers/connection-manager.js";
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
 import { ApprovalRegistry, type ApprovalRegistryOptions } from "./permissions/approvals.js";
@@ -21,7 +22,19 @@ export interface ActionHubOptions {
   servers?: readonly ServerConfig[];
   clientFactory: McpClientFactory;
   policy?: PolicyOptions;
-  semanticScorer?: SemanticScorer;
+  /**
+   * Overrides the built-in local scorer. Pass `null` to run pure BM25.
+   * An external scorer is never awaited on the critical path without a guard —
+   * if it throws, search silently degrades to lexical-only.
+   */
+  semanticScorer?: SemanticScorer | null;
+  /**
+   * Tuning for the built-in dependency-free semantic index. Ignored when
+   * `semanticScorer` is supplied.
+   */
+  semantic?: LocalSemanticOptions;
+  /** Blend weight for the semantic signal. Defaults to 0.2. */
+  semanticWeight?: number;
   /** Ring-buffer size for invocation history. */
   historyLimit?: number;
   /**
@@ -69,12 +82,26 @@ export class ActionHub {
   readonly #history: InvocationRecord[] = [];
   readonly #historyLimit: number;
   readonly #denyOnApprovalRequired: boolean;
+  /** Undefined when the caller supplied their own scorer or disabled scoring. */
+  readonly #semanticIndex?: LocalSemanticIndex;
   readonly #approvals: ApprovalRegistry;
 
   constructor(options: ActionHubOptions) {
     this.#connections = new ConnectionManager(options.clientFactory, options.servers ?? []);
     this.#search = new SearchEngine(this.#catalog);
-    this.#search.setSemanticScorer(options.semanticScorer);
+    if (options.semanticWeight !== undefined) {
+      this.#search.setSemanticWeight(options.semanticWeight);
+    }
+    if (options.semanticScorer === null) {
+      this.#search.setSemanticScorer(undefined);
+    } else if (options.semanticScorer) {
+      this.#search.setSemanticScorer(options.semanticScorer);
+    } else {
+      // Default: the built-in local index. It adds no dependency and no
+      // install-time download, so semantic scoring can be on out of the box.
+      this.#semanticIndex = new LocalSemanticIndex(options.semantic);
+      this.#search.setSemanticScorer(this.#semanticIndex.asScorer());
+    }
     this.#policy = new PermissionPolicy(options.policy ?? {});
     this.#historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
     this.#denyOnApprovalRequired = options.denyOnApprovalRequired ?? false;
@@ -98,10 +125,29 @@ export class ActionHub {
    */
   async indexAll(): Promise<IndexResult[]> {
     const configs = this.#connections.configs().filter((config) => config.enabled !== false);
-    return Promise.all(configs.map((config) => this.indexServer(config.id)));
+    const results = await Promise.all(configs.map((config) => this.#indexServer(config.id)));
+    this.rebuildSemanticIndex();
+    return results;
   }
 
   async indexServer(serverId: string): Promise<IndexResult> {
+    const result = await this.#indexServer(serverId);
+    this.rebuildSemanticIndex();
+    return result;
+  }
+
+  /**
+   * Recomputes every action embedding.
+   *
+   * Embeddings are built here — at index time — and never per query, so query
+   * latency stays proportional to the query rather than to the catalog. Call
+   * this after mutating `catalog` directly.
+   */
+  rebuildSemanticIndex(): void {
+    this.#semanticIndex?.index(this.#catalog.all());
+  }
+
+  async #indexServer(serverId: string): Promise<IndexResult> {
     const config = this.#connections.getConfig(serverId);
     if (!config) return { serverId, indexed: 0, error: `Unknown server "${serverId}"` };
 
@@ -142,6 +188,7 @@ export class ActionHub {
    */
   registerSkills(records: readonly Omit<ActionRecord, "kind">[]): void {
     this.#catalog.addAll(records.map((record) => ({ ...record, kind: "skill" as const })));
+    this.rebuildSemanticIndex();
   }
 
   /** Cheap, schema-free retrieval. */
