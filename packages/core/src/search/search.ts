@@ -14,6 +14,7 @@ const DEFAULT_LIMIT = 10;
 export class SearchEngine {
   readonly #catalog: Catalog;
   #semanticScorer?: SemanticScorer;
+  #semanticWeight = DEFAULT_SEMANTIC_WEIGHT;
 
   constructor(catalog: Catalog) {
     this.#catalog = catalog;
@@ -27,6 +28,21 @@ export class SearchEngine {
    */
   setSemanticScorer(scorer: SemanticScorer | undefined): void {
     this.#semanticScorer = scorer;
+  }
+
+  /**
+   * Sets the blend weight applied to the semantic signal. Clamped to [0, 1];
+   * an out-of-range or non-finite value falls back to the default rather than
+   * silently disabling one of the two signals.
+   */
+  setSemanticWeight(weight: number): void {
+    this.#semanticWeight = Number.isFinite(weight)
+      ? Math.min(1, Math.max(0, weight))
+      : DEFAULT_SEMANTIC_WEIGHT;
+  }
+
+  get semanticWeight(): number {
+    return this.#semanticWeight;
   }
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchHit[]> {
@@ -53,11 +69,11 @@ export class SearchEngine {
     }));
 
     let ranked = lexical;
-    if (this.#semanticScorer) {
-      const semantic = await this.#semanticScorer(query, candidates);
+    const semantic = await this.#semanticScores(query, candidates);
+    if (semantic) {
       ranked = lexical.map((entry, i) => ({
         record: entry.record,
-        score: blend(entry.score, semantic[i] ?? 0),
+        score: blend(entry.score, semantic[i] ?? 0, this.#semanticWeight),
       }));
     }
 
@@ -67,6 +83,34 @@ export class SearchEngine {
       .slice(0, limit)
       .map((entry) => toHit(entry.record, entry.score));
   }
+
+  /**
+   * Runs the semantic scorer defensively. Semantic scoring is an enhancement,
+   * never a dependency: a scorer that throws, hangs on a rejected promise,
+   * returns the wrong shape, or emits non-finite values must degrade search to
+   * pure BM25 rather than fail the query.
+   */
+  async #semanticScores(
+    query: string,
+    candidates: readonly ActionRecord[],
+  ): Promise<number[] | undefined> {
+    const scorer = this.#semanticScorer;
+    if (!scorer || this.#semanticWeight <= 0) return undefined;
+
+    let scores: unknown;
+    try {
+      scores = await scorer(query, candidates);
+    } catch {
+      return undefined;
+    }
+    if (!Array.isArray(scores)) return undefined;
+
+    return candidates.map((_, i) => {
+      const value = scores[i];
+      if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+      return Math.min(1, Math.max(0, value));
+    });
+  }
 }
 
 /** Returns a normalized [0,1] relevance score per candidate, index-aligned. */
@@ -75,13 +119,17 @@ export type SemanticScorer = (
   candidates: readonly ActionRecord[],
 ) => Promise<number[]>;
 
-const SEMANTIC_WEIGHT = 0.4;
+/**
+ * Deliberately below 0.5 so that a weak, misconfigured, or partially failing
+ * embedding model shifts the ranking rather than dictating it.
+ */
+export const DEFAULT_SEMANTIC_WEIGHT = 0.4;
 
-function blend(lexicalScore: number, semanticScore: number): number {
+function blend(lexicalScore: number, semanticScore: number, weight: number): number {
   // Lexical scores are unbounded, so squash before blending to keep the two
   // signals on comparable scales.
   const squashed = lexicalScore / (1 + lexicalScore);
-  return (1 - SEMANTIC_WEIGHT) * squashed + SEMANTIC_WEIGHT * semanticScore;
+  return (1 - weight) * squashed + weight * semanticScore;
 }
 
 function toHit(record: ActionRecord, score: number): SearchHit {

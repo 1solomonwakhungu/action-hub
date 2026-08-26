@@ -5,8 +5,11 @@
 **Layer 1 — `packages/core`**
 
 - `Catalog` — action records keyed by `serverId:name`, with trust ranking
-- `SearchEngine` — BM25 with name weighting, camelCase tokenization, optional
-  blended semantic scoring, empty-query browse
+- `SearchEngine` — BM25 with name weighting, camelCase tokenization, blended
+  semantic scoring with a tunable weight, empty-query browse
+- `LocalSemanticIndex` — dependency-free local embeddings (subword n-gram
+  hashing plus a concept lexicon), precomputed at index time, blended at
+  `w = 0.4`, with a non-throwing fallback to pure BM25
 - `ConnectionManager` — lazy activation, shared in-flight connection promises,
   per-server state tracking, ordered shutdown
 - `PermissionPolicy` — trust tiers, auto-approve floor, allow/deny lists
@@ -14,8 +17,9 @@
 - `BundleRegistry` — named capability scopes
 - `ActionHub` — the `search` / `load` / `execute` façade, invocation history,
   context savings estimate
-- 32 tests covering ranking, the schema split, validation, policy gating,
-  per-server failure isolation, and activation counts
+- 51 tests covering ranking, semantic paraphrase and morphology wins, scorer
+  fallback, the schema split, validation, policy gating, per-server failure
+  isolation, and activation counts
 
 **Layer 2 — `packages/copilot-plugin`**
 
@@ -33,10 +37,6 @@
 startup cost scales with the number of downstream servers. Cache the catalog to
 `~/.cache/action-hub/catalog.json`, keyed by a hash of the server config, and
 re-index in the background. The canvas already reads this file.
-
-**Semantic scoring by default.** The `SemanticScorer` hook exists but nothing
-implements it. Ship a small local embedding model so retrieval stops being
-purely lexical. Gate it on the eval suite below.
 
 **Evaluation suite.** Search quality is the product. A corpus of (query →
 expected action) pairs with recall@1/@5 reported on every change, so retrieval

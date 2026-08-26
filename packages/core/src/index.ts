@@ -1,8 +1,10 @@
 export { ActionHub, ActionHubError } from "./action-hub.js";
 export type { ActionHubOptions, HubSnapshot, IndexResult } from "./action-hub.js";
 export { Catalog, trustRank } from "./catalog/catalog.js";
-export { SearchEngine, tokenize } from "./search/search.js";
+export { SearchEngine, tokenize, DEFAULT_SEMANTIC_WEIGHT } from "./search/search.js";
 export type { SemanticScorer } from "./search/search.js";
+export { LocalSemanticIndex, createLocalSemanticScorer } from "./search/semantic.js";
+export type { LocalSemanticOptions, SemanticIndexStats } from "./search/semantic.js";
 export { ConnectionManager } from "./servers/connection-manager.js";
 export { PermissionPolicy, isToolPermitted } from "./permissions/policy.js";
 export type { PolicyDecision, PolicyOptions } from "./permissions/policy.js";

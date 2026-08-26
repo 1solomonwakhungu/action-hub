@@ -80,8 +80,7 @@ cheap, explainable way to encode that without a separate scoring stage.
 reduce to the same terms. Downstream servers are wildly inconsistent about
 naming, and the index should not care.
 
-An optional `SemanticScorer` can be attached. It is blended rather than
-substituted:
+A `SemanticScorer` is blended rather than substituted:
 
 ```
 score = (1 - w) · (s / (1 + s)) + w · semantic     w = 0.4
@@ -90,6 +89,46 @@ score = (1 - w) · (s / (1 + s)) + w · semantic     w = 0.4
 The lexical score is squashed into `[0, 1)` before blending so the two signals
 are commensurate, and the weight is deliberately below 0.5 so a weak or
 misconfigured embedding model degrades results instead of destroying them.
+Tune it with `setSemanticWeight()`; `0` disables the semantic signal entirely.
+
+If the scorer throws, rejects, or returns anything other than a numeric array
+of the right shape, the blend is skipped and the query falls back to pure BM25.
+Retrieval never fails because of the semantic layer.
+
+### The local semantic index
+
+`LocalSemanticIndex` is the default scorer, wired up by `ActionHub` unless you
+pass `semanticScorer: null`. It is deliberately dependency-free: no model
+weights, no download at install time, no network at query time. Embeddings are
+deterministic, so two processes indexing the same catalog agree exactly.
+
+A document embedding is the IDF-weighted sum of two signals, hashed into a
+fixed 256-dimensional space and L2-normalized; scoring is a cosine similarity.
+
+1. **Subword character n-grams** (3-4 chars) over each term. This is what makes
+   morphology work — "messaging" and "message" share most of their n-grams
+   without either being a prefix of the other.
+2. **A concept lexicon** (`DEFAULT_CONCEPTS`), a small hand-written thesaurus of
+   operational vocabulary. Every term in a group anchors to a shared concept
+   dimension, so "instance", "vm", and "virtual machine" land near each other.
+
+The second signal exists because the first cannot possibly cover synonymy:
+n-grams are purely orthographic, and "virtual machine" shares no substring with
+"instance". Concept lookup applies cheap suffix stripping so "working" reaches
+the `task` concept, which the shared `tokenize()` would not do on its own —
+that stemming is confined to concept lookup precisely because BM25 depends on
+`tokenize()` staying literal.
+
+Embeddings are built once per catalog change in `index()`, not per query. A
+record the index has not seen — or whose text changed since the last rebuild —
+is embedded on demand rather than silently scored zero.
+
+An earlier iteration derived term relatedness from catalog co-occurrence via
+random indexing. It was removed after measurement, not left switched off: a
+co-occurrence pass pulls every term toward its own document's centroid, which
+destroys discrimination between actions on the *same* server, which is exactly
+where ranking is hardest. Every configuration in the parameter sweep preferred
+a weight of zero for it.
 
 An empty query is treated as a browse request and returns a stable
 alphabetical slice, not an error. "Show me what is available" is a legitimate
