@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import type { ServerConfig, TrustTier } from "@action-hub/core";
@@ -6,12 +7,19 @@ import type { ServerConfig, TrustTier } from "@action-hub/core";
 export interface HubConfigFile {
   servers?: unknown;
   autoApproveAtOrAbove?: unknown;
+  approvalTtlSeconds?: unknown;
 }
 
 export interface HubConfig {
   servers: ServerConfig[];
   autoApproveAtOrAbove: TrustTier;
+  /** Lifetime of an approval token, in milliseconds. */
+  approvalTtlMs: number;
 }
+
+const DEFAULT_APPROVAL_TTL_SECONDS = 300;
+const MAX_APPROVAL_TTL_SECONDS = 3600;
+const mutationChains = new Map<string, Promise<void>>();
 
 const VALID_TRUST: readonly string[] = ["blocked", "untrusted", "trusted"];
 
@@ -33,7 +41,13 @@ export async function loadConfig(path: string): Promise<HubConfig> {
   try {
     raw = await readFile(path, "utf8");
   } catch (cause) {
-    if (isNotFound(cause)) return { servers: [], autoApproveAtOrAbove: "trusted" };
+    if (isNotFound(cause)) {
+      return {
+        servers: [],
+        autoApproveAtOrAbove: "trusted",
+        approvalTtlMs: DEFAULT_APPROVAL_TTL_SECONDS * 1000,
+      };
+    }
     throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
   }
 
@@ -49,7 +63,16 @@ export async function loadConfig(path: string): Promise<HubConfig> {
     autoApproveAtOrAbove: isTrust(parsed.autoApproveAtOrAbove)
       ? parsed.autoApproveAtOrAbove
       : "trusted",
+    approvalTtlMs: parseApprovalTtl(parsed.approvalTtlSeconds),
   };
+}
+
+/** Clamped rather than rejected: a nonsensical TTL should not stop the hub booting. */
+function parseApprovalTtl(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_APPROVAL_TTL_SECONDS * 1000;
+  }
+  return Math.min(Math.round(value), MAX_APPROVAL_TTL_SECONDS) * 1000;
 }
 
 /**
@@ -110,9 +133,39 @@ export async function writeRawConfig(
   path: string,
   config: Record<string, unknown>,
 ): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
-  await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  await enqueueMutation(path, () => writeRawConfigFile(path, config));
+}
+
+export async function mutateRawConfig(
+  path: string,
+  mutate: (config: Record<string, unknown>) => void,
+): Promise<void> {
+  await enqueueMutation(path, async () => {
+    const config = await readRawConfig(path);
+    mutate(config);
+    await writeRawConfigFile(path, config);
+  });
+}
+
+async function enqueueMutation(path: string, mutation: () => Promise<void>): Promise<void> {
+  const previous = mutationChains.get(path) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(mutation);
+  mutationChains.set(path, current);
+  try {
+    await current;
+  } finally {
+    if (mutationChains.get(path) === current) mutationChains.delete(path);
+  }
+}
+
+async function writeRawConfigFile(
+  path: string,
+  config: Record<string, unknown>,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const mode = await stat(path).then((entry) => entry.mode & 0o777).catch(() => 0o600);
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode });
   await rename(temp, path);
 }
 

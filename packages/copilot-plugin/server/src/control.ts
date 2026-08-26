@@ -1,16 +1,15 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import type { ActionHub, TrustTier } from "@action-hub/core";
+import { CatalogCache, hashServerConfigs, type ActionHub, type TrustTier } from "@action-hub/core";
 import {
   TRUST_TIERS,
   isTrust,
   parseServerEntry,
   rawServers,
-  readRawConfig,
-  writeRawConfig,
+  mutateRawConfig,
 } from "./config.js";
 import { writeSnapshot } from "./snapshot.js";
 
@@ -52,9 +51,10 @@ export async function startControlServer(
   controlPath = defaultControlPath(),
 ): Promise<ControlServer> {
   const token = randomBytes(32).toString("hex");
+  const cache = new CatalogCache();
 
   const http = createServer((req, res) => {
-    handle(hub, configPath, token, req, res).catch((cause: unknown) => {
+    handle(hub, configPath, token, cache, req, res).catch((cause: unknown) => {
       respond(res, 500, { ok: false, error: message(cause) });
     });
   });
@@ -92,6 +92,7 @@ async function handle(
   hub: ActionHub,
   configPath: string,
   token: string,
+  cache: CatalogCache,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -112,6 +113,11 @@ async function handle(
     return;
   }
 
+  if (req.headers["content-type"] !== "application/json") {
+    respond(res, 415, { ok: false, error: "Content-Type must be application/json" });
+    return;
+  }
+
   let input: Record<string, unknown>;
   try {
     input = await readBody(req);
@@ -123,16 +129,16 @@ async function handle(
   try {
     switch (path) {
       case "/set-enabled":
-        respond(res, 200, await setEnabled(hub, configPath, input));
+        respond(res, 200, await setEnabled(hub, configPath, cache, input));
         return;
       case "/set-trust":
-        respond(res, 200, await setTrust(hub, configPath, input));
+        respond(res, 200, await setTrust(hub, configPath, cache, input));
         return;
       case "/search":
         respond(res, 200, await search(hub, input));
         return;
       case "/add-server":
-        respond(res, 200, await addServer(hub, configPath, input));
+        respond(res, 200, await addServer(hub, configPath, cache, input));
         return;
       default:
         respond(res, 404, { ok: false, error: `Unknown control operation "${path}"` });
@@ -149,6 +155,7 @@ async function handle(
 async function setEnabled(
   hub: ActionHub,
   configPath: string,
+  cache: CatalogCache,
   input: Record<string, unknown>,
 ): Promise<unknown> {
   const serverId = requireKnownServer(hub, input["serverId"]);
@@ -162,7 +169,7 @@ async function setEnabled(
     const result = await hub.indexServer(serverId);
     indexed = result.indexed;
     if (result.error) {
-      await writeSnapshot(hub);
+      await refreshSnapshot(hub, cache);
       return { ok: true, serverId, enabled, indexed, warning: result.error };
     }
   } else {
@@ -172,13 +179,14 @@ async function setEnabled(
     hub.connections.recordToolCount(serverId, 0);
   }
 
-  await writeSnapshot(hub);
+  await refreshSnapshot(hub, cache);
   return { ok: true, serverId, enabled, indexed };
 }
 
 async function setTrust(
   hub: ActionHub,
   configPath: string,
+  cache: CatalogCache,
   input: Record<string, unknown>,
 ): Promise<unknown> {
   const serverId = requireKnownServer(hub, input["serverId"]);
@@ -190,7 +198,7 @@ async function setTrust(
   hub.connections.setTrust(serverId, trust);
   retagCatalog(hub, serverId, trust);
   await persist(configPath, serverId, { trust });
-  await writeSnapshot(hub);
+  await refreshSnapshot(hub, cache);
 
   return { ok: true, serverId, trust, retagged: hub.catalog.countByServer(serverId) };
 }
@@ -232,6 +240,7 @@ async function search(hub: ActionHub, input: Record<string, unknown>): Promise<u
 async function addServer(
   hub: ActionHub,
   configPath: string,
+  cache: CatalogCache,
   input: Record<string, unknown>,
 ): Promise<unknown> {
   const config = parseServerEntry(input["server"], "add_server");
@@ -240,22 +249,20 @@ async function addServer(
     throw new Error(`Server "${config.id}" already exists`);
   }
 
-  const raw = await readRawConfig(configPath);
-  const servers = rawServers(raw);
-  if (servers.some((entry) => entry["id"] === config.id)) {
-    throw new Error(`Server "${config.id}" already exists in ${configPath}`);
-  }
-
+  await mutateRawConfig(configPath, (raw) => {
+    const servers = rawServers(raw);
+    if (servers.some((entry) => entry["id"] === config.id)) {
+      throw new Error(`Server "${config.id}" already exists in ${configPath}`);
+    }
+    // Persist the caller's entry rather than the parsed one so `${ENV_VAR}`
+    // references stay unexpanded and secrets are never written to disk.
+    servers.push(asRecord(input["server"]));
+    raw["servers"] = servers;
+  });
   hub.connections.register(config);
 
-  // Persist the caller's entry rather than the parsed one so `${ENV_VAR}`
-  // references stay unexpanded and secrets are never written to disk.
-  servers.push(asRecord(input["server"]));
-  raw["servers"] = servers;
-  await writeRawConfig(configPath, raw);
-
   const result = config.enabled === false ? { indexed: 0 } : await hub.indexServer(config.id);
-  await writeSnapshot(hub);
+  await refreshSnapshot(hub, cache);
 
   return {
     ok: true,
@@ -277,15 +284,15 @@ async function persist(
   serverId: string,
   patch: Record<string, unknown>,
 ): Promise<void> {
-  const raw = await readRawConfig(configPath);
-  const servers = rawServers(raw);
-  const entry = servers.find((candidate) => candidate["id"] === serverId);
-  if (!entry) {
-    throw new Error(`Server "${serverId}" is not present in ${configPath}`);
-  }
-  Object.assign(entry, patch);
-  raw["servers"] = servers;
-  await writeRawConfig(configPath, raw);
+  await mutateRawConfig(configPath, (raw) => {
+    const servers = rawServers(raw);
+    const entry = servers.find((candidate) => candidate["id"] === serverId);
+    if (!entry) {
+      throw new Error(`Server "${serverId}" is not present in ${configPath}`);
+    }
+    Object.assign(entry, patch);
+    raw["servers"] = servers;
+  });
 }
 
 /**
@@ -326,6 +333,11 @@ function liveState(hub: ActionHub, configPath: string): unknown {
     context: snapshot.context,
     indexedAt: snapshot.indexedAt,
   };
+}
+
+async function refreshSnapshot(hub: ActionHub, cache: CatalogCache): Promise<void> {
+  const configHash = hashServerConfigs(hub.connections.configs());
+  await writeSnapshot(hub, configHash, cache);
 }
 
 function requireKnownServer(hub: ActionHub, value: unknown): string {
@@ -391,8 +403,8 @@ function respond(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 async function publish(path: string, payload: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   // 0600: the token in this file is the only credential guarding the endpoint.
   await writeFile(temp, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
   await rename(temp, path);

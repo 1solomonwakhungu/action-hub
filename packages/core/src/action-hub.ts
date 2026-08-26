@@ -1,7 +1,10 @@
 import { Catalog } from "./catalog/catalog.js";
+import { CATALOG_CACHE_VERSION, type PersistedCatalog } from "./catalog/persistence.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
+import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
 import { ConnectionManager } from "./servers/connection-manager.js";
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
+import { ApprovalRegistry, type ApprovalRegistryOptions } from "./permissions/approvals.js";
 import { validateArguments } from "./router/validate.js";
 import type {
   ActionRecord,
@@ -19,15 +22,34 @@ export interface ActionHubOptions {
   servers?: readonly ServerConfig[];
   clientFactory: McpClientFactory;
   policy?: PolicyOptions;
-  semanticScorer?: SemanticScorer;
+  /**
+   * Overrides the built-in local scorer. Pass `null` to run pure BM25.
+   * An external scorer is never awaited on the critical path without a guard —
+   * if it throws, search silently degrades to lexical-only.
+   */
+  semanticScorer?: SemanticScorer | null;
+  /**
+   * Tuning for the built-in dependency-free semantic index. Ignored when
+   * `semanticScorer` is supplied.
+   */
+  semantic?: LocalSemanticOptions;
+  /** Blend weight for the semantic signal. Defaults to 0.2. */
+  semanticWeight?: number;
   /** Ring-buffer size for invocation history. */
   historyLimit?: number;
   /**
    * When true, an action whose policy decision requires approval is refused
-   * instead of executed. Hosts that can prompt the user should set this false
-   * and surface `requiresApproval` themselves.
+   * outright rather than offered an approval token. For hosts that cannot
+   * prompt a user at all and must fail closed.
    */
   denyOnApprovalRequired?: boolean;
+  /** Token lifetime and clock for the approval gate. */
+  approvals?: ApprovalRegistryOptions;
+}
+
+export interface ExecuteOptions {
+  /** Token returned by a previous gated execute of this exact call. */
+  approvalToken?: string;
 }
 
 export interface IndexResult {
@@ -60,14 +82,30 @@ export class ActionHub {
   readonly #history: InvocationRecord[] = [];
   readonly #historyLimit: number;
   readonly #denyOnApprovalRequired: boolean;
+  /** Undefined when the caller supplied their own scorer or disabled scoring. */
+  readonly #semanticIndex?: LocalSemanticIndex;
+  readonly #approvals: ApprovalRegistry;
 
   constructor(options: ActionHubOptions) {
     this.#connections = new ConnectionManager(options.clientFactory, options.servers ?? []);
     this.#search = new SearchEngine(this.#catalog);
-    this.#search.setSemanticScorer(options.semanticScorer);
+    if (options.semanticWeight !== undefined) {
+      this.#search.setSemanticWeight(options.semanticWeight);
+    }
+    if (options.semanticScorer === null) {
+      this.#search.setSemanticScorer(undefined);
+    } else if (options.semanticScorer) {
+      this.#search.setSemanticScorer(options.semanticScorer);
+    } else {
+      // Default: the built-in local index. It adds no dependency and no
+      // install-time download, so semantic scoring can be on out of the box.
+      this.#semanticIndex = new LocalSemanticIndex(options.semantic);
+      this.#search.setSemanticScorer(this.#semanticIndex.asScorer());
+    }
     this.#policy = new PermissionPolicy(options.policy ?? {});
     this.#historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
     this.#denyOnApprovalRequired = options.denyOnApprovalRequired ?? false;
+    this.#approvals = new ApprovalRegistry(options.approvals ?? {});
   }
 
   get catalog(): Catalog {
@@ -87,10 +125,29 @@ export class ActionHub {
    */
   async indexAll(): Promise<IndexResult[]> {
     const configs = this.#connections.configs().filter((config) => config.enabled !== false);
-    return Promise.all(configs.map((config) => this.indexServer(config.id)));
+    const results = await Promise.all(configs.map((config) => this.#indexServer(config.id)));
+    this.rebuildSemanticIndex();
+    return results;
   }
 
   async indexServer(serverId: string): Promise<IndexResult> {
+    const result = await this.#indexServer(serverId);
+    this.rebuildSemanticIndex();
+    return result;
+  }
+
+  /**
+   * Recomputes every action embedding.
+   *
+   * Embeddings are built here — at index time — and never per query, so query
+   * latency stays proportional to the query rather than to the catalog. Call
+   * this after mutating `catalog` directly.
+   */
+  rebuildSemanticIndex(): void {
+    this.#semanticIndex?.index(this.#catalog.all());
+  }
+
+  async #indexServer(serverId: string): Promise<IndexResult> {
     const config = this.#connections.getConfig(serverId);
     if (!config) return { serverId, indexed: 0, error: `Unknown server "${serverId}"` };
 
@@ -131,6 +188,7 @@ export class ActionHub {
    */
   registerSkills(records: readonly Omit<ActionRecord, "kind">[]): void {
     this.#catalog.addAll(records.map((record) => ({ ...record, kind: "skill" as const })));
+    this.rebuildSemanticIndex();
   }
 
   /** Cheap, schema-free retrieval. */
@@ -154,7 +212,18 @@ export class ActionHub {
     };
   }
 
-  async execute(actionId: string, args: Record<string, unknown> = {}): Promise<ExecuteResult> {
+  /**
+   * Runs an action, subject to policy.
+   *
+   * When the policy gates the action, this does *not* run it. It returns an
+   * `ApprovalRequest` carrying a single-use token; passing that token back on
+   * an identical call is what actually executes it.
+   */
+  async execute(
+    actionId: string,
+    args: Record<string, unknown> = {},
+    options: ExecuteOptions = {},
+  ): Promise<ExecuteResult> {
     const startedAt = new Date().toISOString();
     const start = Date.now();
 
@@ -175,20 +244,16 @@ export class ActionHub {
       );
     }
 
+    // Deny is evaluated first and is unconditional. An approval token is only
+    // ever offered for a call the policy already permits, so approval can never
+    // become a path around a disabled server, a blocked tier, or a deny-list.
     const decision = this.#policy.evaluate(record, this.#connections.getConfig(record.serverId));
     if (!decision.allowed) {
       return this.#fail(actionId, record.serverId, decision.reason ?? "Denied by policy", startedAt, start);
     }
-    if (decision.requiresApproval && this.#denyOnApprovalRequired) {
-      return this.#fail(
-        actionId,
-        record.serverId,
-        `Approval required: ${decision.reason ?? "untrusted server"}`,
-        startedAt,
-        start,
-      );
-    }
 
+    // Validated before the gate so a user is never asked to approve a call that
+    // would fail locally anyway, and so a bad call cannot burn a valid token.
     const validation = validateArguments(record.inputSchema, args);
     if (!validation.valid) {
       return this.#fail(
@@ -200,16 +265,90 @@ export class ActionHub {
       );
     }
 
+    let approved = false;
+    if (decision.requiresApproval) {
+      const reason = decision.reason ?? `Server "${record.serverId}" is ${record.trust}`;
+
+      if (options.approvalToken) {
+        const check = this.#approvals.consume(options.approvalToken, actionId, args);
+        if (!check.ok) {
+          return this.#fail(
+            actionId,
+            record.serverId,
+            `Approval rejected: ${check.reason ?? "invalid approval token"}`,
+            startedAt,
+            start,
+            "required",
+          );
+        }
+        approved = true;
+      } else if (this.#denyOnApprovalRequired) {
+        return this.#fail(
+          actionId,
+          record.serverId,
+          `Approval required: ${reason}`,
+          startedAt,
+          start,
+          "required",
+        );
+      } else {
+        const approval = this.#approvals.issue({
+          actionId,
+          serverId: record.serverId,
+          name: record.name,
+          trust: record.trust,
+          reason,
+          args,
+        });
+        const durationMs = Date.now() - start;
+        this.#record({
+          actionId,
+          serverId: record.serverId,
+          startedAt,
+          durationMs,
+          ok: false,
+          error: `Approval required: ${reason}`,
+          approval: "required",
+        });
+        return {
+          ok: false,
+          actionId,
+          error: `Approval required: ${reason}`,
+          durationMs,
+          approval,
+        };
+      }
+    }
+
     try {
       const client = await this.#connections.activate(record.serverId);
       const content = await client.callTool(record.name, args);
       const durationMs = Date.now() - start;
-      this.#record({ actionId, serverId: record.serverId, startedAt, durationMs, ok: true });
+      this.#record({
+        actionId,
+        serverId: record.serverId,
+        startedAt,
+        durationMs,
+        ok: true,
+        ...(approved ? { approval: "approved" as const } : {}),
+      });
       return { ok: true, actionId, content, durationMs };
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      return this.#fail(actionId, record.serverId, message, startedAt, start);
+      return this.#fail(
+        actionId,
+        record.serverId,
+        message,
+        startedAt,
+        start,
+        approved ? "approved" : undefined,
+      );
     }
+  }
+
+  /** Outstanding, unexpired approval tokens. Diagnostics only. */
+  pendingApprovals(): number {
+    return this.#approvals.size;
   }
 
   serverStates(): ServerState[] {
@@ -252,6 +391,45 @@ export class ActionHub {
     };
   }
 
+  /**
+   * Rehydrates the catalog from a persisted entry, skipping the eager
+   * round-trip to every downstream server.
+   *
+   * Only the catalog is restored. Connection state deliberately is not:
+   * nothing has been spawned yet, so every server stays `inactive` until an
+   * action from it is executed. Actions belonging to servers that are no
+   * longer configured are dropped, since they could never be dispatched.
+   */
+  restoreCatalog(entry: PersistedCatalog): number {
+    const known = new Set(this.#connections.configs().map((config) => config.id));
+    const records = entry.actions.filter(
+      (record) => record.kind === "skill" || known.has(record.serverId),
+    );
+
+    for (const serverId of this.#catalog.serverIds()) this.#catalog.removeServer(serverId);
+    this.#catalog.addAll(records);
+
+    for (const serverId of known) {
+      this.#connections.recordToolCount(serverId, this.#catalog.listByServer(serverId).length);
+    }
+    return records.length;
+  }
+
+  /**
+   * The full serializable catalog, ready to be written to a cache.
+   *
+   * A superset of `snapshot()` — the diagnostics fields are identical, so a
+   * single file can serve both the cache and the capability manager canvas.
+   */
+  toPersisted(configHash: string): PersistedCatalog {
+    return {
+      version: CATALOG_CACHE_VERSION,
+      configHash,
+      ...this.snapshot(),
+      actions: this.#catalog.all(),
+    };
+  }
+
   async close(): Promise<void> {
     await this.#connections.closeAll();
   }
@@ -262,9 +440,18 @@ export class ActionHub {
     error: string,
     startedAt: string,
     start: number,
+    approval?: InvocationRecord["approval"],
   ): ExecuteResult {
     const durationMs = Date.now() - start;
-    this.#record({ actionId, serverId, startedAt, durationMs, ok: false, error });
+    this.#record({
+      actionId,
+      serverId,
+      startedAt,
+      durationMs,
+      ok: false,
+      error,
+      ...(approval ? { approval } : {}),
+    });
     return { ok: false, actionId, error, durationMs };
   }
 

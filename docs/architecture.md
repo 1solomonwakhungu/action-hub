@@ -16,7 +16,7 @@ GitHub Copilot app
         ▼
   ActionHub façade           ← Layer 1, the actual IP
         │
-        ├── Catalog
+        ├── Catalog ──────────► CatalogCache (~/.cache/action-hub)
         ├── SearchEngine
         ├── ConnectionManager ──► GitHub MCP, Linear MCP, Slack MCP, …
         ├── PermissionPolicy
@@ -80,8 +80,7 @@ cheap, explainable way to encode that without a separate scoring stage.
 reduce to the same terms. Downstream servers are wildly inconsistent about
 naming, and the index should not care.
 
-An optional `SemanticScorer` can be attached. It is blended rather than
-substituted:
+A `SemanticScorer` is blended rather than substituted:
 
 ```
 score = (1 - w) · (s / (1 + s)) + w · semantic     w = 0.4
@@ -90,6 +89,46 @@ score = (1 - w) · (s / (1 + s)) + w · semantic     w = 0.4
 The lexical score is squashed into `[0, 1)` before blending so the two signals
 are commensurate, and the weight is deliberately below 0.5 so a weak or
 misconfigured embedding model degrades results instead of destroying them.
+Tune it with `setSemanticWeight()`; `0` disables the semantic signal entirely.
+
+If the scorer throws, rejects, or returns anything other than a numeric array
+of the right shape, the blend is skipped and the query falls back to pure BM25.
+Retrieval never fails because of the semantic layer.
+
+### The local semantic index
+
+`LocalSemanticIndex` is the default scorer, wired up by `ActionHub` unless you
+pass `semanticScorer: null`. It is deliberately dependency-free: no model
+weights, no download at install time, no network at query time. Embeddings are
+deterministic, so two processes indexing the same catalog agree exactly.
+
+A document embedding is the IDF-weighted sum of two signals, hashed into a
+fixed 256-dimensional space and L2-normalized; scoring is a cosine similarity.
+
+1. **Subword character n-grams** (3-4 chars) over each term. This is what makes
+   morphology work — "messaging" and "message" share most of their n-grams
+   without either being a prefix of the other.
+2. **A concept lexicon** (`DEFAULT_CONCEPTS`), a small hand-written thesaurus of
+   operational vocabulary. Every term in a group anchors to a shared concept
+   dimension, so "instance", "vm", and "virtual machine" land near each other.
+
+The second signal exists because the first cannot possibly cover synonymy:
+n-grams are purely orthographic, and "virtual machine" shares no substring with
+"instance". Concept lookup applies cheap suffix stripping so "working" reaches
+the `task` concept, which the shared `tokenize()` would not do on its own —
+that stemming is confined to concept lookup precisely because BM25 depends on
+`tokenize()` staying literal.
+
+Embeddings are built once per catalog change in `index()`, not per query. A
+record the index has not seen — or whose text changed since the last rebuild —
+is embedded on demand rather than silently scored zero.
+
+An earlier iteration derived term relatedness from catalog co-occurrence via
+random indexing. It was removed after measurement, not left switched off: a
+co-occurrence pass pulls every term toward its own document's centroid, which
+destroys discrimination between actions on the *same* server, which is exactly
+where ranking is hardest. Every configuration in the parameter sweep preferred
+a weight of zero for it.
 
 An empty query is treated as a browse request and returns a stable
 alphabetical slice, not an error. "Show me what is available" is a legitimate
@@ -109,19 +148,86 @@ Indexing failures are captured per server. One broken integration produces one
 `IndexResult` with an `error` field; the rest of the catalog still builds. A
 misconfigured Slack token must not take down GitHub.
 
+## Catalog persistence
+
+Indexing is the only eager cost in the system, and it is linear in the number
+of configured servers. `bootstrapCatalog` removes it from the critical path:
+the catalog is read from `$XDG_CACHE_HOME/action-hub/catalog.json` (falling
+back to `~/.cache`), the hub becomes answerable immediately, and the real index
+runs behind it and writes the refreshed catalog back.
+
+An entry is reused only when both the schema `version` and a `configHash`
+match. That hash covers command, args, cwd, transport type, URL, trust,
+enabled, and the allow/deny lists. It deliberately covers env and header *keys*
+but not their *values*: a rotated token must not discard a valid catalog, and a
+secret must not end up in a digest that lives on disk. A value change that
+actually alters the catalog is caught by the background re-index instead.
+Servers are sorted before hashing, so reordering the config file is not a
+cache-invalidating edit.
+
+Every failure mode degrades to a full index rather than an error. A missing,
+corrupt, truncated, or unreadable file is a miss; individual malformed action
+records are dropped while the rest of the entry survives; an unwritable cache
+directory produces a warning and a working hub. The background refresh catches
+its own rejections, because an unhandled one would take down the process the
+agent session depends on.
+
+Restoring a catalog restores *only* the catalog. No server is activated, so
+lazy activation is preserved — a warm start connects to nothing until an action
+is executed. Actions belonging to servers that have since been removed from the
+config are dropped, since they could never be dispatched.
+
+The cache file and the Capability Manager snapshot are the same file. The
+persisted entry is a superset of `HubSnapshot`, so one atomic write keeps the
+canvas current and the cache warm without the two drifting apart. Each write
+goes to a unique temp file (`<path>.<pid>.<uuid>.tmp`) and is renamed into
+place, and every write on a `CatalogCache` instance is serialised onto a
+promise chain. That combination is what makes the "atomic" claim hold under the
+concurrency the host actually produces — an unawaited write after every
+`execute` plus the background refresh — so two writes can never interleave their
+bytes or race each other's rename, and a reader always sees a complete entry.
+The cache directory is created `0700` and the file written `0600`.
+
 ## Permissions
 
 Three tiers: `blocked` < `untrusted` < `trusted`.
 
 `autoApproveAtOrAbove` sets the floor for silent execution. Anything below it
-is *allowed but gated* — the decision carries `requiresApproval: true` and the
-host decides what to do. A host that can prompt the user should surface the
-prompt; a host that cannot should set `denyOnApprovalRequired: true` and fail
-closed.
+is *allowed but gated*: the decision carries `requiresApproval: true`.
 
 Per-server `allowTools` / `denyTools` filter at both index time and execute
 time. Deny always beats allow, so an explicitly denied tool cannot be reached
 by any path.
+
+## Approval
+
+A gated `execute` does not run. It returns an `ApprovalRequest` describing what
+was asked for — server, action, trust tier, argument summary — plus a
+single-use `approvalToken`. Passing that token back on an identical `execute`
+is what actually dispatches the call.
+
+The token is bound to a SHA-256 fingerprint of the canonicalized arguments, not
+to the action alone. Approving "post *this* message to *this* channel" must not
+become authority to post anything else, so changing any value invalidates it.
+Key order is normalized, so the binding tracks meaning rather than
+serialization. Tokens are single-use and expire in five minutes by default
+(`approvalTtlSeconds` in the host config, clamped to an hour): an approval is a
+decision about *now*, not a standing grant.
+
+Ordering inside `execute` is the security property:
+
+1. **Deny is evaluated first, and unconditionally.** A disabled server, a
+   `blocked` tier, or a deny-listed tool fails outright — and crucially, *no
+   token is issued*. There is no denied-but-approvable state, so approval can
+   never become a path around an explicit deny. A token minted elsewhere is
+   worthless because the deny check runs before the token is read.
+2. **Arguments are validated before the gate.** A user is never asked to
+   approve a call that would fail locally anyway, and a malformed retry cannot
+   burn a valid token.
+3. **Only then is the gate applied.**
+
+A host that cannot prompt the user at all should set
+`denyOnApprovalRequired: true` and fail closed rather than issue tokens.
 
 ## Validation
 

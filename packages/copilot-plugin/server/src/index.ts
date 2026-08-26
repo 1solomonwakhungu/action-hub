@@ -2,11 +2,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { ActionHub, ActionHubError } from "@action-hub/core";
+import { ActionHub, ActionHubError, CatalogCache, bootstrapCatalog } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { startControlServer, type ControlServer } from "./control.js";
 import { createSdkClientFactory } from "./sdk-client.js";
-import { writeSnapshot } from "./snapshot.js";
+import { warn, writeSnapshot } from "./snapshot.js";
 
 const TOOL_DESCRIPTION = `Search, load, and run capabilities from every connected MCP server and installed skill.
 
@@ -17,7 +17,9 @@ Always follow three steps in order:
 2. load — pass an action_id from search. Returns the full JSON Schema for its arguments.
 3. execute — pass the same action_id plus arguments matching the loaded schema.
 
-Never execute an action you have not loaded in this conversation; argument names cannot be reliably guessed from an action name.`;
+Never execute an action you have not loaded in this conversation; argument names cannot be reliably guessed from an action name.
+
+Some actions are gated. If execute returns status "approval_required", it did NOT run. Show the user the server, action, and arguments, ask them to confirm, and only if they agree repeat the identical execute call with approval_token set to the returned token. The token is single-use, expires quickly, and is only valid for those exact arguments. Never approve on the user's behalf.`;
 
 const inputShape = {
   operation: z
@@ -37,6 +39,12 @@ const inputShape = {
     .describe("Arguments for execute, matching the schema returned by load."),
   server_id: z.string().optional().describe("Restrict a search to one server."),
   limit: z.number().int().min(1).max(50).optional().describe("Max search results. Default 10."),
+  approval_token: z
+    .string()
+    .optional()
+    .describe(
+      "Token from a prior approval_required response. Pass it on an identical execute call, only after the user has explicitly confirmed. Single-use, short-lived, and bound to these exact arguments.",
+    ),
 } as const;
 
 async function main(): Promise<void> {
@@ -47,17 +55,27 @@ async function main(): Promise<void> {
     servers: config.servers,
     clientFactory: createSdkClientFactory(),
     policy: { autoApproveAtOrAbove: config.autoApproveAtOrAbove },
+    approvals: { ttlMs: config.approvalTtlMs },
   });
 
-  const indexed = await hub.indexAll();
-  for (const result of indexed) {
-    if (result.error) {
-      // stdout is the MCP channel; diagnostics must go to stderr.
-      process.stderr.write(`action-hub: failed to index "${result.serverId}": ${result.error}\n`);
-    }
-  }
+  const cache = new CatalogCache({ onWarning: warn });
 
-  await writeSnapshot(hub);
+  // A warm cache makes the hub answerable immediately; the authoritative index
+  // then runs behind it and writes the refreshed catalog back.
+  const bootstrap = await bootstrapCatalog(hub, {
+    servers: config.servers,
+    cache,
+    onWarning: warn,
+  });
+
+  bootstrap.refreshed.then(
+    (results) => {
+      for (const result of results) {
+        if (result.error) warn(`failed to index "${result.serverId}": ${result.error}`);
+      }
+    },
+    (cause: unknown) => warn(`re-index failed: ${cause instanceof Error ? cause.message : String(cause)}`),
+  );
 
   // The control endpoint only powers the Capability Manager canvas, so a
   // failure to bind must never take the MCP server down with it — the canvas
@@ -81,7 +99,7 @@ async function main(): Promise<void> {
     },
     async (input) => {
       try {
-        return text(await dispatch(hub, input));
+        return text(await dispatch(hub, input, bootstrap.configHash, cache));
       } catch (cause) {
         const message =
           cause instanceof ActionHubError || cause instanceof Error
@@ -95,10 +113,13 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // Let an in-flight background re-index settle before tearing down the
+  // connections it is still writing to, so a shutdown mid-refresh does not
+  // surface as a broken pipe against a downstream server.
   const shutdown = () => {
-    const stopControl = control?.close() ?? Promise.resolve();
-    void stopControl
+    void bootstrap.refreshed
       .catch(() => undefined)
+      .then(() => control?.close())
       .then(() => hub.close())
       .finally(() => process.exit(0));
   };
@@ -113,9 +134,15 @@ type ToolInput = {
   arguments?: Record<string, unknown>;
   server_id?: string;
   limit?: number;
+  approval_token?: string;
 };
 
-async function dispatch(hub: ActionHub, input: ToolInput): Promise<unknown> {
+async function dispatch(
+  hub: ActionHub,
+  input: ToolInput,
+  configHash: string,
+  cache: CatalogCache,
+): Promise<unknown> {
   switch (input.operation) {
     case "search": {
       const hits = await hub.search(input.query ?? "", {
@@ -157,9 +184,37 @@ async function dispatch(hub: ActionHub, input: ToolInput): Promise<unknown> {
 
     case "execute": {
       const actionId = requireActionId(input, "execute");
-      const result = await hub.execute(actionId, input.arguments ?? {});
+      const result = await hub.execute(
+        actionId,
+        input.arguments ?? {},
+        input.approval_token ? { approvalToken: input.approval_token } : {},
+      );
       // Refreshes server activation state and invocation history for the canvas.
-      void writeSnapshot(hub);
+      // Reuse the bootstrap cache instance so this unawaited write is serialised
+      // with the background refresh on the same promise chain.
+      void writeSnapshot(hub, configHash, cache);
+
+      if (result.approval) {
+        const approval = result.approval;
+        return {
+          ok: false,
+          status: "approval_required",
+          action_id: approval.actionId,
+          server: approval.serverId,
+          name: approval.name,
+          trust: approval.trust,
+          reason: approval.reason,
+          arguments_summary: approval.argumentsSummary,
+          argument_keys: approval.argumentKeys,
+          approval_token: approval.approvalToken,
+          expires_at: approval.expiresAt,
+          expires_in_seconds: Math.round(approval.ttlMs / 1000),
+          executed: false,
+          next: approval.instructions,
+          duration_ms: result.durationMs,
+        };
+      }
+
       return {
         ok: result.ok,
         action_id: result.actionId,

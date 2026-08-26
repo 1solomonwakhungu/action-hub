@@ -1,4 +1,4 @@
-export function renderPage() {
+export function renderPage(controlToken) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -115,6 +115,7 @@ export function renderPage() {
 <script type="module">
 const STATUS = { ready:"ok", error:"err", disabled:"warn", connecting:"warn", inactive:"" };
 const TRUST = ["blocked", "untrusted", "trusted"];
+const CONTROL_TOKEN = ${JSON.stringify(controlToken)};
 const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) =>
   ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 const $ = (id) => document.getElementById(id);
@@ -133,7 +134,10 @@ async function control(name, input) {
   try {
     const res = await fetch("/control/" + name, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-action-hub-canvas-token": CONTROL_TOKEN,
+      },
       body: JSON.stringify(input),
     });
     return await res.json();

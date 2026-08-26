@@ -1,8 +1,10 @@
 import { createServer } from "node:http";
+import { randomBytes } from "node:crypto";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 import { readState } from "./state.mjs";
 import { renderPage } from "./render.mjs";
 import { TRUST_TIERS, runOperation } from "./controls.mjs";
+import { MAX_BODY_BYTES, validateMutationRequest } from "./request-security.mjs";
 
 const servers = new Map();
 
@@ -140,7 +142,11 @@ const canvas = createCanvas({
     const existing = servers.get(ctx.instanceId);
     if (existing) return { title: "Capability Manager", url: existing.url };
 
-    const entry = { state: await readState(), tab: ctx.input?.tab ?? "servers" };
+    const entry = {
+      state: await readState(),
+      tab: ctx.input?.tab ?? "servers",
+      token: randomBytes(32).toString("hex"),
+    };
 
     const http = createServer((req, res) => {
       handleRequest(entry, req, res).catch((cause) => {
@@ -180,6 +186,11 @@ async function handleRequest(entry, req, res) {
   }
 
   if (req.method === "POST" && path.startsWith("/control/")) {
+    const rejection = validateMutationRequest(req, entry.token);
+    if (rejection) {
+      json(res, rejection.status, { ok: false, error: rejection.error });
+      return;
+    }
     const name = path.slice("/control/".length);
     const input = await readJsonBody(req);
     json(res, 200, await runOperation(name, input, entry));
@@ -187,18 +198,23 @@ async function handleRequest(entry, req, res) {
   }
 
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-  res.end(renderPage());
+  res.end(renderPage(entry.token));
 }
 
 async function readJsonBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  if (chunks.length === 0) return {};
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString("utf8")) ?? {};
-  } catch {
-    return {};
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) throw new Error("Request body is too large");
+    chunks.push(chunk);
   }
+  if (chunks.length === 0) return {};
+  const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Request body must be a JSON object");
+  }
+  return parsed;
 }
 
 function json(res, status, payload) {
