@@ -2,6 +2,7 @@ import { Catalog } from "./catalog/catalog.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { ConnectionManager } from "./servers/connection-manager.js";
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
+import { ApprovalRegistry, type ApprovalRegistryOptions } from "./permissions/approvals.js";
 import { validateArguments } from "./router/validate.js";
 import type {
   ActionRecord,
@@ -24,10 +25,17 @@ export interface ActionHubOptions {
   historyLimit?: number;
   /**
    * When true, an action whose policy decision requires approval is refused
-   * instead of executed. Hosts that can prompt the user should set this false
-   * and surface `requiresApproval` themselves.
+   * outright rather than offered an approval token. For hosts that cannot
+   * prompt a user at all and must fail closed.
    */
   denyOnApprovalRequired?: boolean;
+  /** Token lifetime and clock for the approval gate. */
+  approvals?: ApprovalRegistryOptions;
+}
+
+export interface ExecuteOptions {
+  /** Token returned by a previous gated execute of this exact call. */
+  approvalToken?: string;
 }
 
 export interface IndexResult {
@@ -60,6 +68,7 @@ export class ActionHub {
   readonly #history: InvocationRecord[] = [];
   readonly #historyLimit: number;
   readonly #denyOnApprovalRequired: boolean;
+  readonly #approvals: ApprovalRegistry;
 
   constructor(options: ActionHubOptions) {
     this.#connections = new ConnectionManager(options.clientFactory, options.servers ?? []);
@@ -68,6 +77,7 @@ export class ActionHub {
     this.#policy = new PermissionPolicy(options.policy ?? {});
     this.#historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
     this.#denyOnApprovalRequired = options.denyOnApprovalRequired ?? false;
+    this.#approvals = new ApprovalRegistry(options.approvals ?? {});
   }
 
   get catalog(): Catalog {
@@ -154,7 +164,18 @@ export class ActionHub {
     };
   }
 
-  async execute(actionId: string, args: Record<string, unknown> = {}): Promise<ExecuteResult> {
+  /**
+   * Runs an action, subject to policy.
+   *
+   * When the policy gates the action, this does *not* run it. It returns an
+   * `ApprovalRequest` carrying a single-use token; passing that token back on
+   * an identical call is what actually executes it.
+   */
+  async execute(
+    actionId: string,
+    args: Record<string, unknown> = {},
+    options: ExecuteOptions = {},
+  ): Promise<ExecuteResult> {
     const startedAt = new Date().toISOString();
     const start = Date.now();
 
@@ -175,20 +196,16 @@ export class ActionHub {
       );
     }
 
+    // Deny is evaluated first and is unconditional. An approval token is only
+    // ever offered for a call the policy already permits, so approval can never
+    // become a path around a disabled server, a blocked tier, or a deny-list.
     const decision = this.#policy.evaluate(record, this.#connections.getConfig(record.serverId));
     if (!decision.allowed) {
       return this.#fail(actionId, record.serverId, decision.reason ?? "Denied by policy", startedAt, start);
     }
-    if (decision.requiresApproval && this.#denyOnApprovalRequired) {
-      return this.#fail(
-        actionId,
-        record.serverId,
-        `Approval required: ${decision.reason ?? "untrusted server"}`,
-        startedAt,
-        start,
-      );
-    }
 
+    // Validated before the gate so a user is never asked to approve a call that
+    // would fail locally anyway, and so a bad call cannot burn a valid token.
     const validation = validateArguments(record.inputSchema, args);
     if (!validation.valid) {
       return this.#fail(
@@ -200,16 +217,90 @@ export class ActionHub {
       );
     }
 
+    let approved = false;
+    if (decision.requiresApproval) {
+      const reason = decision.reason ?? `Server "${record.serverId}" is ${record.trust}`;
+
+      if (options.approvalToken) {
+        const check = this.#approvals.consume(options.approvalToken, actionId, args);
+        if (!check.ok) {
+          return this.#fail(
+            actionId,
+            record.serverId,
+            `Approval rejected: ${check.reason ?? "invalid approval token"}`,
+            startedAt,
+            start,
+            "required",
+          );
+        }
+        approved = true;
+      } else if (this.#denyOnApprovalRequired) {
+        return this.#fail(
+          actionId,
+          record.serverId,
+          `Approval required: ${reason}`,
+          startedAt,
+          start,
+          "required",
+        );
+      } else {
+        const approval = this.#approvals.issue({
+          actionId,
+          serverId: record.serverId,
+          name: record.name,
+          trust: record.trust,
+          reason,
+          args,
+        });
+        const durationMs = Date.now() - start;
+        this.#record({
+          actionId,
+          serverId: record.serverId,
+          startedAt,
+          durationMs,
+          ok: false,
+          error: `Approval required: ${reason}`,
+          approval: "required",
+        });
+        return {
+          ok: false,
+          actionId,
+          error: `Approval required: ${reason}`,
+          durationMs,
+          approval,
+        };
+      }
+    }
+
     try {
       const client = await this.#connections.activate(record.serverId);
       const content = await client.callTool(record.name, args);
       const durationMs = Date.now() - start;
-      this.#record({ actionId, serverId: record.serverId, startedAt, durationMs, ok: true });
+      this.#record({
+        actionId,
+        serverId: record.serverId,
+        startedAt,
+        durationMs,
+        ok: true,
+        ...(approved ? { approval: "approved" as const } : {}),
+      });
       return { ok: true, actionId, content, durationMs };
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      return this.#fail(actionId, record.serverId, message, startedAt, start);
+      return this.#fail(
+        actionId,
+        record.serverId,
+        message,
+        startedAt,
+        start,
+        approved ? "approved" : undefined,
+      );
     }
+  }
+
+  /** Outstanding, unexpired approval tokens. Diagnostics only. */
+  pendingApprovals(): number {
+    return this.#approvals.size;
   }
 
   serverStates(): ServerState[] {
@@ -262,9 +353,18 @@ export class ActionHub {
     error: string,
     startedAt: string,
     start: number,
+    approval?: InvocationRecord["approval"],
   ): ExecuteResult {
     const durationMs = Date.now() - start;
-    this.#record({ actionId, serverId, startedAt, durationMs, ok: false, error });
+    this.#record({
+      actionId,
+      serverId,
+      startedAt,
+      durationMs,
+      ok: false,
+      error,
+      ...(approval ? { approval } : {}),
+    });
     return { ok: false, actionId, error, durationMs };
   }
 

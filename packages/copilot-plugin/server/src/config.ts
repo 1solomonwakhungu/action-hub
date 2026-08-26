@@ -6,12 +6,18 @@ import type { ServerConfig, TrustTier } from "@action-hub/core";
 export interface HubConfigFile {
   servers?: unknown;
   autoApproveAtOrAbove?: unknown;
+  approvalTtlSeconds?: unknown;
 }
 
 export interface HubConfig {
   servers: ServerConfig[];
   autoApproveAtOrAbove: TrustTier;
+  /** Lifetime of an approval token, in milliseconds. */
+  approvalTtlMs: number;
 }
+
+const DEFAULT_APPROVAL_TTL_SECONDS = 300;
+const MAX_APPROVAL_TTL_SECONDS = 3600;
 
 const VALID_TRUST: readonly string[] = ["blocked", "untrusted", "trusted"];
 
@@ -33,7 +39,13 @@ export async function loadConfig(path: string): Promise<HubConfig> {
   try {
     raw = await readFile(path, "utf8");
   } catch (cause) {
-    if (isNotFound(cause)) return { servers: [], autoApproveAtOrAbove: "trusted" };
+    if (isNotFound(cause)) {
+      return {
+        servers: [],
+        autoApproveAtOrAbove: "trusted",
+        approvalTtlMs: DEFAULT_APPROVAL_TTL_SECONDS * 1000,
+      };
+    }
     throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
   }
 
@@ -49,7 +61,16 @@ export async function loadConfig(path: string): Promise<HubConfig> {
     autoApproveAtOrAbove: isTrust(parsed.autoApproveAtOrAbove)
       ? parsed.autoApproveAtOrAbove
       : "trusted",
+    approvalTtlMs: parseApprovalTtl(parsed.approvalTtlSeconds),
   };
+}
+
+/** Clamped rather than rejected: a nonsensical TTL should not stop the hub booting. */
+function parseApprovalTtl(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_APPROVAL_TTL_SECONDS * 1000;
+  }
+  return Math.min(Math.round(value), MAX_APPROVAL_TTL_SECONDS) * 1000;
 }
 
 function parseServers(value: unknown, path: string): ServerConfig[] {
