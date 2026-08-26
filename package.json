@@ -16,6 +16,7 @@
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
+    "eval": "npm run eval --workspace @action-hub/core",
     "clean": "rm -rf packages/*/dist packages/*/*/dist"
   },
   "devDependencies": {
