@@ -2,10 +2,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { ActionHub, ActionHubError } from "@action-hub/core";
+import { ActionHub, ActionHubError, CatalogCache, bootstrapCatalog } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { createSdkClientFactory } from "./sdk-client.js";
-import { writeSnapshot } from "./snapshot.js";
+import { warn, writeSnapshot } from "./snapshot.js";
 
 const TOOL_DESCRIPTION = `Search, load, and run capabilities from every connected MCP server and installed skill.
 
@@ -57,15 +57,24 @@ async function main(): Promise<void> {
     approvals: { ttlMs: config.approvalTtlMs },
   });
 
-  const indexed = await hub.indexAll();
-  for (const result of indexed) {
-    if (result.error) {
-      // stdout is the MCP channel; diagnostics must go to stderr.
-      process.stderr.write(`action-hub: failed to index "${result.serverId}": ${result.error}\n`);
-    }
-  }
+  const cache = new CatalogCache({ onWarning: warn });
 
-  await writeSnapshot(hub);
+  // A warm cache makes the hub answerable immediately; the authoritative index
+  // then runs behind it and writes the refreshed catalog back.
+  const bootstrap = await bootstrapCatalog(hub, {
+    servers: config.servers,
+    cache,
+    onWarning: warn,
+  });
+
+  bootstrap.refreshed.then(
+    (results) => {
+      for (const result of results) {
+        if (result.error) warn(`failed to index "${result.serverId}": ${result.error}`);
+      }
+    },
+    (cause: unknown) => warn(`re-index failed: ${cause instanceof Error ? cause.message : String(cause)}`),
+  );
 
   const server = new McpServer({ name: "action-hub", version: "0.1.0" });
 
@@ -78,7 +87,7 @@ async function main(): Promise<void> {
     },
     async (input) => {
       try {
-        return text(await dispatch(hub, input));
+        return text(await dispatch(hub, input, bootstrap.configHash, cache));
       } catch (cause) {
         const message =
           cause instanceof ActionHubError || cause instanceof Error
@@ -92,8 +101,14 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  // Let an in-flight background re-index settle before tearing down the
+  // connections it is still writing to, so a shutdown mid-refresh does not
+  // surface as a broken pipe against a downstream server.
   const shutdown = () => {
-    void hub.close().finally(() => process.exit(0));
+    void bootstrap.refreshed
+      .catch(() => undefined)
+      .then(() => hub.close())
+      .finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
@@ -109,7 +124,12 @@ type ToolInput = {
   approval_token?: string;
 };
 
-async function dispatch(hub: ActionHub, input: ToolInput): Promise<unknown> {
+async function dispatch(
+  hub: ActionHub,
+  input: ToolInput,
+  configHash: string,
+  cache: CatalogCache,
+): Promise<unknown> {
   switch (input.operation) {
     case "search": {
       const hits = await hub.search(input.query ?? "", {
@@ -157,7 +177,9 @@ async function dispatch(hub: ActionHub, input: ToolInput): Promise<unknown> {
         input.approval_token ? { approvalToken: input.approval_token } : {},
       );
       // Refreshes server activation state and invocation history for the canvas.
-      void writeSnapshot(hub);
+      // Reuse the bootstrap cache instance so this unawaited write is serialised
+      // with the background refresh on the same promise chain.
+      void writeSnapshot(hub, configHash, cache);
 
       if (result.approval) {
         const approval = result.approval;

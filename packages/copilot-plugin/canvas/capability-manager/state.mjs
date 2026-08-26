@@ -8,8 +8,13 @@ function configPath() {
   return resolve(homedir(), ".config", "action-hub", "servers.json");
 }
 
+/** Mirrors `defaultCatalogCachePath` in core: explicit override, then XDG, then ~/.cache. */
 function cachePath() {
-  return resolve(homedir(), ".cache", "action-hub", "catalog.json");
+  const fromEnv = process.env.ACTION_HUB_CACHE;
+  if (fromEnv) return fromEnv;
+  const xdg = process.env.XDG_CACHE_HOME;
+  const base = xdg || resolve(homedir(), ".cache");
+  return resolve(base, "action-hub", "catalog.json");
 }
 
 /**
