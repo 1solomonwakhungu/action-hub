@@ -14,10 +14,13 @@
   backing the two-step execute flow for gated actions
 - `validateArguments` — JSON Schema subset validator
 - `BundleRegistry` — named capability scopes
+- `CatalogCache` / `bootstrapCatalog` — versioned on-disk catalog keyed by a
+  config fingerprint, served on startup and refreshed in the background
 - `ActionHub` — the `search` / `load` / `execute` façade, invocation history,
   context savings estimate
-- 49 tests covering ranking, the schema split, validation, policy gating,
-  approval tokens, per-server failure isolation, and activation counts
+- 92 tests covering ranking, the schema split, validation, policy gating,
+  approval tokens, per-server failure isolation, activation counts, and cache
+  invalidation/corruption handling
 
 **Layer 2 — `packages/copilot-plugin`**
 
@@ -32,18 +35,9 @@
 
 ## Next
 
-**Catalog persistence.** Indexing currently runs on every server start, so
-startup cost scales with the number of downstream servers. Cache the catalog to
-`~/.cache/action-hub/catalog.json`, keyed by a hash of the server config, and
-re-index in the background. The canvas already reads this file.
-
 **Semantic scoring by default.** The `SemanticScorer` hook exists but nothing
 implements it. Ship a small local embedding model so retrieval stops being
 purely lexical. Gate it on the eval suite below.
-
-**Evaluation suite.** Search quality is the product. A corpus of (query →
-expected action) pairs with recall@1/@5 reported on every change, so retrieval
-regressions fail CI instead of being discovered in use.
 
 **Interactive canvas controls.** The canvas is read-only today. Add enable and
 disable toggles, trust changes, live search testing, and add-a-server — writing
