@@ -27,6 +27,9 @@ downstream server.
   policy, argument validator, bundles, and the `ActionHub` façade
 - `packages/copilot-plugin` — plugin manifest, `.mcp.json`, skill, meta-MCP
   server, and the Capability Manager canvas
+- Interactive canvas controls — enable/disable, trust changes, live search
+  testing, and add-a-server, routed through a localhost control endpoint on the
+  running hub
 - `docs/architecture.md`, `docs/roadmap.md`, README, MIT license
 
 ## Next
@@ -37,8 +40,7 @@ In priority order, with rationale in `docs/roadmap.md`:
 2. A search evaluation suite — retrieval quality is the product and is
    currently unguarded against regressions
 3. Semantic scoring — the `SemanticScorer` hook exists but nothing implements it
-4. Interactive canvas controls — the canvas is read-only today
-5. Approval flow — `requiresApproval` is computed but no host surfaces it
+4. Approval flow — `requiresApproval` is computed but no host surfaces it
 
 ## Notes for future sessions
 

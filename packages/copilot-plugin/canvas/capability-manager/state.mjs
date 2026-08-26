@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { hubState } from "./hub.mjs";
 
 function configPath() {
   const fromEnv = process.env.ACTION_HUB_CONFIG;
@@ -8,50 +9,93 @@ function configPath() {
   return resolve(homedir(), ".config", "action-hub", "servers.json");
 }
 
+/**
+ * Mirrors core's XDG resolution so the canvas reads the same cache file the hub
+ * writes. This file belongs to core; the canvas only ever reads it. Every write
+ * the canvas performs goes through the hub's control endpoint instead, because
+ * writing here would corrupt the catalog rather than merely a display snapshot.
+ */
 function cachePath() {
-  return resolve(homedir(), ".cache", "action-hub", "catalog.json");
+  const fromEnv = process.env.ACTION_HUB_CACHE;
+  if (fromEnv) return fromEnv;
+  const xdg = process.env.XDG_CACHE_HOME;
+  const base = xdg ? xdg : resolve(homedir(), ".cache");
+  return resolve(base, "action-hub", "catalog.json");
 }
 
 /**
- * The canvas reads the same config the MCP server reads, plus the catalog
- * snapshot the server writes after indexing. It deliberately does not connect
- * to downstream servers itself — the hub owns every connection.
+ * Reads the live hub when it is running, and the config plus catalog snapshot
+ * on disk when it is not.
+ *
+ * The live path matters because a toggle applied through the control endpoint
+ * takes effect in memory immediately, while the snapshot on disk is only a
+ * point-in-time copy. The file path matters because the canvas must still show
+ * something useful when no hub is running — it just cannot offer controls.
+ *
+ * It deliberately never connects to downstream servers itself; the hub owns
+ * every connection.
  */
 export async function readState() {
+  const live = await hubState();
+  if (live) return { ...live, hubAvailable: true };
+
+  const fallback = await readFileState();
+  return { ...fallback, hubAvailable: false };
+}
+
+/**
+ * Every field is treated as absent until proven well-formed.
+ *
+ * The cache file is written by another process and may be observed missing,
+ * empty, half-written, or in a newer schema than this canvas understands. None
+ * of those are error states worth showing the user — the config file alone is
+ * enough to render a useful server list, so anything unreadable degrades to
+ * "not indexed yet" rather than a broken panel.
+ */
+async function readFileState() {
   const [config, cache] = await Promise.all([readJson(configPath()), readJson(cachePath())]);
 
   const configured = Array.isArray(config?.servers) ? config.servers : [];
-  const indexed = cache?.servers ?? {};
+  const indexed = isRecord(cache?.servers) ? cache.servers : {};
 
-  const serverRows = configured.map((server) => {
-    const stats = indexed[server.id] ?? {};
-    return {
-      id: server.id,
-      displayName: server.displayName ?? server.id,
-      transport: server.transport?.type ?? "unknown",
-      trust: server.trust ?? "untrusted",
-      enabled: server.enabled !== false,
-      status: stats.status ?? "inactive",
-      toolCount: stats.toolCount ?? 0,
-      error: stats.error,
-      lastActivatedAt: stats.lastActivatedAt,
-    };
-  });
+  const serverRows = configured
+    .filter((server) => isRecord(server) && typeof server.id === "string")
+    .map((server) => {
+      const stats = isRecord(indexed[server.id]) ? indexed[server.id] : {};
+      return {
+        id: server.id,
+        displayName: typeof server.displayName === "string" ? server.displayName : server.id,
+        transport: isRecord(server.transport) ? (server.transport.type ?? "unknown") : "unknown",
+        trust: typeof server.trust === "string" ? server.trust : "untrusted",
+        enabled: server.enabled !== false,
+        status: typeof stats.status === "string" ? stats.status : "inactive",
+        toolCount: Number.isFinite(stats.toolCount) ? stats.toolCount : 0,
+        error: typeof stats.error === "string" ? stats.error : undefined,
+        lastActivatedAt: stats.lastActivatedAt,
+      };
+    });
 
   return {
     configPath: configPath(),
     servers: serverRows,
     actions: serverRows.reduce((sum, row) => sum + row.toolCount, 0),
-    skills: cache?.skills ?? 0,
-    history: Array.isArray(cache?.history) ? cache.history.slice(-50).reverse() : [],
-    context: cache?.context ?? null,
-    indexedAt: cache?.indexedAt ?? null,
+    skills: Number.isFinite(cache?.skills) ? cache.skills : 0,
+    history: Array.isArray(cache?.history)
+      ? cache.history.filter(isRecord).slice(-50).reverse()
+      : [],
+    context: isRecord(cache?.context) ? cache.context : null,
+    indexedAt: typeof cache?.indexedAt === "string" ? cache.indexedAt : null,
   };
+}
+
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function readJson(path) {
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    const parsed = JSON.parse(await readFile(path, "utf8"));
+    return isRecord(parsed) ? parsed : null;
   } catch {
     return null;
   }

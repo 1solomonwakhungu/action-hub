@@ -26,6 +26,10 @@
 - `@modelcontextprotocol/sdk` client adapter for stdio and HTTP transports
 - Capability Manager canvas — server table, health, trust, indexed counts,
   invocation history, context savings
+- Interactive canvas controls — enable/disable toggles, trust tier changes,
+  live search testing, and add-a-server, all writing back through a
+  localhost-only control endpoint on the running hub rather than editing the
+  config file directly; degrades to the read-only view when no hub is running
 
 ## Next
 
@@ -41,10 +45,6 @@ purely lexical. Gate it on the eval suite below.
 **Evaluation suite.** Search quality is the product. A corpus of (query →
 expected action) pairs with recall@1/@5 reported on every change, so retrieval
 regressions fail CI instead of being discovered in use.
-
-**Interactive canvas controls.** The canvas is read-only today. Add enable and
-disable toggles, trust changes, live search testing, and add-a-server — writing
-back through the hub rather than editing the config file directly.
 
 **Approval flow.** `requiresApproval` is computed and returned but no host
 surfaces it. Wire it to a Copilot confirmation prompt so untrusted servers are

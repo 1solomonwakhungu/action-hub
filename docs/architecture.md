@@ -146,3 +146,26 @@ that skill bodies are never injected into context until requested.
 `execute` on a skill fails by design, before the policy check, since a skill
 has no downstream server to evaluate against. Skills are loaded and followed,
 not dispatched.
+
+## The control endpoint
+
+The Capability Manager canvas runs in a separate process from the hub, which
+is a stdio MCP subprocess. To let the canvas change state rather than merely
+display it, the plugin server binds a control listener on `127.0.0.1:0` and
+publishes its URL and a per-process random bearer token to
+`~/.cache/action-hub/control.json`, written user-only. The canvas discovers the
+endpoint by reading that file.
+
+Every mutation the canvas offers — enable and disable, trust changes, adding a
+server — is a `POST` to this endpoint. The canvas never writes to the config
+file, and never writes to the catalog cache, which belongs to core. This is the
+whole point of the design: validation, the in-memory hub update, and config
+persistence all happen on the server side, where canvas-supplied values are
+treated as untrusted input. A canvas that edited the files directly would
+desynchronize the running hub and could corrupt core's cache.
+
+Two consequences follow. Failing to bind the control listener is not fatal —
+the MCP server still starts, and the canvas simply renders read-only. And the
+token file is unlinked on shutdown, so a canvas that finds no file, or a stale
+one pointing at a dead port, concludes the hub is not running and disables its
+controls rather than failing.

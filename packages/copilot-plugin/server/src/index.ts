@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { ActionHub, ActionHubError } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
+import { startControlServer, type ControlServer } from "./control.js";
 import { createSdkClientFactory } from "./sdk-client.js";
 import { writeSnapshot } from "./snapshot.js";
 
@@ -58,6 +59,17 @@ async function main(): Promise<void> {
 
   await writeSnapshot(hub);
 
+  // The control endpoint only powers the Capability Manager canvas, so a
+  // failure to bind must never take the MCP server down with it — the canvas
+  // falls back to its read-only view when the endpoint is absent.
+  let control: ControlServer | undefined;
+  try {
+    control = await startControlServer(hub, configPath);
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    process.stderr.write(`action-hub: control endpoint unavailable: ${reason}\n`);
+  }
+
   const server = new McpServer({ name: "action-hub", version: "0.1.0" });
 
   server.registerTool(
@@ -84,7 +96,11 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   const shutdown = () => {
-    void hub.close().finally(() => process.exit(0));
+    const stopControl = control?.close() ?? Promise.resolve();
+    void stopControl
+      .catch(() => undefined)
+      .then(() => hub.close())
+      .finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
