@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -47,12 +47,15 @@ export function defaultCatalogCachePath(env: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
- * Stable fingerprint of everything that could change what indexing produces.
+ * Fingerprint of the parts of the server config that change what indexing
+ * produces *and* are safe to persist.
  *
- * Env *keys* are hashed but their values are not: a rotated token should not
- * throw away a valid catalog, and secrets should never end up in a digest that
- * lives on disk. Server order is normalised away so reordering the config file
- * is not a cache-invalidating edit.
+ * Env and header **keys** are hashed but their **values** are not. This is a
+ * deliberate trade-off, not a claim that values are irrelevant: a rotated token
+ * should not throw away an otherwise-valid catalog, and a secret must never end
+ * up in a digest that lives on disk. The background re-index is what catches a
+ * value change that actually altered the catalog. Server order is normalised
+ * away so reordering the config file is not a cache-invalidating edit.
  */
 export function hashServerConfigs(servers: readonly ServerConfig[]): string {
   const normalized = servers
@@ -104,6 +107,14 @@ export interface CatalogCacheOptions {
 export class CatalogCache {
   readonly path: string;
   readonly #warn: (message: string) => void;
+  /**
+   * Serialises writes on this instance. Each `write` chains onto the previous
+   * one so two concurrent callers never race the shared destination path: the
+   * last write enqueued wins deterministically, and no rename/unlink from one
+   * write can interleave with another. Rejections are swallowed here so a single
+   * failed write does not poison every write that follows it.
+   */
+  #writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(options: CatalogCacheOptions = {}) {
     this.path = options.path ?? defaultCatalogCachePath(options.env);
@@ -160,14 +171,34 @@ export class CatalogCache {
   }
 
   /**
-   * Atomic write (temp file + rename) because the canvas polls this path on a
-   * timer and must never observe a half-written file.
+   * Atomic, serialised write.
+   *
+   * The canvas polls this path on a timer and must never observe a half-written
+   * file, so the payload is written to a temp file and renamed into place —
+   * rename is atomic on a single filesystem. Two things make it safe under the
+   * concurrency the host actually produces (an unawaited write after every
+   * `execute`, plus the background refresh):
+   *
+   *  1. Each write uses a **unique** temp path (`randomUUID`), so two writes
+   *     racing in the same process can never share a temp file and interleave
+   *     their bytes, and cleanup only ever removes *this* write's temp.
+   *  2. Writes are **serialised** on a per-instance promise chain, so the
+   *     rename/unlink of one write cannot interleave with another and the last
+   *     write enqueued is the last to land on disk.
    */
-  async write(entry: PersistedCatalog): Promise<boolean> {
-    const temp = `${this.path}.${process.pid}.tmp`;
+  write(entry: PersistedCatalog): Promise<boolean> {
+    const run = this.#writeChain.then(() => this.#writeNow(entry));
+    // Keep the chain alive regardless of this write's outcome.
+    this.#writeChain = run.catch(() => undefined);
+    return run;
+  }
+
+  async #writeNow(entry: PersistedCatalog): Promise<boolean> {
+    const dir = dirname(this.path);
+    const temp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await mkdir(dirname(this.path), { recursive: true });
-      await writeFile(temp, JSON.stringify(entry, null, 2), "utf8");
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+      await writeFile(temp, JSON.stringify(entry, null, 2), { encoding: "utf8", mode: 0o600 });
       await rename(temp, this.path);
       return true;
     } catch (cause) {

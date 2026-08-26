@@ -11,9 +11,11 @@ export function warn(message: string): void {
  *
  * The snapshot and the startup cache are the same file: the persisted entry is
  * a superset of the snapshot, so writing it keeps the canvas current and the
- * cache warm in one atomic write. Failures are reduced to a warning — a
- * missing diagnostics snapshot must never take down the MCP server the agent
- * depends on.
+ * cache warm in one atomic write. `CatalogCache.write` serialises concurrent
+ * writes and uses a unique temp file per write, so the unawaited call after
+ * every `execute` cannot corrupt the file the canvas is polling. Failures are
+ * reduced to a warning — a missing diagnostics snapshot must never take down
+ * the MCP server the agent depends on.
  */
 export async function writeSnapshot(
   hub: ActionHub,

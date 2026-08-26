@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, readFile, writeFile, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, stat, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { ActionHub } from "../dist/action-hub.js";
@@ -242,8 +242,81 @@ test("individual malformed actions are dropped, not the whole file", async () =>
   assert.equal(loaded.actions.length, 3);
 });
 
-test("a write to an unwritable location returns false instead of throwing", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "action-hub-readonly-"));
+test("concurrent writes never publish a corrupt or partial file", async () => {
+  const path = await tempCachePath();
+  const { hub } = buildHub();
+  await hub.indexAll();
+
+  const cache = new CatalogCache({ path });
+
+  // Fan out many writes on one instance at once, mimicking the host firing an
+  // unawaited snapshot after every execute while the background refresh writes
+  // too. Each carries a distinct configHash so we can prove last-enqueued-wins.
+  const count = 40;
+  const results = await Promise.all(
+    Array.from({ length: count }, (_, i) => cache.write(hub.toPersisted(`hash-${i}`))),
+  );
+
+  // Every write reports success and the file on disk is always complete JSON.
+  assert.ok(results.every((ok) => ok === true));
+
+  const onDisk = JSON.parse(await readFile(path, "utf8")) as PersistedCatalog;
+  assert.equal(onDisk.version, CATALOG_CACHE_VERSION);
+  assert.equal(onDisk.actions.length, 3);
+  assert.ok(onDisk.actions.every((action) => typeof action.id === "string" && action.id.length > 0));
+
+  // Serialisation means the last enqueued write is the one that lands.
+  assert.equal(onDisk.configHash, `hash-${count - 1}`);
+
+  // No temp files are left behind once the chain settles.
+  const dir = join(path, "..");
+  const leftovers = (await readdir(dir)).filter((name) => name.endsWith(".tmp"));
+  assert.deepEqual(leftovers, []);
+});
+
+test("interleaved reads during concurrent writes always parse", async () => {
+  const path = await tempCachePath();
+  const { hub } = buildHub();
+  await hub.indexAll();
+
+  const cache = new CatalogCache({ path });
+  await cache.write(hub.toPersisted("seed"));
+
+  const writes = Array.from({ length: 25 }, (_, i) => cache.write(hub.toPersisted(`hash-${i}`)));
+
+  // Hammer the path with reads while writes are in flight; a non-atomic write
+  // would occasionally surface a truncated file that fails to parse.
+  const reads = Array.from({ length: 60 }, async () => {
+    try {
+      const raw = await readFile(path, "utf8");
+      JSON.parse(raw);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  const [, readOutcomes] = await Promise.all([Promise.all(writes), Promise.all(reads)]);
+  assert.ok(readOutcomes.every((ok) => ok === true));
+});
+
+test("the cache directory and file are written with private permissions", async () => {
+  if (process.platform === "win32") return; // POSIX mode bits are meaningless here.
+
+  const dir = await mkdtemp(join(tmpdir(), "action-hub-perms-"));
+  const path = join(dir, "nested", "catalog.json");
+  const { hub } = buildHub();
+  await hub.indexAll();
+
+  assert.equal(await new CatalogCache({ path }).write(hub.toPersisted("hash-a")), true);
+
+  const fileMode = (await stat(path)).mode & 0o777;
+  const dirMode = (await stat(join(path, ".."))).mode & 0o777;
+  assert.equal(fileMode, 0o600);
+  assert.equal(dirMode, 0o700);
+});
+
+test("a write to an unwritable location returns false instead of throwing", async () => {  const dir = await mkdtemp(join(tmpdir(), "action-hub-readonly-"));
   const nested = join(dir, "nested");
   await mkdir(nested);
   await chmod(nested, 0o500);

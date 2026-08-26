@@ -44,7 +44,8 @@ Catalog persistence is done: the catalog is cached to
 `$XDG_CACHE_HOME/action-hub/catalog.json` (falling back to `~/.cache`), keyed
 by a hash of the server config and a schema version, served on startup, and
 re-indexed in the background. The cache file is a superset of the canvas
-snapshot, so both stay in sync from one atomic write.
+snapshot, so both stay in sync from one atomic, per-instance-serialised write
+(unique temp file plus rename); the directory is `0700` and the file `0600`.
 
 ## Notes for future sessions
 

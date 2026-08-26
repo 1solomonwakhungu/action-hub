@@ -119,11 +119,12 @@ runs behind it and writes the refreshed catalog back.
 
 An entry is reused only when both the schema `version` and a `configHash`
 match. That hash covers command, args, cwd, transport type, URL, trust,
-enabled, and the allow/deny lists — everything that could change what indexing
-produces. It deliberately covers env and header *keys* but not their values: a
-rotated token must not discard a valid catalog, and a secret must not end up in
-a digest that lives on disk. Servers are sorted before hashing, so reordering
-the config file is not a cache-invalidating edit.
+enabled, and the allow/deny lists. It deliberately covers env and header *keys*
+but not their *values*: a rotated token must not discard a valid catalog, and a
+secret must not end up in a digest that lives on disk. A value change that
+actually alters the catalog is caught by the background re-index instead.
+Servers are sorted before hashing, so reordering the config file is not a
+cache-invalidating edit.
 
 Every failure mode degrades to a full index rather than an error. A missing,
 corrupt, truncated, or unreadable file is a miss; individual malformed action
@@ -138,9 +139,15 @@ is executed. Actions belonging to servers that have since been removed from the
 config are dropped, since they could never be dispatched.
 
 The cache file and the Capability Manager snapshot are the same file. The
-persisted entry is a superset of `HubSnapshot`, so one atomic write (temp file
-plus rename) keeps the canvas current and the cache warm without the two
-drifting apart.
+persisted entry is a superset of `HubSnapshot`, so one atomic write keeps the
+canvas current and the cache warm without the two drifting apart. Each write
+goes to a unique temp file (`<path>.<pid>.<uuid>.tmp`) and is renamed into
+place, and every write on a `CatalogCache` instance is serialised onto a
+promise chain. That combination is what makes the "atomic" claim hold under the
+concurrency the host actually produces — an unawaited write after every
+`execute` plus the background refresh — so two writes can never interleave their
+bytes or race each other's rename, and a reader always sees a complete entry.
+The cache directory is created `0700` and the file written `0600`.
 
 ## Permissions
 
