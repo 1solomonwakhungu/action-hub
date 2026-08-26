@@ -16,7 +16,9 @@ Always follow three steps in order:
 2. load — pass an action_id from search. Returns the full JSON Schema for its arguments.
 3. execute — pass the same action_id plus arguments matching the loaded schema.
 
-Never execute an action you have not loaded in this conversation; argument names cannot be reliably guessed from an action name.`;
+Never execute an action you have not loaded in this conversation; argument names cannot be reliably guessed from an action name.
+
+Some actions are gated. If execute returns status "approval_required", it did NOT run. Show the user the server, action, and arguments, ask them to confirm, and only if they agree repeat the identical execute call with approval_token set to the returned token. The token is single-use, expires quickly, and is only valid for those exact arguments. Never approve on the user's behalf.`;
 
 const inputShape = {
   operation: z
@@ -36,6 +38,12 @@ const inputShape = {
     .describe("Arguments for execute, matching the schema returned by load."),
   server_id: z.string().optional().describe("Restrict a search to one server."),
   limit: z.number().int().min(1).max(50).optional().describe("Max search results. Default 10."),
+  approval_token: z
+    .string()
+    .optional()
+    .describe(
+      "Token from a prior approval_required response. Pass it on an identical execute call, only after the user has explicitly confirmed. Single-use, short-lived, and bound to these exact arguments.",
+    ),
 } as const;
 
 async function main(): Promise<void> {
@@ -46,6 +54,7 @@ async function main(): Promise<void> {
     servers: config.servers,
     clientFactory: createSdkClientFactory(),
     policy: { autoApproveAtOrAbove: config.autoApproveAtOrAbove },
+    approvals: { ttlMs: config.approvalTtlMs },
   });
 
   const cache = new CatalogCache({ onWarning: warn });
@@ -112,6 +121,7 @@ type ToolInput = {
   arguments?: Record<string, unknown>;
   server_id?: string;
   limit?: number;
+  approval_token?: string;
 };
 
 async function dispatch(
@@ -161,9 +171,37 @@ async function dispatch(
 
     case "execute": {
       const actionId = requireActionId(input, "execute");
-      const result = await hub.execute(actionId, input.arguments ?? {});
+      const result = await hub.execute(
+        actionId,
+        input.arguments ?? {},
+        input.approval_token ? { approvalToken: input.approval_token } : {},
+      );
       // Refreshes server activation state and invocation history for the canvas.
+      // Reuse the bootstrap cache instance so this unawaited write is serialised
+      // with the background refresh on the same promise chain.
       void writeSnapshot(hub, configHash, cache);
+
+      if (result.approval) {
+        const approval = result.approval;
+        return {
+          ok: false,
+          status: "approval_required",
+          action_id: approval.actionId,
+          server: approval.serverId,
+          name: approval.name,
+          trust: approval.trust,
+          reason: approval.reason,
+          arguments_summary: approval.argumentsSummary,
+          argument_keys: approval.argumentKeys,
+          approval_token: approval.approvalToken,
+          expires_at: approval.expiresAt,
+          expires_in_seconds: Math.round(approval.ttlMs / 1000),
+          executed: false,
+          next: approval.instructions,
+          duration_ms: result.durationMs,
+        };
+      }
+
       return {
         ok: result.ok,
         action_id: result.actionId,

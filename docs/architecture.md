@@ -154,14 +154,41 @@ The cache directory is created `0700` and the file written `0600`.
 Three tiers: `blocked` < `untrusted` < `trusted`.
 
 `autoApproveAtOrAbove` sets the floor for silent execution. Anything below it
-is *allowed but gated* — the decision carries `requiresApproval: true` and the
-host decides what to do. A host that can prompt the user should surface the
-prompt; a host that cannot should set `denyOnApprovalRequired: true` and fail
-closed.
+is *allowed but gated*: the decision carries `requiresApproval: true`.
 
 Per-server `allowTools` / `denyTools` filter at both index time and execute
 time. Deny always beats allow, so an explicitly denied tool cannot be reached
 by any path.
+
+## Approval
+
+A gated `execute` does not run. It returns an `ApprovalRequest` describing what
+was asked for — server, action, trust tier, argument summary — plus a
+single-use `approvalToken`. Passing that token back on an identical `execute`
+is what actually dispatches the call.
+
+The token is bound to a SHA-256 fingerprint of the canonicalized arguments, not
+to the action alone. Approving "post *this* message to *this* channel" must not
+become authority to post anything else, so changing any value invalidates it.
+Key order is normalized, so the binding tracks meaning rather than
+serialization. Tokens are single-use and expire in five minutes by default
+(`approvalTtlSeconds` in the host config, clamped to an hour): an approval is a
+decision about *now*, not a standing grant.
+
+Ordering inside `execute` is the security property:
+
+1. **Deny is evaluated first, and unconditionally.** A disabled server, a
+   `blocked` tier, or a deny-listed tool fails outright — and crucially, *no
+   token is issued*. There is no denied-but-approvable state, so approval can
+   never become a path around an explicit deny. A token minted elsewhere is
+   worthless because the deny check runs before the token is read.
+2. **Arguments are validated before the gate.** A user is never asked to
+   approve a call that would fail locally anyway, and a malformed retry cannot
+   burn a valid token.
+3. **Only then is the gate applied.**
+
+A host that cannot prompt the user at all should set
+`denyOnApprovalRequired: true` and fail closed rather than issue tokens.
 
 ## Validation
 
