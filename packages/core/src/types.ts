@@ -106,6 +106,35 @@ export interface LoadedAction {
   trust: TrustTier;
 }
 
+/**
+ * Returned instead of running an action when policy requires a human decision.
+ *
+ * This is the machine-readable half of the two-step flow: it tells the caller
+ * exactly what was requested and hands back a token that authorizes one repeat
+ * of the identical call.
+ */
+export interface ApprovalRequest {
+  status: "approval_required";
+  actionId: string;
+  serverId: string;
+  /** Upstream tool name, so the prompt can name the real operation. */
+  name: string;
+  trust: TrustTier;
+  /** Why approval is needed, e.g. the server's trust tier. */
+  reason: string;
+  /** Single-use token, bound to this action and these exact arguments. */
+  approvalToken: string;
+  issuedAt: string;
+  expiresAt: string;
+  ttlMs: number;
+  /** Argument names, sorted, so the caller can show scope without full values. */
+  argumentKeys: string[];
+  /** Human-readable preview of the argument payload. */
+  argumentsSummary: string;
+  /** What the caller must do next. */
+  instructions: string;
+}
+
 export interface ExecuteResult {
   ok: boolean;
   actionId: string;
@@ -113,6 +142,11 @@ export interface ExecuteResult {
   content?: unknown;
   error?: string;
   durationMs: number;
+  /**
+   * Present, with `ok: false`, when the call was gated rather than failed.
+   * A caller that sees this should prompt the user, not retry.
+   */
+  approval?: ApprovalRequest;
 }
 
 /** One entry in the invocation history surfaced by the capability manager. */
@@ -123,6 +157,8 @@ export interface InvocationRecord {
   durationMs: number;
   ok: boolean;
   error?: string;
+  /** How the call cleared the approval gate, when one applied. */
+  approval?: "required" | "approved";
 }
 
 /**

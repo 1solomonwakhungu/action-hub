@@ -1,5 +1,6 @@
 {
   "autoApproveAtOrAbove": "trusted",
+  "approvalTtlSeconds": 300,
   "servers": [
     {
       "id": "github",
