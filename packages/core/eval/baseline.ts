@@ -34,3 +34,21 @@ export const BAND_BASELINE = Object.freeze({
   paraphrase: 0.37,
   ambiguous: 0.66,
 });
+
+/**
+ * Floors for the built-in semantic scorer at its default weight. Measured at
+ * recall@1 0.775, recall@5 0.975, MRR 0.863, with exact/paraphrase/ambiguous
+ * recall@1 of 1.000/0.500/0.917. These retain a small one-query margin while
+ * still requiring a material improvement over the lexical baseline.
+ */
+export const SEMANTIC_BASELINE = Object.freeze({
+  recallAt1: 0.75,
+  recallAt5: 0.95,
+  mrr: 0.84,
+});
+
+export const SEMANTIC_BAND_BASELINE = Object.freeze({
+  exact: 1,
+  paraphrase: 0.49,
+  ambiguous: 0.83,
+});

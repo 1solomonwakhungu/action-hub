@@ -5,8 +5,11 @@
 **Layer 1 — `packages/core`**
 
 - `Catalog` — action records keyed by `serverId:name`, with trust ranking
-- `SearchEngine` — BM25 with name weighting, camelCase tokenization, optional
-  blended semantic scoring, empty-query browse
+- `SearchEngine` — BM25 with name weighting, camelCase tokenization, blended
+  semantic scoring with a tunable weight, empty-query browse
+- `LocalSemanticIndex` — dependency-free local embeddings (subword n-gram
+  hashing plus a concept lexicon), precomputed at index time, blended at
+  `w = 0.2`, with a non-throwing fallback to pure BM25
 - `ConnectionManager` — lazy activation, shared in-flight connection promises,
   per-server state tracking, ordered shutdown
 - `PermissionPolicy` — trust tiers, auto-approve floor, allow/deny lists
@@ -18,9 +21,9 @@
   config fingerprint, served on startup and refreshed in the background
 - `ActionHub` — the `search` / `load` / `execute` façade, invocation history,
   context savings estimate
-- 92 tests covering ranking, the schema split, validation, policy gating,
-  approval tokens, per-server failure isolation, activation counts, and cache
-  invalidation/corruption handling
+- Tests covering ranking and semantic quality gates, scorer fallback, the schema
+  split, validation, policy gating, approval tokens, per-server failure
+  isolation, activation counts, and cache invalidation/corruption handling
 
 **Layer 2 — `packages/copilot-plugin`**
 
@@ -34,10 +37,6 @@
   invocation history, context savings
 
 ## Next
-
-**Semantic scoring by default.** The `SemanticScorer` hook exists but nothing
-implements it. Ship a small local embedding model so retrieval stops being
-purely lexical. Gate it on the eval suite below.
 
 **Interactive canvas controls.** The canvas is read-only today. Add enable and
 disable toggles, trust changes, live search testing, and add-a-server — writing

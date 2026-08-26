@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EVAL_CORPUS } from "../eval/corpus.ts";
 import { EVAL_QUERIES } from "../eval/queries.ts";
-import { BASELINE, BAND_BASELINE } from "../eval/baseline.ts";
-import { formatReport, metricsFor, runEval } from "../eval/evaluate.ts";
+import {
+  BASELINE,
+  BAND_BASELINE,
+  SEMANTIC_BASELINE,
+  SEMANTIC_BAND_BASELINE,
+} from "../eval/baseline.ts";
+import { formatReport, metricsFor, runEval, runSemanticEval } from "../eval/evaluate.ts";
 
 /**
  * The retrieval regression gate.
@@ -14,6 +19,7 @@ import { formatReport, metricsFor, runEval } from "../eval/evaluate.ts";
  */
 
 const report = await runEval();
+const semanticReport = await runSemanticEval();
 
 test("the eval corpus is large and varied enough to be discriminating", () => {
   assert.ok(EVAL_CORPUS.length >= 60, `corpus has only ${EVAL_CORPUS.length} actions`);
@@ -80,6 +86,22 @@ test("no single difficulty band has collapsed", () => {
         formatReport(report),
     );
   }
+});
+
+test("the default semantic scorer materially improves retrieval", () => {
+  assert.ok(semanticReport.overall.recallAt1 >= SEMANTIC_BASELINE.recallAt1, formatReport(semanticReport));
+  assert.ok(semanticReport.overall.recallAt5 >= SEMANTIC_BASELINE.recallAt5, formatReport(semanticReport));
+  assert.ok(semanticReport.overall.mrr >= SEMANTIC_BASELINE.mrr, formatReport(semanticReport));
+  for (const band of ["exact", "paraphrase", "ambiguous"] as const) {
+    assert.ok(
+      semanticReport.byDifficulty[band].recallAt1 >= SEMANTIC_BAND_BASELINE[band],
+      `${band} semantic recall@1 regressed\n${formatReport(semanticReport)}`,
+    );
+  }
+  assert.ok(
+    semanticReport.overall.recallAt1 > report.overall.recallAt1,
+    `semantic recall@1 no longer improves BM25\n${formatReport(semanticReport)}`,
+  );
 });
 
 test("exact-name queries resolve to the named action first", async () => {
