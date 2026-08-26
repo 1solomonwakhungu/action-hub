@@ -12,10 +12,13 @@
 - `PermissionPolicy` — trust tiers, auto-approve floor, allow/deny lists
 - `validateArguments` — JSON Schema subset validator
 - `BundleRegistry` — named capability scopes
+- `CatalogCache` / `bootstrapCatalog` — versioned on-disk catalog keyed by a
+  config fingerprint, served on startup and refreshed in the background
 - `ActionHub` — the `search` / `load` / `execute` façade, invocation history,
   context savings estimate
-- 32 tests covering ranking, the schema split, validation, policy gating,
-  per-server failure isolation, and activation counts
+- 60 tests covering ranking, the schema split, validation, policy gating,
+  per-server failure isolation, activation counts, and cache
+  invalidation/corruption handling
 
 **Layer 2 — `packages/copilot-plugin`**
 
@@ -28,11 +31,6 @@
   invocation history, context savings
 
 ## Next
-
-**Catalog persistence.** Indexing currently runs on every server start, so
-startup cost scales with the number of downstream servers. Cache the catalog to
-`~/.cache/action-hub/catalog.json`, keyed by a hash of the server config, and
-re-index in the background. The canvas already reads this file.
 
 **Semantic scoring by default.** The `SemanticScorer` hook exists but nothing
 implements it. Ship a small local embedding model so retrieval stops being

@@ -16,7 +16,7 @@ GitHub Copilot app
         ▼
   ActionHub façade           ← Layer 1, the actual IP
         │
-        ├── Catalog
+        ├── Catalog ──────────► CatalogCache (~/.cache/action-hub)
         ├── SearchEngine
         ├── ConnectionManager ──► GitHub MCP, Linear MCP, Slack MCP, …
         ├── PermissionPolicy
@@ -108,6 +108,39 @@ a thundering herd.
 Indexing failures are captured per server. One broken integration produces one
 `IndexResult` with an `error` field; the rest of the catalog still builds. A
 misconfigured Slack token must not take down GitHub.
+
+## Catalog persistence
+
+Indexing is the only eager cost in the system, and it is linear in the number
+of configured servers. `bootstrapCatalog` removes it from the critical path:
+the catalog is read from `$XDG_CACHE_HOME/action-hub/catalog.json` (falling
+back to `~/.cache`), the hub becomes answerable immediately, and the real index
+runs behind it and writes the refreshed catalog back.
+
+An entry is reused only when both the schema `version` and a `configHash`
+match. That hash covers command, args, cwd, transport type, URL, trust,
+enabled, and the allow/deny lists — everything that could change what indexing
+produces. It deliberately covers env and header *keys* but not their values: a
+rotated token must not discard a valid catalog, and a secret must not end up in
+a digest that lives on disk. Servers are sorted before hashing, so reordering
+the config file is not a cache-invalidating edit.
+
+Every failure mode degrades to a full index rather than an error. A missing,
+corrupt, truncated, or unreadable file is a miss; individual malformed action
+records are dropped while the rest of the entry survives; an unwritable cache
+directory produces a warning and a working hub. The background refresh catches
+its own rejections, because an unhandled one would take down the process the
+agent session depends on.
+
+Restoring a catalog restores *only* the catalog. No server is activated, so
+lazy activation is preserved — a warm start connects to nothing until an action
+is executed. Actions belonging to servers that have since been removed from the
+config are dropped, since they could never be dispatched.
+
+The cache file and the Capability Manager snapshot are the same file. The
+persisted entry is a superset of `HubSnapshot`, so one atomic write (temp file
+plus rename) keeps the canvas current and the cache warm without the two
+drifting apart.
 
 ## Permissions
 

@@ -12,7 +12,7 @@ downstream server.
 
 - `npm run build` — clean, both workspaces
 - `npm run typecheck` — clean
-- `npm test` — 32/32 passing
+- `npm test` — 60/60 passing
 - End-to-end smoke test against `@modelcontextprotocol/server-filesystem`:
   the server exposed exactly one tool (`action_hub`), indexed 14 downstream
   tools, and completed a full search → load → execute cycle. Execute returned
@@ -23,8 +23,9 @@ downstream server.
 
 ## What is done
 
-- `packages/core` — catalog, BM25 search, connection manager, permission
-  policy, argument validator, bundles, and the `ActionHub` façade
+- `packages/core` — catalog, catalog persistence, BM25 search, connection
+  manager, permission policy, argument validator, bundles, and the `ActionHub`
+  façade
 - `packages/copilot-plugin` — plugin manifest, `.mcp.json`, skill, meta-MCP
   server, and the Capability Manager canvas
 - `docs/architecture.md`, `docs/roadmap.md`, README, MIT license
@@ -33,12 +34,17 @@ downstream server.
 
 In priority order, with rationale in `docs/roadmap.md`:
 
-1. Catalog persistence — startup currently re-indexes every server every time
-2. A search evaluation suite — retrieval quality is the product and is
+1. A search evaluation suite — retrieval quality is the product and is
    currently unguarded against regressions
-3. Semantic scoring — the `SemanticScorer` hook exists but nothing implements it
-4. Interactive canvas controls — the canvas is read-only today
-5. Approval flow — `requiresApproval` is computed but no host surfaces it
+2. Semantic scoring — the `SemanticScorer` hook exists but nothing implements it
+3. Interactive canvas controls — the canvas is read-only today
+4. Approval flow — `requiresApproval` is computed but no host surfaces it
+
+Catalog persistence is done: the catalog is cached to
+`$XDG_CACHE_HOME/action-hub/catalog.json` (falling back to `~/.cache`), keyed
+by a hash of the server config and a schema version, served on startup, and
+re-indexed in the background. The cache file is a superset of the canvas
+snapshot, so both stay in sync from one atomic write.
 
 ## Notes for future sessions
 
