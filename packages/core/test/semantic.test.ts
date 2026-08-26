@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Catalog } from "../dist/catalog/catalog.js";
-import { SearchEngine } from "../dist/search/search.js";
+import { DEFAULT_SEMANTIC_WEIGHT, SearchEngine } from "../dist/search/search.js";
 import { LocalSemanticIndex, createLocalSemanticScorer } from "../dist/search/semantic.js";
 import type { ActionRecord } from "../dist/types.js";
 
@@ -324,7 +324,7 @@ test("the blend weight is clamped and rejects non-finite values", () => {
   engine.setSemanticWeight(-2);
   assert.equal(engine.semanticWeight, 0);
   engine.setSemanticWeight(Number.NaN);
-  assert.equal(engine.semanticWeight, 0.4);
+  assert.equal(engine.semanticWeight, DEFAULT_SEMANTIC_WEIGHT);
 });
 
 test("custom concepts extend the built-in lexicon", () => {

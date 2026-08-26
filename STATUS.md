@@ -12,7 +12,7 @@ downstream server.
 
 - `npm run build` — clean, both workspaces
 - `npm run typecheck` — clean
-- `npm test` — 32/32 passing
+- `npm test` — 49/49 passing
 - End-to-end smoke test against `@modelcontextprotocol/server-filesystem`:
   the server exposed exactly one tool (`action_hub`), indexed 14 downstream
   tools, and completed a full search → load → execute cycle. Execute returned
@@ -35,13 +35,13 @@ downstream server.
 In priority order, with rationale in `docs/roadmap.md`:
 
 1. Catalog persistence — startup currently re-indexes every server every time
-2. A search evaluation suite — retrieval quality is the product and is
-   currently unguarded against regressions
-3. Interactive canvas controls — the canvas is read-only today
-4. Approval flow — `requiresApproval` is computed but no host surfaces it
+2. Interactive canvas controls — the canvas is read-only today
 
-Semantic scoring is done — `LocalSemanticIndex` now implements `SemanticScorer`
-and is on by default. See `docs/architecture.md`.
+Recently landed: a search evaluation suite (recall/MRR regression gate),
+single-use approval tokens for gated actions, and dependency-free local
+semantic scoring. `LocalSemanticIndex` now implements `SemanticScorer` and is
+on by default, blended at a conservative weight with a non-throwing fallback to
+pure BM25. See `docs/architecture.md`.
 
 ## Notes for future sessions
 

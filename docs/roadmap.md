@@ -9,22 +9,25 @@
   semantic scoring with a tunable weight, empty-query browse
 - `LocalSemanticIndex` — dependency-free local embeddings (subword n-gram
   hashing plus a concept lexicon), precomputed at index time, blended at
-  `w = 0.4`, with a non-throwing fallback to pure BM25
+  `w = 0.2`, with a non-throwing fallback to pure BM25
 - `ConnectionManager` — lazy activation, shared in-flight connection promises,
   per-server state tracking, ordered shutdown
 - `PermissionPolicy` — trust tiers, auto-approve floor, allow/deny lists
+- `ApprovalRegistry` — single-use, argument-bound, expiring approval tokens
+  backing the two-step execute flow for gated actions
 - `validateArguments` — JSON Schema subset validator
 - `BundleRegistry` — named capability scopes
 - `ActionHub` — the `search` / `load` / `execute` façade, invocation history,
   context savings estimate
-- 51 tests covering ranking, semantic paraphrase and morphology wins, scorer
-  fallback, the schema split, validation, policy gating, per-server failure
-  isolation, and activation counts
+- Tests covering ranking, semantic paraphrase and morphology wins, scorer
+  fallback, the schema split, validation, policy gating, approval tokens,
+  per-server failure isolation, and activation counts
 
 **Layer 2 — `packages/copilot-plugin`**
 
 - `plugin.json` and `.mcp.json` in the Copilot plugin format
-- `skills/action-hub/SKILL.md` teaching the search → load → execute loop
+- `skills/action-hub/SKILL.md` teaching the search → load → execute loop and
+  the approval handshake for gated actions
 - Meta-MCP server exposing the single `action_hub` tool over stdio
 - Config loader with `~` and `${ENV_VAR}` expansion
 - `@modelcontextprotocol/sdk` client adapter for stdio and HTTP transports
@@ -45,10 +48,6 @@ regressions fail CI instead of being discovered in use.
 **Interactive canvas controls.** The canvas is read-only today. Add enable and
 disable toggles, trust changes, live search testing, and add-a-server — writing
 back through the hub rather than editing the config file directly.
-
-**Approval flow.** `requiresApproval` is computed and returned but no host
-surfaces it. Wire it to a Copilot confirmation prompt so untrusted servers are
-genuinely gated rather than merely flagged.
 
 ## Later
 

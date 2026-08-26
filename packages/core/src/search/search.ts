@@ -120,10 +120,17 @@ export type SemanticScorer = (
 ) => Promise<number[]>;
 
 /**
- * Deliberately below 0.5 so that a weak, misconfigured, or partially failing
+ * Deliberately small so that a weak, misconfigured, or partially failing
  * embedding model shifts the ranking rather than dictating it.
+ *
+ * 0.2 was chosen by an independent weight sweep over the 40-query / 91-action
+ * labelled set (see `packages/core/eval`). It is the setting that maximises
+ * overall and paraphrase recall@1 while holding exact recall@1 at 100%; larger
+ * weights let the semantic signal demote lexically-exact matches. Recorded
+ * results at 0.2 vs. pure BM25: overall recall@1 70.0% → 77.5%, paraphrase
+ * recall@1 43.8% → 50.0%, ambiguous recall@1 75.0% → 91.7%, MRR .804 → .863.
  */
-export const DEFAULT_SEMANTIC_WEIGHT = 0.4;
+export const DEFAULT_SEMANTIC_WEIGHT = 0.2;
 
 function blend(lexicalScore: number, semanticScore: number, weight: number): number {
   // Lexical scores are unbounded, so squash before blending to keep the two
