@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present && node --test packages/copilot-plugin/canvas/capability-manager/*.test.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "eval": "npm run eval --workspace @action-hub/core",
     "clean": "rm -rf packages/*/dist packages/*/*/dist"

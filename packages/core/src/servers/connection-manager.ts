@@ -76,6 +76,16 @@ export class ConnectionManager {
     }
   }
 
+  /**
+   * Retiers a server at runtime. Catalog records copy trust at index time, so
+   * callers must re-index (or re-tag) after changing it for search and policy
+   * to agree with the new tier.
+   */
+  setTrust(serverId: string, trust: TrustTier): void {
+    const entry = this.#requireEntry(serverId);
+    entry.config = { ...entry.config, trust };
+  }
+
   recordToolCount(serverId: string, count: number): void {
     const entry = this.#entries.get(serverId);
     if (entry) entry.toolCount = count;

@@ -28,13 +28,14 @@ downstream server.
   bundles, and the `ActionHub` façade
 - `packages/copilot-plugin` — plugin manifest, `.mcp.json`, skill, meta-MCP
   server, and the Capability Manager canvas
+- Interactive canvas controls — enable/disable, trust changes, live search
+  testing, and add-a-server, routed through a localhost control endpoint on the
+  running hub
 - `docs/architecture.md`, `docs/roadmap.md`, README, MIT license
 
 ## Next
 
 In priority order, with rationale in `docs/roadmap.md`:
-
-1. Interactive canvas controls — the canvas is read-only today
 
 Catalog persistence is done: the catalog is cached to
 `$XDG_CACHE_HOME/action-hub/catalog.json` (falling back to `~/.cache`), keyed
@@ -50,6 +51,10 @@ server as an `approval_required` response.
 Semantic scoring is done: `LocalSemanticIndex` is enabled by default at weight
 0.2 and guarded against the 91-action evaluation corpus without regressing exact
 matches.
+
+Interactive canvas controls are done: enable/disable, trust changes, live search
+testing, and add-a-server are routed through an authenticated localhost control
+plane owned by the running hub.
 
 ## Notes for future sessions
 

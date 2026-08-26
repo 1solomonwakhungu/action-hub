@@ -1,6 +1,7 @@
-import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import type { ServerConfig, TrustTier } from "@action-hub/core";
 
 export interface HubConfigFile {
@@ -18,6 +19,7 @@ export interface HubConfig {
 
 const DEFAULT_APPROVAL_TTL_SECONDS = 300;
 const MAX_APPROVAL_TTL_SECONDS = 3600;
+const mutationChains = new Map<string, Promise<void>>();
 
 const VALID_TRUST: readonly string[] = ["blocked", "untrusted", "trusted"];
 
@@ -57,7 +59,7 @@ export async function loadConfig(path: string): Promise<HubConfig> {
   }
 
   return {
-    servers: parseServers(parsed.servers, path),
+    servers: parseServers(parsed.servers, `Action Hub config at ${path}`),
     autoApproveAtOrAbove: isTrust(parsed.autoApproveAtOrAbove)
       ? parsed.autoApproveAtOrAbove
       : "trusted",
@@ -73,27 +75,121 @@ function parseApprovalTtl(value: unknown): number {
   return Math.min(Math.round(value), MAX_APPROVAL_TTL_SECONDS) * 1000;
 }
 
-function parseServers(value: unknown, path: string): ServerConfig[] {
+/**
+ * Validates a single server entry that did not come from the config file —
+ * notably one supplied by the capability manager canvas.
+ *
+ * The canvas is untrusted input, so a candidate entry goes through exactly the
+ * same parser the on-disk config does before it is registered or persisted.
+ */
+export function parseServerEntry(entry: unknown, label = "server"): ServerConfig {
+  const parsed = parseServers([entry], label);
+  const config = parsed[0];
+  if (!config) throw new Error(`${label}: a server entry is required`);
+  return config;
+}
+
+/**
+ * Reads the config file without normalizing or expanding anything.
+ *
+ * Mutations are applied to this raw form so that `${ENV_VAR}` references and
+ * any keys this version does not understand survive a write-back instead of
+ * being replaced by their expanded values.
+ */
+export async function readRawConfig(path: string): Promise<Record<string, unknown>> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (cause) {
+    if (isNotFound(cause)) return {};
+    throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    throw new Error(`Action Hub config at ${path} is not valid JSON: ${message(cause)}`);
+  }
+
+  if (!isRecord(parsed)) {
+    throw new Error(`Action Hub config at ${path} must contain a JSON object`);
+  }
+  return parsed;
+}
+
+/** Reads the `servers` array out of a raw config document. */
+export function rawServers(config: Record<string, unknown>): Record<string, unknown>[] {
+  const value = config["servers"];
+  if (!Array.isArray(value)) return [];
+  return value.filter(isRecord);
+}
+
+/**
+ * Persists a raw config document atomically, matching the snapshot writer, so
+ * a concurrently reading canvas can never observe a half-written file.
+ */
+export async function writeRawConfig(
+  path: string,
+  config: Record<string, unknown>,
+): Promise<void> {
+  await enqueueMutation(path, () => writeRawConfigFile(path, config));
+}
+
+export async function mutateRawConfig(
+  path: string,
+  mutate: (config: Record<string, unknown>) => void,
+): Promise<void> {
+  await enqueueMutation(path, async () => {
+    const config = await readRawConfig(path);
+    mutate(config);
+    await writeRawConfigFile(path, config);
+  });
+}
+
+async function enqueueMutation(path: string, mutation: () => Promise<void>): Promise<void> {
+  const previous = mutationChains.get(path) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(mutation);
+  mutationChains.set(path, current);
+  try {
+    await current;
+  } finally {
+    if (mutationChains.get(path) === current) mutationChains.delete(path);
+  }
+}
+
+async function writeRawConfigFile(
+  path: string,
+  config: Record<string, unknown>,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const mode = await stat(path).then((entry) => entry.mode & 0o777).catch(() => 0o600);
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode });
+  await rename(temp, path);
+}
+
+function parseServers(value: unknown, label: string): ServerConfig[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
-    throw new Error(`Action Hub config at ${path}: "servers" must be an array`);
+    throw new Error(`${label}: "servers" must be an array`);
   }
 
   const seen = new Set<string>();
   return value.map((entry, index) => {
     if (!isRecord(entry)) {
-      throw new Error(`Action Hub config at ${path}: servers[${index}] must be an object`);
+      throw new Error(`${label}: servers[${index}] must be an object`);
     }
     const id = entry["id"];
     if (typeof id !== "string" || id.length === 0) {
-      throw new Error(`Action Hub config at ${path}: servers[${index}].id must be a non-empty string`);
+      throw new Error(`${label}: servers[${index}].id must be a non-empty string`);
     }
     if (seen.has(id)) {
-      throw new Error(`Action Hub config at ${path}: duplicate server id "${id}"`);
+      throw new Error(`${label}: duplicate server id "${id}"`);
     }
     seen.add(id);
 
-    const transport = parseTransport(entry["transport"], `servers[${index}]`, path);
+    const transport = parseTransport(entry["transport"], `servers[${index}]`, label);
     const trust = entry["trust"];
 
     return {
@@ -108,16 +204,16 @@ function parseServers(value: unknown, path: string): ServerConfig[] {
   });
 }
 
-function parseTransport(value: unknown, where: string, path: string): ServerConfig["transport"] {
+function parseTransport(value: unknown, where: string, label: string): ServerConfig["transport"] {
   if (!isRecord(value)) {
-    throw new Error(`Action Hub config at ${path}: ${where}.transport is required`);
+    throw new Error(`${label}: ${where}.transport is required`);
   }
   const type = value["type"];
 
   if (type === "stdio") {
     const command = value["command"];
     if (typeof command !== "string" || command.length === 0) {
-      throw new Error(`Action Hub config at ${path}: ${where}.transport.command is required for stdio`);
+      throw new Error(`${label}: ${where}.transport.command is required for stdio`);
     }
     return {
       type: "stdio",
@@ -131,7 +227,7 @@ function parseTransport(value: unknown, where: string, path: string): ServerConf
   if (type === "http") {
     const url = value["url"];
     if (typeof url !== "string" || url.length === 0) {
-      throw new Error(`Action Hub config at ${path}: ${where}.transport.url is required for http`);
+      throw new Error(`${label}: ${where}.transport.url is required for http`);
     }
     return {
       type: "http",
@@ -140,9 +236,7 @@ function parseTransport(value: unknown, where: string, path: string): ServerConf
     };
   }
 
-  throw new Error(
-    `Action Hub config at ${path}: ${where}.transport.type must be "stdio" or "http"`,
-  );
+  throw new Error(`${label}: ${where}.transport.type must be "stdio" or "http"`);
 }
 
 function parseStringArray(value: unknown): string[] | undefined {
@@ -171,9 +265,11 @@ function expandHome(value: string): string {
   return expandEnv(value);
 }
 
-function isTrust(value: unknown): value is TrustTier {
+export function isTrust(value: unknown): value is TrustTier {
   return typeof value === "string" && VALID_TRUST.includes(value);
 }
+
+export const TRUST_TIERS: readonly string[] = VALID_TRUST;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
