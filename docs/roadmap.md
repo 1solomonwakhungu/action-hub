@@ -35,12 +35,15 @@
 - `@modelcontextprotocol/sdk` client adapter for stdio and HTTP transports
 - Capability Manager canvas — server table, health, trust, indexed counts,
   invocation history, context savings
+- Interactive canvas controls — enable/disable toggles, trust tier changes,
+  live search testing, and add-a-server, all writing back through a
+  localhost-only control endpoint on the running hub rather than editing the
+  config file directly; degrades to the read-only view when no hub is running
 
 ## Next
 
-**Interactive canvas controls.** The canvas is read-only today. Add enable and
-disable toggles, trust changes, live search testing, and add-a-server — writing
-back through the hub rather than editing the config file directly.
+All five near-term roadmap items are implemented. The next priorities should be
+chosen from production usage and the committed search evaluation results.
 
 ## Later
 
