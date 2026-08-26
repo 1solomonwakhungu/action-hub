@@ -1,4 +1,5 @@
 import { Catalog } from "./catalog/catalog.js";
+import { CATALOG_CACHE_VERSION, type PersistedCatalog } from "./catalog/persistence.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
 import { ConnectionManager } from "./servers/connection-manager.js";
@@ -387,6 +388,45 @@ export class ActionHub {
       skills: this.#catalog.filter({ kind: "skill" }).length,
       context: this.contextStats(),
       history: [...this.#history],
+    };
+  }
+
+  /**
+   * Rehydrates the catalog from a persisted entry, skipping the eager
+   * round-trip to every downstream server.
+   *
+   * Only the catalog is restored. Connection state deliberately is not:
+   * nothing has been spawned yet, so every server stays `inactive` until an
+   * action from it is executed. Actions belonging to servers that are no
+   * longer configured are dropped, since they could never be dispatched.
+   */
+  restoreCatalog(entry: PersistedCatalog): number {
+    const known = new Set(this.#connections.configs().map((config) => config.id));
+    const records = entry.actions.filter(
+      (record) => record.kind === "skill" || known.has(record.serverId),
+    );
+
+    for (const serverId of this.#catalog.serverIds()) this.#catalog.removeServer(serverId);
+    this.#catalog.addAll(records);
+
+    for (const serverId of known) {
+      this.#connections.recordToolCount(serverId, this.#catalog.listByServer(serverId).length);
+    }
+    return records.length;
+  }
+
+  /**
+   * The full serializable catalog, ready to be written to a cache.
+   *
+   * A superset of `snapshot()` — the diagnostics fields are identical, so a
+   * single file can serve both the cache and the capability manager canvas.
+   */
+  toPersisted(configHash: string): PersistedCatalog {
+    return {
+      version: CATALOG_CACHE_VERSION,
+      configHash,
+      ...this.snapshot(),
+      actions: this.#catalog.all(),
     };
   }
 
