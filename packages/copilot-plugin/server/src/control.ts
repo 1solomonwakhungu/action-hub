@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -24,9 +24,10 @@ export interface ControlServer {
 }
 
 export function defaultControlPath(): string {
-  return (
-    process.env["ACTION_HUB_CONTROL"] ?? resolve(homedir(), ".cache", "action-hub", "control.json")
-  );
+  const explicit = process.env["ACTION_HUB_CONTROL"];
+  if (explicit) return explicit;
+  const base = process.env["XDG_CACHE_HOME"] || resolve(homedir(), ".cache");
+  return resolve(base, "action-hub", "control.json");
 }
 
 /**
@@ -403,11 +404,18 @@ function respond(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 async function publish(path: string, payload: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  // 0600: the token in this file is the only credential guarding the endpoint.
-  await writeFile(temp, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
-  await rename(temp, path);
+  try {
+    // 0600: the token in this file is the only credential guarding the endpoint.
+    await writeFile(temp, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
+    await rename(temp, path);
+  } catch (cause) {
+    await rm(temp, { force: true }).catch(() => undefined);
+    throw cause;
+  }
 }
 
 async function closeHttp(http: Server): Promise<void> {

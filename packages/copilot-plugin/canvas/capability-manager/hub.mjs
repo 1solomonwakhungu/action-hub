@@ -7,7 +7,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
 function controlPath() {
   const fromEnv = process.env.ACTION_HUB_CONTROL;
   if (fromEnv) return fromEnv;
-  return resolve(homedir(), ".cache", "action-hub", "control.json");
+  const base = process.env.XDG_CACHE_HOME || resolve(homedir(), ".cache");
+  return resolve(base, "action-hub", "control.json");
 }
 
 /**
