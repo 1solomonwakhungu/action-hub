@@ -10,6 +10,7 @@ import { validateArguments } from "./router/validate.js";
 import type {
   ActionRecord,
   ExecuteResult,
+  HealthCheckResult,
   InvocationRecord,
   LoadedAction,
   LoadedBundle,
@@ -424,6 +425,21 @@ export class ActionHub {
 
   serverStates(): ServerState[] {
     return this.#connections.states();
+  }
+
+  /** Probes server health and tracks response latency. */
+  async checkHealth(serverId: string): Promise<HealthCheckResult> {
+    return this.#connections.checkHealth(serverId);
+  }
+
+  /** Probes all registered servers in parallel. */
+  async checkAllHealth(): Promise<HealthCheckResult[]> {
+    return this.#connections.checkAllHealth();
+  }
+
+  /** Reconnects a server. */
+  async reconnect(serverId: string): Promise<void> {
+    await this.#connections.reconnect(serverId);
   }
 
   history(): readonly InvocationRecord[] {
