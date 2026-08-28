@@ -1,5 +1,6 @@
 import { Catalog } from "./catalog/catalog.js";
 import { CATALOG_CACHE_VERSION, type PersistedCatalog } from "./catalog/persistence.js";
+import { BundleRegistry, type Bundle } from "./bundles/bundles.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
 import { ConnectionManager } from "./servers/connection-manager.js";
@@ -11,6 +12,7 @@ import type {
   ExecuteResult,
   InvocationRecord,
   LoadedAction,
+  LoadedBundle,
   McpClientFactory,
   SearchHit,
   SearchOptions,
@@ -20,6 +22,7 @@ import type {
 
 export interface ActionHubOptions {
   servers?: readonly ServerConfig[];
+  bundles?: readonly Bundle[];
   clientFactory: McpClientFactory;
   policy?: PolicyOptions;
   /**
@@ -82,6 +85,7 @@ const DEFAULT_EXECUTION_TIMEOUT_MS = 30_000;
  */
 export class ActionHub {
   readonly #catalog = new Catalog();
+  readonly #bundles: BundleRegistry;
   readonly #search: SearchEngine;
   readonly #connections: ConnectionManager;
   readonly #policy: PermissionPolicy;
@@ -95,6 +99,7 @@ export class ActionHub {
 
   constructor(options: ActionHubOptions) {
     this.#connections = new ConnectionManager(options.clientFactory, options.servers ?? []);
+    this.#bundles = new BundleRegistry(options.bundles ?? []);
     this.#defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS;
     this.#search = new SearchEngine(this.#catalog);
     if (options.semanticWeight !== undefined) {
@@ -118,6 +123,10 @@ export class ActionHub {
 
   get catalog(): Catalog {
     return this.#catalog;
+  }
+
+  get bundles(): BundleRegistry {
+    return this.#bundles;
   }
 
   get connections(): ConnectionManager {
@@ -223,6 +232,48 @@ export class ActionHub {
       inputSchema: record.inputSchema ?? {},
       trust: record.trust,
     };
+  }
+
+  /** Loads all action schemas in a bundle and computes token metrics. */
+  loadBundle(bundleId: string): LoadedBundle {
+    const bundle = this.#bundles.get(bundleId);
+    if (!bundle) throw new ActionHubError(`Unknown bundle "${bundleId}"`, "unknown_bundle");
+
+    const records = this.#bundles.resolveActions(bundleId, this.#catalog);
+    const actions: LoadedAction[] = records.map((record) => ({
+      id: record.id,
+      kind: record.kind,
+      serverId: record.serverId,
+      name: record.name,
+      summary: record.summary,
+      description: record.description,
+      inputSchema: record.inputSchema ?? {},
+      trust: record.trust,
+    }));
+
+    const eagerChars = actions.reduce((sum, act) => {
+      const schema = act.inputSchema ? JSON.stringify(act.inputSchema).length : 0;
+      return sum + act.name.length + (act.description?.length ?? 0) + schema;
+    }, 0);
+
+    const totalEagerTokens = Math.ceil(eagerChars / 4);
+    const totalLazyTokens = HUB_TOOL_TOKENS;
+    const tokensSaved = Math.max(0, totalEagerTokens - totalLazyTokens);
+
+    return {
+      id: bundle.id,
+      displayName: bundle.displayName,
+      description: bundle.description,
+      actions,
+      totalEagerTokens,
+      totalLazyTokens,
+      tokensSaved,
+    };
+  }
+
+  /** Searches available capability bundles. */
+  searchBundles(query: string): Bundle[] {
+    return this.#bundles.search(query);
   }
 
   /**
