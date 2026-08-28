@@ -141,6 +141,21 @@ async function handle(
       case "/add-server":
         respond(res, 200, await addServer(hub, configPath, cache, input));
         return;
+      case "/reconnect":
+        respond(res, 200, await reconnect(hub, cache, input));
+        return;
+      case "/check-health":
+        respond(res, 200, await checkHealth(hub, cache, input));
+        return;
+      case "/import-config":
+        respond(res, 200, await importConfig(hub, configPath, cache, input));
+        return;
+      case "/load-action":
+        respond(res, 200, await loadAction(hub, input));
+        return;
+      case "/load-bundle":
+        respond(res, 200, await loadBundle(hub, input));
+        return;
       default:
         respond(res, 404, { ok: false, error: `Unknown control operation "${path}"` });
         return;
@@ -204,6 +219,177 @@ async function setTrust(
   return { ok: true, serverId, trust, retagged: hub.catalog.countByServer(serverId) };
 }
 
+async function reconnect(
+  hub: ActionHub,
+  cache: CatalogCache,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const serverId = requireKnownServer(hub, input["serverId"]);
+  const health = await hub.reconnect(serverId);
+  await refreshSnapshot(hub, cache);
+  return { ok: true, serverId, health };
+}
+
+async function checkHealth(
+  hub: ActionHub,
+  cache: CatalogCache,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const serverId = input["serverId"];
+  if (typeof serverId === "string" && serverId.length > 0) {
+    const health = await hub.checkHealth(serverId);
+    await refreshSnapshot(hub, cache);
+    return { ok: true, serverId, health };
+  }
+  const results = await hub.checkAllHealth();
+  await refreshSnapshot(hub, cache);
+  return { ok: true, results };
+}
+
+async function loadAction(hub: ActionHub, input: Record<string, unknown>): Promise<unknown> {
+  const actionId = input["actionId"];
+  if (typeof actionId !== "string" || !actionId) {
+    throw new Error(`"actionId" must be a non-empty string`);
+  }
+  const action = hub.load(actionId);
+  return {
+    ok: true,
+    action: {
+      id: action.id,
+      name: action.name,
+      serverId: action.serverId,
+      kind: action.kind,
+      trust: action.trust,
+      summary: action.summary,
+      description: action.description ?? action.summary,
+      inputSchema: action.inputSchema,
+    },
+  };
+}
+
+async function loadBundle(hub: ActionHub, input: Record<string, unknown>): Promise<unknown> {
+  const bundleId = input["bundleId"];
+  if (typeof bundleId !== "string" || !bundleId) {
+    throw new Error(`"bundleId" must be a non-empty string`);
+  }
+  const loaded = hub.loadBundle(bundleId);
+  return {
+    ok: true,
+    bundle: {
+      id: loaded.id,
+      displayName: loaded.displayName,
+      description: loaded.description,
+      tokensSaved: loaded.tokensSaved,
+      actions: loaded.actions.map((act) => ({
+        id: act.id,
+        name: act.name,
+        serverId: act.serverId,
+        trust: act.trust,
+        summary: act.summary,
+        inputSchema: act.inputSchema,
+      })),
+    },
+  };
+}
+
+async function importConfig(
+  hub: ActionHub,
+  configPath: string,
+  cache: CatalogCache,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const rawConfig = input["config"];
+  if (!rawConfig || typeof rawConfig !== "object") {
+    throw new Error(`"config" must be a JSON object containing MCP servers`);
+  }
+
+  const record = rawConfig as Record<string, unknown>;
+  const serversMap = record["mcpServers"] || record["servers"];
+  const added: string[] = [];
+  const errors: string[] = [];
+
+  if (serversMap && typeof serversMap === "object" && !Array.isArray(serversMap)) {
+    // Claude Desktop / VS Code / Cursor style: { "mcpServers": { "github": { "command": "...", "args": [...] } } }
+    for (const [id, value] of Object.entries(serversMap as Record<string, unknown>)) {
+      try {
+        if (!value || typeof value !== "object") continue;
+        const entry = value as Record<string, unknown>;
+        const transport: Record<string, unknown> = entry["url"]
+          ? { type: "http", url: entry["url"], headers: entry["headers"] }
+          : {
+              type: "stdio",
+              command: entry["command"],
+              args: Array.isArray(entry["args"]) ? entry["args"] : [],
+              env: entry["env"],
+            };
+
+        const serverPayload = {
+          id,
+          displayName: typeof entry["displayName"] === "string" ? entry["displayName"] : id,
+          trust: "untrusted" as TrustTier,
+          enabled: entry["enabled"] !== false,
+          transport,
+        };
+
+        if (hub.connections.getConfig(id)) {
+          errors.push(`Server "${id}" already exists`);
+          continue;
+        }
+
+        const config = parseServerEntry(serverPayload, "import_config");
+        await mutateRawConfig(configPath, (raw) => {
+          const servers = rawServers(raw);
+          if (!servers.some((s) => s["id"] === config.id)) {
+            servers.push(serverPayload);
+            raw["servers"] = servers;
+          }
+        });
+        hub.connections.register(config);
+        if (config.enabled !== false) {
+          await hub.indexServer(config.id);
+        }
+        added.push(id);
+      } catch (err) {
+        errors.push(`Failed to import "${id}": ${message(err)}`);
+      }
+    }
+  } else if (Array.isArray(serversMap)) {
+    // Array style: { "servers": [ { "id": "...", ... } ] }
+    for (const item of serversMap) {
+      try {
+        if (!item || typeof item !== "object") continue;
+        const entry = item as Record<string, unknown>;
+        const id = String(entry["id"] || "");
+        if (!id) continue;
+        if (hub.connections.getConfig(id)) {
+          errors.push(`Server "${id}" already exists`);
+          continue;
+        }
+        const config = parseServerEntry(entry, "import_config");
+        await mutateRawConfig(configPath, (raw) => {
+          const servers = rawServers(raw);
+          if (!servers.some((s) => s["id"] === config.id)) {
+            servers.push(entry);
+            raw["servers"] = servers;
+          }
+        });
+        hub.connections.register(config);
+        if (config.enabled !== false) {
+          await hub.indexServer(config.id);
+        }
+        added.push(id);
+      } catch (err) {
+        errors.push(`Failed to import "${item}": ${message(err)}`);
+      }
+    }
+  } else {
+    throw new Error(`No "mcpServers" or "servers" found in provided configuration.`);
+  }
+
+  await refreshSnapshot(hub, cache);
+  return { ok: true, imported: added, count: added.length, errors: errors.length > 0 ? errors : undefined };
+}
+
 async function search(hub: ActionHub, input: Record<string, unknown>): Promise<unknown> {
   const query = input["query"];
   if (typeof query !== "string" || query.trim().length === 0) {
@@ -215,18 +401,20 @@ async function search(hub: ActionHub, input: Record<string, unknown>): Promise<u
     throw new Error(`"serverId" must be a string`);
   }
 
+  const limit = parseLimit(input["limit"]);
+  const includeSchema = input["includeSchema"] === true;
   const hits = await hub.search(query, {
-    limit: parseLimit(input["limit"]),
+    limit,
     serverIds: serverId ? [serverId] : undefined,
+    includeSchema,
   });
+
+  const matchingBundles = hub.searchBundles(query);
 
   return {
     ok: true,
     query,
     count: hits.length,
-    // Mirrors the agent-facing search contract: ranked candidates only, never
-    // an inputSchema. The canvas is a diagnostics surface for the same
-    // retrieval the model sees, so it must not show more than the model gets.
     results: hits.map((hit) => ({
       id: hit.id,
       name: hit.name,
@@ -234,6 +422,14 @@ async function search(hub: ActionHub, input: Record<string, unknown>): Promise<u
       kind: hit.kind,
       summary: hit.summary,
       score: Math.round(hit.score * 1000) / 1000,
+      inputSchema: hit.inputSchema,
+    })),
+    bundles: matchingBundles.map((b) => ({
+      id: b.id,
+      displayName: b.displayName,
+      description: b.description,
+      actionIds: b.actionIds,
+      serverIds: b.serverIds,
     })),
   };
 }
@@ -322,8 +518,31 @@ function liveState(hub: ActionHub, configPath: string): unknown {
       toolCount: state.toolCount,
       error: state.error,
       lastActivatedAt: state.lastActivatedAt,
+      latencyMs: state.latencyMs,
+      circuitBreaker: state.circuitOpen,
+      lastHealthCheck: state.lastActivatedAt,
     };
   });
+
+  const catalogRecords = hub.catalog.all();
+  const actionsList = catalogRecords.map((r) => ({
+    id: r.id,
+    name: r.name,
+    serverId: r.serverId,
+    kind: r.kind,
+    trust: r.trust,
+    summary: r.summary,
+    description: r.description ?? r.summary,
+    inputSchema: r.inputSchema,
+  }));
+
+  const bundles = hub.bundles.list().map((b) => ({
+    id: b.id,
+    displayName: b.displayName,
+    description: b.description,
+    actionIds: b.actionIds,
+    serverIds: b.serverIds,
+  }));
 
   return {
     configPath,
@@ -333,6 +552,8 @@ function liveState(hub: ActionHub, configPath: string): unknown {
     history: snapshot.history.slice(-50).reverse(),
     context: snapshot.context,
     indexedAt: snapshot.indexedAt,
+    bundles,
+    actionsList,
   };
 }
 
