@@ -39,6 +39,10 @@ const inputShape = {
     .describe("Arguments for execute, matching the schema returned by load."),
   server_id: z.string().optional().describe("Restrict a search to one server."),
   limit: z.number().int().min(1).max(50).optional().describe("Max search results. Default 10."),
+  include_schema: z
+    .boolean()
+    .optional()
+    .describe("When true, returns the inputSchema for matched actions directly in search results, saving a load round-trip."),
   approval_token: z
     .string()
     .optional()
@@ -134,6 +138,7 @@ type ToolInput = {
   arguments?: Record<string, unknown>;
   server_id?: string;
   limit?: number;
+  include_schema?: boolean;
   approval_token?: string;
 };
 
@@ -145,9 +150,11 @@ async function dispatch(
 ): Promise<unknown> {
   switch (input.operation) {
     case "search": {
+      const includeSchema = input.include_schema === true;
       const hits = await hub.search(input.query ?? "", {
         limit: input.limit ?? 10,
         serverIds: input.server_id ? [input.server_id] : undefined,
+        includeSchema,
       });
       return {
         ok: true,
@@ -158,8 +165,13 @@ async function dispatch(
           server: hit.serverId,
           kind: hit.kind,
           summary: hit.summary,
+          ...(hit.inputSchema ? { input_schema: hit.inputSchema } : {}),
         })),
-        next: hits.length > 0 ? "Call load with an action_id to get its argument schema." : undefined,
+        next: hits.length > 0
+          ? includeSchema
+            ? "You can directly call execute with the action_id and arguments."
+            : "Call load with an action_id to get its argument schema, or execute directly if you already have the schema."
+          : undefined,
       };
     }
 

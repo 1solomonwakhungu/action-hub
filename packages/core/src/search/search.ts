@@ -59,7 +59,7 @@ export class SearchEngine {
         .slice()
         .sort((a, b) => a.id.localeCompare(b.id))
         .slice(0, limit)
-        .map((record) => toHit(record, 0));
+        .map((record) => toHit(record, 0, options.includeSchema ?? false));
     }
 
     const stats = buildStats(candidates);
@@ -81,7 +81,7 @@ export class SearchEngine {
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id))
       .slice(0, limit)
-      .map((entry) => toHit(entry.record, entry.score));
+      .map((entry) => toHit(entry.record, entry.score, options.includeSchema ?? false));
   }
 
   /**
@@ -139,7 +139,7 @@ function blend(lexicalScore: number, semanticScore: number, weight: number): num
   return (1 - weight) * squashed + weight * semanticScore;
 }
 
-function toHit(record: ActionRecord, score: number): SearchHit {
+function toHit(record: ActionRecord, score: number, includeSchema = false): SearchHit {
   return {
     id: record.id,
     kind: record.kind,
@@ -147,6 +147,7 @@ function toHit(record: ActionRecord, score: number): SearchHit {
     name: record.name,
     summary: record.summary,
     score: Number(score.toFixed(6)),
+    ...(includeSchema && record.inputSchema ? { inputSchema: record.inputSchema } : {}),
   };
 }
 

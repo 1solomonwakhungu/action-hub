@@ -32,4 +32,12 @@ export { validateArguments } from "./router/validate.js";
 export type { ValidationResult } from "./router/validate.js";
 export { BundleRegistry } from "./bundles/bundles.js";
 export type { Bundle } from "./bundles/bundles.js";
+export {
+  discoverMcpServers,
+  defaultDiscoveryLocations,
+} from "./discovery/auto-discovery.js";
+export type {
+  DiscoveredServer,
+  DiscoveryOptions,
+} from "./discovery/auto-discovery.js";
 export * from "./types.js";

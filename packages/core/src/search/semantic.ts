@@ -90,16 +90,20 @@ const DEFAULTS = {
  * anything it misses degrades to subword and lexical matching.
  */
 export const DEFAULT_CONCEPTS: Readonly<Record<string, readonly string[]>> = {
-  machine: ["instance", "vm", "machine", "server", "host", "node", "droplet", "container"],
-  start: ["start", "boot", "launch", "power", "spin", "provision", "resume", "run", "up"],
-  stop: ["stop", "halt", "shutdown", "terminate", "kill", "destroy", "down", "off", "pause"],
-  create: ["create", "add", "new", "open", "file", "make", "submit", "register", "insert"],
+  machine: ["instance", "vm", "machine", "server", "host", "node", "droplet", "container", "ec2"],
+  start: ["start", "boot", "launch", "power", "spin", "provision", "resume", "run", "up", "on"],
+  stop: ["stop", "halt", "shutdown", "terminate", "kill", "destroy", "down", "off", "pause", "turn"],
+  create: ["create", "add", "new", "open", "file", "make", "submit", "register", "insert", "cut"],
   delete: ["delete", "remove", "destroy", "purge", "drop", "erase", "clear"],
-  update: ["update", "edit", "modify", "change", "patch", "set", "rename"],
+  update: ["update", "edit", "modify", "change", "patch", "set", "rename", "replace", "line"],
   read: ["get", "read", "fetch", "show", "describe", "view", "inspect", "retrieve"],
   list: ["list", "search", "find", "query", "browse", "enumerate", "index"],
   message: ["message", "chat", "post", "send", "notify", "announce", "tell", "dm", "speak"],
+  comment: ["comment", "discussion", "reply", "note", "leave", "remark"],
   alert: ["alert", "page", "incident", "oncall", "escalate", "wake", "alarm", "outage"],
+  refund: ["refund", "reimburse", "return", "money", "back", "credit", "reversal", "chargeback"],
+  optimize: ["optimize", "optimization", "faster", "slow", "performance", "speed", "tuning", "tune", "accelerate"],
+  error: ["error", "errors", "exception", "fault", "crash", "failure", "broken"],
   task: [
     "issue",
     "ticket",
@@ -118,8 +122,8 @@ export const DEFAULT_CONCEPTS: Readonly<Record<string, readonly string[]>> = {
   file: ["file", "object", "blob", "document", "artifact", "attachment"],
   storage: ["storage", "bucket", "store", "upload", "download", "save", "persist", "s3"],
   metric: ["metric", "telemetry", "timeseries", "stat", "measurement", "gauge", "monitor"],
-  log: ["log", "logs", "trace", "event", "audit", "history"],
-  deploy: ["deploy", "release", "rollout", "publish", "promote", "ship"],
+  log: ["log", "logs", "trace", "event", "audit", "history", "events", "cloudwatch"],
+  deploy: ["deploy", "release", "rollout", "publish", "promote", "ship", "version"],
   user: [
     "user",
     "account",

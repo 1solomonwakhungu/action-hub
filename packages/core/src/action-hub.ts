@@ -23,6 +23,11 @@ export interface ActionHubOptions {
   clientFactory: McpClientFactory;
   policy?: PolicyOptions;
   /**
+   * Default timeout in milliseconds for downstream tool execution.
+   * Defaults to 30,000ms (30s) if not specified.
+   */
+  defaultTimeoutMs?: number;
+  /**
    * Overrides the built-in local scorer. Pass `null` to run pure BM25.
    * An external scorer is never awaited on the critical path without a guard —
    * if it throws, search silently degrades to lexical-only.
@@ -67,6 +72,7 @@ export interface HubSnapshot {
 }
 
 const DEFAULT_HISTORY_LIMIT = 200;
+const DEFAULT_EXECUTION_TIMEOUT_MS = 30_000;
 
 /**
  * The façade the host integration talks to.
@@ -82,12 +88,14 @@ export class ActionHub {
   readonly #history: InvocationRecord[] = [];
   readonly #historyLimit: number;
   readonly #denyOnApprovalRequired: boolean;
+  readonly #defaultTimeoutMs: number;
   /** Undefined when the caller supplied their own scorer or disabled scoring. */
   readonly #semanticIndex?: LocalSemanticIndex;
   readonly #approvals: ApprovalRegistry;
 
   constructor(options: ActionHubOptions) {
     this.#connections = new ConnectionManager(options.clientFactory, options.servers ?? []);
+    this.#defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS;
     this.#search = new SearchEngine(this.#catalog);
     if (options.semanticWeight !== undefined) {
       this.#search.setSemanticWeight(options.semanticWeight);
@@ -152,8 +160,13 @@ export class ActionHub {
     if (!config) return { serverId, indexed: 0, error: `Unknown server "${serverId}"` };
 
     try {
+      const timeoutMs = config.timeoutMs ?? this.#defaultTimeoutMs;
       const client = await this.#connections.activate(serverId);
-      const tools = await client.listTools();
+      const tools = await callWithTimeout(
+        client.listTools(),
+        timeoutMs,
+        `Listing tools for server "${serverId}" timed out after ${timeoutMs}ms`,
+      );
       const trust = this.#connections.trustOf(serverId);
 
       const records: ActionRecord[] = tools
@@ -321,8 +334,15 @@ export class ActionHub {
     }
 
     try {
+      const serverConfig = this.#connections.getConfig(record.serverId);
+      const timeoutMs = serverConfig?.timeoutMs ?? this.#defaultTimeoutMs;
+
       const client = await this.#connections.activate(record.serverId);
-      const content = await client.callTool(record.name, args);
+      const content = await callWithTimeout(
+        client.callTool(record.name, args),
+        timeoutMs,
+        `Tool "${record.id}" timed out after ${timeoutMs}ms`,
+      );
       const durationMs = Date.now() - start;
       this.#record({
         actionId,
@@ -476,6 +496,19 @@ export class ActionHubError extends Error {
 }
 
 const SUMMARY_MAX = 160;
+
+async function callWithTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /** Search results carry a single line; full text is reserved for `load`. */
 function summarize(text: string): string {
