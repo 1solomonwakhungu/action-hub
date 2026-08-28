@@ -33,6 +33,7 @@ export interface Metrics {
   count: number;
   recallAt1: number;
   recallAt5: number;
+  recallAtK: number;
   mrr: number;
 }
 
@@ -99,35 +100,41 @@ async function evaluate(
   const difficulties: EvalDifficulty[] = ["exact", "paraphrase", "ambiguous"];
   const byDifficulty = {} as Record<EvalDifficulty, Metrics>;
   for (const difficulty of difficulties) {
-    byDifficulty[difficulty] = metricsFor(outcomes.filter((o) => o.difficulty === difficulty));
+    byDifficulty[difficulty] = metricsFor(
+      outcomes.filter((o) => o.difficulty === difficulty),
+      limit,
+    );
   }
 
   return {
     corpusSize: EVAL_CORPUS.length,
     serverCount: new Set(EVAL_CORPUS.map((record) => record.serverId)).size,
-    overall: metricsFor(outcomes),
+    overall: metricsFor(outcomes, limit),
     byDifficulty,
     outcomes,
     failures: outcomes.filter((outcome) => outcome.rank !== 1),
   };
 }
 
-export function metricsFor(outcomes: readonly CaseOutcome[]): Metrics {
+export function metricsFor(outcomes: readonly CaseOutcome[], k: number = EVAL_LIMIT): Metrics {
   if (outcomes.length === 0) {
-    return { count: 0, recallAt1: 0, recallAt5: 0, mrr: 0 };
+    return { count: 0, recallAt1: 0, recallAt5: 0, recallAtK: 0, mrr: 0 };
   }
   let hitsAt1 = 0;
   let hitsAt5 = 0;
+  let hitsAtK = 0;
   let reciprocalSum = 0;
   for (const outcome of outcomes) {
     if (outcome.rank === 1) hitsAt1 += 1;
     if (outcome.rank >= 1 && outcome.rank <= 5) hitsAt5 += 1;
+    if (outcome.rank >= 1 && outcome.rank <= k) hitsAtK += 1;
     if (outcome.rank >= 1) reciprocalSum += 1 / outcome.rank;
   }
   return {
     count: outcomes.length,
     recallAt1: hitsAt1 / outcomes.length,
     recallAt5: hitsAt5 / outcomes.length,
+    recallAtK: hitsAtK / outcomes.length,
     mrr: reciprocalSum / outcomes.length,
   };
 }
