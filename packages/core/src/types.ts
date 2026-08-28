@@ -38,6 +38,8 @@ export interface ServerConfig {
   allowTools?: string[];
   /** Optional deny-list applied after `allowTools`. */
   denyTools?: string[];
+  /** Optional timeout in milliseconds for tool executions on this server. */
+  timeoutMs?: number;
 }
 
 export interface StdioTransport {
@@ -83,6 +85,7 @@ export interface SearchHit {
   name: string;
   summary: string;
   score: number;
+  inputSchema?: JsonSchema;
 }
 
 export interface SearchOptions {
@@ -92,6 +95,8 @@ export interface SearchOptions {
   kind?: ActionKind;
   /** Exclude actions whose trust tier is below this. */
   minTrust?: TrustTier;
+  /** When true, includes the inputSchema on retrieved hits */
+  includeSchema?: boolean;
 }
 
 /** Returned by `load`; this is the only path that exposes a full schema. */
