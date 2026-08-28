@@ -3,11 +3,13 @@ import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import type { ServerConfig, TrustTier } from "@action-hub/core";
+import { discoverMcpServers } from "@action-hub/core";
 
 export interface HubConfigFile {
   servers?: unknown;
   autoApproveAtOrAbove?: unknown;
   approvalTtlSeconds?: unknown;
+  autoDiscover?: unknown;
 }
 
 export interface HubConfig {
@@ -38,28 +40,37 @@ export function defaultConfigPath(): string {
  */
 export async function loadConfig(path: string): Promise<HubConfig> {
   let raw: string;
+  let parsed: HubConfigFile = {};
   try {
     raw = await readFile(path, "utf8");
-  } catch (cause) {
-    if (isNotFound(cause)) {
-      return {
-        servers: [],
-        autoApproveAtOrAbove: "trusted",
-        approvalTtlMs: DEFAULT_APPROVAL_TTL_SECONDS * 1000,
-      };
-    }
-    throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
-  }
-
-  let parsed: HubConfigFile;
-  try {
     parsed = JSON.parse(raw) as HubConfigFile;
   } catch (cause) {
-    throw new Error(`Action Hub config at ${path} is not valid JSON: ${message(cause)}`);
+    if (!isNotFound(cause)) {
+      throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
+    }
+  }
+
+  const explicitServers = parseServers(parsed.servers, `Action Hub config at ${path}`);
+  const autoDiscoverEnabled = parsed.autoDiscover !== false;
+
+  let allServers = [...explicitServers];
+  if (autoDiscoverEnabled) {
+    try {
+      const discovered = await discoverMcpServers();
+      const existingIds = new Set(explicitServers.map((s) => s.id));
+      for (const server of discovered) {
+        if (!existingIds.has(server.id)) {
+          existingIds.add(server.id);
+          allServers.push(server);
+        }
+      }
+    } catch {
+      // Auto-discovery failures are non-fatal
+    }
   }
 
   return {
-    servers: parseServers(parsed.servers, `Action Hub config at ${path}`),
+    servers: allServers,
     autoApproveAtOrAbove: isTrust(parsed.autoApproveAtOrAbove)
       ? parsed.autoApproveAtOrAbove
       : "trusted",
@@ -191,6 +202,9 @@ function parseServers(value: unknown, label: string): ServerConfig[] {
 
     const transport = parseTransport(entry["transport"], `servers[${index}]`, label);
     const trust = entry["trust"];
+    const timeoutMs = typeof entry["timeoutMs"] === "number" && entry["timeoutMs"] > 0
+      ? entry["timeoutMs"]
+      : undefined;
 
     return {
       id,
@@ -200,6 +214,7 @@ function parseServers(value: unknown, label: string): ServerConfig[] {
       enabled: entry["enabled"] === undefined ? true : entry["enabled"] !== false,
       allowTools: parseStringArray(entry["allowTools"]),
       denyTools: parseStringArray(entry["denyTools"]),
+      timeoutMs,
     } satisfies ServerConfig;
   });
 }

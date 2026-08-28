@@ -28,8 +28,11 @@ Always follow the same three steps. Do not skip ahead.
 ```
 
 Returns ranked candidates as `id`, `name`, `serverId`, and a one-line summary.
-**Search never returns argument schemas** — that is deliberate, and it is why
-the catalog is affordable.
+
+**Fast-path optimization:** When you want to immediately execute the best match without a separate `load` turn, pass `"include_schema": true`:
+```json
+{ "operation": "search", "query": "open a pull request", "limit": 1, "include_schema": true }
+```
 
 Write the query the way you would describe the task to a colleague. Natural
 phrasing ranks better than a guessed tool name, because summaries and
@@ -47,7 +50,7 @@ Narrow when you already know the source:
 { "operation": "load", "action_id": "github:create_pull_request" }
 ```
 
-Returns the full description and the verbatim upstream JSON Schema. Read the
+Returns the full description and the verbatim upstream JSON Schema. (Optional if you already received `input_schema` via `include_schema: true`). Read the
 schema before constructing arguments. Never guess argument names from the
 action name — load is cheap and guessing wastes a round trip.
 

@@ -191,3 +191,34 @@ test("close shuts down active clients", async () => {
   await hub.close();
   assert.equal(clients.github.closed, true);
 });
+
+test("execute enforces timeout when downstream server hangs", async () => {
+  const slowClient: any = {
+    async listTools() {
+      return [{ name: "slow_action", description: "Slow action" }];
+    },
+    async callTool() {
+      // Hang indefinitely or longer than timeout
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return "done";
+    },
+    async close() {},
+  };
+
+  const hub = new ActionHub({
+    servers: [
+      {
+        id: "slow",
+        transport: { type: "stdio", command: "slow-mcp" },
+        trust: "trusted",
+        timeoutMs: 50,
+      },
+    ],
+    clientFactory: async () => slowClient,
+  });
+
+  await hub.indexAll();
+  const result = await hub.execute("slow:slow_action", {});
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /timed out after 50ms/);
+});
