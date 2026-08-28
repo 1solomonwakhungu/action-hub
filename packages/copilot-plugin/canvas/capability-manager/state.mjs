@@ -85,6 +85,8 @@ async function readFileState() {
       : [],
     context: isRecord(cache?.context) ? cache.context : null,
     indexedAt: typeof cache?.indexedAt === "string" ? cache.indexedAt : null,
+    bundles: Array.isArray(config?.bundles) ? config.bundles : [],
+    actionsList: [],
   };
 }
 

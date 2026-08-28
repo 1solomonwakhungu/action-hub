@@ -38,7 +38,36 @@ export const operations = {
     const body = { query };
     if (input.limit !== undefined) body.limit = input.limit;
     if (input.serverId) body.serverId = input.serverId;
+    if (input.includeSchema !== undefined) body.includeSchema = input.includeSchema;
     return hubRequest("/search", body);
+  },
+
+  reconnect_server: async (input) => {
+    const serverId = text(input?.serverId);
+    if (!serverId) return fail(`"serverId" must be a non-empty string`);
+    return hubRequest("/reconnect", { serverId });
+  },
+
+  check_health: async (input) => {
+    const serverId = text(input?.serverId);
+    return hubRequest("/check-health", serverId ? { serverId } : {});
+  },
+
+  import_config: async (input) => {
+    if (!input?.config) return fail(`"config" must be provided`);
+    return hubRequest("/import-config", { config: input.config });
+  },
+
+  load_action: async (input) => {
+    const actionId = text(input?.actionId);
+    if (!actionId) return fail(`"actionId" must be a non-empty string`);
+    return hubRequest("/load-action", { actionId });
+  },
+
+  load_bundle: async (input) => {
+    const bundleId = text(input?.bundleId);
+    if (!bundleId) return fail(`"bundleId" must be a non-empty string`);
+    return hubRequest("/load-bundle", { bundleId });
   },
 
   add_server: async (input) => {
