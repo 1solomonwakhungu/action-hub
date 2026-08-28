@@ -111,6 +111,17 @@ export interface LoadedAction {
   trust: TrustTier;
 }
 
+/** Returned by `loadBundle`; exposes full schemas and context savings for a compound tool suite. */
+export interface LoadedBundle {
+  id: string;
+  displayName: string;
+  description?: string;
+  actions: LoadedAction[];
+  totalEagerTokens: number;
+  totalLazyTokens: number;
+  tokensSaved: number;
+}
+
 /**
  * Returned instead of running an action when policy requires a human decision.
  *
