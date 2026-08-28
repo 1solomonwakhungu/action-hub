@@ -1,0 +1,28 @@
+{
+  "name": "@action-hub/cli",
+  "version": "0.1.0",
+  "description": "Developer CLI for Action Hub",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "action-hub": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@action-hub/core": "*",
+    "@modelcontextprotocol/sdk": "^1.26.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.6.3"
+  }
+}
