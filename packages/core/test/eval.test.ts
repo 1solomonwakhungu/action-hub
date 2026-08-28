@@ -134,11 +134,23 @@ test("metrics are computed correctly from ranks", () => {
   assert.equal(metrics.count, 3);
   assert.equal(metrics.recallAt1, 1 / 3);
   assert.equal(metrics.recallAt5, 2 / 3);
+  assert.equal(metrics.recallAtK, 2 / 3);
   assert.ok(Math.abs(metrics.mrr - (1 + 0.25) / 3) < 1e-9);
+
+  const metricsAt3 = metricsFor(outcomes, 3);
+  assert.equal(metricsAt3.recallAt1, 1 / 3);
+  assert.equal(metricsAt3.recallAt5, 2 / 3);
+  assert.equal(metricsAt3.recallAtK, 1 / 3);
 });
 
 test("an empty outcome set yields zeroed metrics rather than NaN", () => {
-  assert.deepEqual(metricsFor([]), { count: 0, recallAt1: 0, recallAt5: 0, mrr: 0 });
+  assert.deepEqual(metricsFor([]), { count: 0, recallAt1: 0, recallAt5: 0, recallAtK: 0, mrr: 0 });
+});
+
+test("runEval with custom limit parameterizes recallAtK", async () => {
+  const reportAt3 = await runEval(EVAL_QUERIES, 3);
+  assert.equal(reportAt3.overall.recallAt1, report.overall.recallAt1);
+  assert.ok(reportAt3.overall.recallAtK <= report.overall.recallAt5);
 });
 
 test("the report renders the headline numbers", () => {
