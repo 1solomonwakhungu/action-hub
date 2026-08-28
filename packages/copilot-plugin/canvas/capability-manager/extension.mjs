@@ -136,6 +136,60 @@ const canvas = createCanvas({
         required: ["id", "transport"],
       },
     ),
+    controlAction(
+      "reconnect_server",
+      "Trigger an immediate reconnect and health probe on a server.",
+      {
+        type: "object",
+        properties: {
+          serverId: { type: "string", description: "Id of a configured server." },
+        },
+        required: ["serverId"],
+      },
+    ),
+    controlAction(
+      "check_health",
+      "Run an on-demand latency and health check for one or all servers.",
+      {
+        type: "object",
+        properties: {
+          serverId: { type: "string", description: "Optional server id." },
+        },
+      },
+    ),
+    controlAction(
+      "import_config",
+      "Import MCP servers from Claude Desktop, Cursor, or VS Code config JSON.",
+      {
+        type: "object",
+        properties: {
+          config: { type: "object", description: "Configuration object containing mcpServers or servers." },
+        },
+        required: ["config"],
+      },
+    ),
+    controlAction(
+      "load_action",
+      "Load full action details including JSON Schema for arguments.",
+      {
+        type: "object",
+        properties: {
+          actionId: { type: "string", description: "Identifier of an indexed action." },
+        },
+        required: ["actionId"],
+      },
+    ),
+    controlAction(
+      "load_bundle",
+      "Load compound action bundle details and all member schemas.",
+      {
+        type: "object",
+        properties: {
+          bundleId: { type: "string", description: "Identifier of an action bundle." },
+        },
+        required: ["bundleId"],
+      },
+    ),
   ],
 
   open: async (ctx) => {
