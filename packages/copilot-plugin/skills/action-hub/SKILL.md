@@ -54,6 +54,12 @@ Returns the full description and the verbatim upstream JSON Schema. (Optional if
 schema before constructing arguments. Never guess argument names from the
 action name — load is cheap and guessing wastes a round trip.
 
+For compound workflows spanning multiple tools, you can discover and load entire bundles at once:
+```json
+{ "operation": "load_bundle", "bundle_id": "github:review-pr" }
+```
+This loads all argument schemas for the bundle in a single turn.
+
 For an action of kind `skill`, load returns its instructions. Skills are
 loaded, never executed.
 

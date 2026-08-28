@@ -23,8 +23,8 @@ Some actions are gated. If execute returns status "approval_required", it did NO
 
 const inputShape = {
   operation: z
-    .enum(["search", "load", "execute"])
-    .describe("search finds candidates, load returns one action's schema, execute runs it"),
+    .enum(["search", "load", "execute", "load_bundle", "search_bundles"])
+    .describe("search finds candidates, load returns one action's schema, execute runs it, load_bundle loads a compound bundle of actions"),
   query: z
     .string()
     .optional()
@@ -33,6 +33,10 @@ const inputShape = {
     .string()
     .optional()
     .describe("Identifier returned by search. Required for load and execute."),
+  bundle_id: z
+    .string()
+    .optional()
+    .describe("Identifier of a bundle to load. Required for load_bundle, or load when loading a bundle."),
   arguments: z
     .record(z.unknown())
     .optional()
@@ -57,6 +61,7 @@ async function main(): Promise<void> {
 
   const hub = new ActionHub({
     servers: config.servers,
+    bundles: config.bundles,
     clientFactory: createSdkClientFactory(),
     policy: { autoApproveAtOrAbove: config.autoApproveAtOrAbove },
     approvals: { ttlMs: config.approvalTtlMs },
@@ -132,9 +137,10 @@ async function main(): Promise<void> {
 }
 
 type ToolInput = {
-  operation: "search" | "load" | "execute";
+  operation: "search" | "load" | "execute" | "load_bundle" | "search_bundles";
   query?: string;
   action_id?: string;
+  bundle_id?: string;
   arguments?: Record<string, unknown>;
   server_id?: string;
   limit?: number;
@@ -156,6 +162,7 @@ async function dispatch(
         serverIds: input.server_id ? [input.server_id] : undefined,
         includeSchema,
       });
+      const matchingBundles = hub.searchBundles(input.query ?? "");
       return {
         ok: true,
         count: hits.length,
@@ -167,6 +174,15 @@ async function dispatch(
           summary: hit.summary,
           ...(hit.inputSchema ? { input_schema: hit.inputSchema } : {}),
         })),
+        ...(matchingBundles.length > 0
+          ? {
+              bundles: matchingBundles.map((b) => ({
+                bundle_id: b.id,
+                display_name: b.displayName,
+                description: b.description,
+              })),
+            }
+          : {}),
         next: hits.length > 0
           ? includeSchema
             ? "You can directly call execute with the action_id and arguments."
@@ -175,7 +191,66 @@ async function dispatch(
       };
     }
 
+    case "search_bundles": {
+      const bundles = hub.searchBundles(input.query ?? "");
+      return {
+        ok: true,
+        count: bundles.length,
+        bundles: bundles.map((b) => ({
+          bundle_id: b.id,
+          display_name: b.displayName,
+          description: b.description,
+          server_ids: b.serverIds,
+          action_ids: b.actionIds,
+        })),
+        next: "Call load_bundle with bundle_id to load all tools in a bundle.",
+      };
+    }
+
+    case "load_bundle": {
+      const bundleId = input.bundle_id ?? input.action_id;
+      if (!bundleId) throw new Error(`"bundle_id" is required for operation "load_bundle".`);
+      const loaded = hub.loadBundle(bundleId);
+      return {
+        ok: true,
+        bundle_id: loaded.id,
+        display_name: loaded.displayName,
+        description: loaded.description,
+        actions_count: loaded.actions.length,
+        actions: loaded.actions.map((act) => ({
+          action_id: act.id,
+          name: act.name,
+          server: act.serverId,
+          trust: act.trust,
+          summary: act.summary,
+          input_schema: act.inputSchema,
+        })),
+        tokens_saved: loaded.tokensSaved,
+        next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
+      };
+    }
+
     case "load": {
+      if (input.bundle_id) {
+        const loaded = hub.loadBundle(input.bundle_id);
+        return {
+          ok: true,
+          bundle_id: loaded.id,
+          display_name: loaded.displayName,
+          description: loaded.description,
+          actions_count: loaded.actions.length,
+          actions: loaded.actions.map((act) => ({
+            action_id: act.id,
+            name: act.name,
+            server: act.serverId,
+            trust: act.trust,
+            summary: act.summary,
+            input_schema: act.inputSchema,
+          })),
+          tokens_saved: loaded.tokensSaved,
+          next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
+        };
+      }
       const actionId = requireActionId(input, "load");
       const action = hub.load(actionId);
       return {
@@ -183,6 +258,16 @@ async function dispatch(
         action_id: action.id,
         name: action.name,
         server: action.serverId,
+        kind: action.kind,
+        trust: action.trust,
+        description: action.description ?? action.summary,
+        input_schema: action.inputSchema,
+        next:
+          action.kind === "skill"
+            ? "This is a skill. Follow its instructions; do not execute it."
+            : "Call execute with this action_id and arguments matching input_schema.",
+      };
+    }
         kind: action.kind,
         trust: action.trust,
         description: action.description ?? action.summary,

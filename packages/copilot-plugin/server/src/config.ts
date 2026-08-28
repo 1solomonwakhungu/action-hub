@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import type { ServerConfig, TrustTier } from "@action-hub/core";
+import type { Bundle, ServerConfig, TrustTier } from "@action-hub/core";
 import { discoverMcpServers } from "@action-hub/core";
 
 export interface HubConfigFile {
   servers?: unknown;
+  bundles?: unknown;
   autoApproveAtOrAbove?: unknown;
   approvalTtlSeconds?: unknown;
   autoDiscover?: unknown;
@@ -14,6 +15,7 @@ export interface HubConfigFile {
 
 export interface HubConfig {
   servers: ServerConfig[];
+  bundles: Bundle[];
   autoApproveAtOrAbove: TrustTier;
   /** Lifetime of an approval token, in milliseconds. */
   approvalTtlMs: number;
@@ -51,6 +53,7 @@ export async function loadConfig(path: string): Promise<HubConfig> {
   }
 
   const explicitServers = parseServers(parsed.servers, `Action Hub config at ${path}`);
+  const explicitBundles = parseBundles(parsed.bundles, `Action Hub config at ${path}`);
   const autoDiscoverEnabled = parsed.autoDiscover !== false;
 
   let allServers = [...explicitServers];
@@ -71,6 +74,7 @@ export async function loadConfig(path: string): Promise<HubConfig> {
 
   return {
     servers: allServers,
+    bundles: explicitBundles,
     autoApproveAtOrAbove: isTrust(parsed.autoApproveAtOrAbove)
       ? parsed.autoApproveAtOrAbove
       : "trusted",
@@ -216,6 +220,43 @@ function parseServers(value: unknown, label: string): ServerConfig[] {
       denyTools: parseStringArray(entry["denyTools"]),
       timeoutMs,
     } satisfies ServerConfig;
+  });
+}
+
+function parseBundles(value: unknown, label: string): Bundle[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`${label}: "bundles" must be an array`);
+  }
+
+  const seen = new Set<string>();
+  return value.map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw new Error(`${label}: bundles[${index}] must be an object`);
+    }
+    const id = entry["id"];
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error(`${label}: bundles[${index}].id must be a non-empty string`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`${label}: duplicate bundle id "${id}"`);
+    }
+    seen.add(id);
+
+    const displayName = typeof entry["displayName"] === "string" ? entry["displayName"] : id;
+    const description = typeof entry["description"] === "string" ? entry["description"] : undefined;
+    const serverIds = parseStringArray(entry["serverIds"]);
+    const actionIds = parseStringArray(entry["actionIds"]);
+    const tags = parseStringArray(entry["tags"]);
+
+    return {
+      id,
+      displayName,
+      description,
+      serverIds,
+      actionIds,
+      tags,
+    } satisfies Bundle;
   });
 }
 
