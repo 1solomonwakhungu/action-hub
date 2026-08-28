@@ -191,7 +191,15 @@ export interface McpClient {
 /** Factory used by the connection manager to create clients lazily. */
 export type McpClientFactory = (config: ServerConfig) => Promise<McpClient>;
 
-export type ServerStatus = "inactive" | "connecting" | "ready" | "error" | "disabled";
+export type ServerStatus =
+  | "inactive"
+  | "connecting"
+  | "ready"
+  | "error"
+  | "disabled"
+  | "degraded"
+  | "unreachable"
+  | "reconnecting";
 
 export interface ServerState {
   id: string;
@@ -201,4 +209,13 @@ export interface ServerState {
   toolCount: number;
   error?: string;
   lastActivatedAt?: string;
+  latencyMs?: number;
+  circuitOpen?: boolean;
+}
+
+export interface HealthCheckResult {
+  serverId: string;
+  status: ServerStatus;
+  latencyMs?: number;
+  error?: string;
 }
