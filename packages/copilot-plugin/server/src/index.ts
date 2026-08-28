@@ -268,16 +268,6 @@ async function dispatch(
             : "Call execute with this action_id and arguments matching input_schema.",
       };
     }
-        kind: action.kind,
-        trust: action.trust,
-        description: action.description ?? action.summary,
-        input_schema: action.inputSchema,
-        next:
-          action.kind === "skill"
-            ? "This is a skill. Follow its instructions; do not execute it."
-            : "Call execute with this action_id and arguments matching input_schema.",
-      };
-    }
 
     case "execute": {
       const actionId = requireActionId(input, "execute");
