@@ -13,6 +13,8 @@ export class FakeClient implements McpClient {
 
   readonly #tools: FakeTool[];
   readonly #responder: (name: string, args: Record<string, unknown>) => unknown;
+  listError?: Error;
+  listCalls = 0;
 
   constructor(
     tools: FakeTool[],
@@ -23,6 +25,8 @@ export class FakeClient implements McpClient {
   }
 
   async listTools(): Promise<FakeTool[]> {
+    this.listCalls += 1;
+    if (this.listError) throw this.listError;
     return this.#tools;
   }
 
