@@ -275,3 +275,44 @@ the MCP server still starts, and the canvas simply renders read-only. And the
 token file is unlinked on shutdown, so a canvas that finds no file, or a stale
 one pointing at a dead port, concludes the hub is not running and disables its
 controls rather than failing.
+
+## Shared daemon transport
+
+Foreground stdio mode creates one `ActionHub` per host process. That remains
+useful for isolation, but it duplicates the catalog and every activated
+downstream MCP process when several editors or agents are open.
+
+Daemon mode moves the ownership boundary:
+
+```
+VS Code ─────── action-hub connect ──┐
+Cursor ──────── action-hub connect ──┼── authenticated local socket
+Claude Desktop ─ action-hub connect ─┘            │
+                                                   ▼
+                                      one ActionHub + connection pool
+```
+
+Each socket connection gets its own MCP protocol session and `McpServer`
+instance. Those sessions share one `ActionHub`, so catalog refreshes,
+invocation state, and `ConnectionManager` clients are process-wide. Concurrent
+activation still uses the connection manager's in-flight promise, preventing
+duplicate downstream processes.
+
+The daemon binds a Unix domain socket on macOS and Linux. If the state path
+would exceed the platform socket-path limit, the socket moves to a hashed,
+user-only directory under `/tmp`; the authenticated state file records the
+actual path. Windows uses an ephemeral loopback port. TCP is never bound to a
+non-loopback interface.
+
+Before MCP traffic begins, the proxy must present a 256-bit random token from
+the daemon's `0600` token file. Token comparison is constant-time. The runtime
+directory is `0700`, state and lock files are `0600`, and Unix sockets are
+`0600`. Readers reject symbolic links, files owned by another user, and files
+with group or world access.
+
+An exclusive lock file protects startup. A separate reaper lock serializes
+stale-lock recovery, so concurrent starts cannot delete a newly acquired lock.
+State, token, stale sockets, and dead-process locks are recovered on startup.
+Status and shutdown use the same authenticated local channel as MCP clients;
+graceful shutdown closes client sessions, the listener, the control endpoint,
+the shared hub, and every downstream connection before removing runtime state.

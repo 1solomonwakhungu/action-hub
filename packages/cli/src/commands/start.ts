@@ -9,8 +9,6 @@ export interface StartOptions {
 }
 
 export async function startCommand(options: StartOptions = {}): Promise<number> {
-  console.log("Starting Action Hub MCP Server...\n");
-
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = dirname(__filename);
 
@@ -29,7 +27,7 @@ export async function startCommand(options: StartOptions = {}): Promise<number> 
   }
 
   if (!serverScript) {
-    console.error("Could not locate @action-hub/copilot-mcp server build. Please run `npm run build` first.");
+    console.error("Could not locate @action-hub/copilot-mcp server build. Run `npm run build` first.");
     return 1;
   }
 

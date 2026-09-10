@@ -7,6 +7,12 @@ import { testSearchCommand } from "./commands/test-search.js";
 import { listCommand } from "./commands/list.js";
 import { bundlesCommand } from "./commands/bundles.js";
 import { startCommand } from "./commands/start.js";
+import {
+  connectCommand,
+  daemonStartCommand,
+  daemonStatusCommand,
+  daemonStopCommand,
+} from "./commands/daemon.js";
 
 function printHelp(): void {
   console.log(`
@@ -22,12 +28,20 @@ COMMANDS:
   test-search <query> Search the semantic and keyword catalog with score breakdowns
   list                List all registered tools, skills, and bundles
   bundle              Inspect registered action bundles
-  start               Start the Action Hub MCP server in stdio mode
+  start               Start an isolated Action Hub MCP server in foreground stdio mode
+  connect             Proxy stdio to the shared Action Hub daemon
+  daemon <command>    Manage the shared daemon: start, status, or stop
 
 OPTIONS:
   --config <path>     Path to custom Action Hub configuration file (servers.json)
   --help, -h          Show this help message
   --version, -v       Show version
+
+DAEMON:
+  daemon start        Start the per-user background daemon
+  daemon status       Verify the daemon over its authenticated endpoint
+  daemon stop         Gracefully stop the daemon and downstream servers
+  connect             Bridge this process's stdio to the daemon
 
 MIGRATE OPTIONS:
   --type <type>       Capability types to migrate: all, mcps, skills, plugins (default: all)
@@ -45,6 +59,8 @@ EXAMPLES:
   action-hub list --server github
   action-hub bundle --load triage-issue
   action-hub start
+  action-hub daemon start
+  action-hub connect
 `);
 }
 
@@ -163,6 +179,28 @@ async function main(): Promise<void> {
         exitCode = await startCommand({
           configPath,
         });
+        break;
+      }
+
+      case "connect": {
+        exitCode = await connectCommand({
+          configPath,
+        });
+        break;
+      }
+
+      case "daemon": {
+        const subcommand = positional[0];
+        if (subcommand === "start") {
+          exitCode = await daemonStartCommand({ configPath });
+        } else if (subcommand === "status") {
+          exitCode = await daemonStatusCommand({ configPath });
+        } else if (subcommand === "stop") {
+          exitCode = await daemonStopCommand({ configPath });
+        } else {
+          console.error("Usage: action-hub daemon <start|status|stop>");
+          exitCode = 1;
+        }
         break;
       }
 

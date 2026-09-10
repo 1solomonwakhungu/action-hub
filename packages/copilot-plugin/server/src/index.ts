@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { ActionHub, ActionHubError, CatalogCache, bootstrapCatalog } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
@@ -55,7 +57,16 @@ const inputShape = {
     ),
 } as const;
 
-async function main(): Promise<void> {
+export interface HubRuntime {
+  hub: ActionHub;
+  cache: CatalogCache;
+  configHash: string;
+  configPath: string;
+  refreshed: Promise<unknown>;
+  close(): Promise<void>;
+}
+
+export async function createHubRuntime(options: { control?: boolean } = {}): Promise<HubRuntime> {
   const configPath = defaultConfigPath();
   const config = await loadConfig(configPath);
 
@@ -104,13 +115,30 @@ async function main(): Promise<void> {
   // failure to bind must never take the MCP server down with it — the canvas
   // falls back to its read-only view when the endpoint is absent.
   let control: ControlServer | undefined;
-  try {
-    control = await startControlServer(hub, configPath);
-  } catch (cause) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    process.stderr.write(`action-hub: control endpoint unavailable: ${reason}\n`);
+  if (options.control !== false) {
+    try {
+      control = await startControlServer(hub, configPath);
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      process.stderr.write(`action-hub: control endpoint unavailable: ${reason}\n`);
+    }
   }
 
+  return {
+    hub,
+    cache,
+    configHash: bootstrap.configHash,
+    configPath,
+    refreshed: bootstrap.refreshed,
+    close: async () => {
+      await bootstrap.refreshed.catch(() => undefined);
+      await control?.close();
+      await hub.close();
+    },
+  };
+}
+
+export function createMcpServer(runtime: HubRuntime): McpServer {
   const server = new McpServer({ name: "action-hub", version: "0.1.0" });
 
   server.registerTool(
@@ -122,7 +150,7 @@ async function main(): Promise<void> {
     },
     async (input) => {
       try {
-        return text(await dispatch(hub, input, bootstrap.configHash, cache));
+        return text(await dispatch(runtime.hub, input, runtime.configHash, runtime.cache));
       } catch (cause) {
         const message =
           cause instanceof ActionHubError || cause instanceof Error
@@ -133,18 +161,22 @@ async function main(): Promise<void> {
     },
   );
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  return server;
+}
 
-  // Let an in-flight background re-index settle before tearing down the
-  // connections it is still writing to, so a shutdown mid-refresh does not
-  // surface as a broken pipe against a downstream server.
+export async function connectMcpClient(runtime: HubRuntime, transport: Transport): Promise<McpServer> {
+  const server = createMcpServer(runtime);
+  await server.connect(transport);
+  return server;
+}
+
+async function runForeground(): Promise<void> {
+  const runtime = await createHubRuntime();
+  const transport = new StdioServerTransport();
+  await connectMcpClient(runtime, transport);
+
   const shutdown = () => {
-    void bootstrap.refreshed
-      .catch(() => undefined)
-      .then(() => control?.close())
-      .then(() => hub.close())
-      .finally(() => process.exit(0));
+    void runtime.close().finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
@@ -338,7 +370,16 @@ function text(payload: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
 }
 
-main().catch((cause: unknown) => {
+const entry = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
+const isMain = entry === import.meta.url;
+
+if (isMain) {
+  const launch = process.argv.includes("--daemon")
+    ? import("./daemon.js").then(({ runDaemon }) => runDaemon())
+    : runForeground();
+
+  launch.catch((cause: unknown) => {
   process.stderr.write(`action-hub: fatal: ${cause instanceof Error ? cause.stack : String(cause)}\n`);
   process.exit(1);
-});
+  });
+}
