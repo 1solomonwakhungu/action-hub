@@ -2,6 +2,7 @@
 
 import { doctorCommand } from "./commands/doctor.js";
 import { importCommand } from "./commands/import.js";
+import { migrateCommand } from "./commands/migrate.js";
 import { testSearchCommand } from "./commands/test-search.js";
 import { listCommand } from "./commands/list.js";
 import { bundlesCommand } from "./commands/bundles.js";
@@ -16,6 +17,7 @@ USAGE:
 
 COMMANDS:
   doctor              Run system diagnostics, config validation, and server connectivity checks
+  migrate             Migrate external MCP servers, agent skills, and plugins into Action Hub
   import              Discover and import MCP server configurations from Claude, Cursor, VS Code
   test-search <query> Search the semantic and keyword catalog with score breakdowns
   list                List all registered tools, skills, and bundles
@@ -27,8 +29,17 @@ OPTIONS:
   --help, -h          Show this help message
   --version, -v       Show version
 
+MIGRATE OPTIONS:
+  --type <type>       Capability types to migrate: all, mcps, skills, plugins (default: all)
+  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, agents, all
+  --write             Commit migrated capabilities to config (default is dry-run)
+  --overwrite         Overwrite existing servers or skills on ID conflict
+  --json              Output plan and results in JSON format
+
 EXAMPLES:
   action-hub doctor
+  action-hub migrate --type all
+  action-hub migrate --type skills --write
   action-hub import --write
   action-hub test-search "create pull request" --limit 5
   action-hub list --server github
@@ -83,6 +94,20 @@ async function main(): Promise<void> {
         exitCode = await doctorCommand({
           configPath,
           checkConnectivity: parsedArgs["no-check"] ? false : true,
+        });
+        break;
+      }
+
+      case "migrate": {
+        const typeVal = typeof parsedArgs["type"] === "string" ? parsedArgs["type"] : undefined;
+        const sourceVal = typeof parsedArgs["source"] === "string" ? parsedArgs["source"] : undefined;
+        exitCode = await migrateCommand({
+          configPath,
+          type: typeVal as any,
+          source: sourceVal as any,
+          write: Boolean(parsedArgs["write"]),
+          overwrite: Boolean(parsedArgs["overwrite"]),
+          json: Boolean(parsedArgs["json"]),
         });
         break;
       }

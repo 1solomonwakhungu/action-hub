@@ -1,3 +1,5 @@
+import type { Bundle } from "./bundles/bundles.js";
+
 /**
  * Core domain types for Action Hub.
  *
@@ -218,4 +220,53 @@ export interface HealthCheckResult {
   status: ServerStatus;
   latencyMs?: number;
   error?: string;
+}
+
+/** Configuration for an imported or defined skill. */
+export interface SkillConfig {
+  id: string;
+  name: string;
+  summary: string;
+  description: string;
+  tags?: string[];
+  trust?: TrustTier;
+  sourcePath?: string;
+  sourceClient?: string;
+}
+
+export interface DiscoveredServer extends ServerConfig {
+  sourcePath: string;
+  sourceClient: "claude-desktop" | "cursor" | "vscode" | "copilot" | "custom";
+}
+
+export interface DiscoveredSkill extends SkillConfig {
+  sourcePath: string;
+  sourceClient: "copilot" | "claude" | "cursor" | "agents" | "custom";
+}
+
+export interface DiscoveredPlugin {
+  id: string;
+  name: string;
+  description?: string;
+  version?: string;
+  manifestPath: string;
+  servers: ServerConfig[];
+  skills: SkillConfig[];
+}
+
+export interface MigrationPlan {
+  serversToAdd: ServerConfig[];
+  serversToUpdate: ServerConfig[];
+  skillsToAdd: SkillConfig[];
+  skillsToUpdate: SkillConfig[];
+  bundlesToAdd: Bundle[];
+  conflicts: Array<{ type: "server" | "skill" | "bundle"; id: string; reason: string }>;
+  summary: {
+    mcpsDiscovered: number;
+    mcpsAdded: number;
+    skillsDiscovered: number;
+    skillsAdded: number;
+    pluginsDiscovered: number;
+    bundlesAdded: number;
+  };
 }

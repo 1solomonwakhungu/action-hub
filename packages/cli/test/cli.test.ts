@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { resolve } from "node:path";
-import { writeFile, mkdir, rm } from "node:fs/promises";
+import { resolve, join } from "node:path";
+import { writeFile, mkdir, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { loadCliConfig } from "../dist/config-loader.js";
 import { importCommand } from "../dist/commands/import.js";
+import { migrateCommand } from "../dist/commands/migrate.js";
 import { bundlesCommand } from "../dist/commands/bundles.js";
 import { listCommand } from "../dist/commands/list.js";
 import { testSearchCommand } from "../dist/commands/test-search.js";
@@ -46,6 +47,75 @@ test("CLI config loader handles empty and populated configs", async () => {
 test("import command executes without errors", async () => {
   const code = await importCommand({ write: false });
   assert.equal(code, 0);
+});
+
+test("migrate command plans and executes capability migration", async () => {
+  const tempDir = resolve(tmpdir(), `action-hub-cli-migrate-${Date.now()}`);
+  await mkdir(tempDir, { recursive: true });
+  const cfgPath = resolve(tempDir, "servers.json");
+
+  // Seed an existing config with custom fields and unexpanded secrets
+  await writeFile(
+    cfgPath,
+    JSON.stringify({
+      approvalTtlSeconds: 900,
+      autoDiscover: false,
+      servers: [
+        {
+          id: "existing-secret-server",
+          transport: {
+            type: "stdio",
+            command: "node",
+            args: ["srv.js"],
+            env: { API_KEY: "${SECRET_KEY}" }
+          }
+        }
+      ]
+    }),
+    "utf8"
+  );
+
+  // Create an external skill to discover
+  const skillsDir = join(tempDir, "skills", "triage");
+  await mkdir(skillsDir, { recursive: true });
+  await writeFile(
+    join(skillsDir, "SKILL.md"),
+    `---\nname: issue-triage\ndescription: Triage incoming issues\n---\n# Triage\nTriage issues prompt`,
+    "utf8",
+  );
+
+  try {
+    // 1. Dry run
+    const dryRunCode = await migrateCommand({
+      configPath: cfgPath,
+      customPaths: [join(tempDir, "skills")],
+      skipDefaults: true,
+      write: false,
+      type: "skills",
+    });
+    assert.equal(dryRunCode, 0);
+
+    // 2. Write migration
+    const writeCode = await migrateCommand({
+      configPath: cfgPath,
+      customPaths: [join(tempDir, "skills")],
+      skipDefaults: true,
+      write: true,
+      type: "skills",
+    });
+    assert.equal(writeCode, 0);
+
+    const savedRaw = JSON.parse(await readFile(cfgPath, "utf8"));
+    assert.ok(Array.isArray(savedRaw.skills));
+    assert.equal(savedRaw.skills.length, 1);
+    assert.equal(savedRaw.skills[0].name, "issue-triage");
+    // Verify top-level fields and unexpanded secrets are preserved
+    assert.equal(savedRaw.approvalTtlSeconds, 900);
+    assert.equal(savedRaw.autoDiscover, false);
+    assert.equal(savedRaw.servers[0].transport.env.API_KEY, "${SECRET_KEY}");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("bundles command lists and formats bundles", async () => {

@@ -158,6 +158,18 @@ const canvas = createCanvas({
       },
     ),
     controlAction(
+      "migrate_capabilities",
+      "Discover and migrate MCP servers, skills, and plugins from external configurations into Action Hub.",
+      {
+        type: "object",
+        properties: {
+          write: { type: "boolean", description: "Defaults to true. Set false for a dry-run." },
+          overwrite: { type: "boolean", description: "Defaults to false. Set true to overwrite existing entries." },
+          customPaths: { type: "array", items: { type: "string" } },
+        },
+      },
+    ),
+    controlAction(
       "import_config",
       "Import MCP servers from Claude Desktop, Cursor, or VS Code config JSON.",
       {
