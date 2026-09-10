@@ -142,20 +142,70 @@ This gives a native-feeling control surface without recreating GitHub's desktop 
 action-hub/
 ├── packages/
 │   ├── core/                 # Layer 1 — runtime-agnostic engine
+│   ├── cli/                  # Developer CLI + `action-hub start` (bundled into the binary)
 │   └── copilot-plugin/       # Layer 2 — Copilot integration
-│       ├── server/           #   meta-MCP server
+│       ├── server/           #   meta-MCP server (also run in-process by the CLI)
 │       └── canvas/           #   capability-manager canvas
-├── .github/extensions/       # makes the canvas discoverable during development
+├── .github/
+│   ├── extensions/           # makes the canvas discoverable during development
+│   └── workflows/            # CI and standalone-binary release automation
+├── scripts/                  # esbuild + Node SEA binary build and packaging
+├── packaging/                # generated Homebrew / winget manifests
 ├── config/
 │   └── servers.example.json
 ├── docs/
 │   ├── architecture.md
+│   ├── releasing.md
 │   └── roadmap.md
 └── README.md
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for why the layers are split
 this way and why search must never return schemas.
+
+## Install
+
+Action Hub ships as a **standalone, zero-dependency binary** — the Node runtime,
+the developer CLI, and the Copilot meta-MCP server in one executable. No system
+Node install is required to run it.
+
+### Homebrew (macOS, Linux)
+
+```bash
+brew tap 1solomonwakhungu/tap
+brew install action-hub
+```
+
+### winget (Windows)
+
+```powershell
+winget install SolomonWakhungu.ActionHub
+```
+
+### Direct download
+
+Grab the binary for your platform from the [latest release](https://github.com/1solomonwakhungu/action-hub/releases/latest),
+verify it against `SHA256SUMS.txt`, then put it on your `PATH`:
+
+```bash
+# macOS (Apple Silicon) example
+curl -LO https://github.com/1solomonwakhungu/action-hub/releases/latest/download/action-hub-macos-arm64
+curl -LO https://github.com/1solomonwakhungu/action-hub/releases/latest/download/SHA256SUMS.txt
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+chmod +x action-hub-macos-arm64
+sudo mv action-hub-macos-arm64 /usr/local/bin/action-hub
+action-hub --version
+```
+
+Supported targets: macOS arm64/x64, Linux x64/arm64, Windows x64. Register the
+binary as the Copilot MCP server by pointing `.mcp.json` at
+`action-hub start`. See [`docs/releasing.md`](docs/releasing.md) for how the
+binaries are built and published.
+
+### npm / from source
+
+The npm distribution is unchanged; see **Getting started** below to build from
+source.
 
 ## Getting started
 

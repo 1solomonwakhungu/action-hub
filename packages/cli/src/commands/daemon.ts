@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, openSync } from "node:fs";
+import { closeSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
+import { runDaemonServer } from "@action-hub/copilot-mcp";
 import { resolvePath } from "../config-loader.js";
 
 const START_TIMEOUT_MS = 15_000;
@@ -31,6 +31,8 @@ interface DaemonPaths {
 export interface DaemonOptions {
   configPath?: string;
   daemonDir?: string;
+  /** CLI entrypoint override for embedded callers and integration tests. */
+  entryPath?: string;
 }
 
 export function defaultDaemonDir(): string {
@@ -66,12 +68,6 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   await mkdir(paths.dir, { recursive: true, mode: 0o700 });
   if (platform() !== "win32") await chmod(paths.dir, 0o700);
 
-  const serverScript = findServerScript();
-  if (!serverScript) {
-    console.error("Could not locate @action-hub/copilot-mcp server build. Run `npm run build` first.");
-    return 1;
-  }
-
   const logFd = openSync(paths.log, "a", 0o600);
   const env = {
     ...process.env,
@@ -79,7 +75,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     ...(options.configPath ? { ACTION_HUB_CONFIG: resolvePath(options.configPath) } : {}),
   };
   let spawnError: Error | undefined;
-  const child = spawn(process.execPath, [serverScript, "--daemon"], {
+  const child = spawn(process.execPath, daemonChildArgs(options.entryPath), {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env,
@@ -184,13 +180,14 @@ export async function connectCommand(options: DaemonOptions = {}): Promise<numbe
   });
 }
 
-function findServerScript(): string | undefined {
-  const current = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    resolve(current, "../../copilot-plugin/server/dist/index.js"),
-    resolve(current, "../../../copilot-plugin/server/dist/index.js"),
-  ];
-  return candidates.find((candidate) => existsSync(candidate));
+export async function runDaemonProcess(): Promise<void> {
+  await runDaemonServer();
+}
+
+function daemonChildArgs(entryOverride?: string): string[] {
+  const entry = entryOverride ?? process.argv[1];
+  if (!entry || resolve(entry) === resolve(process.execPath)) return ["__daemon-run"];
+  return [entry, "__daemon-run"];
 }
 
 async function probe(

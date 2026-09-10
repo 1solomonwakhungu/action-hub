@@ -57,6 +57,12 @@ export async function runDaemon(): Promise<void> {
   let listener: NetServer | undefined;
   const clients = new Map<Socket, McpServer>();
   let stopping = false;
+  let resolveStopped!: () => void;
+  let rejectStopped!: (cause: unknown) => void;
+  const stopped = new Promise<void>((resolve, reject) => {
+    resolveStopped = resolve;
+    rejectStopped = reject;
+  });
 
   const cleanup = async (): Promise<void> => {
     const closeListener =
@@ -80,10 +86,16 @@ export async function runDaemon(): Promise<void> {
     await rm(paths.lock, { force: true });
   };
 
-  const shutdown = async (): Promise<void> => {
+  const shutdown = async (cause?: unknown): Promise<void> => {
     if (stopping) return;
     stopping = true;
-    await cleanup();
+    try {
+      await cleanup();
+      if (cause) rejectStopped(cause);
+      else resolveStopped();
+    } catch (cleanupCause) {
+      rejectStopped(cleanupCause);
+    }
   };
 
   try {
@@ -139,10 +151,8 @@ export async function runDaemon(): Promise<void> {
 
     process.once("SIGINT", () => void shutdown());
     process.once("SIGTERM", () => void shutdown());
-    await new Promise<void>((done, fail) => {
-      listener!.once("close", done);
-      listener!.once("error", fail);
-    });
+    listener.once("error", (cause) => void shutdown(cause));
+    await stopped;
   } catch (cause) {
     await cleanup().catch(() => undefined);
     throw cause;

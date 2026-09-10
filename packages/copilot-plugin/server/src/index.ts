@@ -170,16 +170,33 @@ export async function connectMcpClient(runtime: HubRuntime, transport: Transport
   return server;
 }
 
-async function runForeground(): Promise<void> {
+export async function runDaemonServer(): Promise<void> {
+  const { runDaemon } = await import("./daemon.js");
+  await runDaemon();
+}
+
+/**
+ * Boots the Action Hub meta-MCP server on stdio and resolves on transport
+ * close or a termination signal.
+ */
+export async function runServer(): Promise<void> {
   const runtime = await createHubRuntime();
   const transport = new StdioServerTransport();
   await connectMcpClient(runtime, transport);
 
-  const shutdown = () => {
-    void runtime.close().finally(() => process.exit(0));
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  await new Promise<void>((resolveShutdown) => {
+    let closing = false;
+    const shutdown = () => {
+      if (closing) return;
+      closing = true;
+      void runtime.close()
+        .catch(() => undefined)
+        .finally(() => resolveShutdown());
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    transport.onclose = shutdown;
+  });
 }
 
 type ToolInput = {
@@ -370,16 +387,28 @@ function text(payload: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
 }
 
-const entry = process.argv[1] ? pathToFileURL(process.argv[1]).href : undefined;
-const isMain = entry === import.meta.url;
+function isRunAsEntryPoint(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
 
-if (isMain) {
+if (isRunAsEntryPoint()) {
   const launch = process.argv.includes("--daemon")
-    ? import("./daemon.js").then(({ runDaemon }) => runDaemon())
-    : runForeground();
+    ? runDaemonServer()
+    : runServer();
 
-  launch.catch((cause: unknown) => {
-  process.stderr.write(`action-hub: fatal: ${cause instanceof Error ? cause.stack : String(cause)}\n`);
-  process.exit(1);
-  });
+  launch.then(
+    () => process.exit(0),
+    (cause: unknown) => {
+      process.stderr.write(
+        `action-hub: fatal: ${cause instanceof Error ? cause.stack : String(cause)}\n`,
+      );
+      process.exit(1);
+    },
+  );
 }

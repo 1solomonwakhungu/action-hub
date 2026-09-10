@@ -68,8 +68,8 @@ test("daemon shares one hub across authenticated clients and recovers stale stat
   const clients: Client[] = [];
   try {
     const starts = await Promise.all([
-      daemonStartCommand({ daemonDir, configPath }),
-      daemonStartCommand({ daemonDir, configPath }),
+      daemonStartCommand({ daemonDir, configPath, entryPath: cliScript }),
+      daemonStartCommand({ daemonDir, configPath, entryPath: cliScript }),
     ]);
     assert.deepEqual(starts, [0, 0]);
     assert.equal(await daemonStatusCommand({ daemonDir }), 0);

@@ -14,11 +14,13 @@ import {
   daemonStartCommand,
   daemonStatusCommand,
   daemonStopCommand,
+  runDaemonProcess,
 } from "./commands/daemon.js";
+import { VERSION } from "./version.js";
 
 function printHelp(): void {
   console.log(`
-Action Hub Developer CLI (v0.1.0)
+Action Hub Developer CLI (v${VERSION})
 
 USAGE:
   action-hub <command> [options]
@@ -83,7 +85,7 @@ async function main(): Promise<void> {
   }
 
   if (args.includes("--version") || args.includes("-v")) {
-    console.log("action-hub 0.1.0");
+    console.log(`action-hub ${VERSION}`);
     process.exit(0);
   }
 
@@ -230,6 +232,12 @@ async function main(): Promise<void> {
           console.error("Usage: action-hub daemon <start|status|stop>");
           exitCode = 1;
         }
+        break;
+      }
+
+      case "__daemon-run": {
+        await runDaemonProcess();
+        exitCode = 0;
         break;
       }
 
