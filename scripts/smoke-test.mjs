@@ -3,7 +3,7 @@
 // `npm run smoke:binary`. Pass the binary path as the first argument, or let it
 // default to the host-target binary under dist-bin/.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, accessSync } from "node:fs";
+import { mkdtempSync, writeFileSync, accessSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
@@ -58,6 +58,31 @@ function checkLightweightCommand(bin) {
   if (status !== 0) fail(`\`list\` exited ${status}`);
   if (!(stdout ?? "").includes("Action Hub Catalog")) fail(`\`list\` output missing catalog header`);
   process.stderr.write(`  ok  list (empty catalog)\n`);
+}
+
+function checkDaemonLifecycle(bin) {
+  const dir = mkdtempSync(join(tmpdir(), "ah-smoke-daemon-"));
+  const cfg = join(dir, "servers.json");
+  const runtime = join(dir, "runtime");
+  writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
+  const env = { ACTION_HUB_CONFIG: cfg, ACTION_HUB_DAEMON_DIR: runtime };
+
+  try {
+    const start = runBinary(bin, ["daemon", "start"], env);
+    if (start.status !== 0) fail(`\`daemon start\` exited ${start.status}: ${start.stderr ?? ""}`);
+
+    const status = runBinary(bin, ["daemon", "status"], env);
+    if (status.status !== 0 || !(status.stdout ?? "").includes("is running")) {
+      fail(`\`daemon status\` failed: ${status.stderr ?? status.stdout ?? ""}`);
+    }
+
+    const stop = runBinary(bin, ["daemon", "stop"], env);
+    if (stop.status !== 0) fail(`\`daemon stop\` exited ${stop.status}: ${stop.stderr ?? ""}`);
+    process.stderr.write("  ok  daemon lifecycle\n");
+  } finally {
+    runBinary(bin, ["daemon", "stop"], env);
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // Boots the bundled MCP server over stdio and runs a minimal JSON-RPC
@@ -129,6 +154,7 @@ async function main() {
   checkVersion(bin, version);
   checkHelp(bin);
   checkLightweightCommand(bin);
+  checkDaemonLifecycle(bin);
   await checkMcpHandshake(bin);
   process.stderr.write("SMOKE PASS\n");
 }

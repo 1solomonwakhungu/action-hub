@@ -933,6 +933,24 @@ test("concurrent FileTokenStore writes do not lose updates", async () => {
   }
 });
 
+test("separate FileTokenStore instances serialize writes to the same file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "action-hub-auth-"));
+  const path = join(dir, "credentials.json");
+  try {
+    const first = new FileTokenStore({ path });
+    const second = new FileTokenStore({ path });
+    await Promise.all([
+      first.set("srv-a", storedTokens({ accessToken: "access-a" })),
+      second.set("srv-b", storedTokens({ accessToken: "access-b" })),
+    ]);
+
+    assert.equal((await first.get("srv-a"))?.accessToken, "access-a");
+    assert.equal((await second.get("srv-b"))?.accessToken, "access-b");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("an unreadable credential file degrades into re-authorization", async () => {
   const dir = await mkdtemp(join(tmpdir(), "action-hub-auth-"));
   const path = join(dir, "credentials.json");

@@ -222,6 +222,36 @@ npm test
 
 Configure downstream servers in `config/servers.example.json`, then copy it to `config/servers.json`.
 
+### Shared daemon mode
+
+Use daemon mode when several MCP hosts run under the same user account. One
+background process owns the catalog and downstream MCP connections; each host
+keeps its normal stdio MCP configuration and runs the lightweight proxy:
+
+```bash
+action-hub daemon start
+action-hub daemon status
+```
+
+Configure VS Code, Cursor, Claude Desktop, or another stdio MCP host to run:
+
+```json
+{
+  "command": "action-hub",
+  "args": ["connect"]
+}
+```
+
+Stop the shared process with `action-hub daemon stop`. `action-hub start`
+remains available for an isolated foreground stdio server.
+
+On macOS and Linux the daemon uses a user-only Unix domain socket. On Windows
+it binds an ephemeral `127.0.0.1` port. Both transports require a random
+per-daemon token stored in a user-only runtime directory. The daemon rejects
+clients that cannot read and present that token.
+
+### OAuth 2.0 remote servers
+
 Remote servers that speak OAuth 2.0 declare an `auth` block on their HTTP transport and are authorized once from the CLI:
 
 ```bash
