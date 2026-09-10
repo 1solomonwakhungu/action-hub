@@ -1,13 +1,18 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { applyNodeMemoryLimit, createHttpAuthBinding, isAuthorizationRequired } from "@action-hub/core";
-import type {
-  JsonSchema,
-  McpClient,
-  McpClientFactory,
-  ServerConfig,
-  TokenStore,
+import { context, propagation } from "@opentelemetry/api";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  applyNodeMemoryLimit,
+  createHttpAuthBinding,
+  isAuthorizationRequired,
+  type CallToolOptions,
+  type JsonSchema,
+  type McpClient,
+  type McpClientFactory,
+  type ServerConfig,
+  type TokenStore,
 } from "@action-hub/core";
 
 const CLIENT_INFO = { name: "action-hub-cli", version: "0.1.0" } as const;
@@ -38,8 +43,9 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
   options = {},
 ) => {
   return async (config: ServerConfig) => {
+    const activeHeaders = new AsyncLocalStorage<Record<string, string> | undefined>();
     const client = new Client(CLIENT_INFO, { capabilities: {} });
-    const transport = buildTransport(config, options);
+    const transport = buildTransport(config, options, () => activeHeaders.getStore());
 
     try {
       await client.connect(transport);
@@ -48,21 +54,25 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     }
 
     return {
-      async listTools() {
-        const response = await client.listTools();
-        return response.tools.map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema as JsonSchema | undefined,
-        }));
+      async listTools(callOptions?: CallToolOptions) {
+        return activeHeaders.run(callOptions?.headers, async () => {
+          const response = await client.listTools();
+          return response.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema as JsonSchema | undefined,
+          }));
+        });
       },
 
-      async callTool(name: string, args: Record<string, unknown>) {
-        const response = await client.callTool({ name, arguments: args });
-        if (response.isError === true) {
-          throw new Error(renderError(response.content));
-        }
-        return response.content;
+      async callTool(name: string, args: Record<string, unknown>, callOptions?: CallToolOptions) {
+        return activeHeaders.run(callOptions?.headers, async () => {
+          const response = await client.callTool({ name, arguments: args });
+          if (response.isError === true) {
+            throw new Error(renderError(response.content));
+          }
+          return response.content;
+        });
       },
 
       async close() {
@@ -72,7 +82,11 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
   };
 };
 
-function buildTransport(config: ServerConfig, options: SdkClientFactoryOptions) {
+function buildTransport(
+  config: ServerConfig,
+  options: SdkClientFactoryOptions,
+  getHeaders?: () => Record<string, string> | undefined,
+) {
   if (config.transport.type === "stdio") {
     const { command, args, env, cwd } = config.transport;
     const limited = applyNodeMemoryLimit(
@@ -96,14 +110,41 @@ function buildTransport(config: ServerConfig, options: SdkClientFactoryOptions) 
     config,
     store: options.tokenStore,
     env: options.env ?? process.env,
-    onWarning: (message) => options.onWarning?.(`${config.id}: ${message}`),
+    onWarning: (message: string) => options.onWarning?.(`${config.id}: ${message}`),
   });
+
+  type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
+  const baseFetch: FetchLike = auth?.fetch ?? ((u, init) => fetch(u, init));
+  const tracingFetch: FetchLike = async (url, init) => {
+    const reqHeaders = new Headers(init?.headers);
+
+    // Propagate active OpenTelemetry context over HTTP transport
+    const traceCarrier: Record<string, string> = {};
+    propagation.inject(context.active(), traceCarrier);
+    for (const [key, value] of Object.entries(traceCarrier)) {
+      if (!reqHeaders.has(key)) {
+        reqHeaders.set(key, value);
+      }
+    }
+
+    // Include any per-call headers (e.g. from callTool options)
+    const perCall = getHeaders?.();
+    if (perCall) {
+      for (const [key, value] of Object.entries(perCall)) {
+        if (!reqHeaders.has(key)) {
+          reqHeaders.set(key, value);
+        }
+      }
+    }
+
+    return baseFetch(url, { ...init, headers: reqHeaders });
+  };
 
   return new StreamableHTTPClientTransport(new URL(url), {
     // Static headers still apply; the OAuth header is set last and wins, so a
     // stale hand-written `Authorization` cannot shadow a live token.
     requestInit: headers ? { headers } : undefined,
-    fetch: auth?.fetch,
+    fetch: tracingFetch,
   });
 }
 

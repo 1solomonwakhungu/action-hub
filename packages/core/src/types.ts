@@ -229,14 +229,20 @@ export interface InvocationRecord {
   approval?: "required" | "approved";
 }
 
+/** Options passed to downstream MCP tool calls, including propagated trace headers. */
+export interface CallToolOptions {
+  headers?: Record<string, string>;
+  [key: string]: unknown;
+}
+
 /**
  * Minimal contract Action Hub needs from a downstream MCP server. Keeping
  * this narrow means the transport implementation can be swapped (real MCP
  * client, in-memory fake, recorded fixture) without touching the router.
  */
 export interface McpClient {
-  listTools(): Promise<Array<{ name: string; description?: string; inputSchema?: JsonSchema }>>;
-  callTool(name: string, args: Record<string, unknown>): Promise<unknown>;
+  listTools(options?: CallToolOptions): Promise<Array<{ name: string; description?: string; inputSchema?: JsonSchema }>>;
+  callTool(name: string, args: Record<string, unknown>, options?: CallToolOptions): Promise<unknown>;
   close(): Promise<void>;
 }
 

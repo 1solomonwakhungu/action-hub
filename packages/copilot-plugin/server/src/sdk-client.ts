@@ -1,8 +1,18 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { applyNodeMemoryLimit, createHttpAuthBinding } from "@action-hub/core";
-import type { JsonSchema, McpClient, McpClientFactory, ServerConfig, TokenStore } from "@action-hub/core";
+import { context, propagation } from "@opentelemetry/api";
+import { AsyncLocalStorage } from "node:async_hooks";
+import {
+  applyNodeMemoryLimit,
+  createHttpAuthBinding,
+  type CallToolOptions,
+  type JsonSchema,
+  type McpClient,
+  type McpClientFactory,
+  type ServerConfig,
+  type TokenStore,
+} from "@action-hub/core";
 
 const CLIENT_INFO = { name: "action-hub", version: "0.1.0" } as const;
 
@@ -22,27 +32,32 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
   options = {},
 ) =>
   async (config: ServerConfig) => {
+    const activeHeaders = new AsyncLocalStorage<Record<string, string> | undefined>();
     const client = new Client(CLIENT_INFO, { capabilities: {} });
-    const transport = buildTransport(config, options);
+    const transport = buildTransport(config, options, () => activeHeaders.getStore());
 
     await client.connect(transport);
 
     return {
-      async listTools() {
-        const response = await client.listTools();
-        return response.tools.map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.inputSchema as JsonSchema | undefined,
-        }));
+      async listTools(callOptions?: CallToolOptions) {
+        return activeHeaders.run(callOptions?.headers, async () => {
+          const response = await client.listTools();
+          return response.tools.map((tool) => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema as JsonSchema | undefined,
+          }));
+        });
       },
 
-      async callTool(name: string, args: Record<string, unknown>) {
-        const response = await client.callTool({ name, arguments: args });
-        if (response.isError === true) {
-          throw new Error(renderError(response.content));
-        }
-        return response.content;
+      async callTool(name: string, args: Record<string, unknown>, callOptions?: CallToolOptions) {
+        return activeHeaders.run(callOptions?.headers, async () => {
+          const response = await client.callTool({ name, arguments: args });
+          if (response.isError === true) {
+            throw new Error(renderError(response.content));
+          }
+          return response.content;
+        });
       },
 
       async close() {
@@ -51,7 +66,11 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     } satisfies McpClient;
   };
 
-function buildTransport(config: ServerConfig, options: SdkClientFactoryOptions) {
+function buildTransport(
+  config: ServerConfig,
+  options: SdkClientFactoryOptions,
+  getHeaders?: () => Record<string, string> | undefined,
+) {
   if (config.transport.type === "stdio") {
     const { command, args, env, cwd } = config.transport;
     const limited = applyNodeMemoryLimit(
@@ -77,12 +96,39 @@ function buildTransport(config: ServerConfig, options: SdkClientFactoryOptions) 
     config,
     store: options.tokenStore,
     env: process.env,
-    onWarning: (message) => options.onWarning?.(`${config.id}: ${message}`),
+    onWarning: (message: string) => options.onWarning?.(`${config.id}: ${message}`),
   });
+
+  type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
+  const baseFetch: FetchLike = auth?.fetch ?? ((u, init) => fetch(u, init));
+  const tracingFetch: FetchLike = async (url, init) => {
+    const reqHeaders = new Headers(init?.headers);
+
+    // Propagate active OpenTelemetry context over HTTP transport
+    const traceCarrier: Record<string, string> = {};
+    propagation.inject(context.active(), traceCarrier);
+    for (const [key, value] of Object.entries(traceCarrier)) {
+      if (!reqHeaders.has(key)) {
+        reqHeaders.set(key, value);
+      }
+    }
+
+    // Include any per-call headers
+    const perCall = getHeaders?.();
+    if (perCall) {
+      for (const [key, value] of Object.entries(perCall)) {
+        if (!reqHeaders.has(key)) {
+          reqHeaders.set(key, value);
+        }
+      }
+    }
+
+    return baseFetch(url, { ...init, headers: reqHeaders });
+  };
 
   return new StreamableHTTPClientTransport(new URL(url), {
     requestInit: headers ? { headers } : undefined,
-    fetch: auth?.fetch,
+    fetch: tracingFetch,
   });
 }
 
