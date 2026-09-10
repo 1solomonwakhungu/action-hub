@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { ActionHub, ActionHubError, CatalogCache, bootstrapCatalog } from "@action-hub/core";
@@ -56,16 +57,16 @@ const inputShape = {
     ),
 } as const;
 
-/**
- * Boots the Action Hub meta-MCP server on stdio and resolves only once the
- * transport closes or a termination signal is received.
- *
- * Exported so the same entry point can run two ways without divergence: as the
- * standalone `action-hub-mcp` binary/script, and in-process from the developer
- * CLI's `start` command (notably inside the bundled single-file executable,
- * where spawning a separate `node` is not possible).
- */
-export async function runServer(): Promise<void> {
+export interface HubRuntime {
+  hub: ActionHub;
+  cache: CatalogCache;
+  configHash: string;
+  configPath: string;
+  refreshed: Promise<unknown>;
+  close(): Promise<void>;
+}
+
+export async function createHubRuntime(options: { control?: boolean } = {}): Promise<HubRuntime> {
   const configPath = defaultConfigPath();
   const config = await loadConfig(configPath);
 
@@ -114,13 +115,30 @@ export async function runServer(): Promise<void> {
   // failure to bind must never take the MCP server down with it — the canvas
   // falls back to its read-only view when the endpoint is absent.
   let control: ControlServer | undefined;
-  try {
-    control = await startControlServer(hub, configPath);
-  } catch (cause) {
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    process.stderr.write(`action-hub: control endpoint unavailable: ${reason}\n`);
+  if (options.control !== false) {
+    try {
+      control = await startControlServer(hub, configPath);
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      process.stderr.write(`action-hub: control endpoint unavailable: ${reason}\n`);
+    }
   }
 
+  return {
+    hub,
+    cache,
+    configHash: bootstrap.configHash,
+    configPath,
+    refreshed: bootstrap.refreshed,
+    close: async () => {
+      await bootstrap.refreshed.catch(() => undefined);
+      await control?.close();
+      await hub.close();
+    },
+  };
+}
+
+export function createMcpServer(runtime: HubRuntime): McpServer {
   const server = new McpServer({ name: "action-hub", version: "0.1.0" });
 
   server.registerTool(
@@ -132,7 +150,7 @@ export async function runServer(): Promise<void> {
     },
     async (input) => {
       try {
-        return text(await dispatch(hub, input, bootstrap.configHash, cache));
+        return text(await dispatch(runtime.hub, input, runtime.configHash, runtime.cache));
       } catch (cause) {
         const message =
           cause instanceof ActionHubError || cause instanceof Error
@@ -143,24 +161,35 @@ export async function runServer(): Promise<void> {
     },
   );
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  return server;
+}
 
-  // Keep the process alive until the stdio channel closes or we are asked to
-  // stop. Resolving here (rather than leaving a dangling promise) lets the CLI
-  // `await runServer()` and exit cleanly, and lets an in-flight background
-  // re-index settle before tearing down the connections it is still writing to,
-  // so a shutdown mid-refresh does not surface as a broken pipe against a
-  // downstream server.
+export async function connectMcpClient(runtime: HubRuntime, transport: Transport): Promise<McpServer> {
+  const server = createMcpServer(runtime);
+  await server.connect(transport);
+  return server;
+}
+
+export async function runDaemonServer(): Promise<void> {
+  const { runDaemon } = await import("./daemon.js");
+  await runDaemon();
+}
+
+/**
+ * Boots the Action Hub meta-MCP server on stdio and resolves on transport
+ * close or a termination signal.
+ */
+export async function runServer(): Promise<void> {
+  const runtime = await createHubRuntime();
+  const transport = new StdioServerTransport();
+  await connectMcpClient(runtime, transport);
+
   await new Promise<void>((resolveShutdown) => {
     let closing = false;
     const shutdown = () => {
       if (closing) return;
       closing = true;
-      void bootstrap.refreshed
-        .catch(() => undefined)
-        .then(() => control?.close())
-        .then(() => hub.close())
+      void runtime.close()
         .catch(() => undefined)
         .finally(() => resolveShutdown());
     };
@@ -369,7 +398,11 @@ function isRunAsEntryPoint(): boolean {
 }
 
 if (isRunAsEntryPoint()) {
-  runServer().then(
+  const launch = process.argv.includes("--daemon")
+    ? runDaemonServer()
+    : runServer();
+
+  launch.then(
     () => process.exit(0),
     (cause: unknown) => {
       process.stderr.write(

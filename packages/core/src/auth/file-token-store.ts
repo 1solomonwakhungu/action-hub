@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { coerceTokenSet } from "./token-store.js";
@@ -28,6 +28,8 @@ export interface FileTokenStoreOptions {
   onWarning?: (message: string) => void;
 }
 
+const mutationChains = new Map<string, Promise<unknown>>();
+
 /**
  * Credential persistence backed by a mode-0600 file.
  *
@@ -44,8 +46,8 @@ export interface FileTokenStoreOptions {
  *    permissive umask cannot widen it.
  *  - Written to a unique temp path and renamed into place, so a concurrent
  *    reader never sees a half-written credential set.
- *  - Writes are serialised per instance, so two servers refreshing at once
- *    cannot lose each other's update.
+ *  - Writes are serialised per credential path and guarded by an exclusive
+ *    lock file, so threads and processes cannot lose each other's update.
  *  - Reads never throw: an unreadable or corrupt file degrades into "no stored
  *    credentials", which prompts a re-authorization rather than crashing the
  *    MCP server an agent session depends on.
@@ -53,7 +55,6 @@ export interface FileTokenStoreOptions {
 export class FileTokenStore implements TokenStore {
   readonly path: string;
   readonly #warn: (message: string) => void;
-  #writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(options: FileTokenStoreOptions = {}) {
     this.path = options.path ?? defaultCredentialsPath(options.env);
@@ -105,12 +106,23 @@ export class FileTokenStore implements TokenStore {
 
   /** Read-modify-write, serialised so concurrent refreshes do not clobber. */
   #mutate(apply: (all: Record<string, unknown>) => void): Promise<void> {
-    const run = this.#writeChain.then(async () => {
-      const all = await this.#readAll();
-      apply(all);
-      await this.#writeAll(all);
+    const prior = mutationChains.get(this.path) ?? Promise.resolve();
+    const run = prior.then(async () => {
+      await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+      const release = await acquireFileLock(`${this.path}.lock`);
+      try {
+        const all = await this.#readAll();
+        apply(all);
+        await this.#writeAll(all);
+      } finally {
+        await release();
+      }
     });
-    this.#writeChain = run.catch(() => undefined);
+    const tail = run.catch(() => undefined);
+    mutationChains.set(this.path, tail);
+    void tail.finally(() => {
+      if (mutationChains.get(this.path) === tail) mutationChains.delete(this.path);
+    });
     return run;
   }
 
@@ -132,4 +144,69 @@ export class FileTokenStore implements TokenStore {
 
 function message(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+async function acquireFileLock(path: string): Promise<() => Promise<void>> {
+  const owner = `${process.pid}:${randomUUID()}`;
+  const deadline = Date.now() + 10_000;
+
+  while (Date.now() < deadline) {
+    try {
+      const handle = await open(path, "wx", 0o600);
+      await handle.writeFile(owner, "utf8");
+      return async () => {
+        await handle.close();
+        try {
+          if ((await readFile(path, "utf8")) === owner) await unlink(path);
+        } catch {
+          // Another process may already have recovered a stale lock.
+        }
+      };
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
+      const staleOwner = await readLockOwner(path);
+      if (staleOwner && !processAlive(staleOwner.pid)) {
+        try {
+          if ((await readFile(path, "utf8")) === staleOwner.raw) await unlink(path);
+        } catch {
+          // The lock changed between inspection and cleanup; retry normally.
+        }
+      } else if (!staleOwner) {
+        await removeAbandonedEmptyLock(path);
+      }
+      await new Promise((done) => setTimeout(done, 10));
+    }
+
+    async function removeAbandonedEmptyLock(path: string): Promise<void> {
+      try {
+        const before = await stat(path);
+        if (Date.now() - before.mtimeMs < 1_000) return;
+        const after = await stat(path);
+        if (before.ino === after.ino && before.mtimeMs === after.mtimeMs) await unlink(path);
+      } catch {
+        // The lock disappeared or changed while it was inspected.
+      }
+    }
+  }
+
+  throw new Error(`Timed out waiting for credential lock at ${path}`);
+}
+
+async function readLockOwner(path: string): Promise<{ pid: number; raw: string } | undefined> {
+  try {
+    const raw = await readFile(path, "utf8");
+    const pid = Number.parseInt(raw.split(":")[0] ?? "", 10);
+    return Number.isSafeInteger(pid) && pid > 0 ? { pid, raw } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (cause) {
+    return (cause as NodeJS.ErrnoException).code === "EPERM";
+  }
 }

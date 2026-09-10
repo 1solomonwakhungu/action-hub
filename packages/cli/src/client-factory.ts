@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { context, propagation } from "@opentelemetry/api";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   applyNodeMemoryLimit,
   createHttpAuthBinding,
@@ -42,9 +43,9 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
   options = {},
 ) => {
   return async (config: ServerConfig) => {
-    let activeHeaders: Record<string, string> | undefined;
+    const activeHeaders = new AsyncLocalStorage<Record<string, string> | undefined>();
     const client = new Client(CLIENT_INFO, { capabilities: {} });
-    const transport = buildTransport(config, options, () => activeHeaders);
+    const transport = buildTransport(config, options, () => activeHeaders.getStore());
 
     try {
       await client.connect(transport);
@@ -54,30 +55,24 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
 
     return {
       async listTools(callOptions?: CallToolOptions) {
-        activeHeaders = callOptions?.headers;
-        try {
+        return activeHeaders.run(callOptions?.headers, async () => {
           const response = await client.listTools();
           return response.tools.map((tool) => ({
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema as JsonSchema | undefined,
           }));
-        } finally {
-          activeHeaders = undefined;
-        }
+        });
       },
 
       async callTool(name: string, args: Record<string, unknown>, callOptions?: CallToolOptions) {
-        activeHeaders = callOptions?.headers;
-        try {
+        return activeHeaders.run(callOptions?.headers, async () => {
           const response = await client.callTool({ name, arguments: args });
           if (response.isError === true) {
             throw new Error(renderError(response.content));
           }
           return response.content;
-        } finally {
-          activeHeaders = undefined;
-        }
+        });
       },
 
       async close() {
