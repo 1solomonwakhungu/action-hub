@@ -9,6 +9,7 @@ import { migrateCommand } from "../dist/commands/migrate.js";
 import { bundlesCommand } from "../dist/commands/bundles.js";
 import { listCommand } from "../dist/commands/list.js";
 import { testSearchCommand } from "../dist/commands/test-search.js";
+import { authCommand } from "../dist/commands/auth.js";
 
 test("CLI config loader handles empty and populated configs", async () => {
   const tempDir = resolve(tmpdir(), `action-hub-cli-test-${Date.now()}`);
@@ -162,6 +163,66 @@ test("list and test-search commands execute with empty servers", async () => {
     const searchCode = await testSearchCommand("pull request", { configPath: cfgPath });
     assert.equal(searchCode, 0);
   } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("auth command reports status, refuses unknown servers, and clears credentials", async () => {
+  const tempDir = resolve(tmpdir(), `action-hub-cli-auth-${Date.now()}`);
+  await mkdir(tempDir, { recursive: true });
+  const cfgPath = resolve(tempDir, "servers.json");
+  const credentialsPath = resolve(tempDir, "credentials.json");
+  const previousCredentials = process.env["ACTION_HUB_CREDENTIALS"];
+  process.env["ACTION_HUB_CREDENTIALS"] = credentialsPath;
+
+  const logged: string[] = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args: unknown[]) => void logged.push(args.join(" "));
+  console.error = (...args: unknown[]) => void logged.push(args.join(" "));
+
+  try {
+    const testConfig = {
+      servers: [
+        { id: "plain-http", transport: { type: "http", url: "https://example.test/mcp" } },
+        {
+          id: "oauth-srv",
+          transport: {
+            type: "http",
+            url: "https://example.test/mcp",
+            auth: {
+              type: "oauth2",
+              authorizationUrl: "https://example.test/authorize",
+              tokenUrl: "https://example.test/token",
+              clientId: "client-abc",
+              scopes: ["read"],
+            },
+          },
+        },
+      ],
+      bundles: [],
+      autoDiscover: false,
+    };
+    await writeFile(cfgPath, JSON.stringify(testConfig), "utf8");
+
+    assert.equal(await authCommand("status", undefined, { configPath: cfgPath }), 0);
+    const status = logged.join("\n");
+    assert.ok(status.includes("oauth-srv"), "an OAuth server is listed");
+    assert.ok(status.includes("unauthenticated"), "with no credential it is unauthenticated");
+    assert.ok(!status.includes("plain-http"), "a transport with no auth block is not listed");
+
+    // Logging in requires a server; an unknown or non-OAuth one must fail loudly.
+    assert.equal(await authCommand("login", undefined, { configPath: cfgPath }), 1);
+    assert.equal(await authCommand("login", "nope", { configPath: cfgPath }), 1);
+    assert.equal(await authCommand("login", "plain-http", { configPath: cfgPath }), 1);
+
+    // Logout is idempotent: clearing an absent credential is not an error.
+    assert.equal(await authCommand("logout", "oauth-srv", { configPath: cfgPath }), 0);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    if (previousCredentials === undefined) delete process.env["ACTION_HUB_CREDENTIALS"];
+    else process.env["ACTION_HUB_CREDENTIALS"] = previousCredentials;
     await rm(tempDir, { recursive: true, force: true });
   }
 });

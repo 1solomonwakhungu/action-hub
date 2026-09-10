@@ -199,6 +199,77 @@ concurrency the host actually produces — an unawaited write after every
 bytes or race each other's rename, and a reader always sees a complete entry.
 The cache directory is created `0700` and the file written `0600`.
 
+## Remote authentication
+
+A remote HTTP server that speaks OAuth 2.0 declares it in `transport.auth`.
+Nothing else about the transport changes: an HTTP transport with no `auth`
+block, including one carrying a hand-written `Authorization` header, behaves
+exactly as it did before.
+
+Providers are modelled as configuration, not code. GitHub, Slack, Jira and any
+other standards-compliant authorization server are described by their endpoints
+and scopes; there is no provider registry and no per-vendor branch. The two
+escape hatches for the details providers disagree about are
+`extraAuthorizationParams` and `extraTokenParams`.
+
+### The core/host boundary
+
+`packages/core` owns the protocol and nothing else. `OAuthClient` takes an
+injected `fetch`, an injected clock, and an injected `TokenStore`; it never
+opens a browser, reads `process.env`, or talks to a keychain. That is what
+keeps it runtime-agnostic and what makes the lifecycle testable without a
+socket.
+
+The host supplies the parts that are inherently platform-specific:
+
+| Concern | Contract | Default |
+| --- | --- | --- |
+| Credential persistence | `TokenStore` | `FileTokenStore` (mode `0600`) |
+| Secret material | `clientSecretEnv` / `clientIdEnv` | resolved by the host from its environment |
+| User consent | `createAuthorizationRequest` → `exchangeAuthorizationCode` | `action-hub auth login <id>` |
+
+A desktop host that wants the system keychain implements `TokenStore` and
+passes it in; core is unchanged.
+
+### Token lifecycle
+
+`createHttpAuthBinding` returns a `fetch` wrapper that the MCP SDK transport
+uses in place of the global one, so authentication is invisible to the
+connection manager. On each request it:
+
+1. Refreshes **ahead** of expiry, using a 60 s leeway by default. Waiting for a
+   401 costs a wasted round trip and, on some providers, a rate-limit penalty.
+2. Deduplicates concurrent refreshes. Activating several tools at once produces
+   a burst of requests against one expired token; all of them join a single
+   in-flight refresh. Without this, a provider that rotates refresh tokens sees
+   N concurrent uses of a one-time token and revokes the whole grant.
+3. Rotates. A returned `refresh_token` always replaces the stored one; when the
+   provider returns none, the previous one is carried forward per RFC 6749 §6.
+4. Retries a 401 exactly once, after forcing a refresh, and only when the
+   request body can actually be replayed. A stream body cannot, so it is not
+   retried.
+5. Fails explicitly. `invalid_grant` drops the dead credential and raises
+   `authorization_required` rather than retrying something that cannot succeed.
+
+Before replaying, the 401 is attributed to the specific token that failed. If a
+concurrent refresh already replaced it, the invalidation is a no-op — otherwise
+a slow request could discard a token that was just minted.
+
+### Secrets
+
+No token value reaches a log, an error message, the catalog cache, or the
+Capability Manager snapshot.
+
+Token-endpoint error bodies are reduced to the two RFC 6749 fields (`error`,
+`error_description`) before being rendered, because a token endpoint is the one
+place a raw body could carry a credential. Configured secrets are then scrubbed
+from the resulting text as a second pass.
+
+`hashServerConfigs` normalises the `auth` block with `clientSecret` excluded, so
+rotating a secret does not invalidate an otherwise-valid catalog, while changing
+what the connection *is* — token URL, scopes, grant type — correctly forces a
+re-index.
+
 ## Permissions
 
 Three tiers: `blocked` < `untrusted` < `trusted`.

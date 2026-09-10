@@ -15,6 +15,90 @@
       }
     },
     {
+      "id": "github-oauth",
+      "displayName": "GitHub (OAuth)",
+      "trust": "trusted",
+      "enabled": false,
+      "transport": {
+        "type": "http",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "auth": {
+          "type": "oauth2",
+          "authorizationUrl": "https://github.com/login/oauth/authorize",
+          "tokenUrl": "https://github.com/login/oauth/access_token",
+          "clientIdEnv": "GITHUB_OAUTH_CLIENT_ID",
+          "clientSecretEnv": "GITHUB_OAUTH_CLIENT_SECRET",
+          "scopes": ["repo", "read:org"],
+          "redirectUri": "http://127.0.0.1:7788/callback"
+        }
+      }
+    },
+    {
+      "id": "slack",
+      "displayName": "Slack",
+      "trust": "untrusted",
+      "enabled": false,
+      "transport": {
+        "type": "http",
+        "url": "https://slack.example.com/mcp",
+        "auth": {
+          "type": "oauth2",
+          "authorizationUrl": "https://slack.com/oauth/v2/authorize",
+          "tokenUrl": "https://slack.com/api/oauth.v2.access",
+          "clientIdEnv": "SLACK_CLIENT_ID",
+          "clientSecretEnv": "SLACK_CLIENT_SECRET",
+          "clientAuthMethod": "client_secret_post",
+          "scopes": ["channels:read", "chat:write"],
+          "redirectUri": "http://127.0.0.1:7788/callback",
+          "extraAuthorizationParams": {
+            "user_scope": "search:read"
+          }
+        }
+      }
+    },
+    {
+      "id": "jira",
+      "displayName": "Jira",
+      "trust": "untrusted",
+      "enabled": false,
+      "transport": {
+        "type": "http",
+        "url": "https://jira.example.com/mcp",
+        "auth": {
+          "type": "oauth2",
+          "authorizationUrl": "https://auth.atlassian.com/authorize",
+          "tokenUrl": "https://auth.atlassian.com/oauth/token",
+          "clientIdEnv": "JIRA_CLIENT_ID",
+          "clientSecretEnv": "JIRA_CLIENT_SECRET",
+          "clientAuthMethod": "client_secret_post",
+          "scopes": ["read:jira-work", "write:jira-work", "offline_access"],
+          "redirectUri": "http://127.0.0.1:7788/callback",
+          "audience": "api.atlassian.com",
+          "extraAuthorizationParams": {
+            "prompt": "consent"
+          }
+        }
+      }
+    },
+    {
+      "id": "internal-service",
+      "displayName": "Internal service (machine-to-machine)",
+      "trust": "trusted",
+      "enabled": false,
+      "transport": {
+        "type": "http",
+        "url": "https://internal.example.com/mcp",
+        "auth": {
+          "type": "oauth2",
+          "grantType": "client_credentials",
+          "tokenUrl": "https://internal.example.com/oauth2/token",
+          "clientId": "action-hub",
+          "clientSecretEnv": "INTERNAL_CLIENT_SECRET",
+          "scopes": ["mcp.invoke"]
+        }
+      }
+    },
+    {
       "id": "linear",
       "displayName": "Linear",
       "trust": "trusted",

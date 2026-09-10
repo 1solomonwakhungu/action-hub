@@ -1,4 +1,5 @@
 import type { Bundle } from "./bundles/bundles.js";
+import type { OAuthClientConfig } from "./auth/types.js";
 
 /**
  * Core domain types for Action Hub.
@@ -93,7 +94,18 @@ export interface StdioTransport {
 export interface HttpTransport {
   type: "http";
   url: string;
+  /**
+   * Static headers sent on every request. Still the right choice for a
+   * long-lived personal access token; `auth` supersedes the `Authorization`
+   * header when both are present.
+   */
   headers?: Record<string, string>;
+  /**
+   * OAuth 2.0 credentials for this endpoint. When set, the host obtains a
+   * valid access token before connecting and refreshes it on expiry or 401
+   * without any further manual entry.
+   */
+  auth?: OAuthClientConfig;
 }
 
 /**

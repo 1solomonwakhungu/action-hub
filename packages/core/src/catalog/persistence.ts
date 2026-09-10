@@ -2,7 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import type { ActionRecord, InvocationRecord, ServerConfig, ServerState, TrustTier } from "../types.js";
+import type {
+  ActionRecord,
+  HttpTransport,
+  InvocationRecord,
+  ServerConfig,
+  ServerState,
+  TrustTier,
+} from "../types.js";
 import { TRUST_TIERS } from "../types.js";
 
 /**
@@ -50,12 +57,13 @@ export function defaultCatalogCachePath(env: NodeJS.ProcessEnv = process.env): s
  * Fingerprint of the parts of the server config that change what indexing
  * produces *and* are safe to persist.
  *
- * Env and header **keys** are hashed but their **values** are not. This is a
- * deliberate trade-off, not a claim that values are irrelevant: a rotated token
- * should not throw away an otherwise-valid catalog, and a secret must never end
- * up in a digest that lives on disk. The background re-index is what catches a
- * value change that actually altered the catalog. Server order is normalised
- * away so reordering the config file is not a cache-invalidating edit.
+ * Env and header **keys** are hashed but their **values** are not, and OAuth
+ * client secrets are excluded entirely. This is a deliberate trade-off, not a
+ * claim that values are irrelevant: a rotated token should not throw away an
+ * otherwise-valid catalog, and a secret must never end up in a digest that
+ * lives on disk. The background re-index is what catches a value change that
+ * actually altered the catalog. Server order is normalised away so reordering
+ * the config file is not a cache-invalidating edit.
  */
 export function hashServerConfigs(servers: readonly ServerConfig[]): string {
   const normalized = servers
@@ -86,6 +94,32 @@ function normalizeTransport(transport: ServerConfig["transport"]): unknown {
     type: "http",
     url: transport.url,
     headerKeys: Object.keys(transport.headers ?? {}).sort(),
+    auth: normalizeAuth(transport.auth),
+  };
+}
+
+/**
+ * Non-secret fingerprint of an OAuth block.
+ *
+ * Endpoints, grant, and scopes change what the connection *is*, so they belong
+ * in the hash. `clientSecret` never appears — a digest lives on disk, and while
+ * a hash is not reversible, a secret has no business being an input to a file
+ * the user can copy into a bug report. Rotating a secret must not invalidate an
+ * otherwise-valid catalog either, which is the same reasoning applied to header
+ * and env values above.
+ */
+function normalizeAuth(auth: HttpTransport["auth"]): unknown {
+  if (!auth) return null;
+  return {
+    grantType: auth.grantType ?? "authorization_code",
+    tokenUrl: auth.tokenUrl,
+    authorizationUrl: auth.authorizationUrl ?? null,
+    clientId: auth.clientId,
+    clientIdEnv: auth.clientIdEnv ?? null,
+    clientSecretEnv: auth.clientSecretEnv ?? null,
+    scopes: [...(auth.scopes ?? [])].sort(),
+    resource: auth.resource ?? null,
+    audience: auth.audience ?? null,
   };
 }
 

@@ -43,8 +43,7 @@ export type {
   ApprovalRegistryOptions,
   ApprovalRejection,
 } from "./permissions/approvals.js";
-export { validateArguments } from "./router/validate.js";
-export type { ValidationResult } from "./router/validate.js";
+export { validateArguments } from "./router/validate.js";export type { ValidationResult } from "./router/validate.js";
 export { BundleRegistry } from "./bundles/bundles.js";
 export type { Bundle } from "./bundles/bundles.js";
 export {
@@ -71,4 +70,41 @@ export type {
   MigrationPlanParams,
   ExecuteMigrationResult,
 } from "./migration/index.js";
+export {
+  OAuthClient,
+  OAuthError,
+  REDACTED,
+  FileTokenStore,
+  InMemoryTokenStore,
+  coerceTokenSet,
+  createAuthenticatedFetch,
+  createHttpAuthBinding,
+  createPkcePair,
+  createStateValue,
+  defaultCredentialsPath,
+  isAuthorizationRequired,
+  isOAuthClientConfig,
+  redactOAuthConfig,
+  redactSecrets,
+  resolveOAuthConfigSecrets,
+  summarizeTokens,
+} from "./auth/index.js";
+export type {
+  AuthenticatedFetchOptions,
+  AuthorizationRequest,
+  AuthState,
+  ClientAuthMethod,
+  FetchLike,
+  FileTokenStoreOptions,
+  HttpAuthBinding,
+  HttpAuthBindingOptions,
+  OAuthClientConfig,
+  OAuthClientOptions,
+  OAuthErrorCode,
+  OAuthGrantType,
+  PkcePair,
+  TokenSet,
+  TokenStore,
+  TokenSummary,
+} from "./auth/index.js";
 export * from "./types.js";
