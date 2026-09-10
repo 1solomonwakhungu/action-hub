@@ -4,7 +4,7 @@ import { readState } from "./state.mjs";
 export const TRUST_TIERS = ["blocked", "untrusted", "trusted"];
 
 /**
- * The four write/test operations the canvas exposes.
+ * The write/test operations the canvas exposes.
  *
  * Both entry points — a canvas action invoked by the agent and a button
  * clicked in the panel — call these same functions, so there is exactly one
@@ -56,6 +56,14 @@ export const operations = {
   import_config: async (input) => {
     if (!input?.config) return fail(`"config" must be provided`);
     return hubRequest("/import-config", { config: input.config });
+  },
+
+  migrate_capabilities: async (input) => {
+    return hubRequest("/migrate", {
+      write: input?.write !== false,
+      overwrite: input?.overwrite === true,
+      customPaths: Array.isArray(input?.customPaths) ? input.customPaths : undefined,
+    });
   },
 
   load_action: async (input) => {

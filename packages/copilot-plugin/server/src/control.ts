@@ -3,13 +3,21 @@ import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import { CatalogCache, hashServerConfigs, type ActionHub, type TrustTier } from "@action-hub/core";
+import {
+  CatalogCache,
+  discoverAll,
+  executeMigration,
+  hashServerConfigs,
+  type ActionHub,
+  type TrustTier,
+} from "@action-hub/core";
 import {
   TRUST_TIERS,
   isTrust,
   parseServerEntry,
   rawServers,
   mutateRawConfig,
+  readRawConfig,
 } from "./config.js";
 import { writeSnapshot } from "./snapshot.js";
 
@@ -149,6 +157,9 @@ async function handle(
         return;
       case "/import-config":
         respond(res, 200, await importConfig(hub, configPath, cache, input));
+        return;
+      case "/migrate":
+        respond(res, 200, await migrateCapabilities(hub, configPath, cache, input));
         return;
       case "/load-action":
         respond(res, 200, await loadAction(hub, input));
@@ -388,6 +399,78 @@ async function importConfig(
 
   await refreshSnapshot(hub, cache);
   return { ok: true, imported: added, count: added.length, errors: errors.length > 0 ? errors : undefined };
+}
+
+async function migrateCapabilities(
+  hub: ActionHub,
+  configPath: string,
+  cache: CatalogCache,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const write = input["write"] !== false;
+  const overwrite = input["overwrite"] === true;
+  const customPaths = Array.isArray(input["customPaths"])
+    ? input["customPaths"].filter((p): p is string => typeof p === "string")
+    : undefined;
+  const skipDefaults = Boolean(input["skipDefaults"]);
+
+  const discovered = await discoverAll({ customPaths, skipDefaults });
+  const raw = await readRawConfig(configPath);
+  const existingServers = hub.connections.configs();
+  const existingSkills = Array.isArray(raw["skills"]) ? (raw["skills"] as any) : [];
+  const existingBundles = hub.bundles.list();
+
+  const migration = executeMigration({
+    existingServers,
+    existingSkills,
+    existingBundles,
+    discovered,
+    options: { overwrite },
+  });
+
+  if (write) {
+    await mutateRawConfig(configPath, (target) => {
+      target["servers"] = migration.mergedServers;
+      target["skills"] = migration.mergedSkills;
+      target["bundles"] = migration.mergedBundles;
+    });
+
+    // Hot-register newly added servers into live hub
+    for (const server of migration.plan.serversToAdd) {
+      hub.connections.register(server);
+      if (server.enabled !== false) {
+        void hub.indexServer(server.id);
+      }
+    }
+
+    // Hot-register newly added skills into live catalog
+    if (migration.plan.skillsToAdd.length > 0) {
+      hub.registerSkills(
+        migration.plan.skillsToAdd.map((s) => ({
+          id: s.id,
+          name: s.name,
+          serverId: s.sourceClient ?? "skills",
+          summary: s.summary,
+          description: s.description,
+          tags: s.tags,
+          trust: s.trust ?? "trusted",
+        })),
+      );
+    }
+
+    // Hot-register newly added bundles into live registry
+    for (const bundle of migration.plan.bundlesToAdd) {
+      hub.bundles.add(bundle);
+    }
+
+    await refreshSnapshot(hub, cache);
+  }
+
+  return {
+    ok: true,
+    write,
+    plan: migration.plan,
+  };
 }
 
 async function search(hub: ActionHub, input: Record<string, unknown>): Promise<unknown> {

@@ -34,10 +34,26 @@ export { BundleRegistry } from "./bundles/bundles.js";
 export type { Bundle } from "./bundles/bundles.js";
 export {
   discoverMcpServers,
+  discoverSkills,
+  discoverPlugins,
+  discoverAll,
   defaultDiscoveryLocations,
+  defaultSkillDiscoveryLocations,
+  parseSkillContent,
 } from "./discovery/auto-discovery.js";
 export type {
   DiscoveredServer,
+  DiscoveredSkill,
+  DiscoveredPlugin,
   DiscoveryOptions,
 } from "./discovery/auto-discovery.js";
+export {
+  planMigration,
+  executeMigration,
+} from "./migration/index.js";
+export type {
+  MigrationOptions,
+  MigrationPlanParams,
+  ExecuteMigrationResult,
+} from "./migration/index.js";
 export * from "./types.js";

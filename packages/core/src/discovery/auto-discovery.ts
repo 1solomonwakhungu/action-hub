@@ -1,26 +1,42 @@
-import { readFile } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { resolve } from "node:path";
-import type { ServerConfig } from "../types.js";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import type {
+  DiscoveredPlugin,
+  DiscoveredServer,
+  DiscoveredSkill,
+  ServerConfig,
+  SkillConfig,
+} from "../types.js";
 
-export interface DiscoveredServer extends ServerConfig {
-  sourcePath: string;
-  sourceClient: "claude-desktop" | "cursor" | "vscode" | "copilot" | "custom";
-}
+export { type DiscoveredServer, type DiscoveredSkill, type DiscoveredPlugin };
 
 export interface DiscoveryOptions {
   cwd?: string;
   home?: string;
   customPaths?: string[];
+  skipDefaults?: boolean;
 }
 
 /** Standard locations where popular AI and developer tools save MCP configurations. */
-export function defaultDiscoveryLocations(options: DiscoveryOptions = {}): { path: string; client: DiscoveredServer["sourceClient"] }[] {
+export function defaultDiscoveryLocations(
+  options: DiscoveryOptions = {},
+): { path: string; client: DiscoveredServer["sourceClient"] }[] {
+  const locations: { path: string; client: DiscoveredServer["sourceClient"] }[] = [];
+
+  if (options.customPaths) {
+    for (const custom of options.customPaths) {
+      locations.push({ path: custom, client: "custom" });
+    }
+  }
+
+  if (options.skipDefaults) {
+    return locations;
+  }
+
   const home = options.home ?? homedir();
   const cwd = options.cwd ?? process.cwd();
   const os = platform();
-
-  const locations: { path: string; client: DiscoveredServer["sourceClient"] }[] = [];
 
   // Claude Desktop config
   if (os === "darwin") {
@@ -58,12 +74,6 @@ export function defaultDiscoveryLocations(options: DiscoveryOptions = {}): { pat
     { path: resolve(home, ".copilot", "mcp.json"), client: "copilot" },
     { path: resolve(cwd, ".mcp.json"), client: "copilot" },
   );
-
-  if (options.customPaths) {
-    for (const custom of options.customPaths) {
-      locations.push({ path: custom, client: "custom" });
-    }
-  }
 
   return locations;
 }
@@ -136,13 +146,14 @@ function normalizeServerEntry(
   sourceClient: DiscoveredServer["sourceClient"],
 ): DiscoveredServer | undefined {
   if (typeof raw["url"] === "string" && raw["url"].length > 0) {
-    const headers = typeof raw["headers"] === "object" && raw["headers"] !== null
-      ? Object.fromEntries(
-          Object.entries(raw["headers"] as Record<string, unknown>)
-            .filter(([, v]) => typeof v === "string")
-            .map(([k, v]) => [k, String(v)]),
-        )
-      : undefined;
+    const headers =
+      typeof raw["headers"] === "object" && raw["headers"] !== null
+        ? Object.fromEntries(
+            Object.entries(raw["headers"] as Record<string, unknown>)
+              .filter(([, v]) => typeof v === "string")
+              .map(([k, v]) => [k, String(v)]),
+          )
+        : undefined;
 
     return {
       id,
@@ -164,13 +175,14 @@ function normalizeServerEntry(
       ? raw["args"].filter((a): a is string => typeof a === "string")
       : [];
 
-    const env = typeof raw["env"] === "object" && raw["env"] !== null
-      ? Object.fromEntries(
-          Object.entries(raw["env"] as Record<string, unknown>)
-            .filter(([, v]) => typeof v === "string")
-            .map(([k, v]) => [k, String(v)]),
-        )
-      : undefined;
+    const env =
+      typeof raw["env"] === "object" && raw["env"] !== null
+        ? Object.fromEntries(
+            Object.entries(raw["env"] as Record<string, unknown>)
+              .filter(([, v]) => typeof v === "string")
+              .map(([k, v]) => [k, String(v)]),
+          )
+        : undefined;
 
     return {
       id,
@@ -190,4 +202,378 @@ function normalizeServerEntry(
   }
 
   return undefined;
+}
+
+/**
+ * Standard locations to search for skill files and directories.
+ */
+export function defaultSkillDiscoveryLocations(
+  options: DiscoveryOptions = {},
+): { dir: string; client: DiscoveredSkill["sourceClient"] }[] {
+  const dirs: { dir: string; client: DiscoveredSkill["sourceClient"] }[] = [];
+
+  if (options.customPaths) {
+    for (const custom of options.customPaths) {
+      dirs.push({ dir: custom, client: "custom" });
+    }
+  }
+
+  if (options.skipDefaults) {
+    return dirs;
+  }
+
+  const home = options.home ?? homedir();
+  const cwd = options.cwd ?? process.cwd();
+
+  // Copilot skills
+  dirs.push(
+    { dir: resolve(cwd, ".github", "skills"), client: "copilot" },
+    { dir: resolve(cwd, ".copilot", "skills"), client: "copilot" },
+    { dir: resolve(cwd, "skills"), client: "copilot" },
+    { dir: resolve(home, ".copilot", "skills"), client: "copilot" },
+  );
+
+  // Claude & Agent skills
+  dirs.push(
+    { dir: resolve(cwd, ".claude", "skills"), client: "claude" },
+    { dir: resolve(cwd, ".agents", "skills"), client: "agents" },
+    { dir: resolve(cwd, ".gemini", "skills"), client: "agents" },
+    { dir: resolve(home, ".agents", "skills"), client: "agents" },
+  );
+
+  // Cursor rules directory
+  dirs.push({ dir: resolve(cwd, ".cursor", "rules"), client: "cursor" });
+
+  return dirs;
+}
+
+/**
+ * Parses markdown skill content and extracts YAML frontmatter, summary, and instructions.
+ */
+export function parseSkillContent(
+  rawContent: string,
+  filePath: string,
+  sourceClient: DiscoveredSkill["sourceClient"],
+): DiscoveredSkill {
+  const trimmed = rawContent.trim();
+  let name = "";
+  let summary = "";
+  let description = trimmed;
+  const tags: string[] = [];
+
+  // Parse YAML-like frontmatter if present: --- ... ---
+  if (trimmed.startsWith("---")) {
+    const secondDelim = trimmed.indexOf("\n---", 3);
+    if (secondDelim !== -1) {
+      const frontmatter = trimmed.slice(3, secondDelim).trim();
+      description = trimmed.slice(secondDelim + 4).trim();
+
+      const lines = frontmatter.split("\n");
+      let currentKey = "";
+      let inMultiline = false;
+      let multilineVal = "";
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (inMultiline) {
+          if (line.startsWith("- ") || line.includes(":")) {
+            inMultiline = false;
+            if (currentKey === "description") summary = multilineVal.trim();
+          } else {
+            multilineVal += " " + line;
+            continue;
+          }
+        }
+
+        if (line.startsWith("name:")) {
+          name = line.slice(5).trim().replace(/^["']|["']$/g, "");
+          currentKey = "name";
+        } else if (line.startsWith("description:")) {
+          const val = line.slice(12).trim().replace(/^["']|["']$/g, "");
+          if (val === ">-" || val === "|" || val === ">") {
+            inMultiline = true;
+            multilineVal = "";
+          } else {
+            summary = val;
+          }
+          currentKey = "description";
+        } else if (line.startsWith("- ") && currentKey === "tags") {
+          const tag = line.slice(2).trim().replace(/^["']|["']$/g, "");
+          if (tag) tags.push(tag);
+        } else if (line.startsWith("tags:")) {
+          currentKey = "tags";
+          const inlineTags = line.slice(5).trim();
+          if (inlineTags.startsWith("[") && inlineTags.endsWith("]")) {
+            const parsed = inlineTags
+              .slice(1, -1)
+              .split(",")
+              .map((t) => t.trim().replace(/^["']|["']$/g, ""))
+              .filter(Boolean);
+            tags.push(...parsed);
+          }
+        }
+      }
+
+      if (inMultiline && currentKey === "description") {
+        summary = multilineVal.trim();
+      }
+    }
+  }
+
+  // Fallback defaults if frontmatter is absent or sparse
+  if (!name) {
+    const headerMatch = description.match(/^#+\s+(.+)$/m);
+    if (headerMatch && headerMatch[1]) {
+      name = headerMatch[1].trim();
+    } else {
+      const base = basename(filePath, extname(filePath));
+      name = base === "SKILL" ? basename(dirname(filePath)) : base;
+    }
+  }
+
+  if (!summary) {
+    const firstPara = description
+      .split("\n\n")
+      .map((p) => p.trim())
+      .find((p) => p.length > 0 && !p.startsWith("#"));
+    summary = firstPara ? firstPara.slice(0, 160).replace(/\n/g, " ") : name;
+  }
+
+  const normalizedId = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return {
+    id: `skill:${normalizedId}`,
+    name,
+    summary,
+    description,
+    tags: tags.length > 0 ? tags : undefined,
+    trust: "trusted",
+    sourcePath: filePath,
+    sourceClient,
+  };
+}
+
+/**
+ * Scans directories for skills (.md, .mdc, SKILL.md, .cursorrules).
+ */
+export async function discoverSkills(options: DiscoveryOptions = {}): Promise<DiscoveredSkill[]> {
+  const discovered: DiscoveredSkill[] = [];
+  const seenIds = new Set<string>();
+
+  // Check direct .cursorrules in cwd
+  if (!options.skipDefaults) {
+    const cwd = options.cwd ?? process.cwd();
+    const cursorRulesPath = resolve(cwd, ".cursorrules");
+    try {
+      const content = await readFile(cursorRulesPath, "utf8");
+      const skill = parseSkillContent(content, cursorRulesPath, "cursor");
+      skill.id = "skill:cursorrules";
+      skill.name = "Cursor Rules";
+      discovered.push(skill);
+      seenIds.add(skill.id);
+    } catch {
+      // Missing .cursorrules is normal
+    }
+  }
+
+  const locations = defaultSkillDiscoveryLocations(options);
+
+  for (const { dir, client } of locations) {
+    try {
+      const st = await stat(dir);
+      if (!st.isDirectory()) {
+        if (st.isFile()) {
+          const content = await readFile(dir, "utf8");
+          const skill = parseSkillContent(content, dir, client);
+          if (!seenIds.has(skill.id)) {
+            seenIds.add(skill.id);
+            discovered.push(skill);
+          }
+        }
+        continue;
+      }
+
+      const entries = await readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          // Look for SKILL.md inside skill subdirectory
+          const skillMdPath = join(fullPath, "SKILL.md");
+          try {
+            const content = await readFile(skillMdPath, "utf8");
+            const skill = parseSkillContent(content, skillMdPath, client);
+            if (!seenIds.has(skill.id)) {
+              seenIds.add(skill.id);
+              discovered.push(skill);
+            }
+          } catch {
+            // No SKILL.md in this directory
+          }
+        } else if (entry.isFile()) {
+          const ext = extname(entry.name);
+          if (ext === ".md" || ext === ".mdc") {
+            const content = await readFile(fullPath, "utf8");
+            const skill = parseSkillContent(content, fullPath, client);
+            if (!seenIds.has(skill.id)) {
+              seenIds.add(skill.id);
+              discovered.push(skill);
+            }
+          }
+        }
+      }
+    } catch {
+      // Directory missing or unreadable
+    }
+  }
+
+  return discovered;
+}
+
+/**
+ * Discovers Copilot and agent plugins (e.g. plugin.json).
+ */
+export async function discoverPlugins(options: DiscoveryOptions = {}): Promise<DiscoveredPlugin[]> {
+  const discovered: DiscoveredPlugin[] = [];
+  const candidatePaths: string[] = [];
+
+  if (options.customPaths) {
+    for (const custom of options.customPaths) {
+      if (basename(custom) === "plugin.json") {
+        candidatePaths.push(custom);
+      } else {
+        candidatePaths.push(resolve(custom, "plugin.json"));
+      }
+    }
+  }
+
+  if (!options.skipDefaults) {
+    const cwd = options.cwd ?? process.cwd();
+    const home = options.home ?? homedir();
+
+    candidatePaths.push(
+      resolve(cwd, "plugin.json"),
+      resolve(cwd, "packages", "copilot-plugin", "plugin.json"),
+      resolve(home, ".copilot", "plugins"),
+    );
+  }
+
+  const seenManifests = new Set<string>();
+
+  for (const target of candidatePaths) {
+    try {
+      const st = await stat(target);
+      if (st.isDirectory()) {
+        const entries = await readdir(target, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory()) {
+            const manifest = join(target, entry.name, "plugin.json");
+            await parseAndAddPlugin(manifest, discovered, seenManifests);
+          }
+        }
+      } else if (st.isFile()) {
+        await parseAndAddPlugin(target, discovered, seenManifests);
+      }
+    } catch {
+      // Candidate not found
+    }
+  }
+
+  return discovered;
+}
+
+async function parseAndAddPlugin(
+  manifestPath: string,
+  discovered: DiscoveredPlugin[],
+  seen: Set<string>,
+): Promise<void> {
+  if (seen.has(manifestPath)) return;
+  try {
+    const content = await readFile(manifestPath, "utf8");
+    const doc = JSON.parse(content) as Record<string, unknown>;
+    const name = typeof doc["name"] === "string" ? doc["name"] : basename(dirname(manifestPath));
+    const id = typeof doc["id"] === "string" ? doc["id"] : name;
+    const description = typeof doc["description"] === "string" ? doc["description"] : undefined;
+    const version = typeof doc["version"] === "string" ? doc["version"] : undefined;
+
+    // Servers from plugin
+    const servers: ServerConfig[] = [];
+    const pluginDir = dirname(manifestPath);
+
+    // 1. Direct servers in plugin.json
+    if (doc["mcpServers"] || doc["servers"]) {
+      const parsed = parseMcpServersBlock(doc, manifestPath, "copilot");
+      servers.push(...parsed);
+    }
+
+    // 2. Adjacent .mcp.json
+    const adjacentMcp = join(pluginDir, ".mcp.json");
+    try {
+      const mcpContent = await readFile(adjacentMcp, "utf8");
+      const mcpDoc = JSON.parse(mcpContent) as Record<string, unknown>;
+      const parsed = parseMcpServersBlock(mcpDoc, adjacentMcp, "copilot");
+      for (const s of parsed) {
+        if (!servers.some((existing) => existing.id === s.id)) {
+          servers.push(s);
+        }
+      }
+    } catch {
+      // No adjacent .mcp.json
+    }
+
+    // Skills from plugin
+    const skills: SkillConfig[] = [];
+    if (Array.isArray(doc["skills"])) {
+      for (const item of doc["skills"]) {
+        if (typeof item === "string") {
+          const skillDir = resolve(pluginDir, item);
+          const skillMd = join(skillDir, "SKILL.md");
+          try {
+            const skillContent = await readFile(skillMd, "utf8");
+            skills.push(parseSkillContent(skillContent, skillMd, "copilot"));
+          } catch {
+            // Path might be a direct file
+            try {
+              const fileContent = await readFile(skillDir, "utf8");
+              skills.push(parseSkillContent(fileContent, skillDir, "copilot"));
+            } catch {
+              // Not found
+            }
+          }
+        }
+      }
+    }
+
+    seen.add(manifestPath);
+    discovered.push({
+      id,
+      name,
+      description,
+      version,
+      manifestPath,
+      servers,
+      skills,
+    });
+  } catch {
+    // Malformed plugin manifest
+  }
+}
+
+/**
+ * Unified discovery for MCP servers, skills, and plugins across the environment.
+ */
+export async function discoverAll(options: DiscoveryOptions = {}): Promise<{
+  servers: DiscoveredServer[];
+  skills: DiscoveredSkill[];
+  plugins: DiscoveredPlugin[];
+}> {
+  const [servers, skills, plugins] = await Promise.all([
+    discoverMcpServers(options),
+    discoverSkills(options),
+    discoverPlugins(options),
+  ]);
+
+  return { servers, skills, plugins };
 }

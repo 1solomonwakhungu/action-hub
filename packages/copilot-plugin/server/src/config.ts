@@ -2,11 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import type { Bundle, ServerConfig, TrustTier } from "@action-hub/core";
+import type { Bundle, ServerConfig, SkillConfig, TrustTier } from "@action-hub/core";
 import { discoverMcpServers } from "@action-hub/core";
 
 export interface HubConfigFile {
   servers?: unknown;
+  skills?: unknown;
   bundles?: unknown;
   autoApproveAtOrAbove?: unknown;
   approvalTtlSeconds?: unknown;
@@ -15,6 +16,7 @@ export interface HubConfigFile {
 
 export interface HubConfig {
   servers: ServerConfig[];
+  skills: SkillConfig[];
   bundles: Bundle[];
   autoApproveAtOrAbove: TrustTier;
   /** Lifetime of an approval token, in milliseconds. */
@@ -53,6 +55,7 @@ export async function loadConfig(path: string): Promise<HubConfig> {
   }
 
   const explicitServers = parseServers(parsed.servers, `Action Hub config at ${path}`);
+  const explicitSkills = parseSkills(parsed.skills, `Action Hub config at ${path}`);
   const explicitBundles = parseBundles(parsed.bundles, `Action Hub config at ${path}`);
   const autoDiscoverEnabled = parsed.autoDiscover !== false;
 
@@ -74,6 +77,7 @@ export async function loadConfig(path: string): Promise<HubConfig> {
 
   return {
     servers: allServers,
+    skills: explicitSkills,
     bundles: explicitBundles,
     autoApproveAtOrAbove: isTrust(parsed.autoApproveAtOrAbove)
       ? parsed.autoApproveAtOrAbove
@@ -98,93 +102,33 @@ function parseApprovalTtl(value: unknown): number {
  * same parser the on-disk config does before it is registered or persisted.
  */
 export function parseServerEntry(entry: unknown, label = "server"): ServerConfig {
-  const parsed = parseServers([entry], label);
-  const config = parsed[0];
-  if (!config) throw new Error(`${label}: a server entry is required`);
-  return config;
-}
-
-/**
- * Reads the config file without normalizing or expanding anything.
- *
- * Mutations are applied to this raw form so that `${ENV_VAR}` references and
- * any keys this version does not understand survive a write-back instead of
- * being replaced by their expanded values.
- */
-export async function readRawConfig(path: string): Promise<Record<string, unknown>> {
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch (cause) {
-    if (isNotFound(cause)) return {};
-    throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
+  if (!isRecord(entry)) {
+    throw new Error(`${label} must be a JSON object`);
   }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (cause) {
-    throw new Error(`Action Hub config at ${path} is not valid JSON: ${message(cause)}`);
+  const id = entry["id"];
+  if (typeof id !== "string" || id.length === 0) {
+    throw new Error(`${label}.id must be a non-empty string`);
   }
+  const transport = parseTransport(entry["transport"], "transport", label);
+  const trust = entry["trust"];
+  const timeoutMs =
+    typeof entry["timeoutMs"] === "number" && entry["timeoutMs"] > 0
+      ? entry["timeoutMs"]
+      : undefined;
 
-  if (!isRecord(parsed)) {
-    throw new Error(`Action Hub config at ${path} must contain a JSON object`);
-  }
-  return parsed;
+  return {
+    id,
+    displayName: typeof entry["displayName"] === "string" ? entry["displayName"] : undefined,
+    transport,
+    trust: isTrust(trust) ? trust : "untrusted",
+    enabled: entry["enabled"] === undefined ? true : entry["enabled"] !== false,
+    allowTools: parseStringArray(entry["allowTools"]),
+    denyTools: parseStringArray(entry["denyTools"]),
+    timeoutMs,
+  };
 }
 
-/** Reads the `servers` array out of a raw config document. */
-export function rawServers(config: Record<string, unknown>): Record<string, unknown>[] {
-  const value = config["servers"];
-  if (!Array.isArray(value)) return [];
-  return value.filter(isRecord);
-}
-
-/**
- * Persists a raw config document atomically, matching the snapshot writer, so
- * a concurrently reading canvas can never observe a half-written file.
- */
-export async function writeRawConfig(
-  path: string,
-  config: Record<string, unknown>,
-): Promise<void> {
-  await enqueueMutation(path, () => writeRawConfigFile(path, config));
-}
-
-export async function mutateRawConfig(
-  path: string,
-  mutate: (config: Record<string, unknown>) => void,
-): Promise<void> {
-  await enqueueMutation(path, async () => {
-    const config = await readRawConfig(path);
-    mutate(config);
-    await writeRawConfigFile(path, config);
-  });
-}
-
-async function enqueueMutation(path: string, mutation: () => Promise<void>): Promise<void> {
-  const previous = mutationChains.get(path) ?? Promise.resolve();
-  const current = previous.catch(() => undefined).then(mutation);
-  mutationChains.set(path, current);
-  try {
-    await current;
-  } finally {
-    if (mutationChains.get(path) === current) mutationChains.delete(path);
-  }
-}
-
-async function writeRawConfigFile(
-  path: string,
-  config: Record<string, unknown>,
-): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const mode = await stat(path).then((entry) => entry.mode & 0o777).catch(() => 0o600);
-  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temp, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode });
-  await rename(temp, path);
-}
-
-function parseServers(value: unknown, label: string): ServerConfig[] {
+export function parseServers(value: unknown, label: string): ServerConfig[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
     throw new Error(`${label}: "servers" must be an array`);
@@ -206,9 +150,10 @@ function parseServers(value: unknown, label: string): ServerConfig[] {
 
     const transport = parseTransport(entry["transport"], `servers[${index}]`, label);
     const trust = entry["trust"];
-    const timeoutMs = typeof entry["timeoutMs"] === "number" && entry["timeoutMs"] > 0
-      ? entry["timeoutMs"]
-      : undefined;
+    const timeoutMs =
+      typeof entry["timeoutMs"] === "number" && entry["timeoutMs"] > 0
+        ? entry["timeoutMs"]
+        : undefined;
 
     return {
       id,
@@ -220,6 +165,45 @@ function parseServers(value: unknown, label: string): ServerConfig[] {
       denyTools: parseStringArray(entry["denyTools"]),
       timeoutMs,
     } satisfies ServerConfig;
+  });
+}
+
+export function parseSkills(value: unknown, label: string): SkillConfig[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`${label}: "skills" must be an array`);
+  }
+
+  const seen = new Set<string>();
+  return value.map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw new Error(`${label}: skills[${index}] must be an object`);
+    }
+    const id = entry["id"];
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error(`${label}: skills[${index}].id must be a non-empty string`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`${label}: duplicate skill id "${id}"`);
+    }
+    seen.add(id);
+
+    const name = typeof entry["name"] === "string" ? entry["name"] : id;
+    const summary = typeof entry["summary"] === "string" ? entry["summary"] : name;
+    const description = typeof entry["description"] === "string" ? entry["description"] : summary;
+    const tags = parseStringArray(entry["tags"]);
+    const trust = entry["trust"];
+
+    return {
+      id,
+      name,
+      summary,
+      description,
+      tags: tags ?? undefined,
+      trust: isTrust(trust) ? trust : "trusted",
+      sourcePath: typeof entry["sourcePath"] === "string" ? entry["sourcePath"] : undefined,
+      sourceClient: typeof entry["sourceClient"] === "string" ? entry["sourceClient"] : undefined,
+    } satisfies SkillConfig;
   });
 }
 
@@ -337,4 +321,77 @@ function isNotFound(cause: unknown): boolean {
 
 function message(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+export async function readRawConfig(path: string): Promise<Record<string, unknown>> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (cause) {
+    if (isNotFound(cause)) return {};
+    throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (cause) {
+    throw new Error(`Action Hub config at ${path} is not valid JSON: ${message(cause)}`);
+  }
+
+  if (!isRecord(parsed)) {
+    throw new Error(`Action Hub config at ${path} must contain a JSON object`);
+  }
+  return parsed;
+}
+
+/** Reads the `servers` array out of a raw config document. */
+export function rawServers(config: Record<string, unknown>): Record<string, unknown>[] {
+  const value = config["servers"];
+  if (!Array.isArray(value)) return [];
+  return value.filter(isRecord);
+}
+
+/**
+ * Persists a raw config document atomically, matching the snapshot writer, so
+ * a concurrently reading canvas can never observe a half-written file.
+ */
+export async function writeRawConfig(
+  path: string,
+  config: Record<string, unknown>,
+): Promise<void> {
+  await enqueueMutation(path, () => writeRawConfigFile(path, config));
+}
+
+export async function mutateRawConfig(
+  path: string,
+  mutate: (config: Record<string, unknown>) => void,
+): Promise<void> {
+  await enqueueMutation(path, async () => {
+    const config = await readRawConfig(path);
+    mutate(config);
+    await writeRawConfigFile(path, config);
+  });
+}
+
+async function enqueueMutation(path: string, mutation: () => Promise<void>): Promise<void> {
+  const previous = mutationChains.get(path) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(mutation);
+  mutationChains.set(path, current);
+  try {
+    await current;
+  } finally {
+    if (mutationChains.get(path) === current) mutationChains.delete(path);
+  }
+}
+
+async function writeRawConfigFile(
+  path: string,
+  config: Record<string, unknown>,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const serialized = JSON.stringify(config, null, 2) + "\n";
+  const tempPath = `${path}.${randomUUID()}.tmp`;
+  await writeFile(tempPath, serialized, { encoding: "utf8", mode: 0o600 });
+  await rename(tempPath, path);
 }
