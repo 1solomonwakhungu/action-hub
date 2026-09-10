@@ -3,7 +3,7 @@ import { CATALOG_CACHE_VERSION, type PersistedCatalog } from "./catalog/persiste
 import { BundleRegistry, type Bundle } from "./bundles/bundles.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
-import { ConnectionManager } from "./servers/connection-manager.js";
+import { ConnectionManager, type ConnectionManagerOptions } from "./servers/connection-manager.js";
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
 import { ApprovalRegistry, type ApprovalRegistryOptions } from "./permissions/approvals.js";
 import { validateArguments } from "./router/validate.js";
@@ -54,6 +54,8 @@ export interface ActionHubOptions {
   denyOnApprovalRequired?: boolean;
   /** Token lifetime and clock for the approval gate. */
   approvals?: ApprovalRegistryOptions;
+  /** Circuit breaker, heartbeat, restart backoff, and memory-limit defaults. */
+  resilience?: ConnectionManagerOptions;
 }
 
 export interface ExecuteOptions {
@@ -99,7 +101,11 @@ export class ActionHub {
   readonly #approvals: ApprovalRegistry;
 
   constructor(options: ActionHubOptions) {
-    this.#connections = new ConnectionManager(options.clientFactory, options.servers ?? []);
+    this.#connections = new ConnectionManager(
+      options.clientFactory,
+      options.servers ?? [],
+      options.resilience ?? {},
+    );
     this.#bundles = new BundleRegistry(options.bundles ?? []);
     this.#defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS;
     this.#search = new SearchEngine(this.#catalog);

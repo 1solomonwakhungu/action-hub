@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
-import type { Bundle, ServerConfig, SkillConfig, TrustTier } from "@action-hub/core";
+import type {
+  Bundle,
+  CircuitBreakerConfig,
+  HeartbeatConfig,
+  RestartBackoffConfig,
+  ServerConfig,
+  SkillConfig,
+  TrustTier,
+} from "@action-hub/core";
 import { discoverMcpServers } from "@action-hub/core";
 
 export interface HubConfigFile {
@@ -110,22 +118,7 @@ export function parseServerEntry(entry: unknown, label = "server"): ServerConfig
     throw new Error(`${label}.id must be a non-empty string`);
   }
   const transport = parseTransport(entry["transport"], "transport", label);
-  const trust = entry["trust"];
-  const timeoutMs =
-    typeof entry["timeoutMs"] === "number" && entry["timeoutMs"] > 0
-      ? entry["timeoutMs"]
-      : undefined;
-
-  return {
-    id,
-    displayName: typeof entry["displayName"] === "string" ? entry["displayName"] : undefined,
-    transport,
-    trust: isTrust(trust) ? trust : "untrusted",
-    enabled: entry["enabled"] === undefined ? true : entry["enabled"] !== false,
-    allowTools: parseStringArray(entry["allowTools"]),
-    denyTools: parseStringArray(entry["denyTools"]),
-    timeoutMs,
-  };
+  return parseServerFields(entry, id, transport);
 }
 
 export function parseServers(value: unknown, label: string): ServerConfig[] {
@@ -149,23 +142,64 @@ export function parseServers(value: unknown, label: string): ServerConfig[] {
     seen.add(id);
 
     const transport = parseTransport(entry["transport"], `servers[${index}]`, label);
-    const trust = entry["trust"];
-    const timeoutMs =
-      typeof entry["timeoutMs"] === "number" && entry["timeoutMs"] > 0
-        ? entry["timeoutMs"]
-        : undefined;
-
-    return {
-      id,
-      displayName: typeof entry["displayName"] === "string" ? entry["displayName"] : undefined,
-      transport,
-      trust: isTrust(trust) ? trust : "untrusted",
-      enabled: entry["enabled"] === undefined ? true : entry["enabled"] !== false,
-      allowTools: parseStringArray(entry["allowTools"]),
-      denyTools: parseStringArray(entry["denyTools"]),
-      timeoutMs,
-    } satisfies ServerConfig;
+    return parseServerFields(entry, id, transport);
   });
+}
+
+function parseServerFields(
+  entry: Record<string, unknown>,
+  id: string,
+  transport: ServerConfig["transport"],
+): ServerConfig {
+  const trust = entry["trust"];
+  return {
+    id,
+    displayName: typeof entry["displayName"] === "string" ? entry["displayName"] : undefined,
+    transport,
+    trust: isTrust(trust) ? trust : "untrusted",
+    enabled: entry["enabled"] === undefined ? true : entry["enabled"] !== false,
+    allowTools: parseStringArray(entry["allowTools"]),
+    denyTools: parseStringArray(entry["denyTools"]),
+    timeoutMs: parsePositiveNumber(entry["timeoutMs"]),
+    circuitBreaker: parseCircuitBreaker(entry["circuitBreaker"]),
+    restartBackoff: parseRestartBackoff(entry["restartBackoff"]),
+    heartbeat: parseHeartbeat(entry["heartbeat"]),
+    maxOldSpaceSizeMb: parsePositiveNumber(entry["maxOldSpaceSizeMb"]),
+  } satisfies ServerConfig;
+}
+
+function parsePositiveNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return undefined;
+  return value;
+}
+
+function parseCircuitBreaker(value: unknown): CircuitBreakerConfig | undefined {
+  if (!isRecord(value)) return undefined;
+  const failureThreshold = parsePositiveNumber(value["failureThreshold"]);
+  const cooldownMs = parsePositiveNumber(value["cooldownMs"]);
+  if (failureThreshold === undefined && cooldownMs === undefined) return undefined;
+  return { failureThreshold, cooldownMs };
+}
+
+function parseRestartBackoff(value: unknown): RestartBackoffConfig | undefined {
+  if (!isRecord(value)) return undefined;
+  const initialMs = parsePositiveNumber(value["initialMs"]);
+  const maxMs = parsePositiveNumber(value["maxMs"]);
+  const jitter =
+    typeof value["jitter"] === "number" && Number.isFinite(value["jitter"]) && value["jitter"] >= 0
+      ? Math.min(1, value["jitter"])
+      : undefined;
+  if (initialMs === undefined && maxMs === undefined && jitter === undefined) return undefined;
+  return { initialMs, maxMs, jitter };
+}
+
+function parseHeartbeat(value: unknown): HeartbeatConfig | undefined {
+  if (!isRecord(value)) return undefined;
+  const enabled = typeof value["enabled"] === "boolean" ? value["enabled"] : undefined;
+  const intervalMs = parsePositiveNumber(value["intervalMs"]);
+  const timeoutMs = parsePositiveNumber(value["timeoutMs"]);
+  if (enabled === undefined && intervalMs === undefined && timeoutMs === undefined) return undefined;
+  return { enabled, intervalMs, timeoutMs };
 }
 
 export function parseSkills(value: unknown, label: string): SkillConfig[] {

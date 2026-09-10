@@ -1,15 +1,41 @@
 import type {
+  CircuitState,
+  HeartbeatConfig,
   McpClient,
   McpClientFactory,
+  RestartBackoffConfig,
   ServerConfig,
   ServerState,
   ServerStatus,
   TrustTier,
 } from "../types.js";
+import {
+  computeRestartBackoffMs,
+  DEFAULT_BACKOFF_INITIAL_MS,
+  DEFAULT_BACKOFF_JITTER,
+  DEFAULT_BACKOFF_MAX_MS,
+} from "./restart-backoff.js";
 
 export interface CircuitBreakerOptions {
   failureThreshold?: number;
   cooldownMs?: number;
+}
+
+export interface TimerHandle {
+  unref?: () => unknown;
+}
+
+export interface ConnectionManagerHooks {
+  now?: () => number;
+  random?: () => number;
+  setTimeout?: (handler: () => void, ms: number) => TimerHandle;
+  clearTimeout?: (handle: TimerHandle) => void;
+}
+
+export interface ConnectionManagerOptions extends CircuitBreakerOptions, ConnectionManagerHooks {
+  heartbeat?: HeartbeatConfig;
+  restartBackoff?: RestartBackoffConfig;
+  maxOldSpaceSizeMb?: number;
 }
 
 export interface HealthCheckResult {
@@ -17,6 +43,7 @@ export interface HealthCheckResult {
   status: ServerStatus;
   latencyMs?: number;
   error?: string;
+  circuitState?: CircuitState;
 }
 
 interface Entry {
@@ -31,11 +58,22 @@ interface Entry {
   consecutiveFailures: number;
   lastFailureTime?: number;
   lastLatencyMs?: number;
+  circuitState: CircuitState;
+  halfOpen: boolean;
+  generation: number;
+  restartAttempt: number;
+  autoRestart: boolean;
+  manualShutdown: boolean;
+  restartTimer?: TimerHandle;
+  heartbeatTimer?: TimerHandle;
+  nextRestartAt?: number;
+  lastHeartbeatAt?: number;
 }
 
 const DEFAULT_FAILURE_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 10_000;
-const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
 
 /**
  * Owns the lifecycle of downstream MCP servers.
@@ -49,15 +87,36 @@ export class ConnectionManager {
   readonly #factory: McpClientFactory;
   readonly #failureThreshold: number;
   readonly #cooldownMs: number;
+  readonly #heartbeat: HeartbeatConfig;
+  readonly #restartBackoff: RestartBackoffConfig;
+  readonly #maxOldSpaceSizeMb?: number;
+  readonly #now: () => number;
+  readonly #random: () => number;
+  readonly #setTimeout: (handler: () => void, ms: number) => TimerHandle;
+  readonly #clearTimeout: (handle: TimerHandle) => void;
+  #closed = false;
 
   constructor(
     factory: McpClientFactory,
     configs: readonly ServerConfig[] = [],
-    circuitOptions: CircuitBreakerOptions = {},
+    options: ConnectionManagerOptions = {},
   ) {
     this.#factory = factory;
-    this.#failureThreshold = circuitOptions.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
-    this.#cooldownMs = circuitOptions.cooldownMs ?? DEFAULT_COOLDOWN_MS;
+    this.#failureThreshold = options.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
+    this.#cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
+    this.#heartbeat = options.heartbeat ?? {};
+    this.#restartBackoff = options.restartBackoff ?? {};
+    this.#maxOldSpaceSizeMb = options.maxOldSpaceSizeMb;
+    this.#now = options.now ?? Date.now;
+    this.#random = options.random ?? Math.random;
+    this.#setTimeout =
+      options.setTimeout ??
+      ((handler, ms) => {
+        const handle = setTimeout(handler, ms);
+        handle.unref?.();
+        return handle;
+      });
+    this.#clearTimeout = options.clearTimeout ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
     for (const config of configs) this.register(config);
   }
 
@@ -65,12 +124,7 @@ export class ConnectionManager {
     if (this.#entries.has(config.id)) {
       throw new Error(`Server "${config.id}" is already registered`);
     }
-    this.#entries.set(config.id, {
-      config,
-      status: config.enabled === false ? "disabled" : "inactive",
-      toolCount: 0,
-      consecutiveFailures: 0,
-    });
+    this.#entries.set(config.id, this.#newEntry(config));
   }
 
   getConfig(serverId: string): ServerConfig | undefined {
@@ -101,6 +155,8 @@ export class ConnectionManager {
       void this.deactivate(serverId);
     } else if (entry.status === "disabled") {
       entry.status = "inactive";
+      entry.manualShutdown = true;
+      entry.autoRestart = false;
     }
   }
 
@@ -127,22 +183,28 @@ export class ConnectionManager {
     return this.#entries.get(serverId)?.status;
   }
 
+  circuitState(serverId: string): CircuitState | undefined {
+    const entry = this.#entries.get(serverId);
+    return entry ? this.#circuitState(entry) : undefined;
+  }
+
   isCircuitOpen(serverId: string): boolean {
     const entry = this.#entries.get(serverId);
     if (!entry) return false;
-    if (entry.consecutiveFailures < this.#failureThreshold) return false;
-    if (!entry.lastFailureTime) return false;
-    // Check if cooldown has elapsed
-    const elapsed = Date.now() - entry.lastFailureTime;
-    return elapsed < this.#cooldownMs;
+    return this.#circuitState(entry) === "open";
   }
 
   recordSuccess(serverId: string, latencyMs?: number): void {
     const entry = this.#entries.get(serverId);
-    if (!entry) return;
+    if (!entry || entry.manualShutdown) return;
     entry.consecutiveFailures = 0;
     entry.lastFailureTime = undefined;
     entry.error = undefined;
+    entry.circuitState = "closed";
+    entry.halfOpen = false;
+    entry.restartAttempt = 0;
+    entry.nextRestartAt = undefined;
+    this.#clearRestartTimer(entry);
     if (latencyMs !== undefined) entry.lastLatencyMs = latencyMs;
     if (entry.status !== "disabled" && entry.client) {
       entry.status = "ready";
@@ -151,15 +213,20 @@ export class ConnectionManager {
 
   recordFailure(serverId: string, error?: string): void {
     const entry = this.#entries.get(serverId);
-    if (!entry) return;
+    if (!entry || entry.manualShutdown || entry.config.enabled === false) return;
     entry.consecutiveFailures += 1;
-    entry.lastFailureTime = Date.now();
+    entry.lastFailureTime = this.#now();
     entry.error = error;
-    if (entry.consecutiveFailures >= this.#failureThreshold) {
+    entry.halfOpen = false;
+    const threshold = this.#threshold(entry);
+    if (entry.consecutiveFailures >= threshold) {
+      entry.circuitState = "open";
       entry.status = "unreachable";
-    } else if (entry.consecutiveFailures > 1) {
+    } else if (entry.consecutiveFailures > 1 || entry.client) {
+      entry.circuitState = "closed";
       entry.status = "degraded";
     } else {
+      entry.circuitState = "closed";
       entry.status = "error";
     }
   }
@@ -170,6 +237,11 @@ export class ConnectionManager {
     entry.consecutiveFailures = 0;
     entry.lastFailureTime = undefined;
     entry.error = undefined;
+    entry.circuitState = "closed";
+    entry.halfOpen = false;
+    entry.restartAttempt = 0;
+    entry.nextRestartAt = undefined;
+    this.#clearRestartTimer(entry);
     if (entry.status !== "disabled") {
       entry.status = entry.client ? "ready" : "inactive";
     }
@@ -180,37 +252,69 @@ export class ConnectionManager {
    * share a single in-flight connection attempt.
    */
   async activate(serverId: string): Promise<McpClient> {
+    if (this.#closed) {
+      throw new Error("Connection manager is closed");
+    }
     const entry = this.#requireEntry(serverId);
 
     if (entry.config.enabled === false) {
       throw new Error(`Server "${serverId}" is disabled`);
     }
 
-    if (this.isCircuitOpen(serverId)) {
+    if (entry.client) return entry.client;
+    if (entry.pending) return entry.pending;
+
+    const state = this.#circuitState(entry);
+    if (state === "open") {
       throw new Error(
         `Circuit breaker open for server "${serverId}": too many consecutive failures. Cooling down.`,
       );
     }
 
-    if (entry.client) return entry.client;
-    if (entry.pending) return entry.pending;
+    entry.manualShutdown = false;
+    entry.autoRestart = true;
+    this.#clearRestartTimer(entry);
 
-    entry.status = entry.status === "unreachable" ? "reconnecting" : "connecting";
+    if (state === "half-open") {
+      entry.halfOpen = true;
+      entry.circuitState = "half-open";
+    }
+
+    entry.status = entry.status === "unreachable" || state === "half-open" ? "reconnecting" : "connecting";
     entry.error = undefined;
 
-    const pending = this.#factory(entry.config)
-      .then((client) => {
+    const generation = ++entry.generation;
+    const config = this.#factoryConfig(entry);
+
+    const pending = this.#factory(config)
+      .then(async (client) => {
+        if (this.#closed || entry.generation !== generation || entry.manualShutdown || entry.config.enabled === false) {
+          try {
+            await client.close();
+          } catch {
+            // Discarded connect after shutdown must not surface.
+          }
+          throw new Error(`Server "${serverId}" was shut down during connect`);
+        }
         entry.client = client;
         entry.status = "ready";
-        entry.lastActivatedAt = new Date().toISOString();
+        entry.lastActivatedAt = new Date(this.#now()).toISOString();
         entry.consecutiveFailures = 0;
         entry.lastFailureTime = undefined;
+        entry.circuitState = "closed";
+        entry.halfOpen = false;
+        entry.restartAttempt = 0;
+        entry.nextRestartAt = undefined;
         entry.pending = undefined;
+        entry.error = undefined;
+        this.#startHeartbeat(entry);
         return client;
       })
       .catch((cause: unknown) => {
+        if (entry.pending === pending) entry.pending = undefined;
+        if (entry.generation !== generation) throw cause;
         this.recordFailure(serverId, cause instanceof Error ? cause.message : String(cause));
-        entry.pending = undefined;
+        this.#scheduleRestart(entry);
         throw cause;
       });
 
@@ -221,8 +325,20 @@ export class ConnectionManager {
   /** Reconnects a server by deactivating and activating again. */
   async reconnect(serverId: string): Promise<McpClient> {
     const entry = this.#requireEntry(serverId);
+    if (entry.config.enabled === false) {
+      throw new Error(`Server "${serverId}" is disabled`);
+    }
+    if (this.#closed) {
+      throw new Error("Connection manager is closed");
+    }
     entry.status = "reconnecting";
-    await this.deactivate(serverId);
+    entry.manualShutdown = false;
+    entry.autoRestart = true;
+    this.#clearRestartTimer(entry);
+    this.#stopHeartbeat(entry);
+    entry.generation += 1;
+    entry.pending = undefined;
+    await this.#dropClient(entry);
     this.resetCircuit(serverId);
     return this.activate(serverId);
   }
@@ -231,30 +347,33 @@ export class ConnectionManager {
   async checkHealth(serverId: string): Promise<HealthCheckResult> {
     const entry = this.#requireEntry(serverId);
     if (entry.config.enabled === false) {
-      return { serverId, status: "disabled" };
+      return { serverId, status: "disabled", circuitState: this.#circuitState(entry) };
     }
 
-    const start = Date.now();
+    const start = this.#now();
+    let client: McpClient;
     try {
-      const client = await this.activate(serverId);
-      let timer: NodeJS.Timeout | undefined;
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Health check timed out")), HEALTH_CHECK_TIMEOUT_MS);
-      });
+      client = await this.activate(serverId);
+    } catch (cause) {
+      const error = cause instanceof Error ? cause.message : String(cause);
+      return { serverId, status: entry.status, error, circuitState: this.#circuitState(entry) };
+    }
 
-      try {
-        await Promise.race([client.listTools(), timeoutPromise]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-
-      const latencyMs = Date.now() - start;
+    try {
+      await this.#probe(entry, client);
+      const latencyMs = Math.max(0, this.#now() - start);
       this.recordSuccess(serverId, latencyMs);
-      return { serverId, status: "ready", latencyMs };
+      entry.lastHeartbeatAt = this.#now();
+      return { serverId, status: "ready", latencyMs, circuitState: this.#circuitState(entry) };
     } catch (cause) {
       const error = cause instanceof Error ? cause.message : String(cause);
       this.recordFailure(serverId, error);
-      return { serverId, status: entry.status, error };
+      if (this.#circuitState(entry) === "open") {
+        this.#stopHeartbeat(entry);
+        await this.#dropClient(entry);
+        this.#scheduleRestart(entry);
+      }
+      return { serverId, status: entry.status, error, circuitState: this.#circuitState(entry) };
     }
   }
 
@@ -265,41 +384,216 @@ export class ConnectionManager {
 
   async deactivate(serverId: string): Promise<void> {
     const entry = this.#entries.get(serverId);
-    if (!entry?.client) return;
-    const client = entry.client;
-    entry.client = undefined;
-    if (entry.status === "ready" || entry.status === "connecting" || entry.status === "reconnecting") {
-      entry.status = "inactive";
-    }
-    try {
-      await client.close();
-    } catch {
-      // A downstream server that fails to close cleanly must not prevent the
-      // hub from releasing its reference.
-    }
+    if (!entry) return;
+    entry.manualShutdown = true;
+    entry.autoRestart = false;
+    this.#clearRestartTimer(entry);
+    this.#stopHeartbeat(entry);
+    entry.generation += 1;
+    entry.pending = undefined;
+    await this.#dropClient(entry);
+    if (entry.status !== "disabled") entry.status = "inactive";
+    entry.nextRestartAt = undefined;
   }
 
   async closeAll(): Promise<void> {
+    this.#closed = true;
     await Promise.all([...this.#entries.keys()].map((id) => this.deactivate(id)));
   }
 
   states(): ServerState[] {
-    return [...this.#entries.values()].map((entry) => ({
-      id: entry.config.id,
-      displayName: entry.config.displayName ?? entry.config.id,
-      status: entry.status,
-      trust: entry.config.trust ?? "untrusted",
-      toolCount: entry.toolCount,
-      error: entry.error,
-      lastActivatedAt: entry.lastActivatedAt,
-      latencyMs: entry.lastLatencyMs,
-      circuitOpen: this.isCircuitOpen(entry.config.id),
-    }));
+    return [...this.#entries.values()].map((entry) => {
+      const circuitState = this.#circuitState(entry);
+      return {
+        id: entry.config.id,
+        displayName: entry.config.displayName ?? entry.config.id,
+        status: entry.status,
+        trust: entry.config.trust ?? "untrusted",
+        toolCount: entry.toolCount,
+        error: entry.error,
+        lastActivatedAt: entry.lastActivatedAt,
+        latencyMs: entry.lastLatencyMs,
+        circuitOpen: circuitState === "open",
+        circuitState,
+        consecutiveFailures: entry.consecutiveFailures,
+        restartAttempt: entry.restartAttempt,
+        nextRestartAt: entry.nextRestartAt !== undefined ? new Date(entry.nextRestartAt).toISOString() : undefined,
+        lastHeartbeatAt:
+          entry.lastHeartbeatAt !== undefined ? new Date(entry.lastHeartbeatAt).toISOString() : undefined,
+        memoryLimitMb: entry.config.maxOldSpaceSizeMb ?? this.#maxOldSpaceSizeMb,
+      };
+    });
+  }
+
+  #newEntry(config: ServerConfig): Entry {
+    return {
+      config,
+      status: config.enabled === false ? "disabled" : "inactive",
+      toolCount: 0,
+      consecutiveFailures: 0,
+      circuitState: "closed",
+      halfOpen: false,
+      generation: 0,
+      restartAttempt: 0,
+      autoRestart: false,
+      manualShutdown: config.enabled === false,
+    };
   }
 
   #requireEntry(serverId: string): Entry {
     const entry = this.#entries.get(serverId);
     if (!entry) throw new Error(`Unknown server "${serverId}"`);
     return entry;
+  }
+
+  #threshold(entry: Entry): number {
+    return entry.config.circuitBreaker?.failureThreshold ?? this.#failureThreshold;
+  }
+
+  #cooldown(entry: Entry): number {
+    return entry.config.circuitBreaker?.cooldownMs ?? this.#cooldownMs;
+  }
+
+  #circuitState(entry: Entry): CircuitState {
+    if (entry.halfOpen) return "half-open";
+    if (entry.consecutiveFailures < this.#threshold(entry)) return "closed";
+    const lastFailure = entry.lastFailureTime;
+    if (lastFailure === undefined) return "open";
+    if (this.#now() - lastFailure < this.#cooldown(entry)) return "open";
+    return "half-open";
+  }
+
+  #factoryConfig(entry: Entry): ServerConfig {
+    const mb = entry.config.maxOldSpaceSizeMb ?? this.#maxOldSpaceSizeMb;
+    if (mb === undefined || mb === entry.config.maxOldSpaceSizeMb) return entry.config;
+    return { ...entry.config, maxOldSpaceSizeMb: mb };
+  }
+
+  #backoff(entry: Entry): RestartBackoffConfig {
+    return {
+      initialMs: entry.config.restartBackoff?.initialMs ?? this.#restartBackoff.initialMs ?? DEFAULT_BACKOFF_INITIAL_MS,
+      maxMs: entry.config.restartBackoff?.maxMs ?? this.#restartBackoff.maxMs ?? DEFAULT_BACKOFF_MAX_MS,
+      jitter: entry.config.restartBackoff?.jitter ?? this.#restartBackoff.jitter ?? DEFAULT_BACKOFF_JITTER,
+    };
+  }
+
+  #heartbeatOptions(entry: Entry): { enabled: boolean; intervalMs: number; timeoutMs: number } {
+    const cfg = entry.config.heartbeat;
+    return {
+      enabled: cfg?.enabled ?? this.#heartbeat.enabled ?? true,
+      intervalMs: cfg?.intervalMs ?? this.#heartbeat.intervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
+      timeoutMs: cfg?.timeoutMs ?? this.#heartbeat.timeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS,
+    };
+  }
+
+  async #probe(entry: Entry, client: McpClient): Promise<void> {
+    const timeoutMs = this.#heartbeatOptions(entry).timeoutMs;
+    await this.#withTimeout(client.listTools(), timeoutMs, "Health check timed out");
+  }
+
+  async #withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let handle: TimerHandle | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      handle = this.#setTimeout(() => reject(new Error(message)), timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (handle) this.#clearTimeout(handle);
+    }
+  }
+
+  #startHeartbeat(entry: Entry): void {
+    this.#stopHeartbeat(entry);
+    const options = this.#heartbeatOptions(entry);
+    if (!options.enabled) return;
+
+    const tick = (): void => {
+      entry.heartbeatTimer = this.#setTimeout(() => {
+        void this.#heartbeatOnce(entry).finally(() => {
+          if (entry.client && !entry.manualShutdown && !this.#closed) tick();
+        });
+      }, options.intervalMs);
+    };
+    tick();
+  }
+
+  #stopHeartbeat(entry: Entry): void {
+    if (entry.heartbeatTimer) {
+      this.#clearTimeout(entry.heartbeatTimer);
+      entry.heartbeatTimer = undefined;
+    }
+  }
+
+  async #heartbeatOnce(entry: Entry): Promise<void> {
+    if (!entry.client || entry.manualShutdown || this.#closed || entry.config.enabled === false) return;
+    try {
+      const start = this.#now();
+      await this.#probe(entry, entry.client);
+      const latencyMs = Math.max(0, this.#now() - start);
+      this.recordSuccess(entry.config.id, latencyMs);
+      entry.lastHeartbeatAt = this.#now();
+    } catch (cause) {
+      const error = cause instanceof Error ? cause.message : String(cause);
+      this.recordFailure(entry.config.id, error);
+      if (this.#circuitState(entry) === "open") {
+        this.#stopHeartbeat(entry);
+        await this.#dropClient(entry);
+        this.#scheduleRestart(entry);
+      }
+    }
+  }
+
+  #scheduleRestart(entry: Entry): void {
+    if (this.#closed || entry.manualShutdown || !entry.autoRestart || entry.config.enabled === false) return;
+    if (entry.restartTimer || entry.pending || entry.client) return;
+
+    const backoff = this.#backoff(entry);
+    const delay = computeRestartBackoffMs({
+      attempt: entry.restartAttempt,
+      initialMs: backoff.initialMs,
+      maxMs: backoff.maxMs,
+      jitter: backoff.jitter,
+      random: this.#random,
+    });
+    entry.restartAttempt += 1;
+
+    const remainingCooldown =
+      this.#circuitState(entry) === "open"
+        ? Math.max(0, this.#cooldown(entry) - (this.#now() - (entry.lastFailureTime ?? this.#now())))
+        : 0;
+    const wait = Math.max(delay, remainingCooldown);
+    entry.nextRestartAt = this.#now() + wait;
+
+    entry.restartTimer = this.#setTimeout(() => {
+      entry.restartTimer = undefined;
+      entry.nextRestartAt = undefined;
+      if (this.#closed || entry.manualShutdown || !entry.autoRestart || entry.config.enabled === false) return;
+      if (entry.client || entry.pending) return;
+      void this.activate(entry.config.id).catch(() => {
+        // Failure already recorded; another restart is scheduled from activate.
+      });
+    }, wait);
+  }
+
+  #clearRestartTimer(entry: Entry): void {
+    if (entry.restartTimer) {
+      this.#clearTimeout(entry.restartTimer);
+      entry.restartTimer = undefined;
+    }
+    entry.nextRestartAt = undefined;
+  }
+
+  async #dropClient(entry: Entry): Promise<void> {
+    this.#stopHeartbeat(entry);
+    const client = entry.client;
+    entry.client = undefined;
+    if (!client) return;
+    try {
+      await client.close();
+    } catch {
+      // A downstream server that fails to close cleanly must not prevent the
+      // hub from releasing its reference.
+    }
   }
 }

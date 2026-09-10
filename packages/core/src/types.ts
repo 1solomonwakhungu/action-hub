@@ -42,6 +42,44 @@ export interface ServerConfig {
   denyTools?: string[];
   /** Optional timeout in milliseconds for tool executions on this server. */
   timeoutMs?: number;
+  /** Per-server circuit breaker. Overrides hub defaults when set. */
+  circuitBreaker?: CircuitBreakerConfig;
+  /** Per-server restart backoff for crashed or unreachable servers. */
+  restartBackoff?: RestartBackoffConfig;
+  /** Periodic liveness probe for an activated server. */
+  heartbeat?: HeartbeatConfig;
+  /**
+   * Heap cap in megabytes for Node-based stdio servers, applied as
+   * `--max-old-space-size`. Ignored for non-Node commands.
+   */
+  maxOldSpaceSizeMb?: number;
+}
+
+export type CircuitState = "closed" | "open" | "half-open";
+
+export interface CircuitBreakerConfig {
+  /** Consecutive failures before the circuit opens. Default 3. */
+  failureThreshold?: number;
+  /** Milliseconds to fail fast before a half-open probe. Default 10_000. */
+  cooldownMs?: number;
+}
+
+export interface RestartBackoffConfig {
+  /** First restart delay in milliseconds. Default 250. */
+  initialMs?: number;
+  /** Upper bound for the delay, in milliseconds. Default 30_000. */
+  maxMs?: number;
+  /** 0–1. Share of the delay that can be randomized. Default 0.2. */
+  jitter?: number;
+}
+
+export interface HeartbeatConfig {
+  /** Default true once a server is connected. */
+  enabled?: boolean;
+  /** Time between probes in milliseconds. Default 30_000. */
+  intervalMs?: number;
+  /** Probe timeout in milliseconds. Default 5_000. */
+  timeoutMs?: number;
 }
 
 export interface StdioTransport {
@@ -213,6 +251,12 @@ export interface ServerState {
   lastActivatedAt?: string;
   latencyMs?: number;
   circuitOpen?: boolean;
+  circuitState?: CircuitState;
+  consecutiveFailures?: number;
+  restartAttempt?: number;
+  nextRestartAt?: string;
+  lastHeartbeatAt?: string;
+  memoryLimitMb?: number;
 }
 
 export interface HealthCheckResult {
@@ -220,6 +264,7 @@ export interface HealthCheckResult {
   status: ServerStatus;
   latencyMs?: number;
   error?: string;
+  circuitState?: CircuitState;
 }
 
 /** Configuration for an imported or defined skill. */
