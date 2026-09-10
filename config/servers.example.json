@@ -18,6 +18,20 @@
       "id": "linear",
       "displayName": "Linear",
       "trust": "trusted",
+      "maxOldSpaceSizeMb": 512,
+      "heartbeat": {
+        "intervalMs": 30000,
+        "timeoutMs": 5000
+      },
+      "circuitBreaker": {
+        "failureThreshold": 3,
+        "cooldownMs": 10000
+      },
+      "restartBackoff": {
+        "initialMs": 250,
+        "maxMs": 30000,
+        "jitter": 0.2
+      },
       "transport": {
         "type": "stdio",
         "command": "npx",
@@ -29,6 +43,7 @@
       "displayName": "Local filesystem",
       "trust": "untrusted",
       "denyTools": ["write_file", "move_file"],
+      "maxOldSpaceSizeMb": 256,
       "transport": {
         "type": "stdio",
         "command": "npx",
