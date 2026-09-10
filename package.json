@@ -18,9 +18,18 @@
     "test": "npm run test --workspaces --if-present && node --test packages/copilot-plugin/canvas/capability-manager/*.test.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "eval": "npm run eval --workspace @action-hub/core",
-    "clean": "rm -rf packages/*/dist packages/*/*/dist"
+    "build:bundle": "node scripts/bundle.mjs",
+    "build:binary": "node scripts/build-binary.mjs",
+    "dist": "npm run build && npm run build:bundle && npm run build:binary",
+    "smoke:binary": "node scripts/smoke-test.mjs",
+    "checksums": "node scripts/checksums.mjs",
+    "gen:homebrew": "node scripts/gen-homebrew.mjs",
+    "gen:winget": "node scripts/gen-winget.mjs",
+    "clean": "rm -rf packages/*/dist packages/*/*/dist build dist-bin"
   },
   "devDependencies": {
+    "esbuild": "0.24.2",
+    "postject": "1.0.0-alpha.6",
     "typescript": "^5.6.3"
   }
 }

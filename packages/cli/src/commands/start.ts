@@ -1,51 +1,29 @@
-import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { runServer } from "@action-hub/copilot-mcp";
+import { resolvePath } from "../config-loader.js";
 
 export interface StartOptions {
   configPath?: string;
   port?: number;
 }
 
+/**
+ * Runs the Action Hub meta-MCP server on stdio.
+ *
+ * The server runs in-process rather than as a spawned child. This is what makes
+ * the command work identically from `node dist/index.js` and from the bundled
+ * standalone binary, where `process.execPath` is the binary itself and there is
+ * no separate `node` to spawn or server `dist/` on disk to locate.
+ *
+ * stdout is the JSON-RPC channel, so every diagnostic here goes to stderr to
+ * keep the protocol stream clean.
+ */
 export async function startCommand(options: StartOptions = {}): Promise<number> {
-  console.log("Starting Action Hub MCP Server...\n");
+  process.stderr.write("Starting Action Hub MCP server (stdio)...\n");
 
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-
-  // Locate the copilot-mcp server entry point
-  const possiblePaths = [
-    resolve(__dirname, "../../copilot-plugin/server/dist/index.js"),
-    resolve(__dirname, "../../../copilot-plugin/server/dist/index.js"),
-  ];
-
-  let serverScript: string | undefined;
-  for (const p of possiblePaths) {
-    if (existsSync(p)) {
-      serverScript = p;
-      break;
-    }
-  }
-
-  if (!serverScript) {
-    console.error("Could not locate @action-hub/copilot-mcp server build. Please run `npm run build` first.");
-    return 1;
-  }
-
-  const env = { ...process.env };
   if (options.configPath) {
-    env["ACTION_HUB_CONFIG"] = options.configPath;
+    process.env["ACTION_HUB_CONFIG"] = resolvePath(options.configPath);
   }
 
-  const child = spawn(process.execPath, [serverScript], {
-    stdio: "inherit",
-    env,
-  });
-
-  return new Promise((resolve) => {
-    child.on("exit", (code) => {
-      resolve(code ?? 0);
-    });
-  });
+  await runServer();
+  return 0;
 }

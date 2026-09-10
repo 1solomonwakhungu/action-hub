@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-14
+          - target: macos-x64
+            runner: macos-13
+          - target: linux-x64
+            runner: ubuntu-24.04
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: windows-x64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build workspaces
+        run: npm run build
+      - name: Bundle single-file entry
+        run: npm run build:bundle
+      - name: Build standalone binary
+        run: npm run build:binary
+      - name: Smoke test binary
+        run: npm run smoke:binary
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: action-hub-${{ matrix.target }}
+          path: dist-bin/action-hub-*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download all binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          pattern: action-hub-*
+          merge-multiple: true
+      - name: Stage binaries
+        run: |
+          mkdir -p dist-bin
+          find artifacts -type f -name 'action-hub-*' -exec cp {} dist-bin/ \;
+          ls -lh dist-bin
+      - name: Generate checksums
+        run: npm run checksums
+      - name: Generate Homebrew formula
+        run: npm run gen:homebrew -- --version "${TAG#v}"
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+      - name: Generate winget manifests
+        run: npm run gen:winget -- --version "${TAG#v}"
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+      - name: Package manifests
+        run: |
+          cp dist-bin/SHA256SUMS.txt dist-bin/action-hub-SHA256SUMS.txt || true
+          tar -czf dist-bin/winget-manifests.tar.gz -C packaging/winget .
+          cp packaging/homebrew/action-hub.rb dist-bin/action-hub.rb
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ASSETS=(
+            dist-bin/action-hub-macos-arm64
+            dist-bin/action-hub-macos-x64
+            dist-bin/action-hub-linux-x64
+            dist-bin/action-hub-linux-arm64
+            dist-bin/action-hub-windows-x64.exe
+            dist-bin/SHA256SUMS.txt
+            dist-bin/action-hub.rb
+            dist-bin/winget-manifests.tar.gz
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; uploading assets."
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            echo "Creating release $TAG."
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --title "Action Hub $TAG" \
+              --generate-notes
+          fi
+      - name: Publish Homebrew formula to tap
+        if: ${{ env.HOMEBREW_TAP_TOKEN != '' }}
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          TAP_REPO="1solomonwakhungu/homebrew-tap"
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp packaging/homebrew/action-hub.rb tap/Formula/action-hub.rb
+          cd tap
+          git config user.name "action-hub-release[bot]"
+          git config user.email "release@action-hub.invalid"
+          git add Formula/action-hub.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged; nothing to publish."
+          else
+            git commit -m "action-hub ${TAG#v}"
+            git push
+          fi
+      - name: Note winget submission
+        run: |
+          echo "winget manifests attached as winget-manifests.tar.gz."
+          echo "Submit them to microsoft/winget-pkgs via a pull request or wingetcreate;"
+          echo "this requires external credentials and is documented in docs/releasing.md."

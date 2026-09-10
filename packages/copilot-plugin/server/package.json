@@ -5,6 +5,15 @@
   "description": "Meta-MCP server exposing the Action Hub catalog to GitHub Copilot as a single tool",
   "license": "MIT",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
   "bin": {
     "action-hub-mcp": "./dist/index.js"
   },

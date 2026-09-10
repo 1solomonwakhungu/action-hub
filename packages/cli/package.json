@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
+    "@action-hub/copilot-mcp": "*",
     "@action-hub/core": "*",
     "@modelcontextprotocol/sdk": "^1.26.0"
   },
