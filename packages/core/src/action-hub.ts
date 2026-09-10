@@ -7,6 +7,17 @@ import { ConnectionManager, type ConnectionManagerOptions } from "./servers/conn
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
 import { ApprovalRegistry, type ApprovalRegistryOptions } from "./permissions/approvals.js";
 import { validateArguments } from "./router/validate.js";
+import {
+  ActionHubTelemetry,
+  ACTION_HUB_ATTRIBUTES,
+  SpanStatusCode,
+  safeByteLength,
+  trace,
+  context,
+  propagation,
+  type ActionHubTelemetryOptions,
+  type Tracer,
+} from "./telemetry/index.js";
 import type {
   ActionRecord,
   ExecuteResult,
@@ -26,6 +37,16 @@ export interface ActionHubOptions {
   bundles?: readonly Bundle[];
   clientFactory: McpClientFactory;
   policy?: PolicyOptions;
+  /**
+   * Optional OpenTelemetry configuration for Action Hub spans.
+   * When omitted, uses the OpenTelemetry API's default/global tracer,
+   * which safely no-ops unless an SDK/exporter is configured by the host.
+   */
+  telemetry?: ActionHubTelemetryOptions;
+  /**
+   * Shorthand to pass a custom Tracer directly.
+   */
+  tracer?: Tracer;
   /**
    * Default timeout in milliseconds for downstream tool execution.
    * Defaults to 30,000ms (30s) if not specified.
@@ -99,6 +120,7 @@ export class ActionHub {
   /** Undefined when the caller supplied their own scorer or disabled scoring. */
   readonly #semanticIndex?: LocalSemanticIndex;
   readonly #approvals: ApprovalRegistry;
+  readonly #telemetry: ActionHubTelemetry;
 
   constructor(options: ActionHubOptions) {
     this.#connections = new ConnectionManager(
@@ -108,6 +130,7 @@ export class ActionHub {
     );
     this.#bundles = new BundleRegistry(options.bundles ?? []);
     this.#defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS;
+    this.#telemetry = new ActionHubTelemetry(options.telemetry, options.tracer);
     this.#search = new SearchEngine(this.#catalog);
     if (options.semanticWeight !== undefined) {
       this.#search.setSemanticWeight(options.semanticWeight);
@@ -138,6 +161,10 @@ export class ActionHub {
 
   get connections(): ConnectionManager {
     return this.#connections;
+  }
+
+  get telemetry(): ActionHubTelemetry {
+    return this.#telemetry;
   }
 
   /**
@@ -222,60 +249,134 @@ export class ActionHub {
 
   /** Cheap, schema-free retrieval. */
   async search(query: string, options?: SearchOptions): Promise<SearchHit[]> {
-    return this.#search.search(query, options);
+    return this.#telemetry.withActiveSpan(
+      "action_hub.search",
+      {
+        attributes: {
+          [ACTION_HUB_ATTRIBUTES.OPERATION]: "search",
+          [ACTION_HUB_ATTRIBUTES.SEARCH_QUERY_LENGTH]: query.length,
+          [ACTION_HUB_ATTRIBUTES.SEARCH_LIMIT]: options?.limit ?? 10,
+          [ACTION_HUB_ATTRIBUTES.SEARCH_INCLUDE_SCHEMA]: options?.includeSchema ?? false,
+          ...(options?.serverIds
+            ? { [ACTION_HUB_ATTRIBUTES.SEARCH_SERVER_FILTER]: options.serverIds }
+            : {}),
+          ...(options?.minTrust
+            ? { [ACTION_HUB_ATTRIBUTES.SEARCH_MIN_TRUST]: options.minTrust }
+            : {}),
+        },
+      },
+      async (span) => {
+        const hits = await this.#search.search(query, options);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.SEARCH_RESULT_COUNT, hits.length);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "ok");
+        span.setStatus({ code: SpanStatusCode.OK });
+        return hits;
+      },
+    );
   }
 
   /** The only path that returns a full JSON Schema. */
   load(actionId: string): LoadedAction {
-    const record = this.#catalog.get(actionId);
-    if (!record) throw new ActionHubError(`Unknown action "${actionId}"`, "unknown_action");
-    return {
-      id: record.id,
-      kind: record.kind,
-      serverId: record.serverId,
-      name: record.name,
-      summary: record.summary,
-      description: record.description,
-      inputSchema: record.inputSchema ?? {},
-      trust: record.trust,
-    };
+    return this.#telemetry.withSyncSpan(
+      "action_hub.load",
+      {
+        attributes: {
+          [ACTION_HUB_ATTRIBUTES.OPERATION]: "load",
+          [ACTION_HUB_ATTRIBUTES.ACTION_ID]: actionId,
+        },
+      },
+      (span) => {
+        const record = this.#catalog.get(actionId);
+        if (!record) {
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "error");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "unknown_action");
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: `Unknown action "${actionId}"`,
+          });
+          throw new ActionHubError(`Unknown action "${actionId}"`, "unknown_action");
+        }
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.SERVER_ID, record.serverId);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.ACTION_NAME, record.name);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.ACTION_KIND, record.kind);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.TRUST, record.trust);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "ok");
+        span.setStatus({ code: SpanStatusCode.OK });
+        return {
+          id: record.id,
+          kind: record.kind,
+          serverId: record.serverId,
+          name: record.name,
+          summary: record.summary,
+          description: record.description,
+          inputSchema: record.inputSchema ?? {},
+          trust: record.trust,
+        };
+      },
+    );
   }
 
   /** Loads all action schemas in a bundle and computes token metrics. */
   loadBundle(bundleId: string): LoadedBundle {
-    const bundle = this.#bundles.get(bundleId);
-    if (!bundle) throw new ActionHubError(`Unknown bundle "${bundleId}"`, "unknown_bundle");
+    return this.#telemetry.withSyncSpan(
+      "action_hub.load_bundle",
+      {
+        attributes: {
+          [ACTION_HUB_ATTRIBUTES.OPERATION]: "load_bundle",
+          [ACTION_HUB_ATTRIBUTES.BUNDLE_ID]: bundleId,
+        },
+      },
+      (span) => {
+        const bundle = this.#bundles.get(bundleId);
+        if (!bundle) {
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "error");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "unknown_bundle");
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: `Unknown bundle "${bundleId}"`,
+          });
+          throw new ActionHubError(`Unknown bundle "${bundleId}"`, "unknown_bundle");
+        }
 
-    const records = this.#bundles.resolveActions(bundleId, this.#catalog);
-    const actions: LoadedAction[] = records.map((record) => ({
-      id: record.id,
-      kind: record.kind,
-      serverId: record.serverId,
-      name: record.name,
-      summary: record.summary,
-      description: record.description,
-      inputSchema: record.inputSchema ?? {},
-      trust: record.trust,
-    }));
+        const records = this.#bundles.resolveActions(bundleId, this.#catalog);
+        const actions: LoadedAction[] = records.map((record) => ({
+          id: record.id,
+          kind: record.kind,
+          serverId: record.serverId,
+          name: record.name,
+          summary: record.summary,
+          description: record.description,
+          inputSchema: record.inputSchema ?? {},
+          trust: record.trust,
+        }));
 
-    const eagerChars = actions.reduce((sum, act) => {
-      const schema = act.inputSchema ? JSON.stringify(act.inputSchema).length : 0;
-      return sum + act.name.length + (act.description?.length ?? 0) + schema;
-    }, 0);
+        const eagerChars = actions.reduce((sum, act) => {
+          const schema = act.inputSchema ? JSON.stringify(act.inputSchema).length : 0;
+          return sum + act.name.length + (act.description?.length ?? 0) + schema;
+        }, 0);
 
-    const totalEagerTokens = Math.ceil(eagerChars / 4);
-    const totalLazyTokens = HUB_TOOL_TOKENS;
-    const tokensSaved = Math.max(0, totalEagerTokens - totalLazyTokens);
+        const totalEagerTokens = Math.ceil(eagerChars / 4);
+        const totalLazyTokens = HUB_TOOL_TOKENS;
+        const tokensSaved = Math.max(0, totalEagerTokens - totalLazyTokens);
 
-    return {
-      id: bundle.id,
-      displayName: bundle.displayName,
-      description: bundle.description,
-      actions,
-      totalEagerTokens,
-      totalLazyTokens,
-      tokensSaved,
-    };
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.BUNDLE_ACTIONS_COUNT, actions.length);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.BUNDLE_TOTAL_EAGER_TOKENS, totalEagerTokens);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.BUNDLE_TOTAL_LAZY_TOKENS, totalLazyTokens);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.TOKENS_SAVED, tokensSaved);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "ok");
+        span.setStatus({ code: SpanStatusCode.OK });
+
+        return {
+          id: bundle.id,
+          displayName: bundle.displayName,
+          description: bundle.description,
+          actions,
+          totalEagerTokens,
+          totalLazyTokens,
+          tokensSaved,
+        };
+      },
+    );
   }
 
   /** Searches available capability bundles. */
@@ -297,131 +398,262 @@ export class ActionHub {
   ): Promise<ExecuteResult> {
     const startedAt = new Date().toISOString();
     const start = Date.now();
+    const argCount = Object.keys(args).length;
+    const reqPayloadSize = safeByteLength(args);
 
-    const record = this.#catalog.get(actionId);
-    if (!record) {
-      return this.#fail(actionId, "unknown", `Unknown action "${actionId}"`, startedAt, start);
-    }
+    return this.#telemetry.withActiveSpan(
+      "action_hub.execute",
+      {
+        attributes: {
+          [ACTION_HUB_ATTRIBUTES.OPERATION]: "execute",
+          [ACTION_HUB_ATTRIBUTES.ACTION_ID]: actionId,
+          [ACTION_HUB_ATTRIBUTES.REQUEST_ARGUMENT_COUNT]: argCount,
+          [ACTION_HUB_ATTRIBUTES.REQUEST_PAYLOAD_SIZE_BYTES]: reqPayloadSize,
+          [ACTION_HUB_ATTRIBUTES.APPROVAL_HAS_TOKEN]: Boolean(options.approvalToken),
+        },
+      },
+      async (span) => {
+        const record = this.#catalog.get(actionId);
+        if (!record) {
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "failed");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "error");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "unknown_action");
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: `Unknown action "${actionId}"`,
+          });
+          return this.#fail(actionId, "unknown", `Unknown action "${actionId}"`, startedAt, start);
+        }
 
-    // Checked before policy: a skill has no downstream server to evaluate
-    // against, and it can never be dispatched regardless of trust.
-    if (record.kind === "skill") {
-      return this.#fail(
-        actionId,
-        record.serverId,
-        `"${actionId}" is a skill and must be loaded, not executed`,
-        startedAt,
-        start,
-      );
-    }
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.SERVER_ID, record.serverId);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.ACTION_NAME, record.name);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.ACTION_KIND, record.kind);
+        span.setAttribute(ACTION_HUB_ATTRIBUTES.TRUST, record.trust);
 
-    // Deny is evaluated first and is unconditional. An approval token is only
-    // ever offered for a call the policy already permits, so approval can never
-    // become a path around a disabled server, a blocked tier, or a deny-list.
-    const decision = this.#policy.evaluate(record, this.#connections.getConfig(record.serverId));
-    if (!decision.allowed) {
-      return this.#fail(actionId, record.serverId, decision.reason ?? "Denied by policy", startedAt, start);
-    }
-
-    // Validated before the gate so a user is never asked to approve a call that
-    // would fail locally anyway, and so a bad call cannot burn a valid token.
-    const validation = validateArguments(record.inputSchema, args);
-    if (!validation.valid) {
-      return this.#fail(
-        actionId,
-        record.serverId,
-        `Invalid arguments: ${validation.errors.join("; ")}`,
-        startedAt,
-        start,
-      );
-    }
-
-    let approved = false;
-    if (decision.requiresApproval) {
-      const reason = decision.reason ?? `Server "${record.serverId}" is ${record.trust}`;
-
-      if (options.approvalToken) {
-        const check = this.#approvals.consume(options.approvalToken, actionId, args);
-        if (!check.ok) {
+        // Checked before policy: a skill has no downstream server to evaluate
+        // against, and it can never be dispatched regardless of trust.
+        if (record.kind === "skill") {
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "failed");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "error");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "skill_not_executable");
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: `"${actionId}" is a skill and must be loaded, not executed`,
+          });
           return this.#fail(
             actionId,
             record.serverId,
-            `Approval rejected: ${check.reason ?? "invalid approval token"}`,
+            `"${actionId}" is a skill and must be loaded, not executed`,
             startedAt,
             start,
-            "required",
           );
         }
-        approved = true;
-      } else if (this.#denyOnApprovalRequired) {
-        return this.#fail(
-          actionId,
-          record.serverId,
-          `Approval required: ${reason}`,
-          startedAt,
-          start,
-          "required",
-        );
-      } else {
-        const approval = this.#approvals.issue({
-          actionId,
-          serverId: record.serverId,
-          name: record.name,
-          trust: record.trust,
-          reason,
-          args,
-        });
-        const durationMs = Date.now() - start;
-        this.#record({
-          actionId,
-          serverId: record.serverId,
-          startedAt,
-          durationMs,
-          ok: false,
-          error: `Approval required: ${reason}`,
-          approval: "required",
-        });
-        return {
-          ok: false,
-          actionId,
-          error: `Approval required: ${reason}`,
-          durationMs,
-          approval,
-        };
-      }
-    }
 
-    try {
-      const serverConfig = this.#connections.getConfig(record.serverId);
-      const timeoutMs = serverConfig?.timeoutMs ?? this.#defaultTimeoutMs;
+        // Deny is evaluated first and is unconditional. An approval token is only
+        // ever offered for a call the policy already permits, so approval can never
+        // become a path around a disabled server, a blocked tier, or a deny-list.
+        const decision = this.#policy.evaluate(record, this.#connections.getConfig(record.serverId));
+        if (!decision.allowed) {
+          const reason = decision.reason ?? "Denied by policy";
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "rejected");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "rejected");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "policy_denied");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_REASON, reason);
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: reason,
+          });
+          return this.#fail(actionId, record.serverId, reason, startedAt, start);
+        }
 
-      const client = await this.#connections.activate(record.serverId);
-      const content = await callWithTimeout(
-        client.callTool(record.name, args),
-        timeoutMs,
-        `Tool "${record.id}" timed out after ${timeoutMs}ms`,
-      );
-      const durationMs = Date.now() - start;
-      this.#record({
-        actionId,
-        serverId: record.serverId,
-        startedAt,
-        durationMs,
-        ok: true,
-        ...(approved ? { approval: "approved" as const } : {}),
-      });
-      return { ok: true, actionId, content, durationMs };
-    } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      return this.#fail(
-        actionId,
-        record.serverId,
-        message,
-        startedAt,
-        start,
-        approved ? "approved" : undefined,
-      );
-    }
+        // Validated before the gate so a user is never asked to approve a call that
+        // would fail locally anyway, and so a bad call cannot burn a valid token.
+        const validation = validateArguments(record.inputSchema, args);
+        if (!validation.valid) {
+          const errorMsg = `Invalid arguments: ${validation.errors.join("; ")}`;
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "failed");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "error");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "validation_failed");
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: errorMsg,
+          });
+          return this.#fail(
+            actionId,
+            record.serverId,
+            errorMsg,
+            startedAt,
+            start,
+          );
+        }
+
+        let approved = false;
+        if (decision.requiresApproval) {
+          const reason = decision.reason ?? `Server "${record.serverId}" is ${record.trust}`;
+
+          if (options.approvalToken) {
+            const check = this.#approvals.consume(options.approvalToken, actionId, args);
+            if (!check.ok) {
+              const rejMsg = `Approval rejected: ${check.reason ?? "invalid approval token"}`;
+              span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "rejected");
+              span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "rejected");
+              span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS, "rejected");
+              span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_REQUIRED, true);
+              span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "approval_rejected");
+              span.setAttribute(
+                ACTION_HUB_ATTRIBUTES.ERROR_REASON,
+                check.reason ?? "invalid approval token",
+              );
+              span.setStatus({
+                code: SpanStatusCode.ERROR,
+                message: rejMsg,
+              });
+              return this.#fail(
+                actionId,
+                record.serverId,
+                rejMsg,
+                startedAt,
+                start,
+                "required",
+              );
+            }
+            approved = true;
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS, "approved");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_REQUIRED, true);
+          } else if (this.#denyOnApprovalRequired) {
+            const reqMsg = `Approval required: ${reason}`;
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "approval_required");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "approval_required");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS, "required");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_REQUIRED, true);
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "approval_required");
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: reqMsg,
+            });
+            return this.#fail(
+              actionId,
+              record.serverId,
+              reqMsg,
+              startedAt,
+              start,
+              "required",
+            );
+          } else {
+            const approval = this.#approvals.issue({
+              actionId,
+              serverId: record.serverId,
+              name: record.name,
+              trust: record.trust,
+              reason,
+              args,
+            });
+            const durationMs = Date.now() - start;
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "approval_required");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "approval_required");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS, "required");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_REQUIRED, true);
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.ERROR_CODE, "approval_required");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_DURATION_MS, durationMs);
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: `Approval required: ${reason}`,
+            });
+            this.#record({
+              actionId,
+              serverId: record.serverId,
+              startedAt,
+              durationMs,
+              ok: false,
+              error: `Approval required: ${reason}`,
+              approval: "required",
+            });
+            return {
+              ok: false,
+              actionId,
+              error: `Approval required: ${reason}`,
+              durationMs,
+              approval,
+            };
+          }
+        }
+
+        try {
+          const serverConfig = this.#connections.getConfig(record.serverId);
+          const timeoutMs = serverConfig?.timeoutMs ?? this.#defaultTimeoutMs;
+
+          const client = await this.#connections.activate(record.serverId);
+
+          // Propagate trace context to downstream MCP calls
+          const traceHeaders: Record<string, string> = {};
+          const traceContext = trace.setSpan(context.active(), span);
+          propagation.inject(traceContext, traceHeaders);
+
+          const content = await callWithTimeout(
+            client.callTool(record.name, args, { headers: traceHeaders }),
+            timeoutMs,
+            `Tool "${record.id}" timed out after ${timeoutMs}ms`,
+          );
+          const durationMs = Date.now() - start;
+          const respSize = safeByteLength(content);
+
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "success");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "ok");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_DURATION_MS, durationMs);
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.RESPONSE_PAYLOAD_SIZE_BYTES, respSize);
+          if (approved) {
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS, "approved");
+          }
+          span.setStatus({ code: SpanStatusCode.OK });
+
+          this.#record({
+            actionId,
+            serverId: record.serverId,
+            startedAt,
+            durationMs,
+            ok: true,
+            ...(approved ? { approval: "approved" as const } : {}),
+          });
+          return { ok: true, actionId, content, durationMs };
+        } catch (cause) {
+          const durationMs = Date.now() - start;
+          const message = cause instanceof Error ? cause.message : String(cause);
+          const isTimeout = message.includes("timed out after");
+          const isCircuit = message.includes("Circuit breaker open");
+
+          span.setAttribute(
+            ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS,
+            isTimeout ? "timed_out" : "failed",
+          );
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, isTimeout ? "timed_out" : "error");
+          span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_DURATION_MS, durationMs);
+          span.setAttribute(
+            ACTION_HUB_ATTRIBUTES.ERROR_CODE,
+            isTimeout ? "timeout" : isCircuit ? "circuit_breaker_open" : "downstream_error",
+          );
+          span.setAttribute(
+            ACTION_HUB_ATTRIBUTES.ERROR_CLASS,
+            cause instanceof Error ? cause.constructor.name : "Error",
+          );
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message,
+          });
+          if (cause instanceof Error) {
+            span.recordException(cause);
+          }
+
+          return this.#fail(
+            actionId,
+            record.serverId,
+            message,
+            startedAt,
+            start,
+            approved ? "approved" : undefined,
+          );
+        }
+      },
+    );
   }
 
   /** Outstanding, unexpired approval tokens. Diagnostics only. */

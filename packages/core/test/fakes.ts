@@ -1,4 +1,4 @@
-import type { JsonSchema, McpClient, ServerConfig } from "../dist/types.js";
+import type { CallToolOptions, JsonSchema, McpClient, ServerConfig } from "../dist/types.js";
 
 export interface FakeTool {
   name: string;
@@ -8,31 +8,31 @@ export interface FakeTool {
 
 /** In-memory MCP client so the engine can be tested without spawning servers. */
 export class FakeClient implements McpClient {
-  readonly calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  readonly calls: Array<{ name: string; args: Record<string, unknown>; options?: CallToolOptions }> = [];
   closed = false;
 
   readonly #tools: FakeTool[];
-  readonly #responder: (name: string, args: Record<string, unknown>) => unknown;
+  readonly #responder: (name: string, args: Record<string, unknown>, options?: CallToolOptions) => unknown;
   listError?: Error;
   listCalls = 0;
 
   constructor(
     tools: FakeTool[],
-    responder: (name: string, args: Record<string, unknown>) => unknown = (name) => `ok:${name}`,
+    responder: (name: string, args: Record<string, unknown>, options?: CallToolOptions) => unknown = (name) => `ok:${name}`,
   ) {
     this.#tools = tools;
     this.#responder = responder;
   }
 
-  async listTools(): Promise<FakeTool[]> {
+  async listTools(options?: CallToolOptions): Promise<FakeTool[]> {
     this.listCalls += 1;
     if (this.listError) throw this.listError;
     return this.#tools;
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
-    this.calls.push({ name, args });
-    return this.#responder(name, args);
+  async callTool(name: string, args: Record<string, unknown>, options?: CallToolOptions): Promise<unknown> {
+    this.calls.push({ name, args, options });
+    return this.#responder(name, args, options);
   }
 
   async close(): Promise<void> {

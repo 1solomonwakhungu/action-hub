@@ -20,7 +20,8 @@
   "dependencies": {
     "@action-hub/copilot-mcp": "*",
     "@action-hub/core": "*",
-    "@modelcontextprotocol/sdk": "^1.26.0"
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@opentelemetry/api": "^1.9.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
