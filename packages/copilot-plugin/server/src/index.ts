@@ -67,6 +67,20 @@ async function main(): Promise<void> {
     approvals: { ttlMs: config.approvalTtlMs },
   });
 
+  if (config.skills && config.skills.length > 0) {
+    hub.registerSkills(
+      config.skills.map((s) => ({
+        id: s.id,
+        name: s.name,
+        serverId: s.sourceClient ?? "skills",
+        summary: s.summary,
+        description: s.description,
+        tags: s.tags,
+        trust: s.trust ?? "trusted",
+      })),
+    );
+  }
+
   const cache = new CatalogCache({ onWarning: warn });
 
   // A warm cache makes the hub answerable immediately; the authoritative index

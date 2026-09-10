@@ -289,6 +289,20 @@ export function renderPage(controlToken) {
       </div>
       <div id="import-result" style="margin-top:12px;"></div>
     </div>
+
+    <h2>Auto-Migrate Capabilities (MCPs, Skills & Plugins)</h2>
+    <div class="panel">
+      <p style="font-size:13px; color:var(--muted); margin-top:0;">
+        Scan your environment for installed MCP servers (Claude, Cursor, VS Code), agent skills, and plugins, and migrate them directly into Action Hub.
+      </p>
+      <div class="row" style="gap:12px; align-items:center;">
+        <button class="primary" id="btn-migrate">🚀 Auto-Migrate Capabilities</button>
+        <label style="font-size:13px; display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
+          <input type="checkbox" id="migrate-overwrite" /> Overwrite existing entries
+        </label>
+      </div>
+      <div id="migrate-result" style="margin-top:12px;"></div>
+    </div>
   </div>
 
   <!-- TAB: INVOCATIONS HISTORY -->
@@ -603,7 +617,7 @@ async function paint() {
   $("bundles-list").innerHTML = bundlesRows(state.bundles, filter);
   $("actions-list").innerHTML = actionsRows(state.actionsList, filter);
 
-  for (const node of document.querySelectorAll("#add-fields input, #add-fields select, #add-run, #q, #q-run, #btn-check-health, #btn-import")) {
+  for (const node of document.querySelectorAll("#add-fields input, #add-fields select, #add-run, #q, #q-run, #btn-check-health, #btn-import, #btn-migrate, #migrate-overwrite")) {
     node.disabled = !live;
   }
   $("add-args").disabled = !live || $("add-type").value !== "stdio";
@@ -737,6 +751,29 @@ document.querySelectorAll(".preset-card").forEach(card => {
     document.querySelector('.tab-btn[data-tab="servers"]').click();
     $("add-run").scrollIntoView({ behavior: "smooth" });
   });
+});
+
+// AUTO-MIGRATE CAPABILITIES
+$("btn-migrate").addEventListener("click", async () => {
+  $("btn-migrate").disabled = true;
+  $("migrate-result").innerHTML = '<div class="notice">Scanning environment and migrating capabilities...</div>';
+  try {
+    const overwrite = $("migrate-overwrite").checked;
+    const result = await control("migrate_capabilities", { write: true, overwrite });
+    report($("migrate-result"), result, (r) => {
+      const summary = r.plan?.summary;
+      if (!summary) return "Migration completed.";
+      return 'Migration successful: Discovered ' + summary.mcpsDiscovered + ' MCP(s), ' +
+        summary.skillsDiscovered + ' skill(s), and ' + summary.pluginsDiscovered + ' plugin(s). Added ' +
+        summary.mcpsAdded + ' MCP(s), ' + summary.skillsAdded + ' skill(s), and ' +
+        summary.bundlesAdded + ' bundle(s).';
+    });
+    await paint();
+  } catch (err) {
+    $("migrate-result").innerHTML = '<div class="notice err">Migration failed: ' + esc(err.message) + '</div>';
+  } finally {
+    $("btn-migrate").disabled = false;
+  }
 });
 
 // IMPORT CONFIG
