@@ -114,6 +114,7 @@ export async function daemonStatusCommand(options: DaemonOptions = {}): Promise<
     const result = await probe(paths);
     if (!result.ok) throw new Error(result.error ?? "Daemon rejected the status request");
     console.log(`Action Hub daemon is running (pid ${result.state.pid}, since ${result.state.startedAt}).`);
+    if (result.state.configPath) console.log(`Config: ${result.state.configPath}`);
     console.log(formatEndpoint(result.state));
     return 0;
   } catch (cause) {

@@ -100,8 +100,8 @@ test("daemon shares one hub across authenticated clients and recovers stale stat
     const downstreamPids = (await readFile(countFile, "utf8")).trim().split("\n");
     assert.equal(downstreamPids.length, 1, "both clients must share one downstream process");
 
-    await Promise.all(clients.splice(0).map((client) => client.close()));
     assert.equal(await daemonStopCommand({ daemonDir }), 0);
+    await Promise.allSettled(clients.splice(0).map((client) => client.close()));
     await assert.rejects(readFile(join(daemonDir, "daemon.json"), "utf8"), { code: "ENOENT" });
     if (state.endpoint.kind === "unix") {
       await assert.rejects(stat(state.endpoint.path), { code: "ENOENT" });

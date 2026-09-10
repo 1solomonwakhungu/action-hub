@@ -55,15 +55,18 @@ export async function runDaemon(): Promise<void> {
   const lock = await acquireLock(paths.lock);
   let runtime: HubRuntime | undefined;
   let listener: NetServer | undefined;
-  const clients = new Set<McpServer>();
+  const clients = new Map<Socket, McpServer>();
   let stopping = false;
 
   const cleanup = async (): Promise<void> => {
-    await Promise.allSettled([...clients].map((client) => client.close()));
+    const closeListener =
+      listener?.listening
+        ? new Promise<void>((done) => listener!.close(() => done()))
+        : Promise.resolve();
+    for (const socket of clients.keys()) socket.destroy();
+    await Promise.allSettled([...clients.values()].map((client) => client.close()));
     clients.clear();
-    if (listener?.listening) {
-      await new Promise<void>((done) => listener!.close(() => done()));
-    }
+    await closeListener;
     await runtime?.close();
     await Promise.all([
       rm(paths.state, { force: true }),
@@ -90,6 +93,10 @@ export async function runDaemon(): Promise<void> {
 
     runtime = await createHubRuntime();
     listener = createServer((socket) => {
+      if (stopping) {
+        socket.destroy();
+        return;
+      }
       authenticate(socket, token, async (command) => {
         if (command === "status") {
           socket.end(`${JSON.stringify({ ok: true, pid: process.pid })}\n`);
@@ -105,12 +112,16 @@ export async function runDaemon(): Promise<void> {
           return;
         }
 
+        if (stopping) {
+          socket.end(`${JSON.stringify({ ok: false, error: "Daemon is shutting down" })}\n`);
+          return;
+        }
         socket.write(`${JSON.stringify({ ok: true })}\n`);
         const transport = new StdioServerTransport(socket, socket);
         const client = await connectMcpClient(runtime!, transport);
-        clients.add(client);
+        clients.set(socket, client);
         socket.once("close", () => {
-          clients.delete(client);
+          clients.delete(socket);
           void client.close().catch(() => undefined);
         });
       });
@@ -178,6 +189,8 @@ function authenticate(
       return;
     }
 
+    const remainder = buffered.subarray(newline + 1);
+    if (remainder.length > 0) socket.unshift(remainder);
     void onAuthorized(typeof request.command === "string" ? request.command : "")
       .catch((cause: unknown) => {
         socket.end(
