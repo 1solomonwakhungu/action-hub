@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { doctorCommand } from "./commands/doctor.js";
+import { authCommand } from "./commands/auth.js";
+import type { AuthAction } from "./commands/auth.js";
 import { importCommand } from "./commands/import.js";
 import { migrateCommand } from "./commands/migrate.js";
 import { testSearchCommand } from "./commands/test-search.js";
@@ -17,6 +19,7 @@ USAGE:
 
 COMMANDS:
   doctor              Run system diagnostics, config validation, and server connectivity checks
+  auth <action>       Manage OAuth 2.0 credentials for remote servers (login, status, logout)
   migrate             Migrate external MCP servers, agent skills, and plugins into Action Hub
   import              Discover and import MCP server configurations from Claude, Cursor, VS Code
   test-search <query> Search the semantic and keyword catalog with score breakdowns
@@ -36,8 +39,15 @@ MIGRATE OPTIONS:
   --overwrite         Overwrite existing servers or skills on ID conflict
   --json              Output plan and results in JSON format
 
+AUTH OPTIONS:
+  --no-browser        Print the authorization URL instead of opening a browser
+  --timeout <secs>    Seconds to wait for the authorization callback (default: 300)
+
 EXAMPLES:
   action-hub doctor
+  action-hub auth status
+  action-hub auth login github
+  action-hub auth logout github
   action-hub migrate --type all
   action-hub migrate --type skills --write
   action-hub import --write
@@ -94,6 +104,25 @@ async function main(): Promise<void> {
         exitCode = await doctorCommand({
           configPath,
           checkConnectivity: parsedArgs["no-check"] ? false : true,
+        });
+        break;
+      }
+
+      case "auth": {
+        const action = positional[0];
+        if (action !== "login" && action !== "status" && action !== "logout") {
+          console.error("Usage: action-hub auth <login|status|logout> [server-id]");
+          exitCode = 1;
+          break;
+        }
+        const timeoutVal =
+          typeof parsedArgs["timeout"] === "string"
+            ? Number.parseInt(parsedArgs["timeout"], 10)
+            : undefined;
+        exitCode = await authCommand(action as AuthAction, positional[1], {
+          configPath,
+          noBrowser: Boolean(parsedArgs["no-browser"]),
+          timeoutSeconds: Number.isFinite(timeoutVal) ? timeoutVal : undefined,
         });
         break;
       }

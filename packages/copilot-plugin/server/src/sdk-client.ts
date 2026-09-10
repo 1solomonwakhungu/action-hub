@@ -1,67 +1,88 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { applyNodeMemoryLimit, type JsonSchema, type McpClient, type McpClientFactory, type ServerConfig } from "@action-hub/core";
+import { applyNodeMemoryLimit, createHttpAuthBinding } from "@action-hub/core";
+import type { JsonSchema, McpClient, McpClientFactory, ServerConfig, TokenStore } from "@action-hub/core";
 
 const CLIENT_INFO = { name: "action-hub", version: "0.1.0" } as const;
+
+export interface SdkClientFactoryOptions {
+  /** Credential persistence. Defaults to the shared mode-0600 credential file. */
+  tokenStore?: TokenStore;
+  /** Diagnostics sink. stdout is the MCP channel, so this must not use it. */
+  onWarning?: (message: string) => void;
+}
 
 /**
  * Adapts the official MCP SDK to the narrow `McpClient` interface the core
  * depends on. Keeping the surface this small is what lets the core stay
  * runtime-agnostic and lets tests inject in-memory fakes.
  */
-export const createSdkClientFactory: () => McpClientFactory = () => async (config: ServerConfig) => {
-  const client = new Client(CLIENT_INFO, { capabilities: {} });
-  const transport = buildTransport(config);
+export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpClientFactory = (
+  options = {},
+) =>
+  async (config: ServerConfig) => {
+    const client = new Client(CLIENT_INFO, { capabilities: {} });
+    const transport = buildTransport(config, options);
 
-  await client.connect(transport);
+    await client.connect(transport);
 
-  return {
-    async listTools() {
-      const response = await client.listTools();
-      return response.tools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema as JsonSchema | undefined,
-      }));
-    },
+    return {
+      async listTools() {
+        const response = await client.listTools();
+        return response.tools.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema as JsonSchema | undefined,
+        }));
+      },
 
-    async callTool(name: string, args: Record<string, unknown>) {
-      const response = await client.callTool({ name, arguments: args });
-      if (response.isError === true) {
-        throw new Error(renderError(response.content));
-      }
-      return response.content;
-    },
+      async callTool(name: string, args: Record<string, unknown>) {
+        const response = await client.callTool({ name, arguments: args });
+        if (response.isError === true) {
+          throw new Error(renderError(response.content));
+        }
+        return response.content;
+      },
 
-    async close() {
-      await client.close();
-    },
-  } satisfies McpClient;
-};
+      async close() {
+        await client.close();
+      },
+    } satisfies McpClient;
+  };
 
-function buildTransport(config: ServerConfig) {
+function buildTransport(config: ServerConfig, options: SdkClientFactoryOptions) {
   if (config.transport.type === "stdio") {
     const { command, args, env, cwd } = config.transport;
     const limited = applyNodeMemoryLimit(
       command,
       args ?? [],
+      // The SDK does not inherit the parent environment, so a server that needs
+      // PATH or HOME gets nothing unless we merge it in explicitly.
       { ...inheritableEnv(), ...(env ?? {}) },
       config.maxOldSpaceSizeMb,
     );
     return new StdioClientTransport({
       command: limited.command,
       args: limited.args,
-      // The SDK does not inherit the parent environment, so a server that needs
-      // PATH or HOME gets nothing unless we merge it in explicitly.
       env: limited.env,
       cwd,
     });
   }
 
   const { url, headers } = config.transport;
+  // Present only when the server declares an `auth` block; otherwise the
+  // transport is built exactly as before and static headers keep working.
+  const auth = createHttpAuthBinding({
+    config,
+    store: options.tokenStore,
+    env: process.env,
+    onWarning: (message) => options.onWarning?.(`${config.id}: ${message}`),
+  });
+
   return new StreamableHTTPClientTransport(new URL(url), {
     requestInit: headers ? { headers } : undefined,
+    fetch: auth?.fetch,
   });
 }
 
