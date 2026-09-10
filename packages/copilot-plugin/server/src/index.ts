@@ -73,7 +73,7 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
   const hub = new ActionHub({
     servers: config.servers,
     bundles: config.bundles,
-    clientFactory: createSdkClientFactory(),
+    clientFactory: createSdkClientFactory({ onWarning: warn }),
     policy: { autoApproveAtOrAbove: config.autoApproveAtOrAbove },
     approvals: { ttlMs: config.approvalTtlMs },
   });

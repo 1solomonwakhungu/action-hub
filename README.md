@@ -84,6 +84,7 @@ This is the actual intellectual property. It has **no dependency on Copilot** an
 | Search | Hybrid lexical + semantic retrieval and ranking |
 | Schema store | Original upstream schemas, retrievable on demand |
 | Permissions | Trust tiers, allow/deny policy, approval gates |
+| Auth | OAuth 2.0 for remote HTTP servers: PKCE, proactive refresh, token rotation, host-injected credential storage |
 | Router | Argument validation and dispatch to the owning server |
 | Bundles | Named capability sets scoped to a task or repo |
 | Evaluation | Retrieval-quality harness; guards against search regressions |
@@ -197,6 +198,18 @@ On macOS and Linux the daemon uses a user-only Unix domain socket. On Windows
 it binds an ephemeral `127.0.0.1` port. Both transports require a random
 per-daemon token stored in a user-only runtime directory. The daemon rejects
 clients that cannot read and present that token.
+
+### OAuth 2.0 remote servers
+
+Remote servers that speak OAuth 2.0 declare an `auth` block on their HTTP transport and are authorized once from the CLI:
+
+```bash
+action-hub auth login github-oauth   # opens the provider, stores the grant 0600
+action-hub auth status               # per-server state; never prints a token
+action-hub auth logout github-oauth
+```
+
+Tokens are then refreshed automatically ahead of expiry and rotated in place, so no re-entry is needed. Servers using a static `Authorization` header keep working unchanged.
 
 ## Status
 
