@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { ActionHub, ActionHubError, CatalogCache, bootstrapCatalog } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
@@ -55,7 +56,16 @@ const inputShape = {
     ),
 } as const;
 
-async function main(): Promise<void> {
+/**
+ * Boots the Action Hub meta-MCP server on stdio and resolves only once the
+ * transport closes or a termination signal is received.
+ *
+ * Exported so the same entry point can run two ways without divergence: as the
+ * standalone `action-hub-mcp` binary/script, and in-process from the developer
+ * CLI's `start` command (notably inside the bundled single-file executable,
+ * where spawning a separate `node` is not possible).
+ */
+export async function runServer(): Promise<void> {
   const configPath = defaultConfigPath();
   const config = await loadConfig(configPath);
 
@@ -136,18 +146,28 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  // Let an in-flight background re-index settle before tearing down the
-  // connections it is still writing to, so a shutdown mid-refresh does not
-  // surface as a broken pipe against a downstream server.
-  const shutdown = () => {
-    void bootstrap.refreshed
-      .catch(() => undefined)
-      .then(() => control?.close())
-      .then(() => hub.close())
-      .finally(() => process.exit(0));
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  // Keep the process alive until the stdio channel closes or we are asked to
+  // stop. Resolving here (rather than leaving a dangling promise) lets the CLI
+  // `await runServer()` and exit cleanly, and lets an in-flight background
+  // re-index settle before tearing down the connections it is still writing to,
+  // so a shutdown mid-refresh does not surface as a broken pipe against a
+  // downstream server.
+  await new Promise<void>((resolveShutdown) => {
+    let closing = false;
+    const shutdown = () => {
+      if (closing) return;
+      closing = true;
+      void bootstrap.refreshed
+        .catch(() => undefined)
+        .then(() => control?.close())
+        .then(() => hub.close())
+        .catch(() => undefined)
+        .finally(() => resolveShutdown());
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    transport.onclose = shutdown;
+  });
 }
 
 type ToolInput = {
@@ -338,7 +358,24 @@ function text(payload: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
 }
 
-main().catch((cause: unknown) => {
-  process.stderr.write(`action-hub: fatal: ${cause instanceof Error ? cause.stack : String(cause)}\n`);
-  process.exit(1);
-});
+function isRunAsEntryPoint(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isRunAsEntryPoint()) {
+  runServer().then(
+    () => process.exit(0),
+    (cause: unknown) => {
+      process.stderr.write(
+        `action-hub: fatal: ${cause instanceof Error ? cause.stack : String(cause)}\n`,
+      );
+      process.exit(1);
+    },
+  );
+}

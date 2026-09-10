@@ -9,3 +9,10 @@ dist/
 coverage/
 .action-hub/
 roadmap/
+
+# Standalone binary build outputs
+build/
+dist-bin/
+# Generated packaging manifests (produced per release)
+packaging/homebrew/*.rb
+packaging/winget/
