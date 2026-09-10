@@ -85,6 +85,7 @@ This is the actual intellectual property. It has **no dependency on Copilot** an
 | Schema store | Original upstream schemas, retrievable on demand |
 | Permissions | Trust tiers, allow/deny policy, approval gates |
 | Auth | OAuth 2.0 for remote HTTP servers: PKCE, proactive refresh, token rotation, host-injected credential storage |
+| Observability | OpenTelemetry instrumentation for search, load, and execute; low-cardinality attributes; W3C trace propagation; zero runtime lock-in ([docs/telemetry.md](docs/telemetry.md)) |
 | Router | Argument validation and dispatch to the owning server |
 | Bundles | Named capability sets scoped to a task or repo |
 | Evaluation | Retrieval-quality harness; guards against search regressions |

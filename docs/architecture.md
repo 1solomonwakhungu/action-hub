@@ -357,3 +357,21 @@ the MCP server still starts, and the canvas simply renders read-only. And the
 token file is unlinked on shutdown, so a canvas that finds no file, or a stale
 one pointing at a dead port, concludes the hub is not running and disables its
 controls rather than failing.
+
+## Observability & Telemetry
+
+Action Hub core instruments `search`, `load`, `loadBundle`, and `execute` using
+the `@opentelemetry/api`.
+
+- **Zero-runtime lock-in:** `@action-hub/core` has no dependency on an OpenTelemetry
+  SDK or exporter. Without an initialized SDK, tracing calls default to zero-overhead
+  no-ops. Hosts register and configure SDK exporters (`NodeSDK`, OTLP exporters,
+  batch span processors) independently.
+- **Privacy and cardinality boundaries:** Span attributes track low-cardinality metadata
+  (operation names, action/server IDs, latency, payload sizes, token savings, error codes).
+  Arguments, schemas, credentials, and tool output are strictly omitted.
+- **Trace propagation:** For HTTP/SSE transports, W3C trace context (`traceparent`,
+  `tracestate`) is injected into outbound HTTP headers alongside OAuth 2.0 credentials.
+  Stdio transports remain untouched to protect stdio JSON-RPC framing.
+- Detailed semantics and setup instructions are documented in [docs/telemetry.md](telemetry.md).
+

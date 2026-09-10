@@ -107,4 +107,23 @@ export type {
   TokenStore,
   TokenSummary,
 } from "./auth/index.js";
+export {
+  ActionHubTelemetry,
+  ACTION_HUB_ATTRIBUTES,
+  SpanStatusCode,
+  safeByteLength,
+  trace,
+  context,
+  propagation,
+} from "./telemetry/index.js";
+export type {
+  ActionHubTelemetryOptions,
+  ActionHubAttributeKey,
+  ExecutionStatus,
+  ActionHubErrorCode,
+  Tracer,
+  TracerProvider,
+  Span,
+  SpanOptions,
+} from "./telemetry/index.js";
 export * from "./types.js";
