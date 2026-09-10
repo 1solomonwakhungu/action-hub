@@ -1,0 +1,138 @@
+// Executes a produced Action Hub binary and asserts it behaves. Used by the
+// release workflow on each build runner and available locally via
+// `npm run smoke:binary`. Pass the binary path as the first argument, or let it
+// default to the host-target binary under dist-bin/.
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, accessSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
+
+function fail(message) {
+  process.stderr.write(`SMOKE FAIL: ${message}\n`);
+  process.exit(1);
+}
+
+function resolveBinary() {
+  const provided = process.argv[2];
+  const path = provided ? resolve(provided) : resolve(repoRoot, "dist-bin", binaryFileName());
+  try {
+    accessSync(path);
+  } catch {
+    fail(`binary not found at ${path}`);
+  }
+  return path;
+}
+
+function runBinary(bin, args, env = {}) {
+  const result = spawnSync(bin, args, {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+    timeout: 30_000,
+  });
+  if (result.error) fail(`spawning ${bin} ${args.join(" ")} threw: ${result.error.message}`);
+  return result;
+}
+
+function checkVersion(bin, version) {
+  const { status, stdout } = runBinary(bin, ["--version"]);
+  const out = (stdout ?? "").trim();
+  if (status !== 0) fail(`--version exited ${status}`);
+  if (out !== `action-hub ${version}`) fail(`--version printed "${out}", expected "action-hub ${version}"`);
+  process.stderr.write(`  ok  --version -> ${out}\n`);
+}
+
+function checkHelp(bin) {
+  const { status, stdout } = runBinary(bin, ["--help"]);
+  const out = stdout ?? "";
+  if (status !== 0) fail(`--help exited ${status}`);
+  if (!out.includes("USAGE") || !out.includes("action-hub")) fail(`--help output missing expected sections`);
+  process.stderr.write(`  ok  --help\n`);
+}
+
+function checkLightweightCommand(bin) {
+  const dir = mkdtempSync(join(tmpdir(), "ah-smoke-"));
+  const cfg = join(dir, "servers.json");
+  writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
+  const { status, stdout } = runBinary(bin, ["list"], { ACTION_HUB_CONFIG: cfg });
+  if (status !== 0) fail(`\`list\` exited ${status}`);
+  if (!(stdout ?? "").includes("Action Hub Catalog")) fail(`\`list\` output missing catalog header`);
+  process.stderr.write(`  ok  list (empty catalog)\n`);
+}
+
+// Boots the bundled MCP server over stdio and runs a minimal JSON-RPC
+// handshake. This is the load-bearing check that the Copilot MCP entry point
+// was bundled into the binary correctly.
+function checkMcpHandshake(bin) {
+  return new Promise((resolvePromise) => {
+    const dir = mkdtempSync(join(tmpdir(), "ah-smoke-mcp-"));
+    const cfg = join(dir, "servers.json");
+    writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
+
+    const child = spawn(bin, ["start"], {
+      env: { ...process.env, ACTION_HUB_CONFIG: cfg },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let buffer = "";
+    let step = 0;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      fail("MCP handshake timed out");
+    }, 20_000);
+
+    const send = (obj) => child.stdin.write(`${JSON.stringify(obj)}\n`);
+
+    child.on("error", (err) => fail(`starting MCP server threw: ${err.message}`));
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.id === 1 && step === 0) {
+          step = 1;
+          if (msg.result?.serverInfo?.name !== "action-hub") fail(`unexpected serverInfo: ${JSON.stringify(msg.result?.serverInfo)}`);
+          send({ jsonrpc: "2.0", method: "notifications/initialized" });
+          send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+        } else if (msg.id === 2 && step === 1) {
+          step = 2;
+          clearTimeout(timer);
+          const names = (msg.result?.tools ?? []).map((t) => t.name);
+          child.kill("SIGTERM");
+          if (!names.includes("action_hub")) fail(`tools/list missing action_hub: [${names.join(", ")}]`);
+          process.stderr.write(`  ok  MCP handshake (initialize + tools/list)\n`);
+          resolvePromise();
+        }
+      }
+    });
+
+    send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "smoke", version: "0" } },
+    });
+  });
+}
+
+async function main() {
+  const bin = resolveBinary();
+  const version = await readCliVersion();
+  process.stderr.write(`Smoke testing ${bin} (expecting v${version})\n`);
+  checkVersion(bin, version);
+  checkHelp(bin);
+  checkLightweightCommand(bin);
+  await checkMcpHandshake(bin);
+  process.stderr.write("SMOKE PASS\n");
+}
+
+main().catch((err) => {
+  fail(err instanceof Error ? err.stack : String(err));
+});

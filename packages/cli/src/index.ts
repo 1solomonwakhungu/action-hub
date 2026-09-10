@@ -9,10 +9,11 @@ import { testSearchCommand } from "./commands/test-search.js";
 import { listCommand } from "./commands/list.js";
 import { bundlesCommand } from "./commands/bundles.js";
 import { startCommand } from "./commands/start.js";
+import { VERSION } from "./version.js";
 
 function printHelp(): void {
   console.log(`
-Action Hub Developer CLI (v0.1.0)
+Action Hub Developer CLI (v${VERSION})
 
 USAGE:
   action-hub <command> [options]
@@ -67,7 +68,7 @@ async function main(): Promise<void> {
   }
 
   if (args.includes("--version") || args.includes("-v")) {
-    console.log("action-hub 0.1.0");
+    console.log(`action-hub ${VERSION}`);
     process.exit(0);
   }
 
