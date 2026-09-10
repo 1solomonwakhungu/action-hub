@@ -430,23 +430,53 @@ async function migrateCapabilities(
 
   if (write) {
     await mutateRawConfig(configPath, (target) => {
-      target["servers"] = migration.mergedServers;
+      // Preserve raw entries so unexpanded ${ENV_VAR} secrets and custom fields remain intact
+      const existingRaw = rawServers(target);
+      const serverEntries = [...existingRaw];
+
+      for (const toAdd of migration.plan.serversToAdd) {
+        if (!serverEntries.some((s) => s["id"] === toAdd.id)) {
+          serverEntries.push({ ...toAdd });
+        }
+      }
+
+      for (const toUpdate of migration.plan.serversToUpdate) {
+        const idx = serverEntries.findIndex((s) => s["id"] === toUpdate.id);
+        if (idx !== -1) {
+          serverEntries[idx] = { ...serverEntries[idx], ...toUpdate };
+        } else {
+          serverEntries.push({ ...toUpdate });
+        }
+      }
+
+      target["servers"] = serverEntries;
       target["skills"] = migration.mergedSkills;
       target["bundles"] = migration.mergedBundles;
     });
 
-    // Hot-register newly added servers into live hub
-    for (const server of migration.plan.serversToAdd) {
+    // Hot-register newly added and updated servers into live hub
+    const serversToProcess = [
+      ...migration.plan.serversToAdd,
+      ...migration.plan.serversToUpdate,
+    ];
+    for (const server of serversToProcess) {
       hub.connections.register(server);
       if (server.enabled !== false) {
         void hub.indexServer(server.id);
+      } else {
+        hub.catalog.removeServer(server.id);
+        hub.connections.recordToolCount(server.id, 0);
       }
     }
 
-    // Hot-register newly added skills into live catalog
-    if (migration.plan.skillsToAdd.length > 0) {
+    // Hot-register newly added and updated skills into live catalog
+    const skillsToProcess = [
+      ...migration.plan.skillsToAdd,
+      ...migration.plan.skillsToUpdate,
+    ];
+    if (skillsToProcess.length > 0) {
       hub.registerSkills(
-        migration.plan.skillsToAdd.map((s) => ({
+        skillsToProcess.map((s) => ({
           id: s.id,
           name: s.name,
           serverId: s.sourceClient ?? "skills",

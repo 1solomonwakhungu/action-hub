@@ -196,3 +196,61 @@ test("discovers plugins with MCP servers and skills", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("discovers plugins with directory-string skills and file-referenced mcpServers", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ah-plugin-str-"));
+  try {
+    const pluginDir = join(dir, "repo-plugin");
+    const skillDir = join(pluginDir, "skills", "action-hub");
+    await mkdir(skillDir, { recursive: true });
+
+    await writeFile(
+      join(skillDir, "SKILL.md"),
+      `---
+name: action-hub
+description: Action Hub helper
+---
+# Action Hub
+Use the tool.`,
+      "utf8",
+    );
+
+    await writeFile(
+      join(pluginDir, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          hub: {
+            command: "node",
+            args: ["index.js"],
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const manifestPath = join(pluginDir, "plugin.json");
+    await writeFile(
+      manifestPath,
+      JSON.stringify({
+        name: "action-hub",
+        skills: "skills/",
+        mcpServers: ".mcp.json",
+      }),
+      "utf8",
+    );
+
+    const plugins = await discoverPlugins({
+      customPaths: [manifestPath],
+      skipDefaults: true,
+    });
+
+    assert.equal(plugins.length, 1);
+    const plugin = plugins[0]!;
+    assert.equal(plugin.servers.length, 1);
+    assert.equal(plugin.servers[0]?.id, "hub");
+    assert.equal(plugin.skills.length, 1);
+    assert.equal(plugin.skills[0]?.name, "action-hub");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -149,15 +149,44 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
   }
 
   if (options.write) {
-    const payload = {
-      servers: mergedServers,
-      skills: mergedSkills,
-      bundles: mergedBundles,
-      autoApproveAtOrAbove: currentConfig.autoApproveAtOrAbove,
-    };
+    // Preserve existing raw config to retain top-level settings like approvalTtlSeconds,
+    // autoDiscover, and unexpanded environment variable references in servers.
+    const raw: Record<string, unknown> = currentConfig.raw
+      ? { ...currentConfig.raw }
+      : {};
+
+    const existingRawServers: Record<string, unknown>[] = Array.isArray(raw["servers"])
+      ? (raw["servers"].filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null))
+      : [];
+
+    const serverEntries = [...existingRawServers];
+
+    // Apply additions
+    for (const toAdd of plan.serversToAdd) {
+      if (!serverEntries.some((s) => s["id"] === toAdd.id)) {
+        serverEntries.push({ ...toAdd });
+      }
+    }
+
+    // Apply updates (if overwrite mode was enabled)
+    for (const toUpdate of plan.serversToUpdate) {
+      const idx = serverEntries.findIndex((s) => s["id"] === toUpdate.id);
+      if (idx !== -1) {
+        serverEntries[idx] = { ...serverEntries[idx], ...toUpdate };
+      } else {
+        serverEntries.push({ ...toUpdate });
+      }
+    }
+
+    raw["servers"] = serverEntries;
+    raw["skills"] = mergedSkills;
+    raw["bundles"] = mergedBundles;
+    if (raw["autoApproveAtOrAbove"] === undefined) {
+      raw["autoApproveAtOrAbove"] = currentConfig.autoApproveAtOrAbove;
+    }
 
     await mkdir(dirname(currentConfig.path), { recursive: true });
-    await writeFile(currentConfig.path, JSON.stringify(payload, null, 2) + "\n", "utf8");
+    await writeFile(currentConfig.path, JSON.stringify(raw, null, 2) + "\n", "utf8");
 
     if (!isJson) {
       console.log(

@@ -502,8 +502,22 @@ async function parseAndAddPlugin(
     const servers: ServerConfig[] = [];
     const pluginDir = dirname(manifestPath);
 
-    // 1. Direct servers in plugin.json
-    if (doc["mcpServers"] || doc["servers"]) {
+    // 1. Referenced or direct servers in plugin.json
+    if (typeof doc["mcpServers"] === "string") {
+      const referencedMcp = resolve(pluginDir, doc["mcpServers"]);
+      try {
+        const mcpContent = await readFile(referencedMcp, "utf8");
+        const mcpDoc = JSON.parse(mcpContent) as Record<string, unknown>;
+        const parsed = parseMcpServersBlock(mcpDoc, referencedMcp, "copilot");
+        for (const s of parsed) {
+          if (!servers.some((existing) => existing.id === s.id)) {
+            servers.push(s);
+          }
+        }
+      } catch {
+        // Referenced mcpServers file not found
+      }
+    } else if (doc["mcpServers"] || doc["servers"]) {
       const parsed = parseMcpServersBlock(doc, manifestPath, "copilot");
       servers.push(...parsed);
     }
@@ -523,26 +537,75 @@ async function parseAndAddPlugin(
       // No adjacent .mcp.json
     }
 
-    // Skills from plugin
+    // Skills from plugin (supports arrays or directory string like "skills/")
     const skills: SkillConfig[] = [];
-    if (Array.isArray(doc["skills"])) {
+    const skillCandidates: string[] = [];
+    if (typeof doc["skills"] === "string") {
+      skillCandidates.push(doc["skills"]);
+    } else if (Array.isArray(doc["skills"])) {
       for (const item of doc["skills"]) {
-        if (typeof item === "string") {
-          const skillDir = resolve(pluginDir, item);
-          const skillMd = join(skillDir, "SKILL.md");
+        if (typeof item === "string") skillCandidates.push(item);
+      }
+    }
+
+    const seenSkillIds = new Set<string>();
+    for (const item of skillCandidates) {
+      const resolved = resolve(pluginDir, item);
+      try {
+        const st = await stat(resolved);
+        if (st.isDirectory()) {
+          const directSkillMd = join(resolved, "SKILL.md");
           try {
-            const skillContent = await readFile(skillMd, "utf8");
-            skills.push(parseSkillContent(skillContent, skillMd, "copilot"));
+            const skillContent = await readFile(directSkillMd, "utf8");
+            const parsedSkill = parseSkillContent(skillContent, directSkillMd, "copilot");
+            if (!seenSkillIds.has(parsedSkill.id)) {
+              seenSkillIds.add(parsedSkill.id);
+              skills.push(parsedSkill);
+            }
           } catch {
-            // Path might be a direct file
-            try {
-              const fileContent = await readFile(skillDir, "utf8");
-              skills.push(parseSkillContent(fileContent, skillDir, "copilot"));
-            } catch {
-              // Not found
+            // Not directly a skill directory
+          }
+
+          const entries = await readdir(resolved, { withFileTypes: true });
+          for (const entry of entries) {
+            const childPath = join(resolved, entry.name);
+            if (entry.isDirectory()) {
+              const childSkillMd = join(childPath, "SKILL.md");
+              try {
+                const skillContent = await readFile(childSkillMd, "utf8");
+                const parsedSkill = parseSkillContent(skillContent, childSkillMd, "copilot");
+                if (!seenSkillIds.has(parsedSkill.id)) {
+                  seenSkillIds.add(parsedSkill.id);
+                  skills.push(parsedSkill);
+                }
+              } catch {
+                // No SKILL.md
+              }
+            } else if (entry.isFile() && (entry.name.endsWith(".md") || entry.name.endsWith(".mdc"))) {
+              if (entry.name !== "SKILL.md") {
+                try {
+                  const skillContent = await readFile(childPath, "utf8");
+                  const parsedSkill = parseSkillContent(skillContent, childPath, "copilot");
+                  if (!seenSkillIds.has(parsedSkill.id)) {
+                    seenSkillIds.add(parsedSkill.id);
+                    skills.push(parsedSkill);
+                  }
+                } catch {
+                  // File unreadable
+                }
+              }
             }
           }
+        } else if (st.isFile()) {
+          const skillContent = await readFile(resolved, "utf8");
+          const parsedSkill = parseSkillContent(skillContent, resolved, "copilot");
+          if (!seenSkillIds.has(parsedSkill.id)) {
+            seenSkillIds.add(parsedSkill.id);
+            skills.push(parsedSkill);
+          }
         }
+      } catch {
+        // Path missing
       }
     }
 

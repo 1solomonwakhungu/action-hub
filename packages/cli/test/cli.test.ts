@@ -54,6 +54,27 @@ test("migrate command plans and executes capability migration", async () => {
   await mkdir(tempDir, { recursive: true });
   const cfgPath = resolve(tempDir, "servers.json");
 
+  // Seed an existing config with custom fields and unexpanded secrets
+  await writeFile(
+    cfgPath,
+    JSON.stringify({
+      approvalTtlSeconds: 900,
+      autoDiscover: false,
+      servers: [
+        {
+          id: "existing-secret-server",
+          transport: {
+            type: "stdio",
+            command: "node",
+            args: ["srv.js"],
+            env: { API_KEY: "${SECRET_KEY}" }
+          }
+        }
+      ]
+    }),
+    "utf8"
+  );
+
   // Create an external skill to discover
   const skillsDir = join(tempDir, "skills", "triage");
   await mkdir(skillsDir, { recursive: true });
@@ -88,6 +109,10 @@ test("migrate command plans and executes capability migration", async () => {
     assert.ok(Array.isArray(savedRaw.skills));
     assert.equal(savedRaw.skills.length, 1);
     assert.equal(savedRaw.skills[0].name, "issue-triage");
+    // Verify top-level fields and unexpanded secrets are preserved
+    assert.equal(savedRaw.approvalTtlSeconds, 900);
+    assert.equal(savedRaw.autoDiscover, false);
+    assert.equal(savedRaw.servers[0].transport.env.API_KEY, "${SECRET_KEY}");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
