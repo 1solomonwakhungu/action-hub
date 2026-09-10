@@ -32,54 +32,67 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
     clientFactory: factory,
   });
 
-  console.log("Indexing servers...");
-  const indexResults = await hub.indexAll();
+  try {
+    console.log("Indexing servers...");
+    const indexResults = await hub.indexAll();
 
-  console.log("\nServer Connectivity & Indexing Status:");
-  let failures = 0;
+    console.log("\nServer Connectivity & Indexing Status:");
+    let failures = 0;
 
-  for (const res of indexResults) {
-    const srv = config.servers.find((s) => s.id === res.serverId);
-    const transportType = srv?.transport.type ?? "unknown";
-    const transportDesc =
-      srv?.transport.type === "stdio"
-        ? `${srv.transport.command} ${(srv.transport.args ?? []).join(" ")}`
-        : srv?.transport.type === "http"
-          ? srv.transport.url
-          : "";
+    for (const res of indexResults) {
+      const srv = config.servers.find((s) => s.id === res.serverId);
+      const transportType = srv?.transport.type ?? "unknown";
+      const transportDesc =
+        srv?.transport.type === "stdio"
+          ? `${srv.transport.command} ${(srv.transport.args ?? []).join(" ")}`
+          : srv?.transport.type === "http"
+            ? srv.transport.url
+            : "";
 
-    if (res.error) {
-      failures++;
-      console.log(`  ✖ [${res.serverId}] (${transportType}) ${transportDesc}`);
-      console.log(`    Error: ${res.error}`);
-    } else {
-      console.log(`  ✔ [${res.serverId}] (${transportType}) ${res.indexed} tools indexed`);
-    }
-  }
-
-  // Health checks / Latency probing
-  if (options.checkConnectivity !== false && indexResults.some((r) => !r.error)) {
-    console.log("\nProbing Server Latency & Health:");
-    const healthResults = await hub.checkAllHealth();
-    for (const h of healthResults) {
-      if (h.status === "ready") {
-        console.log(`  ✔ [${h.serverId}] Status: ${h.status} (${h.latencyMs ?? 0}ms latency)`);
+      if (res.error) {
+        failures++;
+        console.log(`  ✖ [${res.serverId}] (${transportType}) ${transportDesc}`);
+        console.log(`    Error: ${res.error}`);
       } else {
-        console.log(`  ✖ [${h.serverId}] Status: ${h.status} ${h.error ? `(${h.error})` : ""}`);
+        console.log(`  ✔ [${res.serverId}] (${transportType}) ${res.indexed} tools indexed`);
       }
     }
+
+    // Health checks / Latency probing
+    if (options.checkConnectivity !== false && indexResults.some((r) => !r.error)) {
+      console.log("\nProbing Server Latency & Health:");
+      const healthResults = await hub.checkAllHealth();
+      for (const h of healthResults) {
+        if (h.status === "ready") {
+          console.log(`  ✔ [${h.serverId}] Status: ${h.status} (${h.latencyMs ?? 0}ms latency)`);
+        } else {
+          console.log(`  ✖ [${h.serverId}] Status: ${h.status} ${h.error ? `(${h.error})` : ""}`);
+        }
+      }
+    }
+
+    console.log("\nResilience:");
+    for (const state of hub.serverStates()) {
+      const memory = state.memoryLimitMb ? `${state.memoryLimitMb} MB` : "unset";
+      const restart = state.nextRestartAt ? `; next restart ${state.nextRestartAt}` : "";
+      console.log(
+        `  [${state.id}] circuit=${state.circuitState ?? "closed"} failures=${state.consecutiveFailures ?? 0} memory=${memory}${restart}`,
+      );
+    }
+
+    const stats = hub.contextStats();
+    console.log("\nContext Savings Estimate:");
+    console.log(`  Total tools indexed:   ${stats.actions}`);
+    console.log(`  Eager tokens estimate: ${stats.eagerTokensEstimate}`);
+    console.log(`  Hub tokens estimate:   ${stats.hubTokensEstimate}`);
+    const savings =
+      stats.eagerTokensEstimate > 0
+        ? Math.round(((stats.eagerTokensEstimate - stats.hubTokensEstimate) / stats.eagerTokensEstimate) * 100)
+        : 0;
+    console.log(`  Estimated token savings per turn: ~${savings}%`);
+
+    return failures > 0 ? 1 : 0;
+  } finally {
+    await hub.close();
   }
-
-  const stats = hub.contextStats();
-  console.log("\nContext Savings Estimate:");
-  console.log(`  Total tools indexed:   ${stats.actions}`);
-  console.log(`  Eager tokens estimate: ${stats.eagerTokensEstimate}`);
-  console.log(`  Hub tokens estimate:   ${stats.hubTokensEstimate}`);
-  const savings =
-    stats.eagerTokensEstimate > 0
-      ? Math.round(((stats.eagerTokensEstimate - stats.hubTokensEstimate) / stats.eagerTokensEstimate) * 100)
-      : 0;
-  console.log(`  Estimated token savings per turn: ~${savings}%`);
-
-  return failures > 0 ? 1 : 0;
 }

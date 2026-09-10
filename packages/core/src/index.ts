@@ -15,6 +15,21 @@ export type { SemanticScorer } from "./search/search.js";
 export { LocalSemanticIndex, createLocalSemanticScorer } from "./search/semantic.js";
 export type { LocalSemanticOptions, SemanticIndexStats } from "./search/semantic.js";
 export { ConnectionManager } from "./servers/connection-manager.js";
+export type {
+  CircuitBreakerOptions,
+  ConnectionManagerHooks,
+  ConnectionManagerOptions,
+  TimerHandle,
+} from "./servers/connection-manager.js";
+export {
+  computeRestartBackoffMs,
+  DEFAULT_BACKOFF_INITIAL_MS,
+  DEFAULT_BACKOFF_JITTER,
+  DEFAULT_BACKOFF_MAX_MS,
+} from "./servers/restart-backoff.js";
+export type { RestartBackoffInput } from "./servers/restart-backoff.js";
+export { applyNodeMemoryLimit, isNodeStdioCommand } from "./servers/node-memory.js";
+export type { NodeMemoryLimitResult } from "./servers/node-memory.js";
 export { PermissionPolicy, isToolPermitted } from "./permissions/policy.js";
 export type { PolicyDecision, PolicyOptions } from "./permissions/policy.js";
 export {

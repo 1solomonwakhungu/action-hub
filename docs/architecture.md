@@ -144,6 +144,17 @@ Concurrent `activate()` calls for the same server share a single in-flight
 promise, so a burst of parallel executions produces one connection rather than
 a thundering herd.
 
+`ConnectionManager` also owns recovery. Each server has its own closed / open /
+half-open circuit: consecutive failures trip it, the cooldown fails fast, and
+the first call after cooldown is a single half-open probe. Crashed or
+unreachable stdio servers restart with bounded exponential backoff and jitter.
+Manual `deactivate()`, `setEnabled(false)`, and `closeAll()` cancel timers and
+never auto-restart. Heartbeats probe `listTools` on connected servers and move
+status through `degraded` then `unreachable`. Node-based stdio servers can set
+`maxOldSpaceSizeMb`; the client factory injects `--max-old-space-size` (or
+`NODE_OPTIONS` for wrappers such as `npx`) without duplicating an existing flag
+or touching non-Node commands.
+
 Indexing failures are captured per server. One broken integration produces one
 `IndexResult` with an `error` field; the rest of the catalog still builds. A
 misconfigured Slack token must not take down GitHub.

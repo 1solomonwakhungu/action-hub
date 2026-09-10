@@ -1,7 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { JsonSchema, McpClient, McpClientFactory, ServerConfig } from "@action-hub/core";
+import { applyNodeMemoryLimit, type JsonSchema, type McpClient, type McpClientFactory, type ServerConfig } from "@action-hub/core";
 
 const CLIENT_INFO = { name: "action-hub-cli", version: "0.1.0" } as const;
 
@@ -38,10 +38,16 @@ export const createSdkClientFactory: () => McpClientFactory = () => async (confi
 function buildTransport(config: ServerConfig) {
   if (config.transport.type === "stdio") {
     const { command, args, env, cwd } = config.transport;
-    return new StdioClientTransport({
+    const limited = applyNodeMemoryLimit(
       command,
-      args: args ?? [],
-      env: { ...inheritableEnv(), ...(env ?? {}) },
+      args ?? [],
+      { ...inheritableEnv(), ...(env ?? {}) },
+      config.maxOldSpaceSizeMb,
+    );
+    return new StdioClientTransport({
+      command: limited.command,
+      args: limited.args,
+      env: limited.env,
       cwd,
     });
   }

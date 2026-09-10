@@ -11,7 +11,9 @@
   hashing plus a concept lexicon), precomputed at index time, blended at
   `w = 0.2`, with a non-throwing fallback to pure BM25
 - `ConnectionManager` — lazy activation, shared in-flight connection promises,
-  per-server state tracking, ordered shutdown
+  per-server state tracking, ordered shutdown, closed/open/half-open circuit
+  breakers, heartbeat probes, bounded restart backoff with jitter, and Node
+  heap caps via `--max-old-space-size`
 - `PermissionPolicy` — trust tiers, auto-approve floor, allow/deny lists
 - `ApprovalRegistry` — single-use, argument-bound, expiring approval tokens
   backing the two-step execute flow for gated actions

@@ -79,7 +79,7 @@ This is the actual intellectual property. It has **no dependency on Copilot** an
 
 | Module | Responsibility |
 | --- | --- |
-| Connection manager | Lifecycle for downstream MCP servers; lazy activation, health, reconnect |
+| Connection manager | Lifecycle for downstream MCP servers; lazy activation, health, reconnect, circuit breakers, heartbeats, restart backoff, Node memory caps |
 | Catalog | Unified index of tools and skills, with provenance; persisted to disk and refreshed in the background |
 | Search | Hybrid lexical + semantic retrieval and ranking |
 | Schema store | Original upstream schemas, retrievable on demand |
