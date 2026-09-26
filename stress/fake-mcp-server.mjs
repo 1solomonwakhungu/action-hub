@@ -128,10 +128,10 @@ function maybeCrashAfterDelivery() {
 }
 
 /**
- * Wrap a transport so a response is only counted as served once its write
- * completed. Everything else (onmessage/onerror/onclose assignment by the
- * SDK, sessionId) passes through unchanged. Used for stdio and per-request
- * HTTP transports alike.
+ * Stdio transport wrapper: a response is counted as served only once its
+ * stdout write has drained (StdioServerTransport.send resolves on the write
+ * callback), then exit(1) — proven to arrive before the disconnect.
+ * Everything the SDK assigns (onmessage/onerror/onclose) passes through.
  */
 function withDeliveryCounting(inner) {
   return new Proxy(inner, {
@@ -142,6 +142,35 @@ function withDeliveryCounting(inner) {
           if (msg && typeof msg === "object" && msg.id !== undefined && !("method" in msg)) {
             responsesDelivered += 1;
             maybeCrashAfterDelivery();
+          }
+          return result;
+        };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/**
+ * HTTP transport wrapper: StreamableHTTPServerTransport.send resolves once
+ * the response is handed to the web stream — the ServerResponse may not be
+ * flushed yet — so exit(1) there would cut the client off mid-response.
+ * Instead, reaching N only sets httpCrashPending; the caller (runHttp) arms
+ * a 'finish' hook on that request's ServerResponse and exits there.
+ */
+let httpCrashPending = false;
+function withDeliveryCountingHttp(inner) {
+  return new Proxy(inner, {
+    get(target, prop, recv) {
+      if (prop === "send") {
+        return async (msg) => {
+          const result = await target.send(msg);
+          if (msg && typeof msg === "object" && msg.id !== undefined && !("method" in msg)) {
+            responsesDelivered += 1;
+            if (crashAfter !== undefined && responsesDelivered >= crashAfter) {
+              httpCrashPending = true;
+            }
           }
           return result;
         };
@@ -274,7 +303,7 @@ function runHttp() {
 
     // Stateless Streamable HTTP: a fresh transport + server per POST request
     // (SDK stateless pattern). GET/DELETE are rejected with 405.
-    const transport = withDeliveryCounting(new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }));
+    const transport = withDeliveryCountingHttp(new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }));
     res.on("close", () => {
       void transport.close().catch(() => {});
     });
@@ -283,6 +312,21 @@ function runHttp() {
     try {
       await server.connect(transport);
       await transport.handleRequest(req, res, parsed);
+      // Crash only after the Nth response is fully flushed to the socket
+      // (ServerResponse 'finish' = handed to the OS, not merely 'close').
+      if (httpCrashPending) {
+        res.once("finish", () => {
+          process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${responsesDelivered} completed responses\n`);
+          process.exit(1);
+        });
+        // Safety net: a response stream that never reaches 'finish' still
+        // crashes once the request object closes.
+        res.once("close", () => {
+          if (!res.writableFinished) return;
+          process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${responsesDelivered} completed responses (close)\n`);
+          process.exit(1);
+        });
+      }
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(500).end();
