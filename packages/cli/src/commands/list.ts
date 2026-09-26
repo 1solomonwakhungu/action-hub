@@ -55,27 +55,33 @@ export async function listCommand(options: ListOptions = {}): Promise<number> {
     ];
     hub.replaceSkills(skillRecords);
 
-    if (options.server) {
-      // F12: index only the requested server instead of the whole fleet.
-      const exists = config.servers.some((s) => s.id === options.server);
-      if (!exists) {
-        console.error(`Error: server "${options.server}" is not registered in the config.`);
-        return 1;
-      }
-      const result = await hub.indexServer(options.server);
-      if (result.error) {
-        console.error(`Warning: indexing "${options.server}" failed: ${result.error}`);
-      }
-    } else if (options.kind !== "skill") {
+    if (options.kind !== "skill") {
       // kind=skill needs no MCP server contact at all — tool records would be
-      // filtered out immediately. Tool kinds index servers (skills are already
-      // registered locally above).
-      await hub.indexAll();
+      // filtered out immediately — even when --server is also given. Tool kinds
+      // index servers (skills are already registered locally above).
+      if (options.server) {
+        // F12: index only the requested server instead of the whole fleet.
+        const exists = config.servers.some((s) => s.id === options.server);
+        if (!exists) {
+          console.error(`Error: server "${options.server}" is not registered in the config.`);
+          return 1;
+        }
+        const result = await hub.indexServer(options.server);
+        if (result.error) {
+          console.error(`Warning: indexing "${options.server}" failed: ${result.error}`);
+        }
+      } else {
+        await hub.indexAll();
+      }
     }
 
     let actions = hub.catalog.all();
     if (options.server) {
-      actions = actions.filter((a) => a.serverId === options.server);
+      // Skills are local (serverId "skills"/"custom"), so a --server filter
+      // must not strip them; it only scopes tool records.
+      if (options.kind !== "skill") {
+        actions = actions.filter((a) => a.serverId === options.server);
+      }
     }
     if (options.kind && options.kind !== "all") {
       actions = actions.filter((a) => a.kind === options.kind);

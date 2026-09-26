@@ -182,8 +182,12 @@ test("list --kind skill registers config and directory skills (F11)", async () =
 // daemon that accepts and never responds must not keep the CLI process alive.
 test("connect destroys the socket on handshake failure (MUST-FIX)", async () => {
   const net = await import("node:net");
+  const { spawn } = await import("node:child_process");
+  const { chmod } = await import("node:fs/promises");
+  let accepted = false;
   const server = net.createServer((sock) => {
     // Accept and never respond; keep the socket open.
+    accepted = true;
     sock.on("error", () => {});
   });
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
@@ -191,7 +195,7 @@ test("connect destroys the socket on handshake failure (MUST-FIX)", async () => 
 
   const tempDir = await mkdtemp(join(tmpdir(), "ah-connect-"));
   const daemonDir = join(tempDir, "daemon");
-  await mkdir(daemonDir, { recursive: true });
+  await mkdir(daemonDir, { recursive: true, mode: 0o700 });
   await writeFile(join(daemonDir, "daemon.json"), JSON.stringify({
     version: 1,
     pid: process.pid,
@@ -199,17 +203,28 @@ test("connect destroys the socket on handshake failure (MUST-FIX)", async () => 
     endpoint: { kind: "tcp", host: "127.0.0.1", port },
   }));
   await writeFile(join(daemonDir, "auth-token"), "0".repeat(64));
+  // assertPrivate refuses 0644 state files; the real daemon writes 0600.
+  await chmod(join(daemonDir, "daemon.json"), 0o600);
+  await chmod(join(daemonDir, "auth-token"), 0o600);
 
   try {
-    const res = spawnSync(
-      "node",
-      [cliBin, "connect", "--daemon-dir", daemonDir],
-      { encoding: "utf8", timeout: 10_000, input: "" },
-    );
-    // Must exit 1 promptly (timeout would surface as a killed process, not a
-    // clean exit) with the connection-failure message on stderr.
-    assert.equal(res.status, 1, `status=${res.status} stderr=${String(res.stderr).slice(0, 200)}`);
-    assert.match(res.stderr ?? "", /could not connect to daemon/);
+    // Async spawn: spawnSync would block this same process's server callback.
+    const child = spawn("node", [cliBin, "connect", "--daemon-dir", daemonDir], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const stderrChunks: Buffer[] = [];
+    child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
+    const exitCode = await Promise.race([
+      new Promise<number | null>((done) => child.once("exit", (code) => done(code))),
+      new Promise<"timeout">((done) => setTimeout(() => done("timeout"), 15_000)),
+    ]);
+    // The fake daemon must have accepted the connection AND the CLI must have
+    // exited 1 promptly after the read timeout (a live process at this point
+    // is the hang this regression guards against).
+    assert.equal(accepted, true, "fake daemon must have accepted the connection");
+    assert.equal(exitCode, 1, `expected exit 1, got ${exitCode}; stderr=${Buffer.concat(stderrChunks).toString().slice(0, 200)}`);
+    assert.match(Buffer.concat(stderrChunks).toString(), /could not connect to daemon/);
+    if (exitCode === null) child.kill("SIGKILL");
   } finally {
     server.close();
     await rm(tempDir, { recursive: true, force: true });
@@ -261,6 +276,55 @@ test("list --kind skill never contacts MCP servers (HIGH)", async () => {
       contacted = false;
     }
     assert.equal(contacted, false, "list --kind skill must not index MCP servers");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// Combined flags: --kind skill --server X must never index any MCP server and
+// must still list the local skills (FX4-R HIGH).
+test("list --kind skill --server never indexes servers and still lists skills", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-skill-srv-"));
+  const countFile = join(tempDir, "count");
+  const cfgPath = join(tempDir, "servers.json");
+  await writeFile(
+    cfgPath,
+    JSON.stringify({
+      servers: [{
+        id: "srv-a",
+        transport: { type: "stdio", command: process.execPath, args: [fixture], env: { COUNT_FILE: countFile } },
+      }],
+      skills: [{ id: "c1", name: "C1", summary: "from config", description: "config" }],
+      autoDiscover: false,
+    }),
+  );
+
+  try {
+    const savedHome = process.env["HOME"];
+    const savedSkillsDir = process.env["ACTION_HUB_SKILLS_DIR"];
+    process.env["HOME"] = tempDir;
+    process.env["ACTION_HUB_SKILLS_DIR"] = join(tempDir, "empty-skills");
+    await mkdir(join(tempDir, "empty-skills"), { recursive: true });
+    const captured = captureConsole();
+    try {
+      const code = await listCommand({ configPath: cfgPath, server: "srv-a", kind: "skill" });
+      assert.equal(code, 0);
+      assert.match(captured.logs.join("\n"), /C1/);
+    } finally {
+      captured.restore();
+      if (savedHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = savedHome;
+      if (savedSkillsDir === undefined) delete process.env["ACTION_HUB_SKILLS_DIR"];
+      else process.env["ACTION_HUB_SKILLS_DIR"] = savedSkillsDir;
+    }
+    let contacted = false;
+    try {
+      await readFile(countFile, "utf8");
+      contacted = true;
+    } catch {
+      contacted = false;
+    }
+    assert.equal(contacted, false, "--kind skill --server X must not index MCP servers");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
