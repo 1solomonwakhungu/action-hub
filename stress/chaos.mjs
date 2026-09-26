@@ -59,22 +59,50 @@ const HUGE_BYTES = 5 * 1024 * 1024;
 const CHAOS_SEED = 7;
 const DOCTOR_TIMEOUT_MS = 180_000;
 
-// CONTRACT.md hard rule 2: every run uses isolated env dirs — applied to
-// the ENTIRE process (not just child spawns) before any factory/hub
-// construction, so the in-process hub and all 44 fake-server children
-// (which inherit process.env) can never touch owner state. The script
-// exits after the run, so the mutation is inherently scoped.
+// CONTRACT.md hard rule 2 + intake ISOLATION.md checklist: every var is
+// REPLACED (never forwarded) under ONE fresh temp root, applied to the
+// ENTIRE process before factory/hub construction — the in-process hub and
+// all 44 spawned children (which inherit process.env) can never touch
+// owner state. A sentinel self-check refuses to run if any resolved path
+// still lies inside the real owner home (resolved independently of $HOME
+// via os.userInfo().homedir). The script exits after the run, so the
+// process.env mutation is inherently scoped.
+import { userInfo as osUserInfo } from "node:os";
 const tmpRoot = join(tmpdir(), `action-hub-chaos-${process.pid}-${Date.now()}`);
-for (const d of ["home", "cache", "config", "skills", "pi"]) {
+for (const d of ["home", "cache", "config", "state", "data", "skills", "pi", "daemon", "credentials"]) {
   mkdirSync(join(tmpRoot, d), { recursive: true });
 }
-const GEN_CONFIG_PLACEHOLDER = join(tmpRoot, "servers.json");
-process.env.HOME = join(tmpRoot, "home");
-process.env.XDG_CACHE_HOME = join(tmpRoot, "cache");
-process.env.XDG_CONFIG_HOME = join(tmpRoot, "config");
-process.env.ACTION_HUB_CONFIG = GEN_CONFIG_PLACEHOLDER; // repointed to the real config once generated
-process.env.ACTION_HUB_SKILLS_DIR = join(tmpRoot, "skills");
-process.env.PI_CODING_AGENT_DIR = join(tmpRoot, "pi");
+const isolationPaths = {
+  HOME: join(tmpRoot, "home"),
+  USERPROFILE: join(tmpRoot, "home"),
+  APPDATA: join(tmpRoot, "config"),
+  LOCALAPPDATA: join(tmpRoot, "cache"),
+  XDG_CACHE_HOME: join(tmpRoot, "cache"),
+  XDG_CONFIG_HOME: join(tmpRoot, "config"),
+  XDG_STATE_HOME: join(tmpRoot, "state"),
+  XDG_DATA_HOME: join(tmpRoot, "data"),
+  ACTION_HUB_CONFIG: join(tmpRoot, "servers.json"), // repointed to the real config once generated
+  ACTION_HUB_CACHE: join(tmpRoot, "cache", "action-hub"),
+  ACTION_HUB_SKILLS_DIR: join(tmpRoot, "skills"),
+  ACTION_HUB_DAEMON_DIR: join(tmpRoot, "daemon"),
+  ACTION_HUB_CREDENTIALS: join(tmpRoot, "credentials"),
+  PI_CODING_AGENT_DIR: join(tmpRoot, "pi"),
+};
+for (const [k, v] of Object.entries(isolationPaths)) {
+  process.env[k] = v; // REPLACE, never forward the caller's value
+}
+// Sentinel self-check: refuse to run if any isolation path resolves inside
+// the real owner home (independent of $HOME).
+const realHome = osUserInfo().homedir;
+const resolveSafe = (p) => {
+  const r = resolve(p);
+  if (r === realHome || r.startsWith(realHome + "/")) {
+    console.error(`[chaos] refusing to run: ${r} resolves inside the real owner home ${realHome}`);
+    process.exit(2);
+  }
+  return r;
+};
+for (const v of Object.values(isolationPaths)) resolveSafe(v);
 const isolationEnv = () => ({ ...process.env }); // children inherit the already-isolated env
 process.on("exit", () => {
   try {
@@ -470,8 +498,11 @@ async function main() {
     indexBounded: summary.index.bounded,
     memoryBounded,
     hubResponsive: summary.search.p95 < 1_000 && searchErrors === 0,
-    circuitBreakersOpened: circuit.opened.length > 0,
-    circuitBreakersRecovered: circuit.recovered.length > 0,
+    // Derived from the SAME per-id booleans the findings use, so verdict
+    // and findings cannot diverge: EVERY crash id (incl. flapper) must
+    // open; every finite id must open AND recover AND pass post-recovery.
+    circuitBreakersOpened: circuit.opened.length === crashIds.length,
+    circuitBreakersRecovered: circuit.recovered.length === finiteIds.length,
     hangsBounded: hang.bounded,
     doctorBounded: summary.doctor.bounded,
     secretsContained: !leaked,
@@ -486,12 +517,17 @@ async function main() {
     // The hub is closed on EVERY path: happy path, findings, and uncaught
     // errors — closing the hub tears down all 44 child transports, so no
     // fake-server process survives a failed run.
-    hubClosed = true;
-    await hub.close().catch(() => {});
+    try {
+      await hub.close();
+      hubClosed = true; // only after an UNGuarded-success close
+    } catch (closeErr) {
+      finding("P1", `hub.close() failed during teardown: ${String(closeErr).slice(0, 200)}`, "stress/chaos.mjs finally block");
+    }
   }
 
   summary.elapsedMs = Date.now() - startedAt;
-  summary.hubClosedOnAllPaths = hubClosed;
+  summary.hubClosedOnAllPaths = hubClosed; // true ONLY when close() succeeded
+  summary.hubCloseAttempted = true;
   summary.secretScan = { sentinelLength: SECRET.length, prefixChecked: true, leaked };
 
 
