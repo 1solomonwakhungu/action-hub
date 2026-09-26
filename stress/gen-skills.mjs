@@ -394,6 +394,7 @@ const onDisk = await readdir(SKILLS_DIR, { withFileTypes: true });
 const claimedIds = new Set(skills.map((s) => s.slug));
 const verifiedIds = new Set();
 const indexedDocs = new Map(); // slug -> Set(tokens of the fields SearchEngine indexes)
+const indexedRecords = []; // parsed records, reused for the SearchEngine negative check
 let mismatches = 0;
 for (const entry of onDisk) {
   if (!entry.isDirectory()) continue;
@@ -404,6 +405,7 @@ for (const entry of onDisk) {
     parsed.id,
     new Set([...token(parsed.name), ...token(parsed.summary), ...token(parsed.description)]),
   );
+  indexedRecords.push(parsed);
   if (parsed.id !== `skill:${entry.name}` || !claimedIds.has(parsed.id)) mismatches++;
 }
 if (verifiedIds.size !== skills.length || mismatches !== 0) {
@@ -705,24 +707,98 @@ const NO_MATCH_SEEDS = [
 ];
 const corpusTokens = new Set();
 // Validate against the fields the engine actually indexes (parsed record:
-// name + summary + the 4-sentence body as description), not the raw template.
+// name + summary + the 4-sentence body as description, plus tags and the
+// serverId the runtime assigns skills), not the raw template.
 for (const doc of indexedDocs.values()) for (const t of doc) corpusTokens.add(t);
-const noMatchQueries = [];
-for (const seed of NO_MATCH_SEEDS) {
-  if (noMatchQueries.length >= 25) break;
-  if (token(seed).some((t) => corpusTokens.has(t))) continue;
-  if (
-    tryPush({
-      query: withNoise(`find the ${seed} skill`, rand, 0.2, counters),
-      expected: null,
-      difficulty: "hard",
-      subtype: "no-match",
-    })
-  ) {
-    noMatchQueries.push(true);
+for (const rec of indexedRecords) {
+  if (rec.tags) for (const t of token(rec.tags.join(" "))) corpusTokens.add(t);
+}
+for (const t of token("skills custom")) corpusTokens.add(t); // runtime serverIds
+const noMatchCount = (() => {
+  // Fixed, documented English stopword list (intake contract v2): content-token
+  // overlap is evaluated after removing these from the FINAL emitted query.
+  const STOPWORDS = new Set([
+    "the", "a", "an", "of", "for", "to", "in", "on", "with", "and", "or",
+    "how", "find", "my", "me", "i", "is", "what", "do",
+  ]);
+  const contentTokens = (q) => token(q).filter((t) => !STOPWORDS.has(t));
+  let count = 0;
+  for (const seed of NO_MATCH_SEEDS) {
+    if (count >= 25) break;
+    // Natural queries (intake decision): wrap with common English words, then
+    // validate the FINAL emitted query — after stopword removal — for zero
+    // content-token overlap with the actual indexed inputs. "skill" is NOT a
+    // wrapper here: it is content in this corpus.
+    let finalQuery = null;
+    for (const head of ["find the", "locate the", ""]) {
+      const candidate = withNoise(
+        `${head ? head + " " : ""}${seed}`,
+        rand,
+        0.2,
+        counters,
+      );
+      const tokens = contentTokens(candidate);
+      if (tokens.some((t) => corpusTokens.has(t))) continue;
+      finalQuery = candidate;
+      break;
+    }
+    if (finalQuery === null) continue; // every wrapper variant overlaps: skip seed
+    if (
+      !tryPush({
+        query: finalQuery,
+        expected: null,
+        difficulty: "hard",
+        subtype: "no-match",
+      })
+    ) {
+      continue;
+    }
+    count++;
+  }
+  return { count, STOPWORDS, contentTokens };
+})();
+const noMatchMeta = noMatchCount;
+const noMatchTotal = noMatchCount.count;
+
+// Final invariant over emitted no-match rows: after removing the documented
+// stopword list, every content token of every emitted query must be absent
+// from all indexed inputs (name, summary, description, tags, serverId).
+// SearchEngine hit counts are recorded for the evaluator (hits caused ONLY by
+// stopwords are a search defect to be measured, not a fixture defect) and a
+// non-stopword overlap fails generation.
+const searchEngineHitCounts = [];
+{
+  const { Catalog } = await import(
+    new URL("file://" + join(repoRoot, "packages/core/dist/catalog/catalog.js")).href
+  );
+  const { SearchEngine } = await import(
+    new URL("file://" + join(repoRoot, "packages/core/dist/search/search.js")).href
+  );
+  const catalog = new Catalog();
+  catalog.addAll(
+    indexedRecords.map((rec) => ({
+      id: rec.id,
+      kind: "skill",
+      serverId: "skills",
+      name: rec.name,
+      summary: rec.summary,
+      description: rec.description,
+      tags: rec.tags,
+      trust: rec.trust ?? "trusted",
+    })),
+  );
+  const engine = new SearchEngine(catalog);
+  for (const row of queries.filter((q) => q.subtype === "no-match")) {
+    const content = noMatchMeta.contentTokens(row.query);
+    if (content.some((t) => corpusTokens.has(t))) {
+      throw new Error(`no-match row has non-stopword content overlap: ${row.query}`);
+    }
+    searchEngineHitCounts.push({
+      query: row.query,
+      hits: (await engine.search(row.query)).length,
+    });
   }
 }
-const noMatchCount = noMatchQueries.length;
 
 // --- Invariants (review HIGH-1): every query text is unique and resolves to
 // exactly one expected id (multi queries may additionally carry expectedAll;
@@ -758,7 +834,17 @@ const summary = {
     }, {}),
     withTypos: counters.typo,
     withFragments: counters.fragment,
-    noMatchFailed: 25 - noMatchCount,
+    noMatchFailed: 25 - noMatchTotal,
+    noMatchInvariant:
+      "after removing the documented stopword list (the,a,an,of,for,to,in,on,with,and,or,how,find,my,me,i,is,what,do) from the FINAL emitted query, zero content tokens overlap the actual indexed inputs (parsed record name, summary, description body, tags, serverId); SearchEngine hits caused only by stopwords are a search defect to be measured, not a fixture defect",
+    noMatchSearchEngineHits: searchEngineHitCounts.reduce(
+      (acc, x) => {
+        acc.total += x.hits;
+        acc.queriesWithHits += x.hits > 0 ? 1 : 0;
+        return acc;
+      },
+      { total: 0, queriesWithHits: 0 },
+    ),
   },
   generationMs: durationMs,
   totalBytes,
