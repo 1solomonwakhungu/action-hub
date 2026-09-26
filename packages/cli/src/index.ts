@@ -18,6 +18,24 @@ import {
   runDaemonProcess,
 } from "./commands/daemon.js";
 import { VERSION } from "./version.js";
+import { IMPORT_SOURCE_FILTERS, type ImportSourceFilter } from "./commands/import.js";
+import { MIGRATE_SOURCE_FILTERS, type MigrateSourceFilter } from "./commands/migrate.js";
+
+/** Validates a raw --source CLI value (including "all") against the allowed filter list. */
+function parseSourceFilter<S extends string>(
+  raw: string | undefined,
+  allowed: readonly S[],
+): S | "all" | undefined {
+  if (!raw) return undefined;
+  if (raw === "all") return "all";
+  if (!(allowed as readonly string[]).includes(raw)) {
+    console.error(
+      `Unknown --source value "${raw}". Supported sources: ${allowed.join(", ")}, all`,
+    );
+    return undefined;
+  }
+  return raw as S;
+}
 
 function printHelp(): void {
   console.log(`
@@ -30,7 +48,7 @@ COMMANDS:
   doctor              Run system diagnostics, config validation, and server connectivity checks
   auth <action>       Manage OAuth 2.0 credentials for remote servers (login, status, logout)
   migrate             Migrate external MCP servers, agent skills, and plugins into Action Hub
-  import              Discover and import MCP server configurations from Claude, Cursor, VS Code
+  import              Discover and import MCP server configurations from Claude, Cursor, VS Code, Codex, Windsurf, Cline, and Roo Code
   test-search <query> Search the semantic and keyword catalog with score breakdowns
   list                List all registered tools, skills, and bundles
   bundle              Inspect registered action bundles
@@ -52,10 +70,14 @@ DAEMON:
 
 MIGRATE OPTIONS:
   --type <type>       Capability types to migrate: all, mcps, skills, plugins (default: all)
-  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, agents, all
+  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, agents, codex, windsurf, cline, roo-code, all
   --write             Commit migrated capabilities to config (default is dry-run)
   --overwrite         Overwrite existing servers or skills on ID conflict
   --json              Output plan and results in JSON format
+
+IMPORT OPTIONS:
+  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, codex, windsurf, cline, roo-code, all
+  --write             Save discovered servers to the Action Hub config
 
 AUTH OPTIONS:
   --no-browser        Print the authorization URL instead of opening a browser
@@ -150,11 +172,24 @@ async function main(): Promise<void> {
 
       case "migrate": {
         const typeVal = typeof parsedArgs["type"] === "string" ? parsedArgs["type"] : undefined;
-        const sourceVal = typeof parsedArgs["source"] === "string" ? parsedArgs["source"] : undefined;
+        const sourceArg = parsedArgs["source"];
+        const sourceVal = typeof sourceArg === "string" ? sourceArg : undefined;
+        if (sourceArg !== undefined && (typeof sourceArg !== "string" || sourceArg.trim() === "")) {
+          // Missing or invalid value: never run an unfiltered migration.
+          console.error("Missing value for --source");
+          exitCode = 1;
+          break;
+        }
+        const sourceFilter = parseSourceFilter(sourceVal, MIGRATE_SOURCE_FILTERS);
+        if (sourceVal !== undefined && sourceFilter === undefined) {
+          // Stop before invoking the command: never run an unfiltered migration.
+          exitCode = 1;
+          break;
+        }
         exitCode = await migrateCommand({
           configPath,
           type: typeVal as any,
-          source: sourceVal as any,
+          source: sourceFilter,
           write: Boolean(parsedArgs["write"]),
           overwrite: Boolean(parsedArgs["overwrite"]),
           json: Boolean(parsedArgs["json"]),
@@ -163,10 +198,23 @@ async function main(): Promise<void> {
       }
 
       case "import": {
-        const sourceVal = typeof parsedArgs["source"] === "string" ? parsedArgs["source"] : undefined;
+        const sourceArg = parsedArgs["source"];
+        const sourceVal = typeof sourceArg === "string" ? sourceArg : undefined;
+        if (sourceArg !== undefined && (typeof sourceArg !== "string" || sourceArg.trim() === "")) {
+          // Missing or invalid value: never run an unfiltered import.
+          console.error("Missing value for --source");
+          exitCode = 1;
+          break;
+        }
+        const sourceFilter = parseSourceFilter(sourceVal, IMPORT_SOURCE_FILTERS);
+        if (sourceVal !== undefined && sourceFilter === undefined) {
+          // Stop before invoking the command: never run an unfiltered import.
+          exitCode = 1;
+          break;
+        }
         exitCode = await importCommand({
           configPath,
-          source: sourceVal as any,
+          source: sourceFilter,
           write: Boolean(parsedArgs["write"]),
         });
         break;
