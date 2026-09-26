@@ -17,6 +17,14 @@ import { defaultConfigPath, loadConfig } from "./config.js";
 import { startControlServer, type ControlServer } from "./control.js";
 import { createSdkClientFactory } from "./sdk-client.js";
 import { warn, writeSnapshot } from "./snapshot.js";
+import {
+  LOAD_DESCRIPTION_MAX_BYTES,
+  LOAD_SCHEMA_MAX_BYTES,
+  SEARCH_SUMMARY_MAX_BYTES,
+  SKILL_INSTRUCTIONS_MAX_BYTES,
+  hardenSchema,
+  hardenText,
+} from "./output-hardening.js";
 
 const TOOL_DESCRIPTION = `Search, load, and run capabilities from every connected MCP server and installed skill.
 
@@ -270,8 +278,8 @@ async function dispatch(
           name: hit.name,
           server: hit.serverId,
           kind: hit.kind,
-          summary: hit.summary,
-          ...(hit.inputSchema ? { input_schema: hit.inputSchema } : {}),
+          summary: hardenText(hit.summary, SEARCH_SUMMARY_MAX_BYTES),
+          ...(hit.inputSchema ? { input_schema: hardenSchema(hit.inputSchema, LOAD_SCHEMA_MAX_BYTES) } : {}),
         })),
         ...(matchingBundles.length > 0
           ? {
@@ -352,6 +360,8 @@ async function dispatch(
       }
       const actionId = requireActionId(input, "load");
       const action = hub.load(actionId);
+      const descriptionLimit =
+        action.kind === "skill" ? SKILL_INSTRUCTIONS_MAX_BYTES : LOAD_DESCRIPTION_MAX_BYTES;
       return {
         ok: true,
         action_id: action.id,
@@ -359,8 +369,8 @@ async function dispatch(
         server: action.serverId,
         kind: action.kind,
         trust: action.trust,
-        description: action.description ?? action.summary,
-        input_schema: action.inputSchema,
+        description: hardenText(action.description ?? action.summary, descriptionLimit),
+        input_schema: hardenSchema(action.inputSchema, LOAD_SCHEMA_MAX_BYTES),
         next:
           action.kind === "skill"
             ? "This is a skill. Follow its instructions; do not execute it."
