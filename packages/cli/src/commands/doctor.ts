@@ -1,4 +1,12 @@
-import { ActionHub } from "@action-hub/core";
+import { stat } from "node:fs/promises";
+import {
+  ActionHub,
+  defaultCatalogCachePath,
+  redactArgs,
+  redactUrl,
+  sanitizeErrorForServer,
+  type ServerConfig,
+} from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
 import { createSdkClientFactory } from "../client-factory.js";
 
@@ -7,24 +15,54 @@ export interface DoctorOptions {
   checkConnectivity?: boolean;
 }
 
+function describeTransport(transport: ServerConfig["transport"]): string {
+  if (transport.type === "stdio") {
+    return `${transport.command} ${(redactArgs(transport.args) ?? []).join(" ")}`;
+  }
+  return redactUrl(transport.url);
+}
+
 export async function doctorCommand(options: DoctorOptions = {}): Promise<number> {
   console.log("Action Hub System Diagnostics & Health Check\n");
 
-  const config = await loadCliConfig(options.configPath);
+  let criticalFailures = 0;
 
-  console.log("Configuration:");
+  // 1. Node.js Version Check
+  const nodeVersion = process.version;
+  const major = parseInt(nodeVersion.slice(1).split(".")[0] ?? "0", 10);
+  const minor = parseInt(nodeVersion.slice(1).split(".")[1] ?? "0", 10);
+  const nodeOk = major > 20 || (major === 20 && minor >= 11);
+  if (nodeOk) {
+    console.log(`✔ Node.js runtime: ${nodeVersion} (compatible >= v20.11.0)`);
+  } else {
+    console.log(`✖ Node.js runtime: ${nodeVersion} (INCOMPATIBLE: requires >= v20.11.0)`);
+    criticalFailures++;
+  }
+
+  // 2. Configuration Discovery & Syntax
+  const config = await loadCliConfig(options.configPath);
+  console.log(`\nConfiguration:`);
   console.log(`  File location: ${config.path}`);
   console.log(`  File exists:   ${config.exists ? "Yes" : "No (using defaults / auto-discovery)"}`);
   console.log(`  Configured servers: ${config.servers.length}`);
   console.log(`  Configured bundles: ${config.bundles.length}`);
   console.log(`  Auto-approve at or above: ${config.autoApproveAtOrAbove}`);
-  console.log("");
 
-  if (config.servers.length === 0) {
-    console.log("⚠ No MCP servers configured. Run `action-hub import` to detect servers from other apps.");
-    return 0;
+  // 3. Cache Health
+  const cachePath = defaultCatalogCachePath();
+  try {
+    const st = await stat(cachePath);
+    console.log(`✔ Catalog Cache: active at ${cachePath} (${st.size} bytes)`);
+  } catch {
+    console.log(`ℹ Catalog Cache: not yet generated at ${cachePath} (generated on first index)`);
   }
 
+  if (config.servers.length === 0) {
+    console.log("\n⚠ No MCP servers configured. Run `action-hub import` to detect servers from other apps.");
+    return criticalFailures > 0 ? 1 : 0;
+  }
+
+  // 4. Downstream Server Connectivity & Indexing Status
   const factory = createSdkClientFactory();
   const hub = new ActionHub({
     servers: config.servers,
@@ -33,40 +71,44 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
   });
 
   try {
-    console.log("Indexing servers...");
-    const indexResults = await hub.indexAll();
-
     console.log("\nServer Connectivity & Indexing Status:");
-    let failures = 0;
+    const indexResults = await hub.indexAll();
 
     for (const res of indexResults) {
       const srv = config.servers.find((s) => s.id === res.serverId);
       const transportType = srv?.transport.type ?? "unknown";
-      const transportDesc =
-        srv?.transport.type === "stdio"
-          ? `${srv.transport.command} ${(srv.transport.args ?? []).join(" ")}`
-          : srv?.transport.type === "http"
-            ? srv.transport.url
-            : "";
+      // Secret-bearing args and URL query values are redacted for display.
+      const transportDesc = srv ? describeTransport(srv.transport) : "";
 
       if (res.error) {
-        failures++;
+        criticalFailures++;
         console.log(`  ✖ [${res.serverId}] (${transportType}) ${transportDesc}`);
-        console.log(`    Error: ${res.error}`);
+        // Error text may echo the server's own configuration (URLs, args,
+        // env); every secret value is redacted before printing.
+        console.log(`    Error: ${srv ? sanitizeErrorForServer(srv, res.error) : res.error}`);
       } else {
         console.log(`  ✔ [${res.serverId}] (${transportType}) ${res.indexed} tools indexed`);
       }
     }
 
-    // Health checks / Latency probing
+    // 5. Latency & Health Probing
     if (options.checkConnectivity !== false && indexResults.some((r) => !r.error)) {
       console.log("\nProbing Server Latency & Health:");
       const healthResults = await hub.checkAllHealth();
       for (const h of healthResults) {
+        const srv = config.servers.find((s) => s.id === h.serverId);
+        if (srv?.enabled === false || h.status === "disabled") {
+          console.log(`  ℹ [${h.serverId}] intentionally disabled; health probe skipped`);
+          continue;
+        }
         if (h.status === "ready") {
           console.log(`  ✔ [${h.serverId}] Status: ${h.status} (${h.latencyMs ?? 0}ms latency)`);
         } else {
-          console.log(`  ✖ [${h.serverId}] Status: ${h.status} ${h.error ? `(${h.error})` : ""}`);
+          criticalFailures++;
+          const detail = h.error
+            ? (srv ? sanitizeErrorForServer(srv, h.error) : h.error)
+            : "";
+          console.log(`  ✖ [${h.serverId}] Status: ${h.status} ${detail ? `(${detail})` : ""}`);
         }
       }
     }
@@ -91,7 +133,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
         : 0;
     console.log(`  Estimated token savings per turn: ~${savings}%`);
 
-    return failures > 0 ? 1 : 0;
+    return criticalFailures > 0 ? 1 : 0;
   } finally {
     await hub.close();
   }
