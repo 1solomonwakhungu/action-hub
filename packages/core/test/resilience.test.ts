@@ -988,3 +988,123 @@ test("connectWithDeadline: never-settling client.close still closes the transpor
   assert.ok(Date.now() - t0 < 3_500, "bounded close must not wait on the never-settling close");
   clearTimeout(keepAlive);
 });
+
+test("execute timeouts: N-1 then a success resets the streak, circuit stays closed", async () => {
+  const clock = new FakeClock();
+  const manager = new ConnectionManager(
+    () => Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }])),
+    [{ ...server("slowpoke"), executeTimeoutThreshold: 3 }],
+    { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+      now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+  );
+  for (const _ of [1, 2]) manager.recordExecuteTimeout("slowpoke", "Tool timed out");
+  let st = manager.states()[0]!;
+  assert.equal(st.executeTimeoutStreak, 2);
+  assert.equal(st.circuitState, "closed", "below threshold: circuit stays closed");
+  assert.equal(st.status, "inactive");
+  manager.recordSuccess("slowpoke");
+  st = manager.states()[0]!;
+  assert.equal(st.executeTimeoutStreak, 0, "a successful execute resets the streak");
+  assert.equal(st.circuitState, "closed");
+});
+
+test("execute timeouts: N consecutive open the circuit with the distinct reason", async () => {
+  const clock = new FakeClock();
+  const manager = new ConnectionManager(
+    () => Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }])),
+    [{ ...server("slowpoke"), executeTimeoutThreshold: 3 }],
+    { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+      restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+      now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+  );
+  manager.recordExecuteTimeout("slowpoke");
+  manager.recordExecuteTimeout("slowpoke");
+  manager.recordExecuteTimeout("slowpoke");
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "open");
+  assert.equal(st.status, "unreachable");
+  assert.equal(st.executeTimeoutStreak, 3);
+  assert.match(st.error ?? "", /repeated execute timeouts \(3 in a row\)/, "distinct reason is surfaced");
+  assert.ok(st.nextRestartAt, "same restart/cooldown recovery as transport failures");
+  await assert.rejects(
+    () => manager.activate("slowpoke"),
+    /repeated execute timeouts/,
+    "activate() surfaces the timeout reason",
+  );
+});
+
+test("execute timeouts: after cooldown a successful probe closes the circuit", async () => {
+  const clock = new FakeClock();
+  const manager = new ConnectionManager(
+    () => Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }])),
+    [{ ...server("slowpoke"), executeTimeoutThreshold: 2 }],
+    { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+      // Large restart backoff so the scheduled restart does NOT fire during
+      // the cooldown advance — the half-open probe path is what is under
+      // test here (the scheduled-restart recovery is covered by the
+      // repeated-timeout transport test).
+      restartBackoff: { initialMs: 60_000, maxMs: 60_000, jitter: 0 },
+      now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+  );
+  manager.recordExecuteTimeout("slowpoke");
+  manager.recordExecuteTimeout("slowpoke");
+  assert.equal(manager.states()[0]!.circuitState, "open");
+  await clock.advance(3_500); // cooldown elapses -> half-open
+  assert.equal(manager.circuitState("slowpoke"), "half-open");
+  const client = await manager.activate("slowpoke");
+  await client.callTool("ping", {});
+  manager.recordSuccess("slowpoke");
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "closed", "probe success closes the circuit");
+  assert.equal(st.executeTimeoutStreak, 0);
+  assert.equal(st.status, "ready");
+  await manager.closeAll();
+});
+
+test("execute timeouts: tool errors and transport failures never touch the streak", async () => {
+  const clock = new FakeClock();
+  const manager = new ConnectionManager(
+    () => Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }])),
+    [{ ...server("slowpoke"), executeTimeoutThreshold: 3 }],
+    { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+      now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+  );
+  manager.recordExecuteTimeout("slowpoke");
+  manager.recordExecuteTimeout("slowpoke");
+  // Transport failure path: does not reset the timeout streak...
+  manager.recordFailure("slowpoke", "EPIPE");
+  assert.equal(manager.states()[0]!.executeTimeoutStreak, 2);
+  // ...and tool errors (no record call at all) obviously never count.
+  assert.equal(manager.states()[0]!.circuitState, "closed", "failure below transport threshold");
+  manager.recordExecuteTimeout("slowpoke");
+  assert.equal(manager.states()[0]!.circuitState, "open", "timeout streak trips on its own threshold");
+});
+
+test("execute timeouts: slow-but-within-timeout successes never count", async () => {
+  const clock = new FakeClock();
+  const manager = new ConnectionManager(
+    () => Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }])),
+    [{ ...server("slowpoke"), executeTimeoutThreshold: 2 }],
+    { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+      now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+  );
+  for (const _ of [1, 2, 3]) {
+    manager.recordSuccess("slowpoke", 4_999); // slow but within timeout
+  }
+  assert.equal(manager.states()[0]!.executeTimeoutStreak, 0);
+  assert.equal(manager.states()[0]!.circuitState, "closed");
+});
+
+test("execute timeouts: threshold 0 disables the policy", async () => {
+  const clock = new FakeClock();
+  const manager = new ConnectionManager(
+    () => Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }])),
+    [{ ...server("slowpoke"), executeTimeoutThreshold: 0 }],
+    { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+      now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+  );
+  for (let i = 0; i < 50; i++) manager.recordExecuteTimeout("slowpoke");
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "closed", "threshold 0 disables isolation");
+  assert.equal(st.status, "inactive");
+});

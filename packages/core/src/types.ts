@@ -46,6 +46,13 @@ export interface ServerConfig {
  * call. A server that never answers initialize is abandoned after this
  * deadline and marked unreachable instead of gating startup (F27). */
   timeoutMs?: number;
+  /** Per-server threshold for consecutive EXECUTE timeouts (F26): when this
+   * many tools/call timeouts occur in a row, the server is isolated — the
+   * circuit opens with a "repeated execute timeouts" reason and recovers
+   * through the same cooldown/half-open probe as transport failures. A
+   * successful execute resets the streak; tool errors never count. Default 5;
+   * 0 disables the policy. */
+  executeTimeoutThreshold?: number;
   /** Per-server circuit breaker. Overrides hub defaults when set. */
   circuitBreaker?: CircuitBreakerConfig;
   /** Per-server restart backoff for crashed or unreachable servers. */
@@ -318,6 +325,9 @@ export interface ServerState {
   circuitOpen?: boolean;
   circuitState?: CircuitState;
   consecutiveFailures?: number;
+  /** Consecutive execute-timeout streak (F26): reset only by a successful
+   * execute; the circuit opens with a distinct reason at the threshold. */
+  executeTimeoutStreak?: number;
   restartAttempt?: number;
   nextRestartAt?: string;
   lastHeartbeatAt?: string;

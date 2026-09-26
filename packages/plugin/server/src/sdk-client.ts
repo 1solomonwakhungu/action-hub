@@ -93,7 +93,12 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
       },
 
       async close() {
-        await client.close();
+        // client.close() on a half-connected SDK client is a no-op: the
+        // TRANSPORT owns the spawned stdio child (or HTTP session), so close
+        // it too — best-effort, independent of client.close()'s outcome (F26:
+        // a tripped breaker must release the child, not leak it).
+        await client.close().catch(() => {});
+        await transport.close?.().catch(() => {});
       },
     } satisfies McpClient;
   };

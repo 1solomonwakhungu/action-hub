@@ -730,7 +730,14 @@ export class ActionHub {
           // boundary as transport-level (see isTransportFailure): JSON-RPC
           // error responses and isError results from a live server are ignored,
           // and the breaker's recovery (drop + restart) never blocks on close.
-          if (!isTimeout && !isCircuit) {
+          if (isCircuit) {
+            // Already tripped; nothing to feed back.
+          } else if (isTimeout) {
+            // F26: consecutive execute timeouts isolate a server that hangs
+            // every tools/call (a slow handler is not a transport failure,
+            // so the breaker's transport path ignores these by design).
+            this.#connections.recordExecuteTimeout(record.serverId, message);
+          } else {
             await this.#connections.reportExecuteFailure(record.serverId, cause, message);
           }
 
