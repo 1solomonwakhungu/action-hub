@@ -115,16 +115,24 @@ async function main() {
   } catch {
     run.resultFiles = [];
   }
-  // Parse per-scenario result files for SUCCESS/FAILURE counts.
+  // Parse per-scenario result files: the suite writes one directory per
+  // scenario containing checks.json.
   const counts = { success: 0, failure: 0, warning: 0, scenarios: 0 };
   try {
     const { readdirSync, readFileSync, statSync } = await import("node:fs");
     for (const f of run.resultFiles) {
       const p = join(outDir, f);
-      if (!statSync(p).isFile() || !f.endsWith(".json")) continue;
-      const d = JSON.parse(readFileSync(p, "utf8"));
+      if (!statSync(p).isDirectory()) continue;
+      const checksPath = join(p, "checks.json");
+      let checks = null;
+      try {
+        checks = JSON.parse(readFileSync(checksPath, "utf8"));
+      } catch {
+        continue;
+      }
       counts.scenarios++;
-      for (const c of d.checks ?? []) {
+      const list = Array.isArray(checks) ? checks : (checks.checks ?? []);
+      for (const c of list) {
         if (c.status === "SUCCESS") counts.success++;
         else if (c.status === "FAILURE") counts.failure++;
         else if (c.status === "WARNING") counts.warning++;
