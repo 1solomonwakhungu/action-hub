@@ -513,31 +513,27 @@ for (const s of take(100)) {
   });
 }
 
-// 20% paraphrase (100)
-const PARAPHRASE_MAP = [
-  ["run", "execute"],
-  ["review", "go over"],
-  ["report", "surface"],
-  ["compare against", "measure against"],
-  ["confirm", "double-check"],
-  ["escalate", "flag upward"],
-  ["update", "refresh"],
-  ["verify", "validate"],
+// 20% paraphrase (100) — FX13 (F31): natural user phrasing built from the
+// domain's plain-English synonym tables. The old construction paraphrased
+// `goalOnlyQuery` (name deleted mid-sentence, leaving "for against" debris)
+// and appended the name's first word as an opaque token; both defects are
+// gone: the query is one grammatical question with no deletion and no append.
+const PARAPHRASE_OPENERS = [
+  "How do I",
+  "What's the right way to",
+  "Can you show me how to",
+  "I need to know how to",
+  "Help me",
 ];
-function paraphrase(text) {
-  let out = text;
-  for (const [from, to] of PARAPHRASE_MAP) out = out.replace(new RegExp(`\\b${from}\\b`, "gi"), to);
-  return out;
-}
-for (const s of take(300)) {
+const paraphraseCleanTexts = [];
+for (const s of take(400)) {
   if (queries.filter((q) => q.subtype === "paraphrase").length >= 100) break;
-  const firstWord = s.name.split(" ")[0];
-  const q = withNoise(
-    paraphrase(goalOnlyQuery(s)) + " " + firstWord.toLowerCase(),
-    rand,
-    0.2,
-    counters,
-  );
+  const domain = DOMAINS.find((d) => d.name === s.domain);
+  const [subject, object] = s.name.split(" ");
+  const synOf = (word) => (domain.synonyms?.[word] ?? word).toLowerCase();
+  const clean = `${pick(PARAPHRASE_OPENERS)} handle the ${synOf(object)} for our ${synOf(subject)} in ${domain.context}?`;
+  paraphraseCleanTexts.push(clean);
+  const q = withNoise(clean, rand, 0.2, counters);
   // Invariants (review HIGH-3): paraphrases must not leak the literal target
   // name or any number. Documented overlap ceiling: a paraphrase may cover at
   // most half of the gold document's tokens (inDoc / docTokens <= 0.5) — it
@@ -818,10 +814,65 @@ for (const q of queries) {
 
 await writeFile(QUERIES_PATH, JSON.stringify(queries, null, 2), "utf8");
 
+// --- FX13 query-quality self-check ------------------------------------------------
+// Lint the CLEAN paraphrase texts (before noise/typos) so the gate measures
+// generator phrasing, not injected noise. Zero lint hits is the gate.
+const SKILL_STOPWORDS = new Set([
+  "how", "do", "i", "what", "the", "right", "way", "to", "help", "me", "need",
+  "know", "can", "you", "show", "handle", "our", "for", "in", "and", "or", "a",
+  "an", "of", "with", "on", "at", "is", "are", "s",
+]);
+const skillVocab = new Set(SKILL_STOPWORDS);
+for (const d of DOMAINS) {
+  for (const w of token(d.name)) skillVocab.add(w);
+  for (const w of [
+    ...d.subjects, ...d.objects, ...d.types, d.context, d.metric, d.tool,
+    ...Object.keys(d.synonyms ?? {}), ...Object.values(d.synonyms ?? {}),
+  ]) {
+    for (const t of token(w)) skillVocab.add(t.toLowerCase());
+  }
+}
+const skillLint = { debris: 0, doubleSpace: 0, malformed: 0, unknownVocab: 0, ambiguous: 0 };
+for (const clean of paraphraseCleanTexts) {
+  // Debris = two consecutive PREPOSITIONS (the "for against" class left
+  // by mid-sentence deletions). Article/verb pairs like "in the" or
+  // "to know" are grammatical and must not count.
+  if (/\b(?:for|against|with|of|to|in)\s+(?:for|against|with|of|to|in)\b/i.test(clean)) skillLint.debris += 1;
+  if (/ {2,}/.test(clean)) skillLint.doubleSpace += 1;
+  if (!/^[A-Z]/.test(clean) || !/\?$/.test(clean)) skillLint.malformed += 1;
+  const unknown = token(clean).filter((t) => !skillVocab.has(t));
+  if (unknown.length > 0) skillLint.unknownVocab += 1;
+}
+// Skill names are enforced unique at construction (usedNames), so a single
+// gold slug is never ambiguous by construction; assert it anyway.
+skillLint.ambiguous = skills.length - usedNames.size;
+const skillLintTotal = Object.values(skillLint).reduce((a, b) => a + b, 0);
+
+// 30 random paraphrase samples (deterministic pick from the emitted band).
+const emittedParaphrases = queries.filter((q) => q.subtype === "paraphrase");
+const sampleStride = Math.max(1, Math.floor(emittedParaphrases.length / 30));
+const paraphraseSamples = emittedParaphrases
+  .filter((_, i) => i % sampleStride === 0)
+  .slice(0, 30)
+  .map((q) => q.query);
+console.log("--- FX13 skill paraphrase samples (30) ---");
+for (const sample of paraphraseSamples) console.log("  " + sample);
+console.log("--- FX13 skill lint counts (clean text, gate = all zero) ---");
+console.log(JSON.stringify(skillLint));
+if (skillLintTotal > 0) {
+  throw new Error(`FX13 lint gate failed for skills: ${JSON.stringify(skillLint)}`);
+}
+await writeFile(
+  join(RESULTS_DIR, "query-quality-skills.json"),
+  JSON.stringify({ generatorVersion: 3, lint: skillLint, samples: paraphraseSamples }, null, 2),
+  "utf8",
+);
+
 // --- Summary --------------------------------------------------------------------
 const durationMs = Date.now() - startedAt;
 const summary = {
   script: "gen-skills.mjs",
+  generatorVersion: 3,
   seed: SEED,
   skills: skills.length,
   uniqueIds: verifiedIds.size,
@@ -849,6 +900,7 @@ const summary = {
   generationMs: durationMs,
   totalBytes,
   skillsDir: SKILLS_DIR,
+  queryQuality: { generatorVersion: 3, lint: skillLint, lintHits: skillLintTotal, sampleCount: paraphraseSamples.length },
 };
 await writeFile(join(RESULTS_DIR, "gen-skills.json"), JSON.stringify(summary, null, 2), "utf8");
 console.log(JSON.stringify(summary));

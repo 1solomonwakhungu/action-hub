@@ -45,6 +45,8 @@ function argNum(name, dflt) {
 const SEED = argNum('--seed', 0x5337c0de) >>> 0;
 const OUT_DIR = resolve(argValue('--out-dir') ?? 'stress/.generated/tools');
 const RESULTS_DIR = resolve('stress/.generated/results');
+// Clean (pre-noise) paraphrase texts collected during generation for the FX13 lint gate.
+const paraphraseClean = [];
 const SMALL_SERVERS = argNum('--small-servers', 40);
 const SMALL_TOOLS = argNum('--small-tools', 200);
 const BIG_SERVERS = argNum('--big-servers', 4);
@@ -163,33 +165,33 @@ const QUALIFIERS = ['recent','archived','active','pending','overdue','stale','or
 const VERB_SYN = {
   list: ['enumerate', 'line up', 'round up'], get: ['fetch', 'pull', 'grab'],
   create: ['set up', 'spin up', 'stand up'], update: ['amend', 'adjust', 'revise'],
-  delete: ['wipe', 'erase', 'scrub'], search: ['hunt down', 'dig up', 'track down'],
-  archive: ['shelve', 'box up'], restore: ['bring back', 'put back'],
-  assign: ['hand off', 'delegate'], move: ['relocate', 'shuttle'],
-  merge: ['fold together', 'combine'], export: ['dump out', 'download'],
-  validate: ['sanity check', 'vet'], preview: ['peek at', 'dry look at'],
+  delete: ['wipe', 'erase', 'scrub'], search: ['look for', 'find', 'try to locate'],
+  archive: ['shelve', 'file away'], restore: ['bring back', 'put back'],
+  assign: ['hand off', 'delegate'], move: ['relocate', 'shift over'],
+  merge: ['fold together', 'combine'], export: ['copy out', 'download'],
+  validate: ['sanity check', 'vet'], preview: ['look over', 'glance at'],
   publish: ['go live', 'put out'], cancel: ['call off', 'scrap'],
   retry: ['have another go', 'rerun'], approve: ['green light', 'sign off on'],
   reject: ['turn down', 'veto'], close: ['wrap up', 'shut'],
-  reopen: ['reopen'.replace('reopen', 'un shut'), 'un shut'], clone: ['duplicate', 'copy'],
-  diff: ['compare', 'contrast'], sync: ['mesh up', 'reconcile'] /* reconcile unused in names here */,
+  reopen: ['open again', 'reactivate'], clone: ['duplicate', 'copy'],
+  diff: ['compare', 'contrast'], sync: ['sync up', 'reconcile'] /* reconcile unused in names here */,
   rotate: ['roll over', 'swap out'], revoke: ['claw back', 'withdraw'],
-  send: ['fire off', 'zap', 'dispatch'], schedule: ['slot in', 'book'],
-  acknowledge: ['confirm', 'own up to'], escalate: ['ratchet up', 'bump up'],
-  count: ['tally', 'census'], summarize: ['boil down', 'recap'],
+  send: ['fire off', 'dispatch'], schedule: ['slot in', 'book'],
+  acknowledge: ['confirm', 'own up to'], escalate: ['raise', 'flag as urgent'],
+  count: ['tally up', 'take stock of'], summarize: ['boil down', 'recap'],
   compare: ['weigh', 'juxtapose'], enable: ['switch on', 'activate'],
   disable: ['switch off', 'deactivate'], pause: ['freeze'] /* freeze exists; second choice below */,
   resume: ['unpause', 'carry on'], transfer: ['reassign', 'wire over'],
   attach: ['hook up', 'fasten'], detach: ['unhook', 'unfasten'],
   link: ['tie together', 'connect'], unlink: ['untie', 'disconnect'],
   resolve: ['settle', 'close out'], split: ['carve up', 'split apart'],
-  purge: ['obliterate', 'incinerate'], rollback: ['roll back', 'undo'],
+  purge: ['delete for good', 'wipe out'], rollback: ['roll back', 'undo'],
   promote: ['elevate', 'bump up'], invite: ['bring in', 'recruit'],
   verify: ['double check', 'authenticate'], resend: ['fire off again', 'bounce again'],
   share: ['hand out', 'circulate'], lock: ['bolt shut', 'seal'],
-  unlock: ['unseal', 'unbolt'], freeze: ['put on ice', 'deep six'],
+  unlock: ['unseal', 'unbolt'], freeze: ['put on hold', 'pause for now'],
   unfreeze: ['thaw', 'let thaw'], finalize: ['nail down', 'lock down'],
-  void: ['nullify', 'torpedo'], reindex: ['reshuffle'],
+  void: ['cancel out', 'nullify'], reindex: ['reshuffle'],
   rebuild: ['reassemble', 'reconstruct'], recalculate: ['recompute', 'rework the math on'],
   prune: ['trim', 'thin out'], migrate: ['transport', 'carry over'],
   backfill: ['retrofill', 'catch up'], replay: ['run back', 'restage'],
@@ -204,10 +206,10 @@ const ENTITY_SYN = {
   refund: ['rebate'], dispute: ['claim'],
   chargeback: ['reversal'], settlement: ['payoff'],
   project: ['initiative'], task: ['chore'],
-  event: ['occurrence'], meeting: ['get together'],
+  event: ['occurrence'], meeting: ['meet up', 'calendar event slot'],
   comment: ['remark'], message: ['note'],
   conversation: ['exchange'], thread: ['back and forth'],
-  file: ['dossier'], document: ['writeup'],
+  file: ['paper file'], document: ['writeup'],
   report: ['digest'], dashboard: ['panel'],
   metric: ['gauge'], trace: ['span'],
   log: ['trail'], alert: ['notification'],
@@ -220,10 +222,10 @@ const ENTITY_SYN = {
   permission: ['rights'], webhook: ['callback'],
   deployment: ['rollout'], release: ['ship out'],
   artifact: ['build'], tag: ['marker'],
-  pipeline: ['conduit'], vm: ['machine'],
-  bucket: ['bin'], object: ['blob'],
-  zone: ['area'], certificate: ['cert'],
-  cluster: ['farm'], node: ['box'],
+  pipeline: ['data pipe', 'delivery line'], vm: ['machine'],
+  bucket: ['storage bin', 'object store entry'],
+  zone: ['area'], certificate: ['security document'],
+  cluster: ['server group'], node: ['machine'],
   campaign: ['promotion'], email: ['correspondence'],
   subscriber: ['opt in'], audience: ['demographic'],
   creative: ['artwork'], shipment: ['parcel'],
@@ -525,20 +527,63 @@ function buildQueries(manifests, serverDescs) {
   }
 
   // PARAPHRASE: synonyms only, never tool name / serverId verbatim,
-  // documented overlap ceiling 30% of content tokens.
+  // documented overlap ceiling 30% of content tokens. FX13 (F31): when the
+  // gold tool name is cloned across servers, a bare synonym query is
+  // underdetermined — the query MUST carry a domain clue (org + server
+  // domain words) that uniquely picks the gold server, or generation fails.
   {
+    const domainOf = (sid) => DOMAINS.find((dd) => `${dd.org}-${dd.name}` === sid);
+    // Minimal clue: if every clone lives in the same org, the domain name
+    // alone disambiguates (fewer indexed tokens keeps the 30% overlap ceiling
+    // reachable); otherwise org + domain. Inserted before terminal
+    // punctuation so the sentence stays grammatical.
+    const clueOf = (rec) => {
+      const group = byName.get(rec.tool.name) ?? [];
+      const d = domainOf(rec.serverId);
+      const sameOrg = group.every((r) => domainOf(r.serverId)?.org === d.org);
+      return sameOrg
+        ? `in the ${d.name.replace(/-/g, ' ')} system`
+        : `in the ${d.org.replace(/-/g, ' ')} ${d.name.replace(/-/g, ' ')} system`;
+    };
     const gen = [];
     for (const rec of shuffled(eligible)) {
       gen.push(() => {
         let text = pick(PARAPHRASE_TEMPLATES)
           .replace('{V}', pick(verbSynOf(rec.tool)))
           .replace('{E}', pick(entSynOf(rec.tool)));
+        const clones = (byName.get(rec.tool.name) ?? []).length;
+        if (clones > 1) {
+          text = `${text.replace(/[?.!]*$/, "")}, ${clueOf(rec)}.`;
+        }
+        paraphraseClean.push(text);
         if (rnd() < TYPO_RATE) text = text.replace(/\b\w{4,}\b/, (w) => injectTypo(w));
+        // Clued queries carry extra indexed tokens (the clue); drop candidates
+        // whose overlap would break the documented 30% ceiling.
+        if (clones > 1) {
+          const ct = contentTokens(text);
+          const ratio = ct.filter((t) => rec.indexed.has(t)).length / Math.max(1, ct.length);
+          if (ratio > 0.3) return null;
+        }
         return { query: text, expected: rec.id };
       });
     }
     for (let i = 0; i < quotas[1][1]; i++) {
       if (!tryEmit('paraphrase', 'paraphrase', gen)) throw new Error('could not fill paraphrase quota');
+    }
+    // Ambiguity validator (FX13 #2): fail generation if any paraphrase's gold
+    // is underdetermined by construction — cloned name without a clue, or a
+    // clue that does not actually pick the gold server out of the clone group.
+    for (let i = 0; i < queries.length; i++) {
+      if (queries[i].subtype !== 'paraphrase') continue;
+      const [sid, tname] = queries[i].expected.split(':');
+      const group = byName.get(tname) ?? [];
+      if (group.length <= 1) continue;
+      const goldTokens = new Set(tokenize(sid.replace(/-/g, ' ')));
+      const queryTokens = new Set(tokenize(queries[i].query));
+      const disambiguating = [...goldTokens].some((t) => queryTokens.has(t));
+      if (!disambiguating) {
+        throw new Error(`ambiguous paraphrase: cloned tool name "${tname}" without a disambiguating server clue: ${queries[i].query}`);
+      }
     }
   }
 
@@ -804,6 +849,69 @@ function main() {
   const finalFiles = readdirSync(OUT_DIR).filter((f) => f.endsWith('.json'));
   const { violations, minDistractors } = validate(manifests, queries, serverDescs, staleRemoved, finalFiles);
 
+  // --- FX13 query-quality self-check ------------------------------------------------
+  // Lint CLEAN paraphrase texts (before noise/typos). Zero lint hits is the gate.
+  const toolStopwords = new Set(['can','you','would','love','to','please','whenever','could','someone','today','any','chance','if','possible','when','get','a','i','me','my','the','in','of','for','and','or','on','at','is','are','with','what','how','find','do','our']);
+  const toolVocab = new Set(toolStopwords);
+  for (const table of [VERB_SYN, ENTITY_SYN]) {
+    for (const [k, vals] of Object.entries(table)) {
+      for (const t of tokenize(k)) toolVocab.add(t);
+      for (const v of vals) for (const t of tokenize(v)) toolVocab.add(t);
+    }
+  }
+  for (const d of DOMAINS) {
+    for (const t of tokenize(d.name)) toolVocab.add(t);
+    for (const t of tokenize(d.org.replace(/-/g, ' '))) toolVocab.add(t);
+  }
+  for (const t of ['system', 'recent', 'convenient']) toolVocab.add(t);
+  const toolLint = { debris: 0, doubleSpace: 0, malformed: 0, unknownVocab: 0, ambiguous: 0 };
+  const unknownSamples = [];
+  for (const clean of paraphraseClean) {
+    // Debris = two consecutive prepositions (mid-sentence deletion class).
+    if (/\b(?:for|against|with|of|to|in)\s+(?:for|against|with|of|to|in)\b/i.test(clean)) toolLint.debris += 1;
+    if (/ {2,}/.test(clean)) toolLint.doubleSpace += 1;
+    // Malformed = lowercase start, or ends on a dangling function word (the
+    // mid-sentence deletion signature). Casual templates without terminal
+    // punctuation are fine; dangling connectives are not.
+    if (!/^[A-Z]/.test(clean) || /\b(?:for|against|with|of|to|in|and|or|the|a|an)$/i.test(clean.trim())) {
+      toolLint.malformed += 1;
+    }
+    const unknown = tokenize(clean).filter((t) => !toolVocab.has(t));
+    if (unknown.length > 0) {
+      toolLint.unknownVocab += 1;
+      unknownSamples.push(...unknown.slice(0, 5));
+    }
+  }
+  // Ambiguity count for the record: the validator inside buildQueries already
+  // fails hard on ambiguous paraphrases; this recomputes the same predicate
+  // over the emitted rows so the results file carries the number.
+  const cloneCounts = new Map();
+  for (const m of manifests) for (const t of m.tools) cloneCounts.set(t.name, (cloneCounts.get(t.name) ?? 0) + 1);
+  const ambiguousCount = queries.filter((q) => {
+    if (q.subtype !== 'paraphrase' || !q.expected) return false;
+    const [sid, tname] = q.expected.split(':');
+    if ((cloneCounts.get(tname) ?? 0) <= 1) return false;
+    const goldTokens = new Set(tokenize(sid.replace(/-/g, ' ')));
+    return ![...goldTokens].some((t) => tokenize(q.query).includes(t));
+  }).length;
+  toolLint.ambiguous = ambiguousCount;
+  const toolLintTotal = Object.values(toolLint).reduce((a, b) => a + b, 0);
+
+  const emittedParaphrases = queries.filter((q) => q.subtype === 'paraphrase');
+  const sampleStride = Math.max(1, Math.floor(emittedParaphrases.length / 30));
+  const paraphraseSamples = emittedParaphrases.filter((_, i) => i % sampleStride === 0).slice(0, 30).map((q) => q.query);
+  console.log('--- FX13 tool paraphrase samples (30) ---');
+  for (const sample of paraphraseSamples) console.log('  ' + sample);
+  console.log('--- FX13 tool lint counts (clean text, gate = all zero) ---');
+  console.log(JSON.stringify(toolLint));
+  if (toolLintTotal > 0) {
+    throw new Error(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
+  }
+  writeFileSync(
+    join(RESULTS_DIR, 'query-quality-tools.json'),
+    JSON.stringify({ generatorVersion: 3, lint: toolLint, samples: paraphraseSamples }, null, 2),
+  );
+
   const bySubtype = {};
   const byDifficulty = {};
   for (const q of queries) {
@@ -812,11 +920,13 @@ function main() {
   }
   const summary = {
     script: 'gen-tools.mjs',
+    generatorVersion: 3,
     seed: SEED,
     manifestCount: manifests.length,
     totalTools: manifests.reduce((a, m) => a + m.tools.length, 0),
     bigManifests: BIG_MANIFEST_COUNT,
     queryTotal: queries.length,
+    queryQuality: { generatorVersion: 3, lint: toolLint, lintHits: toolLintTotal, sampleCount: paraphraseSamples.length },
     bySubtype,
     byDifficulty,
     checks: {
