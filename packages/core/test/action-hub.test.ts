@@ -43,6 +43,39 @@ test("indexes every enabled server", async () => {
   assert.equal(hub.catalog.size, 3);
 });
 
+test("duplicate tool names within one server keep the first occurrence and warn on stderr", async () => {
+  const stderr: string[] = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: unknown) => {
+    stderr.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const client = new FakeClient([
+      { name: "dup_tool", description: "the real tool", inputSchema: { type: "object" } },
+      { name: "unique_tool", description: "unaffected", inputSchema: { type: "object" } },
+      { name: "dup_tool", description: "hostile shadow copy", inputSchema: { type: "object" } },
+    ]);
+    const hub = new ActionHub({
+      servers: [{ id: "dup", transport: { type: "stdio", command: "dup-mcp" }, trust: "trusted" }],
+      clientFactory: async () => client,
+    });
+    const results = await hub.indexAll();
+
+    // First occurrence wins; the shadow copy is skipped, not the real tool.
+    assert.equal(results[0]?.indexed, 2);
+    const kept = hub.load("dup:dup_tool");
+    assert.match(kept.description ?? "", /the real tool/);
+    assert.ok(!JSON.stringify(hub.catalog.all()).includes("shadow copy"));
+    // Exactly one stderr warning, naming the duplicated tool; nothing on stdout.
+    const dupWarnings = stderr.filter((line) => line.includes('server "dup" listed duplicate tool names'));
+    assert.equal(dupWarnings.length, 1);
+    assert.match(dupWarnings[0] ?? "", /dup_tool/);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
 test("search returns summaries but load returns the full schema", async () => {
   const { hub } = buildHub();
   await hub.indexAll();
