@@ -94,22 +94,33 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- chaos bookkeeping -------------------------------------------------------
 
-let requestsReceived = 0;
-let responsesDelivered = 0;
-let crashArmed = false;
+// --- crash-after bookkeeping (tools/call only; see header) -------------------
+
+// json-rpc id -> { seq }; the in-flight set of accepted tools/call requests.
+const callState = new Map();
+let acceptedCalls = 0;
+let deliveredCalls = 0;
+let finishedCalls = 0; // HTTP: ServerResponse 'finish' events observed
+let crashDone = false;
+
+function crashLog(reason) {
+  if (crashDone) return;
+  crashDone = true;
+  process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${deliveredCalls} completed tools/call responses (${reason})\n`);
+  process.exit(1);
+}
 
 /**
- * Count a received JSON-RPC request. Returns true when this request reached
- * the crash-after limit; callers must refuse any further work beyond N.
- * Crash delivery is handled by the transport send hook below, so the Nth
- * response is fully written before the process exits.
+ * Called from the tools/call handler. Returns false when this call must be
+ * refused (limit reached); refused calls never enter callState and their
+ * isError replies never count. Accepted calls are registered per JSON-RPC
+ * id so the transport send hook can tie delivery to the exact response.
  */
-function serveRequest() {
-  if (crashArmed) return false;
-  requestsReceived += 1;
-  if (crashAfter !== undefined && requestsReceived >= crashAfter) {
-    crashArmed = true;
-  }
+function beginToolCall(extra) {
+  if (crashAfter === undefined) return true;
+  if (acceptedCalls >= crashAfter) return false;
+  acceptedCalls += 1;
+  callState.set(extra.requestId, { seq: acceptedCalls });
   return true;
 }
 
@@ -120,59 +131,61 @@ function refusalResult() {
   };
 }
 
-function maybeCrashAfterDelivery() {
-  if (crashAfter !== undefined && responsesDelivered >= crashAfter) {
-    process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${responsesDelivered} completed responses\n`);
-    process.exit(1);
-  }
-}
-
 /**
- * Stdio transport wrapper: a response is counted as served only once its
- * stdout write has drained (StdioServerTransport.send resolves on the write
- * callback), then exit(1) — proven to arrive before the disconnect.
- * Everything the SDK assigns (onmessage/onerror/onclose) passes through.
+ * Transport wrapper tying crash delivery to the Nth accepted tools/call
+ * response ONLY. initialize/tools/list/ping responses are not in callState
+ * and never count. stdio: exit after the write resolves (drain). HTTP:
+ * send() resolving does not mean the ServerResponse flushed, so arm a
+ * 'finish' hook on that request's own res (captured via handleRequest),
+ * never a global flag. Every SDK-assigned handler passes through.
  */
-function withDeliveryCounting(inner) {
+function withCrashCounting(inner, { http = false } = {}) {
+  let currentRes = null;
   return new Proxy(inner, {
     get(target, prop, recv) {
       if (prop === "send") {
         return async (msg) => {
           const result = await target.send(msg);
-          if (msg && typeof msg === "object" && msg.id !== undefined && !("method" in msg)) {
-            responsesDelivered += 1;
-            maybeCrashAfterDelivery();
+          if (
+            crashAfter !== undefined &&
+            msg && typeof msg === "object" && !("method" in msg) &&
+            callState.has(msg.id)
+          ) {
+            callState.delete(msg.id);
+            deliveredCalls += 1;
+            if (http && currentRes) {
+              // SSE/HTTP responses drain asynchronously (res.write may be
+              // backpressured well past send() resolving), so the exit waits
+              // for EVERY accepted response's own ServerResponse 'finish' —
+              // never just the triggering one, and never a global flag.
+              const res = currentRes;
+              let counted = false;
+              const arm = (reason) => {
+                if (counted) return;
+                counted = true;
+                finishedCalls += 1;
+                if (finishedCalls >= crashAfter) crashLog(reason);
+              };
+              if (res.writableFinished) arm("finish");
+              else {
+                res.once("finish", () => arm("finish"));
+                res.once("close", () => {
+                  if (!res.writableFinished) arm("client-abort");
+                });
+              }
+            } else if (deliveredCalls >= crashAfter) {
+              // stdio: write callback = chunk handed to the pipe buffer,
+              // which survives process exit.
+              crashLog("write-drained");
+            }
           }
           return result;
         };
       }
-      const value = Reflect.get(target, prop, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-}
-
-/**
- * HTTP transport wrapper: StreamableHTTPServerTransport.send resolves once
- * the response is handed to the web stream — the ServerResponse may not be
- * flushed yet — so exit(1) there would cut the client off mid-response.
- * Instead, reaching N only sets httpCrashPending; the caller (runHttp) arms
- * a 'finish' hook on that request's ServerResponse and exits there.
- */
-let httpCrashPending = false;
-function withDeliveryCountingHttp(inner) {
-  return new Proxy(inner, {
-    get(target, prop, recv) {
-      if (prop === "send") {
-        return async (msg) => {
-          const result = await target.send(msg);
-          if (msg && typeof msg === "object" && msg.id !== undefined && !("method" in msg)) {
-            responsesDelivered += 1;
-            if (crashAfter !== undefined && responsesDelivered >= crashAfter) {
-              httpCrashPending = true;
-            }
-          }
-          return result;
+      if (prop === "handleRequest" && http) {
+        return async (req, res, ...rest) => {
+          currentRes = res;
+          return target.handleRequest(req, res, ...rest);
         };
       }
       const value = Reflect.get(target, prop, target);
@@ -221,12 +234,11 @@ function buildTools() {
 
 function registerHandlers(server) {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    if (!serveRequest()) return refusalResult();
     return { tools: buildTools() };
   });
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (!serveRequest()) return refusalResult();
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    if (!beginToolCall(extra)) return refusalResult();
     const tool = manifest.tools.find((t) => t.name === request.params.name);
     // Unknown tool names are rejected with an isError result, consistent
     // with real servers (a plain ok:true would hide router defects).
@@ -257,7 +269,6 @@ function registerHandlers(server) {
   });
 
   server.setRequestHandler(PingRequestSchema, async () => {
-    if (!serveRequest()) return refusalResult();
     return {};
   });
 }
@@ -267,7 +278,7 @@ function registerHandlers(server) {
 async function runStdio() {
   const server = new Server({ name: serverId, version: "0.0.0" }, { capabilities: { tools: {} } });
   registerHandlers(server);
-  const transport = withDeliveryCounting(new StdioServerTransport());
+  const transport = withCrashCounting(new StdioServerTransport());
   await server.connect(transport);
   // Exit when the client closes the session so spawnSync callers get a
   // clean exit code instead of an orphan; serve until then.
@@ -303,7 +314,7 @@ function runHttp() {
 
     // Stateless Streamable HTTP: a fresh transport + server per POST request
     // (SDK stateless pattern). GET/DELETE are rejected with 405.
-    const transport = withDeliveryCountingHttp(new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }));
+    const transport = withCrashCounting(new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }), { http: true });
     res.on("close", () => {
       void transport.close().catch(() => {});
     });
@@ -312,21 +323,6 @@ function runHttp() {
     try {
       await server.connect(transport);
       await transport.handleRequest(req, res, parsed);
-      // Crash only after the Nth response is fully flushed to the socket
-      // (ServerResponse 'finish' = handed to the OS, not merely 'close').
-      if (httpCrashPending) {
-        res.once("finish", () => {
-          process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${responsesDelivered} completed responses\n`);
-          process.exit(1);
-        });
-        // Safety net: a response stream that never reaches 'finish' still
-        // crashes once the request object closes.
-        res.once("close", () => {
-          if (!res.writableFinished) return;
-          process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${responsesDelivered} completed responses (close)\n`);
-          process.exit(1);
-        });
-      }
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(500).end();
