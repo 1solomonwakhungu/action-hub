@@ -268,7 +268,6 @@ export class ConnectionManager {
     const entry = this.#entries.get(serverId);
     if (!entry || entry.manualShutdown) return;
     entry.consecutiveFailures = 0;
-    entry.consecutiveTimeouts = 0;
     entry.circuitOpenReason = undefined;
     entry.lastFailureTime = undefined;
     entry.error = undefined;
@@ -281,6 +280,20 @@ export class ConnectionManager {
     if (entry.status !== "disabled" && entry.client) {
       entry.status = "ready";
     }
+  }
+
+  /**
+   * A successful EXECUTE (F26): like recordSuccess, but additionally resets
+   * the consecutive execute-timeout streak. Deliberately separate: health
+   * checks and heartbeats report success from listTools — a server that
+   * answers pings while every tools/call hangs would otherwise keep wiping
+   * the streak and never be isolated.
+   */
+  recordExecuteSuccess(serverId: string, latencyMs?: number): void {
+    const entry = this.#entries.get(serverId);
+    if (!entry || entry.manualShutdown) return;
+    entry.consecutiveTimeouts = 0;
+    this.recordSuccess(serverId, latencyMs);
   }
 
   recordFailure(serverId: string, error?: string): void {

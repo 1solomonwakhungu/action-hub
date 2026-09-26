@@ -1002,7 +1002,7 @@ test("execute timeouts: N-1 then a success resets the streak, circuit stays clos
   assert.equal(st.executeTimeoutStreak, 2);
   assert.equal(st.circuitState, "closed", "below threshold: circuit stays closed");
   assert.equal(st.status, "inactive");
-  manager.recordSuccess("slowpoke");
+  manager.recordExecuteSuccess("slowpoke");
   st = manager.states()[0]!;
   assert.equal(st.executeTimeoutStreak, 0, "a successful execute resets the streak");
   assert.equal(st.circuitState, "closed");
@@ -1053,7 +1053,7 @@ test("execute timeouts: after cooldown a successful probe closes the circuit", a
   assert.equal(manager.circuitState("slowpoke"), "half-open");
   const client = await manager.activate("slowpoke");
   await client.callTool("ping", {});
-  manager.recordSuccess("slowpoke");
+  manager.recordExecuteSuccess("slowpoke");
   const st = manager.states()[0]!;
   assert.equal(st.circuitState, "closed", "probe success closes the circuit");
   assert.equal(st.executeTimeoutStreak, 0);
@@ -1107,4 +1107,57 @@ test("execute timeouts: threshold 0 disables the policy", async () => {
   const st = manager.states()[0]!;
   assert.equal(st.circuitState, "closed", "threshold 0 disables isolation");
   assert.equal(st.status, "inactive");
+});
+
+test("execute timeouts: heartbeat/listTools success never resets the streak (F26 rework)", async () => {
+  const clock = new FakeClock();
+  const manager = new ConnectionManager(
+    () => Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }])),
+    [{ ...server("slowpoke"), executeTimeoutThreshold: 2 }],
+    { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+      restartBackoff: { initialMs: 60_000, maxMs: 60_000, jitter: 0 },
+      now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+  );
+  manager.recordExecuteTimeout("slowpoke");
+  // A heartbeat / health check success (recordSuccess from listTools) runs
+  // between the hangs — it must NOT wipe the execute-timeout streak.
+  manager.recordSuccess("slowpoke", 5);
+  assert.equal(manager.states()[0]!.executeTimeoutStreak, 1, "heartbeat success keeps the streak");
+  manager.recordExecuteTimeout("slowpoke");
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "open", "N hanging calls still trip despite successful pings");
+  assert.match(st.error ?? "", /repeated execute timeouts/);
+  // An execute SUCCESS is what resets it.
+  manager.recordExecuteSuccess("slowpoke", 5);
+  assert.equal(manager.states()[0]!.executeTimeoutStreak, 0);
+  await manager.closeAll();
+});
+
+test("a live ToolError whose text says 'timed out after' is a tool error, not an execute timeout (F26 rework)", async () => {
+  const { ToolError } = await import("../dist/servers/transport-errors.js");
+  const { makeFactory } = await import("./fakes.ts");
+  const client = new FakeClient([{ name: "remote_job", description: "d", inputSchema: { type: "object" } }]);
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async () => {
+    throw new ToolError("remote job timed out after 1 retry");
+  };
+  const { factory } = makeFactory({ toolexe: client });
+  const hub = new ActionHub({
+    servers: [{ id: "toolexe", transport: { type: "stdio", command: "x" }, trust: "trusted", executeTimeoutThreshold: 2 }],
+    clientFactory: factory,
+    resilience: { heartbeat: { enabled: false } },
+    defaultTimeoutMs: 5_000,
+  });
+  try {
+    await hub.indexAll();
+    for (const _ of [1, 2]) {
+      const r = await hub.execute("toolexe:remote_job", {});
+      assert.equal(r.ok, false);
+    }
+    const st = hub.serverStates().find((s) => s.id === "toolexe")!;
+    assert.equal(st.executeTimeoutStreak, 0, "tool error text must not feed the timeout streak");
+    assert.equal(st.circuitState, "closed", "healthy server must not be isolated");
+    assert.notEqual(st.status, "unreachable");
+  } finally {
+    await hub.close();
+  }
 });
