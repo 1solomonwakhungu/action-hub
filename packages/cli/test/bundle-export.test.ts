@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { resolve, join } from "node:path";
 import { writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const BUNDLE_CONFIG = {
@@ -22,7 +23,9 @@ test("bundle --export prints the bundle as JSON, unknown ids and valueless --exp
   await mkdir(tempDir, { recursive: true });
   const cfgPath = join(tempDir, "servers.json");
   await writeFile(cfgPath, JSON.stringify(BUNDLE_CONFIG), "utf8");
-  const bin = resolve("dist/index.js");
+  // Resolve relative to THIS test file: resolve("dist/index.js") is
+  // cwd-relative and fails when tests run from the repo root (F33).
+  const bin = fileURLToPath(new URL("../dist/index.js", import.meta.url));
   const env = { ...process.env, HOME: tempDir };
 
   try {
