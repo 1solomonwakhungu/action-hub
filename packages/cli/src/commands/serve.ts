@@ -32,8 +32,13 @@ export async function serveCommand(options: ServeOptions = {}): Promise<number> 
   }
 
   process.stderr.write(
-    `action-hub serve: listening on http://${handle.host}:${handle.port}/mcp ` +
-      `(bearer token: ${handle.token === process.env["ACTION_HUB_HTTP_TOKEN"] ? "from ACTION_HUB_HTTP_TOKEN" : "generated (printed above)"})\n`,
+    `action-hub serve: listening on http://${handle.host}:${handle.port}/mcp (bearer token: ${
+      handle.tokenSource === "env"
+        ? "from ACTION_HUB_HTTP_TOKEN"
+        : handle.tokenSource === "explicit"
+          ? "explicitly supplied"
+          : "generated (printed above)"
+    })\n`,
   );
 
   // Serve until SIGINT/SIGTERM; tear the runtime down before exiting so

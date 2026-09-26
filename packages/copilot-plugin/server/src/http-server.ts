@@ -36,6 +36,21 @@ export const HUB_HTTP_TOKEN_ENV_VAR = "ACTION_HUB_HTTP_TOKEN";
 /** Default cap on a single authenticated request body. */
 export const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 
+/** Where the active bearer token came from. */
+export type HttpTokenSource = "env" | "explicit" | "generated";
+
+/**
+ * Resolves the bearer token BEFORE the environment is scrubbed, so the
+ * source can be reported accurately later (the env var is gone by the time
+ * callers would otherwise try to infer it).
+ */
+export function resolveHttpToken(options: HttpServerOptions): { token: string; source: HttpTokenSource } {
+  if (options.token) return { token: options.token, source: "explicit" };
+  const fromEnv = process.env[HUB_HTTP_TOKEN_ENV_VAR];
+  if (fromEnv) return { token: fromEnv, source: "env" };
+  return { token: randomBytes(24).toString("hex"), source: "generated" };
+}
+
 export interface HttpServerOptions {
   /** Reject request bodies larger than this (default 4 MiB) with 413. */
   maxBodyBytes?: number;
@@ -55,6 +70,8 @@ export interface HttpServerHandle {
   host: string;
   /** The active bearer token (so callers can discover the generated one). */
   token: string;
+  /** Where the token came from — never derived after the env scrub. */
+  tokenSource: HttpTokenSource;
   /** Stops the HTTP listener and tears down the hub runtime. */
   close(): Promise<void>;
 }
@@ -111,10 +128,8 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   const port = options.port ?? 6290;
   const host = options.host ?? "127.0.0.1";
 
-  let token = options.token ?? process.env[HUB_HTTP_TOKEN_ENV_VAR] ?? "";
-  const generated = token === "";
-  if (generated) token = randomBytes(24).toString("hex");
-  if (generated) {
+  const { token, source: tokenSource } = resolveHttpToken(options);
+  if (tokenSource === "generated") {
     process.stderr.write(`action-hub serve: generated bearer token: ${token}\n`);
   }
 
@@ -210,5 +225,5 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
     await runtime.close();
   }
 
-  return { port: boundPort, host, token, close };
+  return { port: boundPort, host, token, tokenSource, close };
 }

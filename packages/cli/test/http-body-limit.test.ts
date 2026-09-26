@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PassThrough } from "node:stream";
 import type { IncomingMessage } from "node:http";
-import { readBoundedBody, DEFAULT_MAX_BODY_BYTES } from "../../copilot-plugin/server/dist/http-server.js";
+import {
+  readBoundedBody,
+  resolveHttpToken,
+  DEFAULT_MAX_BODY_BYTES,
+} from "../../copilot-plugin/server/dist/http-server.js";
 
 // Regression for PR 31 rework: authenticated request bodies are bounded;
 // overflow stops buffering and is answered with 413 by the caller.
@@ -26,4 +30,22 @@ test("readBoundedBody rejects a body over the limit and stops buffering", async 
   }
   req.end();
   assert.equal(await pending, null);
+});
+
+// Regression for reviewer-2 MEDIUM: token source is decided before the env
+// scrub, so an env-supplied token must never be reported as generated.
+test("resolveHttpToken reports the true token source", () => {
+  const previous = process.env["ACTION_HUB_HTTP_TOKEN"];
+  try {
+    process.env["ACTION_HUB_HTTP_TOKEN"] = "from-env";
+    assert.equal(resolveHttpToken({}).source, "env");
+    assert.equal(resolveHttpToken({ token: "explicit" }).source, "explicit");
+    delete process.env["ACTION_HUB_HTTP_TOKEN"];
+    const generated = resolveHttpToken({});
+    assert.equal(generated.source, "generated");
+    assert.ok(generated.token.length > 0);
+  } finally {
+    if (previous === undefined) delete process.env["ACTION_HUB_HTTP_TOKEN"];
+    else process.env["ACTION_HUB_HTTP_TOKEN"] = previous;
+  }
 });
