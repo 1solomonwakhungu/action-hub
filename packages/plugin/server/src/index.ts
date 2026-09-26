@@ -14,7 +14,6 @@ import {
   discoverSkillsFromDirectory,
 } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
-import { startControlServer, type ControlServer } from "./control.js";
 import { createSdkClientFactory } from "./sdk-client.js";
 import { warn, writeSnapshot } from "./snapshot.js";
 import {
@@ -109,7 +108,7 @@ export interface HubRuntime {
   close(): Promise<void>;
 }
 
-export async function createHubRuntime(options: { control?: boolean } = {}): Promise<HubRuntime> {
+export async function createHubRuntime(): Promise<HubRuntime> {
   const configPath = defaultConfigPath();
   const config = await loadConfig(configPath);
 
@@ -180,19 +179,6 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
     (cause: unknown) => warn(`re-index failed: ${cause instanceof Error ? cause.message : String(cause)}`),
   );
 
-  // The control endpoint only powers the Capability Manager canvas, so a
-  // failure to bind must never take the MCP server down with it — the canvas
-  // falls back to its read-only view when the endpoint is absent.
-  let control: ControlServer | undefined;
-  if (options.control !== false) {
-    try {
-      control = await startControlServer(hub, configPath);
-    } catch (cause) {
-      const reason = cause instanceof Error ? cause.message : String(cause);
-      process.stderr.write(`action-hub: control endpoint unavailable: ${reason}\n`);
-    }
-  }
-
   return {
     hub,
     cache,
@@ -201,7 +187,6 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
     refreshed: bootstrap.refreshed,
     close: async () => {
       await bootstrap.refreshed.catch(() => undefined);
-      await control?.close();
       await hub.close();
     },
   };
@@ -378,7 +363,7 @@ async function dispatch(
         input.arguments ?? {},
         input.approval_token ? { approvalToken: input.approval_token } : {},
       );
-      // Refreshes server activation state and invocation history for the canvas.
+      // Refreshes server activation state and invocation history in the snapshot.
       // Reuse the bootstrap cache instance so this unawaited write is serialised
       // with the background refresh on the same promise chain.
       void writeSnapshot(hub, configHash, cache);

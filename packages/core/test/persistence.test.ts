@@ -208,7 +208,7 @@ test("a written entry round-trips with every action", async () => {
   });
 });
 
-test("the persisted entry keeps every field the canvas reads", async () => {
+test("the persisted entry keeps every diagnostic field hosts read", async () => {
   const path = await tempCachePath();
   const { hub } = buildHub();
   await hub.indexAll();

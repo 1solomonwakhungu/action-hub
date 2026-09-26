@@ -161,10 +161,18 @@ between an untrusted server and a real side effect.
 | `Approval rejected: … different arguments` | Arguments changed after approval | Ask again for the new arguments |
 | `is blocked by policy` | Trust tier is `blocked` | Stop. No token exists for this |
 | `excluded by the allow/deny list` | Explicitly denied | Stop. Approval cannot override a deny |
-| `Server "x" is disabled` | Turned off in the capability manager | Tell the user |
+| `Server "x" is disabled` | Turned off in the configuration | Tell the user |
 
 ## Managing servers
 
-Ask the user to open the **Capability Manager** canvas to add servers, inspect
-health and authentication, review invocation history, or change trust levels.
-Do not attempt to edit the configuration file yourself.
+Ask the user to run these `action-hub` CLI commands from a terminal — do not
+edit the configuration file yourself:
+
+- `action-hub import --source <claude-desktop|cursor|vscode|copilot|codex|...>`
+  — discover MCP servers already configured in installed harnesses and add
+  them to Action Hub (add `--write` to persist).
+- `action-hub doctor` — check the configuration and downstream servers.
+- `action-hub auth login <server-id>` — authorize a remote server that needs
+  OAuth; `action-hub auth status` to inspect grants.
+- `action-hub list` — show the indexed catalog by server.
+- `action-hub test-search "query"` — try a search against the real index.

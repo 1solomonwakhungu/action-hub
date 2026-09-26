@@ -6,14 +6,14 @@ export function warn(message: string): void {
 }
 
 /**
- * Publishes the hub's state for the Capability Manager canvas, which reads this
- * file rather than connecting to anything itself.
+ * Publishes the hub's state as a diagnostics file that hosts and tools can
+ * read without connecting to the server itself.
  *
  * The snapshot and the startup cache are the same file: the persisted entry is
- * a superset of the snapshot, so writing it keeps the canvas current and the
+ * a superset of the snapshot, so writing it keeps the diagnostics current and the
  * cache warm in one atomic write. `CatalogCache.write` serialises concurrent
  * writes and uses a unique temp file per write, so the unawaited call after
- * every `execute` cannot corrupt the file the canvas is polling. Failures are
+ * every `execute` cannot corrupt the file a reader is polling. Failures are
  * reduced to a warning — a missing diagnostics snapshot must never take down
  * the MCP server the agent depends on.
  */

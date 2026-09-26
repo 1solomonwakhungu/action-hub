@@ -27,20 +27,16 @@
   split, validation, policy gating, approval tokens, per-server failure
   isolation, activation counts, and cache invalidation/corruption handling
 
-**Layer 2 — `packages/copilot-plugin`**
+**Layer 2 — `packages/plugin`**
 
-- `plugin.json` and `.mcp.json` in the Copilot plugin format
+- `plugin.json` and `.mcp.json` in the standard plugin bundle format
 - `skills/action-hub/SKILL.md` teaching the search → load → execute loop and
   the approval handshake for gated actions
 - Meta-MCP server exposing the single `action_hub` tool over stdio
 - Config loader with `~` and `${ENV_VAR}` expansion
 - `@modelcontextprotocol/sdk` client adapter for stdio and HTTP transports
-- Capability Manager canvas — server table, health, trust, indexed counts,
-  invocation history, context savings
-- Interactive canvas controls — enable/disable toggles, trust tier changes,
-  live search testing, and add-a-server, all writing back through a
-  localhost-only control endpoint on the running hub rather than editing the
-  config file directly; degrades to the read-only view when no hub is running
+- `action-hub` CLI for server management — import, doctor, auth, list,
+  and live search testing against the real index
 
 ## Next
 
@@ -49,17 +45,17 @@ chosen from production usage and the committed search evaluation results.
 
 ## Later
 
-- Authentication state per server, with OAuth refresh surfaced in the canvas
+- Authentication state per server, with OAuth refresh surfaced to the host
 - Bundles exposed to the model, so a task can scope itself to a subset
 - Result caching for idempotent reads
-- Additional hosts: Claude Code, VS Code, any MCP-compatible runtime — Layer 2
-  is the only part that needs rewriting
+- Support for hosts that need richer integration than the single MCP tool
+  (e.g. native tool listings, per-host skill formats)
 
 ## Explicitly out of scope
 
-- **Forking or reimplementing the Copilot app.** `github/app` is a release and
-  issue home, not source, and is all-rights-reserved. The plugin path is
-  supported, legal, and distributable.
+- **Forking or reimplementing a host app.** Hosts are products of their
+  vendors; we integrate through supported extension paths rather than cloning
+  them.
 - **Reinterpreting upstream schemas.** Action Hub routes and validates. A
   downstream server's schema is passed through verbatim.
 - **Becoming a conformant JSON Schema validator.** The validator exists to

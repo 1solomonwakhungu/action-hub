@@ -5,10 +5,10 @@
 The split exists so the engine outlives its first host.
 
 ```
-GitHub Copilot app
+Any MCP host (Copilot, Claude Code, Cursor, VS Code, …)
         │
         ▼
-  Action Hub plugin          ← Layer 2, replaceable
+  Action Hub plugin bundle    ← Layer 2, replaceable
         │
         ▼
   action_hub MCP tool
@@ -23,7 +23,7 @@ GitHub Copilot app
         └── validateArguments
 ```
 
-Layer 1 has no dependency on Copilot, on the MCP SDK, or on any transport. It
+Layer 1 has no dependency on any host harness, on the MCP SDK, or on any transport. It
 talks to downstream servers only through the `McpClient` interface:
 
 ```ts
@@ -188,9 +188,9 @@ lazy activation is preserved — a warm start connects to nothing until an actio
 is executed. Actions belonging to servers that have since been removed from the
 config are dropped, since they could never be dispatched.
 
-The cache file and the Capability Manager snapshot are the same file. The
+The cache file and the diagnostics snapshot are the same file. The
 persisted entry is a superset of `HubSnapshot`, so one atomic write keeps the
-canvas current and the cache warm without the two drifting apart. Each write
+diagnostics current and the cache warm without the two drifting apart. Each write
 goes to a unique temp file (`<path>.<pid>.<uuid>.tmp`) and is renamed into
 place, and every write on a `CatalogCache` instance is serialised onto a
 promise chain. That combination is what makes the "atomic" claim hold under the
@@ -258,7 +258,7 @@ a slow request could discard a token that was just minted.
 ### Secrets
 
 No token value reaches a log, an error message, the catalog cache, or the
-Capability Manager snapshot.
+diagnostics snapshot.
 
 Token-endpoint error bodies are reduced to the two RFC 6749 fields (`error`,
 `error_description`) before being rendered, because a token endpoint is the one
@@ -334,29 +334,6 @@ that skill bodies are never injected into context until requested.
 `execute` on a skill fails by design, before the policy check, since a skill
 has no downstream server to evaluate against. Skills are loaded and followed,
 not dispatched.
-
-## The control endpoint
-
-The Capability Manager canvas runs in a separate process from the hub, which
-is a stdio MCP subprocess. To let the canvas change state rather than merely
-display it, the plugin server binds a control listener on `127.0.0.1:0` and
-publishes its URL and a per-process random bearer token to
-`~/.cache/action-hub/control.json`, written user-only. The canvas discovers the
-endpoint by reading that file.
-
-Every mutation the canvas offers — enable and disable, trust changes, adding a
-server — is a `POST` to this endpoint. The canvas never writes to the config
-file, and never writes to the catalog cache, which belongs to core. This is the
-whole point of the design: validation, the in-memory hub update, and config
-persistence all happen on the server side, where canvas-supplied values are
-treated as untrusted input. A canvas that edited the files directly would
-desynchronize the running hub and could corrupt core's cache.
-
-Two consequences follow. Failing to bind the control listener is not fatal —
-the MCP server still starts, and the canvas simply renders read-only. And the
-token file is unlinked on shutdown, so a canvas that finds no file, or a stale
-one pointing at a dead port, concludes the hub is not running and disables its
-controls rather than failing.
 
 ## Shared daemon transport
 

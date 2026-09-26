@@ -714,7 +714,7 @@ async function scanSkillDirectory(
 }
 
 /**
- * Discovers Copilot and agent plugins (e.g. plugin.json).
+ * Discovers host plugin bundles (e.g. plugin.json), including Copilot plugins.
  */
 export async function discoverPlugins(options: DiscoveryOptions = {}): Promise<DiscoveredPlugin[]> {
   const discovered: DiscoveredPlugin[] = [];
@@ -737,7 +737,7 @@ export async function discoverPlugins(options: DiscoveryOptions = {}): Promise<D
 
     candidatePaths.push(
       resolve(cwd, "plugin.json"),
-      resolve(cwd, "packages", "copilot-plugin", "plugin.json"),
+      resolve(cwd, "packages", "plugin", "plugin.json"),
       resolve(home, ".copilot", "plugins"),
     );
   }
