@@ -40,25 +40,53 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..");
 const FAKE_SERVER = join(HERE, "fake-mcp-server.mjs");
 const GEN_DIR = join(REPO_ROOT, "stress", ".generated", "chaos");
+// findings + failureSummary are declared FIRST so every refusal —
+// including the isolation sentinel — can emit the compact-JSON last line.
+const findings = [];
+function finding(severity, summary, repro) {
+  findings.push({ severity, summary, repro });
+  process.stderr.write(`[chaos] ${severity}: ${summary}\n`);
+}
 const RESULTS_DIR = join(REPO_ROOT, "stress", ".generated", "results");
 const RESULTS_FILE = join(RESULTS_DIR, "chaos.json");
 
-// CONTRACT.md hard rule 2 + intake ISOLATION.md checklist: every var is
-// REPLACED (never forwarded) under ONE fresh temp root, applied to the
-// ENTIRE process before factory/hub construction — the in-process hub and
-// all 44 spawned children (which inherit process.env) can never touch
-// owner state. A sentinel self-check refuses to run if any resolved path
-// still lies inside the real owner home (resolved independently of $HOME
-// via os.userInfo().homedir). The script exits after the run, so the
-// process.env mutation is inherently scoped.
-const tmpRoot = join(tmpdir(), `action-hub-chaos-${process.pid}-${Date.now()}`);
-for (const d of ["home", "cache", "config", "state", "data", "skills", "pi", "daemon", "credentials"]) {
-  mkdirSync(join(tmpRoot, d), { recursive: true });
+// CONTRACT.md + ISOLATION.md output contract: a COMPACT JSON summary is the
+// LAST stdout line on EVERY path; the results file always carries the SAME
+// final object; exit nonzero whenever ok is false. stdout is flushed (with
+// a fallback timer) before exiting — the process.exit-before-flush failure
+// class is not acceptable here either.
+function emitSummary(summary, code) {
+  const compact = JSON.stringify(summary);
+  const pretty = JSON.stringify(summary, null, 2);
+  try {
+    mkdirSync(RESULTS_DIR, { recursive: true });
+    writeFileSync(RESULTS_FILE, pretty + "\n");
+  } catch {}
+  process.stdout.write(compact + "\n", () => {
+    process.exit(code);
+  });
+  // hard fallback if the write callback never fires (rare pipe edge cases)
+  setTimeout(() => process.exit(code), 1_000).unref();
 }
 function failureSummary(reason, extra = {}, code = 2) {
-  const out = { script: "chaos", ok: false, reason, findings, elapsedMs: 0, ...extra };
-  console.log(JSON.stringify(out));
-  process.exit(code);
+  emitSummary({ script: "chaos", ok: false, reason, findings, elapsedMs: 0, ...extra }, code);
+}
+
+// CONTRACT.md hard rule 2 + intake ISOLATION.md checklist (revised
+// 21:27Z): every var is REPLACED (never forwarded) under ONE fresh temp
+// root, applied to the ENTIRE process before factory/hub construction —
+// the in-process hub and all 44 spawned children (which inherit
+// process.env) can never touch owner state. The sentinel refuses the
+// ENUMERATED real owner app-state/harness directories (resolved via
+// os.userInfo().homedir, independent of $HOME), using separator-safe
+// path.relative/isAbsolute containment; os.tmpdir() under USERPROFILE is
+// allowed. Containment of the run root itself uses relative() too and is
+// validated against the FINAL process.env values, so a later env
+// reassignment cannot escape undetected. The script exits after the run,
+// so the process.env mutation is inherently scoped.
+const tmpRoot = join(tmpdir(), `action-hub-chaos-${process.pid}-${Date.now()}`);
+for (const d of ["home", "cache", "config", "state", "data", "skills", "pi", "daemon"]) {
+  mkdirSync(join(tmpRoot, d), { recursive: true });
 }
 const isolationPaths = {
   HOME: join(tmpRoot, "home"),
@@ -80,41 +108,60 @@ const isolationPaths = {
 for (const [k, v] of Object.entries(isolationPaths)) {
   process.env[k] = v; // REPLACE, never forward the caller's value
 }
-// Sentinel self-check: refuse to run if any isolation path resolves inside
-// the real owner's action-hub state (resolved independently of $HOME).
-// Windows-safe containment via path.relative/isAbsolute — no string
-// prefixing. The check targets the owner's ACTION-HUB state specifically
-// (not the entire home): os.tmpdir() legitimately lives under the user
-// profile on some platforms, and a whole-home refusal would reject every
-// run there. Any OTHER isolation violation still fails the check.
 const realHome = resolve(osUserInfo().homedir);
-const insideOwnerState = (p) => {
-  const r = resolve(p);
-  const ownerState = [
+
+// Enumerated real owner app-state / harness directories (revised
+// checklist): macOS Library caches + Application Support, Windows
+// AppData/LocalAppData action-hub dirs, dot-configured harness dirs, and
+// every real-home child matching .claude*.
+function ownerStateDirs() {
+  const dirs = [
     join(realHome, ".cache", "action-hub"),
     join(realHome, ".config", "action-hub"),
     join(realHome, ".action-hub"),
+    join(realHome, "Library", "Caches", "action-hub"),
+    join(realHome, "Library", "Application Support", "action-hub"),
+    join(realHome, "AppData", "Roaming", "action-hub"),
+    join(realHome, "AppData", "Local", "action-hub"),
+    join(realHome, ".cursor"),
+    join(realHome, ".copilot"),
+    join(realHome, ".pi"),
     join(realHome, ".codex"),
     join(realHome, ".claude"),
+    join(realHome, ".claude.json"),
   ];
-  return ownerState.some((o) => {
-    const rel = relative(o, r);
-    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-  });
-};
-function validateIsolation() {
-  for (const [k, v] of Object.entries(isolationPaths)) {
-    if (insideOwnerState(v)) {
-      console.error(`[chaos] refusing to run: ${k}=${v} resolves inside the real owner's action-hub state under ${realHome}`);
-      process.exit(2);
+  try {
+    for (const entry of readdirSync(realHome)) {
+      if (entry.startsWith(".claude") || entry.startsWith(".codex")) {
+        dirs.push(join(realHome, entry));
+      }
     }
-    if (!v.startsWith(tmpRoot)) {
-      console.error(`[chaos] refusing to run: ${k}=${v} is outside the run root ${tmpRoot}`);
-      process.exit(2);
+  } catch {}
+  return dirs;
+}
+
+// Separator-safe containment: child is inside parent when its relative
+// path is non-empty, not absolute, and does not begin with "..".
+const isInside = (child, parent) => {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+};
+
+function validateIsolation() {
+  for (const k of Object.keys(isolationPaths)) {
+    const v = process.env[k]; // FINAL env value, not the table
+    if (!v) continue;
+    if (!isInside(v, tmpRoot)) {
+      failureSummary(`isolation violation: ${k}=${v} is outside the run root ${tmpRoot}`, { phase: "preflight" });
+    }
+    for (const ownerDir of ownerStateDirs()) {
+      if (isInside(v, ownerDir)) {
+        failureSummary(`isolation violation: ${k}=${v} resolves inside the real owner app state ${ownerDir}`, { phase: "preflight" });
+      }
     }
   }
 }
-validateIsolation(); // initial assignment
+validateIsolation(); // validate the initial assignment
 const isolationEnv = () => ({ ...process.env }); // children inherit the already-isolated env
 const MANIFEST_DIR = join(tmpRoot, "manifests");
 const CONFIG_PATH = join(tmpRoot, "servers.json"); // INSIDE the run root (checklist rule 1)
@@ -141,12 +188,6 @@ process.on("exit", () => {
 });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-const findings = [];
-function finding(severity, summary, repro) {
-  findings.push({ severity, summary, repro });
-  process.stderr.write(`[chaos] ${severity}: ${summary}\n`);
-}
 
 // Secret scan over everything this harness (or child processes through
 // inherited pipes) writes to the console, including the summary itself.
@@ -497,38 +538,68 @@ async function main() {
   // 6. doctor: bounded time with 44 servers, exits 1 (10 misbehaving), no secret.
   const doctorStart = Date.now();
   // Bounded, process-tree-safe run: detached (POSIX group leader) so a
-  // timeout kills doctor AND its MCP grandchildren (TERM -> KILL
-  // escalation); the child is reaped in a finally.
+  // timeout kills doctor AND its MCP grandchildren. On timeout the runner
+  // stays alive through escalation (TERM -> 3s -> KILL -> 1s grace) and
+  // resolves only afterwards; a finally re-kills the whole group so no
+  // grandchild can outlive the harness. Windows uses taskkill /T /F.
+  const IS_WIN = process.platform === "win32";
+  const killTree = (pid, sig) => {
+    if (IS_WIN) {
+      try { spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+    } else {
+      try { process.kill(-pid, sig); } catch { try { child?.kill(sig); } catch {} }
+    }
+  };
   const runDoctor = () => new Promise((resolveRun) => {
-    const child = spawn("node", [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"], {
+    let child;
+    let stdout = "", stderr = "", timedOut = false, escalated = false, settled = false;
+    let killTimer = null;
+    const finish = (info) => { if (!settled) { settled = true; resolveRun(info); } };
+    child = spawn("node", [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"], {
       env: isolationEnv(), // isolated process.env, captured after repointing
       cwd: tmpRoot, // cross-cwd proof: not the repo root
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "", stderr = "", timedOut = false, settled = false;
-    let killer = setTimeout(() => {
-      timedOut = true;
-      const killTree = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
-      killTree("SIGTERM");
-      setTimeout(() => killTree("SIGKILL"), 3_000).unref();
-    }, DOCTOR_TIMEOUT_MS);
     child.stdout.on("data", (c) => { stdout += String(c); });
     child.stderr.on("data", (c) => { stderr += String(c); });
-    const finish = (info) => { if (!settled) { settled = true; clearTimeout(killer); resolveRun(info); } };
-    child.on("error", (e) => finish({ code: null, signal: null, timedOut, stdout, stderr, error: String(e) }));
-    child.on("close", (code, signal) => finish({ code, signal, timedOut, stdout, stderr }));
+    child.on("error", (e) => finish({ pid: child.pid, code: null, signal: null, timedOut, escalated, stdout, stderr, error: String(e) }));
+    child.on("close", (code, signal) => {
+      const base = { pid: child.pid, code, signal, timedOut, escalated, stdout, stderr };
+      if (escalated) {
+        // give the OS a beat to reap the KILLed grandchildren group
+        setTimeout(() => finish(base), 1_000);
+      } else {
+        finish(base);
+      }
+    });
+    killTimer = setTimeout(() => {
+      timedOut = true;
+      escalated = true;
+      killTree(child.pid, "SIGTERM");
+      setTimeout(() => {
+        killTree(child.pid, "SIGKILL");
+        // no unref: the escalation must complete before the run can exit
+        setTimeout(() => finish({ pid: child.pid, code: null, signal: "SIGKILL", timedOut, escalated, stdout, stderr }), 4_000);
+      }, 3_000);
+    }, DOCTOR_TIMEOUT_MS);
   });
-  const doctor = await runDoctor();
+  let doctorInfo;
+  try {
+    doctorInfo = await runDoctor();
+  } finally {
+    // belt-and-braces: kill the whole group again whatever happened
+    try { killTree(doctorInfo?.pid ?? 0, "SIGKILL"); } catch {}
+  }  const doctor = await runDoctor();
   const doctorMs = Date.now() - doctorStart;
-  const doctorOut = `${doctor.stdout ?? ""}\n${doctor.stderr ?? ""}`;
+  const doctorOut = `${doctorInfo.stdout ?? ""}\n${doctorInfo.stderr ?? ""}`;
   scanForSecret(doctorOut);
   summary.doctor = {
-    exitCode: doctor.code,
-    timedOut: doctor.timedOut === true,
+    exitCode: doctorInfo.code,
+    timedOut: doctorInfo.timedOut === true,
     durationMs: doctorMs,
-    bounded: doctor.timedOut !== true && doctorMs < DOCTOR_TIMEOUT_MS,
-    error: doctor.error,
+    bounded: doctorInfo.timedOut !== true && doctorMs < DOCTOR_TIMEOUT_MS,
+    error: doctorInfo.error,
   };
   if (!summary.doctor.bounded) {
     finding("P1", `doctor exceeded ${DOCTOR_TIMEOUT_MS}ms with ${SERVER_COUNT} servers`, `ACTION_HUB_CONFIG=${CONFIG_PATH} node ${CLI_ENTRY} doctor`);
@@ -581,26 +652,29 @@ async function main() {
   summary.secretScan = { sentinelLength: SECRET.length, prefixChecked: true, leaked };
 
 
+  // Build the FINAL summary first (ok included), then serialize the SAME
+  // object to stdout (compact, last line) and the results file (pretty) on
+  // EVERY path — no stale success file can survive a failed run.
   const scrub = (t) => t.split(SECRET).join("[redacted]").split(SECRET_PREFIX).join("[redacted]");
-  let text = JSON.stringify(summary, null, 2);
-  if (text.includes(SECRET) || text.includes(SECRET_PREFIX)) {
-    findings.push({ severity: "P1", summary: "secret reached the harness's own summary (scrubbed in this copy)", repro: "captured output fragment in the leak finding" });
-    text = scrub(text);
-  }
-  // CONTRACT.md hard rule: machine-readable JSON is the LAST stdout line —
-  // one compact line; the results file keeps the pretty form.
   summary.ok =
     Object.values(summary.verdict).every(Boolean) &&
     findings.length === 0 &&
     summary.hubClosedOnAllPaths === true;
-  console.log(scrub(JSON.stringify(summary)));
-  mkdirSync(RESULTS_DIR, { recursive: true });
-  writeFileSync(RESULTS_FILE, text + "\n");
-  process.exit(summary.ok ? 0 : 1);
+  if (JSON.stringify(summary).includes(SECRET) || JSON.stringify(summary).includes(SECRET_PREFIX)) {
+    findings.push({ severity: "P1", summary: "secret reached the harness's own summary (scrubbed in this copy)", repro: "captured output fragment in the leak finding" });
+    summary.ok = false;
+    const redactDeep = (o) => {
+      if (typeof o === "string") return scrub(o);
+      if (Array.isArray(o)) return o.map(redactDeep);
+      if (o && typeof o === "object") return Object.fromEntries(Object.entries(o).map(([k, v]) => [k, redactDeep(v)]));
+      return o;
+    };
+    summary = redactDeep(summary);
+  }
+  emitSummary(summary, summary.ok ? 0 : 1);
 }
 
 main().catch((err) => {
   console.error(`[chaos] fatal: ${err?.stack ?? err}`);
-  console.log(JSON.stringify({ script: "chaos", ok: false, reason: `fatal: ${String(err?.message ?? err).slice(0, 200)}`, findings, phase: "run" }));
-  process.exit(1);
+  failureSummary(`fatal: ${String(err?.message ?? err).slice(0, 200)}`, { phase: "run" }, 1);
 });
