@@ -10,6 +10,9 @@ coverage/
 .action-hub/
 roadmap/
 
+# Stress-test generated fixtures (see stress/CONTRACT.md)
+stress/.generated/
+
 # Standalone binary build outputs
 build/
 dist-bin/
