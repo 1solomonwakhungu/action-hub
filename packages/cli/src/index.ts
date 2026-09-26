@@ -289,11 +289,22 @@ async function main(): Promise<void> {
           positional[1] === "export" || positional[1] === "install"
             ? positional[1]
             : undefined;
+        if (
+          parsedArgs["node"] !== undefined &&
+          (typeof parsedArgs["node"] !== "string" || parsedArgs["node"].trim() === "")
+        ) {
+          // Valueless or empty --node would otherwise be silently dropped
+          // (boolean true) or emit an empty command ("").
+          console.error("Missing value for --node (usage: --node <absolute path to node>)");
+          exitCode = 1;
+          break;
+        }
         exitCode = await harnessCommand(target, {
           mode: modeArg,
           write: Boolean(parsedArgs["write"]),
           json: Boolean(parsedArgs["json"]),
           configPath,
+          node: typeof parsedArgs["node"] === "string" ? parsedArgs["node"] : undefined,
         });
         break;
       }

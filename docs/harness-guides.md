@@ -29,11 +29,22 @@ The shape:
   harness config file. `install` requires `--write` as a safety guard.
 - `--config <path>` points the harness at a specific Action Hub config file
   (exported as `ACTION_HUB_CONFIG` in the snippet).
-- `--json` applies to JSON targets only — it prints just the JSON document.
-  For TOML targets such as `codex`, `--json` is rejected with a clear error.
+- `--node <path>` overrides the `node` command in the snippet. By default the
+  snippet runs `node` from `PATH`; pass an absolute node path for GUI
+  harnesses that cannot find `node` on their `PATH` (for example nvm
+  installs).
+- `--json` applies to JSON targets only — it prints just the JSON document on
+  stdout. For TOML targets such as `codex`, `--json` is rejected with a clear
+  error.
 
-Targets: `claude-code`, `claude-desktop`, `cursor`, `codex`, `opencode`,
+Targets: `claude-code`, `claude-desktop`, `cursor`, `codex`, `opencode`, `pi`,
 `vscode`. (Run `action-hub harness --help` for the current exact grammar.)
+
+The `pi` target writes `$PI_CODING_AGENT_DIR/mcp.json` (default
+`~/.pi/agent/mcp.json`), matching pi's agent-dir resolution: a non-empty
+`PI_CODING_AGENT_DIR` overrides the default and a leading `~` expands to your
+home directory. pi loads MCP servers through the pi-mcp-adapter, so install it
+first with `pi install npm:pi-mcp-adapter`.
 
 `export` prints the snippet for you to paste; `install` writes it into the
 harness config file and requires `--write`. When an existing config file is
@@ -49,9 +60,9 @@ action-hub harness codex install --write --config ~/.config/action-hub/servers.j
 ```
 
 The supported targets are `claude-code`, `claude-desktop`, `cursor`, `codex`,
-`opencode`, and `vscode`. Pi is not supported by the harness command; Zed and
-Windsurf are covered by the manual snippets below, which remain the fallback
-for every harness. If the CLI is not on your `PATH`, run the same commands via
+`opencode`, `pi`, and `vscode`. Zed and Windsurf are covered by the manual
+snippets below, which remain the fallback for every harness. If the CLI is not
+on your `PATH`, run the same commands via
 `node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js harness ...`.
 
 Replace `<ABSOLUTE_PATH_TO_ACTION_HUB>` with the absolute path to your checkout
