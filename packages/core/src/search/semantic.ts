@@ -73,6 +73,21 @@ export interface SemanticIndexStats {
   dimensions: number;
 }
 
+/** Options for the cooperative (chunked, yielding) index path. */
+export interface CooperativeIndexOptions {
+  /** Documents embedded per chunk before the event loop is handed back. */
+  chunkSize?: number;
+  /** Called between chunks; defaults to a macrotask yield. */
+  yieldFn?: () => Promise<void>;
+}
+
+/** Documents embedded per event-loop yield by default. */
+const DEFAULT_INDEX_CHUNK = 500;
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((done) => setImmediate(done));
+}
+
 const DEFAULTS = {
   dimensions: 256,
   sparsity: 8,
@@ -231,6 +246,44 @@ export class LocalSemanticIndex {
     for (const document of documents) {
       const vector = this.#embed(document.terms);
       if (vector) this.#documents.set(document.id, { fingerprint: document.fingerprint, vector });
+    }
+  }
+
+  /**
+   * Same computation as {@link index}, but hands the event loop back between
+   * chunks of documents. Index-time embedding of large catalogs (10k+ actions)
+   * otherwise congests the event loop for seconds and starves already-accepted
+   * connections on long-running hosts such as the shared daemon.
+   */
+  async indexCooperative(
+    records: readonly ActionRecord[],
+    options: CooperativeIndexOptions = {},
+  ): Promise<void> {
+    const chunkSize = Math.max(1, options.chunkSize ?? DEFAULT_INDEX_CHUNK);
+    const yieldFn = options.yieldFn ?? yieldToEventLoop;
+    const documents = records.map((record) => describe(record));
+    this.#documentCount = documents.length;
+    this.#documents = new Map();
+    this.#idf = new Map();
+
+    if (documents.length === 0) return;
+
+    const docFreq = new Map<string, number>();
+    for (const document of documents) {
+      for (const term of document.terms.keys()) {
+        docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+      }
+    }
+    for (const [term, df] of docFreq) {
+      this.#idf.set(term, Math.log(1 + documents.length / (df + 0.5)));
+    }
+
+    for (let start = 0; start < documents.length; start += chunkSize) {
+      if (start > 0) await yieldFn();
+      for (const document of documents.slice(start, start + chunkSize)) {
+        const vector = this.#embed(document.terms);
+        if (vector) this.#documents.set(document.id, { fingerprint: document.fingerprint, vector });
+      }
     }
   }
 
