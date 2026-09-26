@@ -31,8 +31,10 @@ test("doctor output contains no secret sentinels from server config", async () =
           id: "broken-stdio",
           transport: {
             type: "stdio",
-            command: "definitely-not-a-real-binary-xyz",
-            args: ["server.js", "--token", "DOCTOR_ARG_TOKEN_35"],
+            command: "node",
+            // Echoes the configured env secret and exits 1, exercising the
+            // sanitized child-stderr path and the error-string sanitizer.
+            args: ["-e", "process.stderr.write('AUTH ' + process.env.API_TOKEN);process.exit(1);"],
             env: { API_TOKEN: "DOCTOR_ENV_VALUE_35" },
           },
         },

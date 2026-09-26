@@ -8,6 +8,7 @@ import {
   applyNodeMemoryLimit,
   createHttpAuthBinding,
   isAuthorizationRequired,
+  sanitizeErrorForServer,
   type CallToolOptions,
   type JsonSchema,
   type McpClient,
@@ -47,6 +48,15 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     const activeHeaders = new AsyncLocalStorage<Record<string, string> | undefined>();
     const client = new Client(CLIENT_INFO, { capabilities: {} });
     const transport = buildTransport(config, options, () => activeHeaders.getStore());
+
+    if (config.transport.type === "stdio") {
+      const stdioTransport = transport as StdioClientTransport;
+      stdioTransport.stderr?.on("data", (chunk: Buffer | string) => {
+        const safe = sanitizeErrorForServer(config, chunk.toString());
+        if (options.onWarning) options.onWarning(`${config.id}: ${safe.trimEnd()}`);
+        else process.stderr.write(safe);
+      });
+    }
 
     try {
       await client.connect(transport);
@@ -104,6 +114,10 @@ function buildTransport(
       args: limited.args,
       env: limited.env,
       cwd,
+      // Child stderr must never reach the parent's stderr verbatim: servers
+      // echo their own configuration (tokens, URLs) in crash output. Piped
+      // stderr is sanitized per-server before it is re-emitted.
+      stderr: "pipe",
     });
   }
 

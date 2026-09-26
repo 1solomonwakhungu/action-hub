@@ -1,4 +1,4 @@
-import { REDACTED, redactOAuthConfig, redactSecrets } from "./auth/index.js";
+import { REDACTED, redactOAuthConfig } from "./auth/index.js";
 import type { OAuthClientConfig } from "./auth/types.js";
 import type { HttpTransport, ServerConfig } from "./types.js";
 
@@ -158,7 +158,18 @@ export function redactUrl(url: string): string {
 export function collectServerSecrets(server: ServerConfig): string[] {
   const secrets: string[] = [];
   const push = (value: unknown): void => {
-    if (typeof value === "string" && value.length >= 8) secrets.push(value);
+    if (typeof value === "string" && value.length > 0) secrets.push(value);
+  };
+  /** Push a header-style value whole, plus its credential components. */
+  const pushWithParts = (value: string): void => {
+    push(value);
+    const bearer = /\b(Bearer|Basic)\s+(\S+)/i.exec(value);
+    if (bearer && bearer[2] !== undefined) push(bearer[2]);
+    const colon = value.indexOf(":");
+    if (colon >= 0) {
+      const rest = value.slice(colon + 1).trim();
+      if (rest.length > 0) push(rest);
+    }
   };
   const transport = server.transport;
   if (transport.type === "stdio") {
@@ -166,19 +177,19 @@ export function collectServerSecrets(server: ServerConfig): string[] {
     let redactNext = false;
     for (const arg of transport.args ?? []) {
       if (redactNext) {
-        push(arg);
+        pushWithParts(arg);
         redactNext = false;
         continue;
       }
       const flag = /^(--?[^=\s]+)(?:=(.*))?$/s.exec(arg);
       if (flag && flag[1] !== undefined && (SENSITIVE_NAME_RE.test(flag[1]) || HEADER_FLAG_RE.test(flag[1]))) {
-        if (flag[2] !== undefined) push(flag[2]);
+        if (flag[2] !== undefined) pushWithParts(flag[2]);
         else redactNext = true;
         continue;
       }
       const bearer = /^(?:[A-Za-z0-9-]+:\s*)?(?:Bearer|Basic)\s+(\S+)$/i.exec(arg);
       if (bearer && bearer[1] !== undefined) {
-        push(bearer[1]);
+        pushWithParts(arg);
         continue;
       }
       const eq = arg.indexOf("=");
@@ -196,7 +207,7 @@ export function collectServerSecrets(server: ServerConfig): string[] {
     } catch {
       // Unparseable URL was already collected whole.
     }
-    for (const value of Object.values(transport.headers ?? {})) push(value);
+    for (const value of Object.values(transport.headers ?? {})) pushWithParts(value);
     if (transport.auth?.clientSecret) push(transport.auth.clientSecret);
   }
   return secrets;
@@ -204,11 +215,21 @@ export function collectServerSecrets(server: ServerConfig): string[] {
 
 /**
  * Sanitize a string that may echo a server's configuration (error messages,
- * diagnostics): value-based replacement of every collected secret, then the
- * raw-secret pattern backstop. Safe to call on any external text.
+ * diagnostics). Uses a dedicated exact-value replacement with a low floor of
+ * 4 characters — config-derived credentials are known values, not
+ * provider-response guesses, so the provider-response 8-character floor does
+ * not apply. Secrets are replaced longest-first so that a value contained in
+ * a longer collected secret is not partially replaced.
  */
 export function sanitizeErrorForServer(server: ServerConfig, text: string): string {
-  return redactRawSecrets(redactSecrets(text, collectServerSecrets(server)));
+  const secrets = collectServerSecrets(server)
+    .filter((value) => value.length >= 4)
+    .sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const secret of secrets) {
+    out = out.split(secret).join(REDACTED);
+  }
+  return redactRawSecrets(out);
 }
 
 /**
