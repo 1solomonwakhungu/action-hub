@@ -44,6 +44,8 @@ export type {
   ApprovalRejection,
 } from "./permissions/approvals.js";
 export { validateArguments } from "./router/validate.js";export type { ValidationResult } from "./router/validate.js";
+export { SkillStore, parseSkillFile } from "./skills/skill-store.js";
+export type { SkillDefinition } from "./skills/skill-store.js";
 export { BundleRegistry } from "./bundles/bundles.js";
 export type { Bundle } from "./bundles/bundles.js";
 export {
