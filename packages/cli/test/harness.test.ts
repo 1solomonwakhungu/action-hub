@@ -388,26 +388,30 @@ test("notes print on stderr in every mode; --json only quiets stdout", async () 
   });
 });
 
-test("pi env resolution matches pi getAgentDir: blank treated as unset, tilde expanded", async () => {
+test("pi agent-dir resolution mirrors pi getAgentDir/normalizePath", async () => {
   await withTempHome(async (home) => {
     const prev = process.env.PI_CODING_AGENT_DIR;
     try {
-      // Blank / whitespace-only env is treated as unset.
-      for (const blank of ["", "   "]) {
-        process.env.PI_CODING_AGENT_DIR = blank;
+      const cases: Array<[string | undefined, string]> = [
+        [undefined, join(home, ".pi", "agent", "mcp.json")], // unset -> default
+        ["", join(home, ".pi", "agent", "mcp.json")], // empty -> default
+        ["   ", join("   ", "mcp.json")], // whitespace is truthy in pi (no trim); stays cwd-relative like any relative dir
+        ["~", join(home, "mcp.json")],
+        ["~/x", join(home, "x", "mcp.json")],
+        ["~other/agent", join("~other/agent", "mcp.json")], // non-~ tilde stays literal
+        ["file:///tmp/x", join("/tmp", "x", "mcp.json")], // file:// URL converted
+        ["/abs/agent", join("/abs/agent", "mcp.json")], // absolute passes through
+        ["rel/agent", join("rel/agent", "mcp.json")], // relative stays relative
+      ];
+      for (const [env, expected] of cases) {
+        if (env === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = env;
         assert.equal(
           HARNESS_DEFS.pi.configPath(home),
-          join(home, ".pi", "agent", "mcp.json"),
-          `blank env (${JSON.stringify(blank)}) falls back to default`,
+          expected,
+          `PI_CODING_AGENT_DIR=${JSON.stringify(env)}`,
         );
       }
-      // A leading ~ expands to the provided home dir.
-      process.env.PI_CODING_AGENT_DIR = "~/.custom-pi-agent";
-      assert.equal(
-        HARNESS_DEFS.pi.configPath(home),
-        join(home, ".custom-pi-agent", "mcp.json"),
-        "tilde expands to home",
-      );
     } finally {
       if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
       else process.env.PI_CODING_AGENT_DIR = prev;

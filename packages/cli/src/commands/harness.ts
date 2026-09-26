@@ -1,6 +1,7 @@
 import { mkdir, readFile, realpathSync, writeFile, copyFile } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as tomlParse, stringify as tomlStringify } from "smol-toml";
 
@@ -124,6 +125,47 @@ async function cliServerEntry(
   return { entry, inSea };
 }
 
+/**
+ * Normalize PI_CODING_AGENT_DIR exactly as pi does. Mirrors
+ * @earendil-works/pi-coding-agent getAgentDir (dist/config.js), which applies
+ * the env value only when truthy (no trimming) via expandTildePath ->
+ * normalizePath (dist/utils/paths.js, default options): win32 shell-path
+ * conversion; tilde expansion only for exactly "~", "~/" (and "~\\" on
+ * Windows) — any other leading-tilde form such as "~other/agent" stays
+ * literal; then file:// URL conversion via fileURLToPath (unguarded, as in
+ * pi: a malformed URL throws).
+ */
+function normalizePiAgentDir(value: string, home: string): string {
+  let dir = value;
+  // pi normalizeWindowsShellPath: /mnt/<d>/ and /cygdrive/<d>/ -> <D>:\ on win32.
+  if (
+    process.platform === "win32" &&
+    dir.startsWith("/") &&
+    !dir.startsWith("//") &&
+    !dir.includes("\\")
+  ) {
+    const match = dir.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+    if (match) {
+      const drive = match[1];
+      if (drive) {
+        const suffix = match[2]?.replaceAll("/", "\\");
+        dir = `${drive.toUpperCase()}:\\${suffix ?? ""}`;
+      }
+    }
+  }
+  if (dir === "~") return home;
+  if (
+    dir.startsWith("~/") ||
+    (process.platform === "win32" && dir.startsWith("~\\"))
+  ) {
+    return join(home, dir.slice(2));
+  }
+  if (/^file:\/\//.test(dir)) {
+    return fileURLToPath(dir);
+  }
+  return dir;
+}
+
 function defaultConfigPath(): string {
   const configured = process.env.ACTION_HUB_CONFIG;
   if (configured) return configured;
@@ -185,19 +227,17 @@ export const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
     serversKey: "mcp",
   },
   pi: {
-    // pi (pi-mcp-adapter >= 2.37.0) reads <agentDir>/mcp.json. Match pi's
-    // getAgentDir semantics: a non-empty PI_CODING_AGENT_DIR overrides the
-    // default (a leading ~ expands to the home dir); otherwise ~/.pi/agent.
-    // The adapter itself is a separate install: `pi install npm:pi-mcp-adapter`.
+    // pi (pi-mcp-adapter >= 2.37.0) reads <agentDir>/mcp.json. agentDir
+    // resolution mirrors pi getAgentDir (dist/config.js) via
+    // normalizePiAgentDir above: truthy PI_CODING_AGENT_DIR wins (raw, no
+    // trim), otherwise ~/.pi/agent. The adapter itself is a separate
+    // install: `pi install npm:pi-mcp-adapter`.
     label: "pi",
     configPath: (home: string) => {
-      const override = process.env.PI_CODING_AGENT_DIR?.trim();
-      let agentDir = join(home, ".pi", "agent");
-      if (override) {
-        agentDir = override.startsWith("~")
-          ? join(home, override.slice(1))
-          : override;
-      }
+      const override = process.env.PI_CODING_AGENT_DIR;
+      const agentDir = override
+        ? normalizePiAgentDir(override, home)
+        : join(home, ".pi", "agent");
       return join(agentDir, "mcp.json");
     },
     format: "json",
