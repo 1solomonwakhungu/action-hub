@@ -49,6 +49,10 @@ export interface ConnectionManagerOptions extends CircuitBreakerOptions, Connect
   heartbeat?: HeartbeatConfig;
   restartBackoff?: RestartBackoffConfig;
   maxOldSpaceSizeMb?: number;
+  /** Per-server deadline for activation (spawn + initialize), covering the
+   * phase before the index/execute timeout can start. Defaults to 10s.
+   * A server's own config.timeoutMs takes precedence. (F27) */
+  activationTimeoutMs?: number;
 }
 
 export interface HealthCheckResult {
@@ -86,6 +90,7 @@ interface Entry {
 const DEFAULT_FAILURE_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 10_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+const DEFAULT_ACTIVATION_TIMEOUT_MS = 10_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
 
 /**
@@ -127,6 +132,7 @@ export class ConnectionManager {
   readonly #heartbeat: HeartbeatConfig;
   readonly #restartBackoff: RestartBackoffConfig;
   readonly #maxOldSpaceSizeMb?: number;
+  readonly #activationTimeoutMs: number;
   readonly #now: () => number;
   readonly #random: () => number;
   readonly #setTimeout: (handler: () => void, ms: number) => TimerHandle;
@@ -144,6 +150,7 @@ export class ConnectionManager {
     this.#heartbeat = options.heartbeat ?? {};
     this.#restartBackoff = options.restartBackoff ?? {};
     this.#maxOldSpaceSizeMb = options.maxOldSpaceSizeMb;
+    this.#activationTimeoutMs = options.activationTimeoutMs ?? DEFAULT_ACTIVATION_TIMEOUT_MS;
     this.#now = options.now ?? Date.now;
     this.#random = options.random ?? Math.random;
     this.#setTimeout =
@@ -355,8 +362,33 @@ export class ConnectionManager {
     const generation = ++entry.generation;
     const config = this.#factoryConfig(entry);
 
-    const pending = this.#factory(config)
-      .then(async (client) => {
+    // F27: activation (spawn + initialize) has a deadline — the index/execute
+    // timeout only starts after activate() returns, so without this a server
+    // that never answers initialize hangs startup forever. The deadline is
+    // the server's config.timeoutMs if set, else the activation default.
+    const deadlineMs = entry.config.timeoutMs ?? this.#activationTimeoutMs;
+    const controller = new AbortController();
+    let deadlineTimer: TimerHandle | undefined = undefined;
+    const clearDeadline = (): void => {
+      if (deadlineTimer !== undefined) this.#clearTimeout(deadlineTimer);
+      deadlineTimer = undefined;
+    };
+    const timedOut = new Promise<never>((_, reject) => {
+      deadlineTimer = this.#setTimeout(() => {
+        controller.abort();
+        reject(
+          new Error(
+            `Activation of server "${serverId}" timed out after ${deadlineMs}ms (spawn + initialize deadline)`,
+          ),
+        );
+      }, deadlineMs);
+    });
+
+    let pendingRef: Promise<McpClient> | undefined;
+    const pending = (async (): Promise<McpClient> => {
+      try {
+        const client = await this.#factory(config, { signal: controller.signal });
+        clearDeadline();
         if (this.#closed || entry.generation !== generation || entry.manualShutdown || entry.config.enabled === false) {
           try {
             await client.close();
@@ -378,17 +410,36 @@ export class ConnectionManager {
         entry.error = undefined;
         this.#startHeartbeat(entry);
         return entry.client;
-      })
-      .catch((cause: unknown) => {
-        if (entry.pending === pending) entry.pending = undefined;
+      } catch (cause) {
+        clearDeadline();
+        if (entry.pending === pendingRef) entry.pending = undefined;
         if (entry.generation !== generation) throw cause;
         this.recordFailure(serverId, cause instanceof Error ? cause.message : String(cause));
+        // A deadline miss must never gate startup again: until a deliberate
+        // retry succeeds, the server is unreachable (same surface state as a
+        // tripped breaker). Circuit accumulation still applies.
+        if (controller.signal.aborted) entry.status = "unreachable";
         this.#scheduleRestart(entry);
         throw cause;
-      });
+      }
+    })();
 
+    pendingRef = pending;
     entry.pending = pending;
-    return pending;
+    try {
+      return await Promise.race([pending, timedOut]);
+    } catch (cause) {
+      if (controller.signal.aborted) {
+        // The deadline expired. A factory that ignores the AbortSignal may
+        // leave the connect hanging: drop the pending handle so a later
+        // activate can retry, and invalidate the generation so any late
+        // client is discarded instead of cached.
+        if (entry.pending === pending) entry.pending = undefined;
+        entry.generation += 1;
+        entry.status = "unreachable";
+      }
+      throw cause;
+    }
   }
 
   /** Reconnects a server by deactivating and activating again. */

@@ -772,3 +772,57 @@ test("execute-time connection errors trip the breaker without waiting for the he
   hub.close();
   live.close();
 });
+
+// ---------------------------------------------------------------------------
+// F27: activation deadline (FX11)
+// ---------------------------------------------------------------------------
+
+test("activation deadline: a never-initializing server cannot gate startup", async () => {
+  const clock = new FakeClock();
+  const neverFactory = (config: ServerConfig): Promise<McpClient> =>
+    new Promise(() => {
+      void config; // spawn "succeeds", initialize never answers, signal ignored
+    });
+  const healthy = (): McpClient =>
+    new FakeClient([{ name: "do_thing", description: "d", inputSchema: { type: "object" } }]);
+  const hub = new ActionHub({
+    servers: [
+      { id: "dead", transport: { type: "stdio", command: "x" }, trust: "trusted", timeoutMs: 500 },
+      { id: "ok1", transport: { type: "stdio", command: "x" }, trust: "trusted" },
+      { id: "ok2", transport: { type: "stdio", command: "x" }, trust: "trusted" },
+    ],
+    clientFactory: (config, options) => {
+      void options;
+      return config.id === "dead" ? neverFactory(config) : Promise.resolve(healthy());
+    },
+    resilience: { now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+    defaultTimeoutMs: 30_000,
+  });
+  const indexing = hub.indexAll();
+  await clock.advance(600); // past the dead server's deadline
+  const results = await indexing;
+  const dead = results.find((r) => r.serverId === "dead")!;
+  assert.match(dead.error ?? "", /timed out/);
+  assert.equal(results.find((r) => r.serverId === "ok1")!.indexed, 1);
+  assert.equal(results.find((r) => r.serverId === "ok2")!.indexed, 1);
+  const [deadState] = hub.serverStates().filter((s) => s.id === "dead");
+  assert.equal(deadState!.status, "unreachable", "deadline miss marks the server unreachable");
+  hub.close();
+});
+
+test("a slow-but-within-deadline server still activates", async () => {
+  const clock = new FakeClock();
+  const hub = new ActionHub({
+    servers: [{ id: "slow", transport: { type: "stdio", command: "x" }, trust: "trusted", timeoutMs: 1_000 }],
+    clientFactory: async () => {
+      await new Promise((r) => setTimeout(r, 50)); // real 50ms, well within deadline
+      return new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }]);
+    },
+    resilience: { now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout },
+    defaultTimeoutMs: 5_000,
+  });
+  const results = await hub.indexAll();
+  assert.equal(results[0]!.indexed, 1);
+  assert.equal(results[0]!.error, undefined);
+  hub.close();
+});

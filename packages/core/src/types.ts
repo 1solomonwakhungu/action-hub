@@ -281,8 +281,17 @@ export interface McpClient {
   close(): Promise<void>;
 }
 
-/** Factory used by the connection manager to create clients lazily. */
-export type McpClientFactory = (config: ServerConfig) => Promise<McpClient>;
+/** Factory used by the connection manager to create clients lazily.
+ *
+ * The optional second argument carries an activation AbortSignal: when the
+ * activation deadline (spawn + initialize) expires, the manager aborts the
+ * signal and the adapter must stop connecting and release the spawned child
+ * (bounded, non-blocking). Implementations that ignore the signal still fail
+ * the activation — the manager times it out independently. */
+export type McpClientFactory = (
+  config: ServerConfig,
+  options?: { signal?: AbortSignal },
+) => Promise<McpClient>;
 
 export type ServerStatus =
   | "inactive"
