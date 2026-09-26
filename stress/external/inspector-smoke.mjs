@@ -1,30 +1,27 @@
 #!/usr/bin/env node
 /**
  * MCP Inspector CLI smoke tests against both Action Hub transports
- * (builder-10, stress/external/).
+ * (builder-10, stress/external/). Four-bar compliant (S9-R5):
+ *  - serve binds port 0; the child's actual port is parsed from its stdout;
+ *  - health is proven to belong to THAT child (authenticated initialize);
+ *  - full ISOLATION.md env; detached spawns with group kill in finally;
+ *  - every path (incl. spawn failure/exception) writes the artifact and
+ *    prints ONE compact JSON last line, ok:false on failure, exit nonzero.
  *
  * Targets (verified against the Inspector CLI docs, modelcontextprotocol/inspector
  * clients/cli/README.md + docs/cli-smoke-testing.md):
  *   stdio:  npx @modelcontextprotocol/inspector --cli <cmd...> -- --method ...
- *           (everything before `--` is the spawned target; after is Inspector's)
  *   http:   --transport http --server-url http://127.0.0.1:<port>/mcp --header ...
  *
- * Exit codes (Inspector v2): 0 ok, 1 usage, 3 auth, 4 unreachable, 5 tool error.
- *
- * Every assertion is one probe: `initialize` (connect-only) and `tools/list`.
- * Results are accumulated into a JSON summary, printed as the last stdout
- * line and written to stress/.generated/results/external-inspector.json
- * (contract rule).
- *
  * Usage: node stress/external/inspector-smoke.mjs [--config <servers.json>]
- * Requires the repo build (packages dist dirs) and network-free npx cache, or
- * network access to fetch @modelcontextprotocol/inspector once.
  */
-import { spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildIsolatedEnv } from "./isolation.mjs";
+import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
+import { startServe, killTree, runTool } from "./serve.mjs";
+import { copyFile, symlink, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -37,69 +34,45 @@ function cliFlag(name, fallback) {
   return i !== -1 && process.argv[i + 1] !== undefined ? process.argv[i + 1] : fallback;
 }
 
-const configPath = resolve(cliFlag("--config", join(genDir, "servers.json")));
-const port = Number(cliFlag("--port", 41710));
-const token = "stress-external-token-0f1e2d3c";
+// Per-run token: any HTTP evidence must come from a server that accepted
+// THIS run's credentials.
+const token = `stress-inspector-${Date.now().toString(36)}-${process.pid}`;
 
-// Full isolation per contract hard rules.
-const { env: isolatedEnv } = buildIsolatedEnv({
-  ACTION_HUB_CONFIG: configPath,
-  ACTION_HUB_SKILLS_DIR: join(genDir, "skills"),
-  ACTION_HUB_HTTP_TOKEN: token,
-});
-
-const CLI = ["npx", "--yes", `@modelcontextprotocol/inspector@${INSPECTOR_VERSION}`, "--cli"];
-
-function runInspector(args, label) {
-  const started = Date.now();
-  const res = spawnSync(CLI[0], [...CLI.slice(1), ...args], {
-    encoding: "utf8",
-    env: isolatedEnv,
-    timeout: 120_000,
-  });
-  let parsed = null;
+async function finish(summary) {
+  await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
   try {
-    parsed = JSON.parse(res.stdout.trim().split("\n").pop());
+    await writeFile(join(resultsDir, "external-inspector.json"), JSON.stringify(summary, null, 2) + "\n");
   } catch {
-    // non-JSON output recorded raw below
+    /* artifact best-effort */
   }
-  return {
-    label,
-    command: [...CLI, ...args].join(" "),
-    inspectorVersion: INSPECTOR_VERSION,
-    exitCode: res.status ?? -1,
-    durationMs: Date.now() - started,
-    ok: res.status === 0 && parsed !== null,
-    parsed,
-    stderr: res.stderr?.slice(0, 2000),
-  };
-}
-
-async function startServe() {
-  const child = spawn(
-    process.execPath,
-    [join(repoRoot, "packages", "cli", "dist", "index.js"), "serve", "--config", configPath, "--port", String(port)],
-    { env: isolatedEnv, stdio: ["ignore", "pipe", "pipe"] },
-  );
-  // Wait for /health (unauthenticated liveness).
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      if (res.ok) return child;
-    } catch {
-      // not up yet
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  child.kill("SIGTERM");
-  throw new Error("action-hub serve did not become healthy in 30s");
+  console.log(JSON.stringify(summary));
+  process.exit(summary.ok === true ? 0 : 1);
 }
 
 async function main() {
   const started = Date.now();
-  await mkdir(genDir, { recursive: true });
-  await mkdir(resultsDir, { recursive: true });
+  const configPath = resolve(cliFlag("--config", join(genDir, "servers.json")));
+  if (!existsSync(configPath)) throw new Error(`config not found: ${configPath}`);
+
+  const { env: isolatedEnv, root, assertFinal } = buildIsolatedEnv({
+    ACTION_HUB_HTTP_TOKEN: token,
+  });
+  // Stage the config into the run root (bar 2).
+  const stagedConfig = join(root, "config", "servers.json");
+  await mkdir(join(root, "config"), { recursive: true });
+  await copyFile(configPath, stagedConfig);
+  isolatedEnv["ACTION_HUB_CONFIG"] = stagedConfig;
+  const stagedSkills = join(root, "skills");
+  try {
+    await unlink(stagedSkills);
+  } catch {
+    /* not present */
+  }
+  const fixtureSkills = join(genDir, "skills");
+  if (existsSync(fixtureSkills)) await symlink(fixtureSkills, stagedSkills);
+  else await mkdir(stagedSkills, { recursive: true });
+  isolatedEnv["ACTION_HUB_SKILLS_DIR"] = stagedSkills;
+  assertFinal(isolatedEnv);
 
   const run = [];
 
@@ -109,16 +82,25 @@ async function main() {
     join(repoRoot, "packages", "cli", "dist", "index.js"),
     "start",
     "--config",
-    configPath,
+    stagedConfig,
     "--",
     "--method",
   ];
-  run.push(runInspector([...startCmd, "initialize", "--format", "json"], "stdio initialize"));
-  run.push(runInspector([...startCmd, "tools/list", "--format", "json"], "stdio tools/list"));
+  run.push(await runInspector(isolatedEnv, [...startCmd, "initialize", "--format", "json"], "stdio initialize"));
+  run.push(await runInspector(isolatedEnv, [...startCmd, "tools/list", "--format", "json"], "stdio tools/list"));
 
   // --- http: action-hub serve (streamable HTTP, bearer token) ---
-  const serve = await startServe();
+  const serve = await startServe({
+    configPath: stagedConfig,
+    token,
+    skillsDir: stagedSkills,
+    env: isolatedEnv,
+    root,
+    repoRoot,
+  });
+  let port = null;
   try {
+    port = serve.port;
     const httpArgs = [
       "--transport",
       "http",
@@ -130,11 +112,10 @@ async function main() {
       "15000",
       "--method",
     ];
-    run.push(runInspector([...httpArgs, "initialize", "--format", "json"], "http initialize"));
-    run.push(runInspector([...httpArgs, "tools/list", "--format", "json"], "http tools/list"));
+    run.push(await runInspector(isolatedEnv, [...httpArgs, "initialize", "--format", "json"], "http initialize"));
+    run.push(await runInspector(isolatedEnv, [...httpArgs, "tools/list", "--format", "json"], "http tools/list"));
   } finally {
-    serve.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 500));
+    await killTree(serve.child, serve.exitP);
   }
 
   const toolsSeen = run
@@ -144,20 +125,47 @@ async function main() {
   const summary = {
     script: "inspector-smoke.mjs",
     inspectorVersion: INSPECTOR_VERSION,
-    configPath,
+    configPath: stagedConfig,
     port,
+    serveChildPid: serve.child.pid,
     probes: run,
     toolsSeen,
-    ok: run.every((r) => r.ok),
+    ok: run.length === 4 && run.every((r) => r.ok),
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
-  await writeFile(join(resultsDir, "external-inspector.json"), JSON.stringify(summary, null, 2) + "\n");
-  console.log(JSON.stringify(summary));
-  process.exit(summary.ok ? 0 : 1);
+  await finish(summary);
 }
 
-main().catch((cause) => {
-  console.error(String(cause));
-  process.exit(1);
+const CLI = ["npx", "--yes", `@modelcontextprotocol/inspector@${INSPECTOR_VERSION}`, "--cli"];
+
+async function runInspector(env, args, label) {
+  const res = await runTool(CLI[0], [...CLI.slice(1), ...args], { env, timeoutMs: 120_000 }).exitP;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(res.stdoutTail.trim().split("\n").pop());
+  } catch {
+    // non-JSON output recorded raw below
+  }
+  return {
+    label,
+    command: [...CLI, ...args].join(" "),
+    inspectorVersion: INSPECTOR_VERSION,
+    exitCode: res.code,
+    timedOut: res.timedOut,
+    durationMs: res.durationMs,
+    ok: res.code === 0 && !res.timedOut && parsed !== null,
+    parsed,
+    stderr: res.stderrTail.slice(-2000),
+  };
+}
+
+main().catch(async (cause) => {
+  const summary = {
+    script: "inspector-smoke.mjs",
+    ok: false,
+    error: String(cause?.stack ?? cause).slice(-2000),
+    at: new Date().toISOString(),
+  };
+  await finish(summary);
 });

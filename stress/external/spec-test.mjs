@@ -1,115 +1,74 @@
 #!/usr/bin/env node
 /**
- * @hasmcp/mcp-spec-test runner (builder-10, stress/external/).
+ * @hasmcp/mcp-spec-test runner (builder-10, stress/external/). Four-bar
+ * compliant (S9-R5): port 0 + child-attested port + authenticated health,
+ * full ISOLATION.md env, detached spawns with group kill, strict evidence
+ * (positive passed count required), last-line JSON on every path.
  *
  * MCP conformance suite over both transports:
  *   stdio — `-c "node <repo>/packages/cli/dist/index.js start --config <cfg>"`
  *   http  — `-u http://127.0.0.1:<port>/mcp -t <bearer token>`
  *
- * Intake flags honored: --disable-telemetry=1, JSON output
- * (--output json --output-folder). Version pinned for reproducibility.
- *
- * Writes a JSON summary as its last stdout line and to
- * stress/.generated/results/external-spec-test.json; suite reports (one JSON
- * file per run) are written under stress/.generated/external/spec-test/.
- *
  * Usage: node stress/external/spec-test.mjs [--config <servers.json>]
  */
-import { spawn, spawnSync } from "node:child_process";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdir, readdir, writeFile, copyFile, symlink, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildIsolatedEnv } from "./isolation.mjs";
+import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
+import { startServe, killTree, runTool } from "./serve.mjs";
+import { specEvidence } from "./parsers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
 const genDir = resolve(here, "..", ".generated", "external");
 const resultsDir = resolve(here, "..", ".generated", "results");
 const reportsDir = join(genDir, "spec-test");
-const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
 const SPEC_VERSION = "0.1.5";
-const SERVE_PORT = 41713;
-const token = "stress-external-token-0f1e2d3c";
+const token = `stress-spec-${Date.now().toString(36)}-${process.pid}`;
 
-const configPath = resolve(
-  process.argv.includes("--config")
-    ? process.argv[process.argv.indexOf("--config") + 1]
-    : join(genDir, "servers.json"),
-);
-
-// Full isolation per contract hard rules.
-const { env: isolatedEnv } = buildIsolatedEnv({
-  ACTION_HUB_CONFIG: configPath,
-  ACTION_HUB_SKILLS_DIR: join(genDir, "skills"),
-  ACTION_HUB_HTTP_TOKEN: token,
-  MCP_DISABLE_TELEMETRY: "1",
-});
-
-async function waitHealthy(port) {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      if (res.ok) return true;
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  return false;
-}
-
-function runSpec(args, label, extraEnv, runOutDir) {
-  const started = Date.now();
-  const res = spawnSync(
-    "npx",
-    ["--yes", `@hasmcp/mcp-spec-test@${SPEC_VERSION}`, ...args],
-    { encoding: "utf8", env: { ...isolatedEnv, ...extraEnv }, timeout: 30 * 60_000 },
-  );
-  const run = {
-    label,
-    command: ["npx", `@hasmcp/mcp-spec-test@${SPEC_VERSION}`, ...args].join(" "),
-    tool: "@hasmcp/mcp-spec-test",
-    version: SPEC_VERSION,
-    exitCode: res.status ?? -1,
-    reportDir: runOutDir,
-    durationMs: Date.now() - started,
-    stdoutTail: res.stdout?.slice(-2000),
-    stderr: res.stderr?.slice(-3000),
-  };
-  // Parse the suite's own JSON report; auth-blocked or failed cases fail the
-  // wrapper — an exit-0 wrapper over a 401-run is never green.
+async function finish(summary) {
+  await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
   try {
-    const files = readdirSync(runOutDir).filter((f) => f.endsWith(".json"));
-    run.reportFiles = [...files];
-    const latest = [...files].sort().pop();
-    const report = JSON.parse(readFileSync(join(runOutDir, latest), "utf8"));
-    run.verdict = report.verdict?.code ?? null;
-    run.counts = report.counts ?? null;
-    run.notVerifiedReasons = (report.cases?.notVerified ?? []).slice(0, 10).map((c) => ({
-      section: c.section,
-      reason: (c.reason ?? c.detail ?? "").slice(0, 200),
-    }));
-    const authBlocked = (report.cases?.notVerified ?? []).filter((c) =>
-      /401|unauthor|auth/i.test(`${c.reason ?? ""}${c.detail ?? ""}`),
-    ).length;
-    run.authBlockedCases = authBlocked;
-    run.ok =
-      run.exitCode === 0 &&
-      (report.counts?.failed ?? 1) === 0 &&
-      authBlocked === 0;
-  } catch (cause) {
-    run.ok = false;
-    run.parseError = String(cause).slice(0, 200);
+    await writeFile(join(resultsDir, "external-spec-test.json"), JSON.stringify(summary, null, 2) + "\n");
+  } catch {
+    /* artifact best-effort */
   }
-  return run;
+  console.log(JSON.stringify(summary));
+  process.exit(summary.ok === true ? 0 : 1);
 }
 
 async function main() {
   const started = Date.now();
-  await mkdir(reportsDir, { recursive: true });
+  const configPath = resolve(
+    process.argv.includes("--config")
+      ? process.argv[process.argv.indexOf("--config") + 1]
+      : join(genDir, "servers.json"),
+  );
+  if (!existsSync(configPath)) throw new Error(`config not found: ${configPath}`);
+  const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
   await mkdir(resultsDir, { recursive: true });
+
+  const { env: isolatedEnv, root, assertFinal } = buildIsolatedEnv({
+    MCP_DISABLE_TELEMETRY: "1",
+    ACTION_HUB_HTTP_TOKEN: token,
+  });
+  const stagedConfig = join(root, "config", "servers.json");
+  await mkdir(join(root, "config"), { recursive: true });
+  await copyFile(configPath, stagedConfig);
+  isolatedEnv["ACTION_HUB_CONFIG"] = stagedConfig;
+  const stagedSkills = join(root, "skills");
+  try {
+    await unlink(stagedSkills);
+  } catch {
+    /* not present */
+  }
+  const fixtureSkills = join(genDir, "skills");
+  if (existsSync(fixtureSkills)) await symlink(fixtureSkills, stagedSkills);
+  else await mkdir(stagedSkills, { recursive: true });
+  isolatedEnv["ACTION_HUB_SKILLS_DIR"] = stagedSkills;
+  assertFinal(isolatedEnv);
+
   const runs = [];
 
   // --- stdio target ---
@@ -118,60 +77,104 @@ async function main() {
     join(repoRoot, "packages", "cli", "dist", "index.js"),
     "start",
     "--config",
-    configPath,
+    stagedConfig,
   ].join(" ");
   runs.push(
-    runSpec(
-      ["-c", cmd, "--output", "json", "--output-folder", join(reportsDir, `stdio-${runStamp}`)],
-      "stdio",
-      {},
-      join(reportsDir, `stdio-${runStamp}`),
-    ),
+    await runSpec(isolatedEnv, ["-c", cmd, "--output", "json", "--output-folder", join(reportsDir, `stdio-${runStamp}`)], "stdio"),
   );
 
-  // --- http target ---
-  const serve = spawn(
-    process.execPath,
-    [join(repoRoot, "packages", "cli", "dist", "index.js"), "serve", "--config", configPath, "--port", String(SERVE_PORT)],
-    { env: isolatedEnv, stdio: ["ignore", "pipe", "pipe"] },
-  );
+  // --- http target (port 0, child-attested port) ---
+  const serve = await startServe({
+    configPath: stagedConfig,
+    token,
+    skillsDir: stagedSkills,
+    env: isolatedEnv,
+    root,
+    repoRoot,
+  });
   try {
-    if (!(await waitHealthy(SERVE_PORT))) throw new Error("serve not healthy in 30s");
     runs.push(
-      runSpec(
-        [
-          "-u", `http://127.0.0.1:${SERVE_PORT}/mcp`,
-          "-t", token,
-          "--output", "json",
-          "--output-folder", join(reportsDir, `http-${runStamp}`),
-        ],
-        "http",
-        {},
-        join(reportsDir, `http-${runStamp}`),
-      ),
+      await runSpec(isolatedEnv, [
+        "-u", `http://127.0.0.1:${serve.port}/mcp`,
+        "-t", token,
+        "--output", "json",
+        "--output-folder", join(reportsDir, `http-${runStamp}`),
+      ], "http"),
     );
   } finally {
-    serve.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 500));
+    await killTree(serve.child, serve.exitP);
   }
 
   const summary = {
     script: "spec-test.mjs",
     tool: "@hasmcp/mcp-spec-test",
     version: SPEC_VERSION,
-    configPath,
+    configPath: stagedConfig,
+    servePort: serve.port,
+    serveChildPid: serve.child.pid,
     reportsDir,
     runs,
-    ok: runs.every((r) => r.ok),
+    ok: runs.length === 2 && runs.every((r) => r.ok),
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
-  await writeFile(join(resultsDir, "external-spec-test.json"), JSON.stringify(summary, null, 2) + "\n");
-  console.log(JSON.stringify(summary));
-  process.exit(summary.ok ? 0 : 1);
+  await finish(summary);
 }
 
-main().catch((cause) => {
-  console.error(String(cause));
-  process.exit(1);
+async function runSpec(env, args, label) {
+  const outDir = args[args.indexOf("--output-folder") + 1];
+  await mkdir(outDir, { recursive: true });
+  const res = await runTool(
+    "npx",
+    ["--yes", `@hasmcp/mcp-spec-test@${SPEC_VERSION}`, ...args],
+    { env, timeoutMs: 30 * 60_000 },
+  ).exitP;
+  const run = {
+    label,
+    command: ["npx", `@hasmcp/mcp-spec-test@${SPEC_VERSION}`, ...args].join(" "),
+    tool: "@hasmcp/mcp-spec-test",
+    version: SPEC_VERSION,
+    exitCode: res.code,
+    timedOut: res.timedOut,
+    reportDir: outDir,
+    durationMs: res.durationMs,
+    stdoutTail: res.stdoutTail.slice(-2000),
+    stderr: res.stderrTail.slice(-3000),
+    spawnError: res.spawnError,
+  };
+  // Strict evidence parse: positive passed count, zero failed, no auth blocks.
+  try {
+    const { readFileSync, readdirSync } = await import("node:fs");
+    const files = readdirSync(outDir).filter((f) => f.endsWith(".json"));
+    run.reportFiles = [...files];
+    const latest = [...files].sort().pop();
+    const report = JSON.parse(readFileSync(join(outDir, latest), "utf8"));
+    run.verdict = report.verdict?.code ?? null;
+    run.counts = report.counts ?? null;
+    const notVerified = report.cases?.notVerified ?? [];
+    run.notVerifiedReasons = notVerified.slice(0, 10).map((c) => ({
+      section: c.section,
+      reason: (c.reason ?? c.detail ?? "").slice(0, 200),
+    }));
+    const authBlocked = notVerified.filter((c) => /401|unauthor|auth/i.test(`${c.reason ?? ""}${c.detail ?? ""}`)).length;
+    run.authBlockedCases = authBlocked;
+    const evidence = specEvidence(report);
+    run.evidence = { ok: evidence.ok, reason: evidence.reason, passed: evidence.passed, failed: evidence.failed, executed: evidence.executed };
+    run.ok = res.code === 0 && !res.timedOut && !res.spawnError && evidence.ok === true && authBlocked === 0;
+    if (!run.ok && evidence.reason) run.evidenceReason = evidence.reason;
+  } catch (cause) {
+    run.ok = false;
+    run.parseError = String(cause).slice(0, 200);
+  }
+  return run;
+}
+
+main().catch(async (cause) => {
+  const summary = {
+    script: "spec-test.mjs",
+    ok: false,
+    error: String(cause?.stack ?? cause).slice(-2000),
+    at: new Date().toISOString(),
+  };
+  await finish(summary);
 });

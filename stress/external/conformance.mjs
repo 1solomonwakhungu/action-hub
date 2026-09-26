@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 /**
- * Official MCP conformance runner (builder-10, stress/external/).
+ * Official MCP conformance runner (builder-10, stress/external/). Four-bar
+ * compliant (S9-R5): port 0 + child-attested port + authenticated health,
+ * full ISOLATION.md env, detached spawn with group kill, strict evidence
+ * (positive parsed scenarios/checks and zero failing checks required — CLI
+ * exit 0 alone is never green), last-line JSON on every path.
  *
  * Tool: @modelcontextprotocol/conformance (`npx`, official suite), server mode:
  *   npx @modelcontextprotocol/conformance server --url http://127.0.0.1:<port>/mcp
@@ -10,153 +14,167 @@
  * flag and does not read one from the environment, so against a
  * token-protected `action-hub serve` every authenticated scenario reports
  * 401-driven failures. That 401 behavior is itself the evidence this runner
- * collects; the verdict is reported as-is, not massaged.
- *
- * Writes a JSON summary as its last stdout line and to
- * stress/.generated/results/external-conformance.json.
+ * collects; the verdict is reported as-is, not massaged — a 401-driven
+ * failure count therefore fails the run (ok:false), by design.
  */
-import { spawn, spawnSync } from "node:child_process";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile, copyFile, symlink, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildIsolatedEnv } from "./isolation.mjs";
+import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
+import { startServe, killTree, runTool } from "./serve.mjs";
+import { conformanceEvidence } from "./parsers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
 const genDir = resolve(here, "..", ".generated", "external");
 const resultsDir = resolve(here, "..", ".generated", "results");
 const outBase = join(genDir, "conformance");
-const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
-const outDir = join(outBase, `run-${runStamp}`); // fresh per run; parse only this
 const CONFORMANCE_VERSION = "0.1.16"; // pinned per contract reproducibility rule
-const SERVE_PORT = 41714;
-const token = "stress-external-token-0f1e2d3c";
+const token = `stress-conformance-${Date.now().toString(36)}-${process.pid}`;
 
-const configPath = resolve(
-  process.argv.includes("--config")
-    ? process.argv[process.argv.indexOf("--config") + 1]
-    : join(genDir, "servers.json"),
-);
-
-const { env: isolatedEnv } = buildIsolatedEnv({
-  ACTION_HUB_CONFIG: configPath,
-});
-
-async function waitHealthy(port) {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      if (res.ok) return true;
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((r) => setTimeout(r, 250));
+async function finish(summary) {
+  await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
+  try {
+    await writeFile(join(resultsDir, "external-conformance.json"), JSON.stringify(summary, null, 2) + "\n");
+  } catch {
+    /* artifact best-effort */
   }
-  return false;
+  console.log(JSON.stringify(summary));
+  process.exit(summary.ok === true ? 0 : 1);
 }
 
 async function main() {
   const started = Date.now();
+  const configPath = resolve(
+    process.argv.includes("--config")
+      ? process.argv[process.argv.indexOf("--config") + 1]
+      : join(genDir, "servers.json"),
+  );
+  if (!existsSync(configPath)) throw new Error(`config not found: ${configPath}`);
+  const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const outDir = join(outBase, `run-${runStamp}`); // fresh per run; parse only this
   await mkdir(outDir, { recursive: true });
   await mkdir(resultsDir, { recursive: true });
 
-  const serve = spawn(
-    process.execPath,
-    [join(repoRoot, "packages", "cli", "dist", "index.js"), "serve", "--config", configPath, "--port", String(SERVE_PORT)],
-    { env: isolatedEnv, stdio: ["ignore", "pipe", "pipe"] },
-  );
-  if (!(await waitHealthy(SERVE_PORT))) {
-    serve.kill("SIGTERM");
-    throw new Error("action-hub serve did not become healthy in 30s");
+  const { env: isolatedEnv, root, assertFinal } = buildIsolatedEnv({
+    ACTION_HUB_HTTP_TOKEN: token,
+  });
+  const stagedConfig = join(root, "config", "servers.json");
+  await mkdir(join(root, "config"), { recursive: true });
+  await copyFile(configPath, stagedConfig);
+  isolatedEnv["ACTION_HUB_CONFIG"] = stagedConfig;
+  const stagedSkills = join(root, "skills");
+  try {
+    await unlink(stagedSkills);
+  } catch {
+    /* not present */
   }
+  const fixtureSkills = join(genDir, "skills");
+  if (existsSync(fixtureSkills)) await symlink(fixtureSkills, stagedSkills);
+  else await mkdir(stagedSkills, { recursive: true });
+  isolatedEnv["ACTION_HUB_SKILLS_DIR"] = stagedSkills;
+  assertFinal(isolatedEnv);
+
+  const serve = await startServe({
+    configPath: stagedConfig,
+    token,
+    skillsDir: stagedSkills,
+    env: isolatedEnv,
+    root,
+    repoRoot,
+  });
 
   let run;
   try {
-    const t = Date.now();
-    const res = spawnSync(
+    const res = await runTool(
       "npx",
       [
         "--yes",
         `@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}`,
         "server",
         "--url",
-        `http://127.0.0.1:${SERVE_PORT}/mcp`,
+        `http://127.0.0.1:${serve.port}/mcp`,
         "--suite",
         "active",
         "--output-dir",
         outDir,
         "--verbose",
       ],
-      { encoding: "utf8", env: isolatedEnv, timeout: 60 * 60_000 },
-    );
+      { env: isolatedEnv, timeoutMs: 60 * 60_000 },
+    ).exitP;
     run = {
       label: "http-server-suite",
       tool: "@modelcontextprotocol/conformance",
       version: CONFORMANCE_VERSION,
-      command: `npx @modelcontextprotocol/conformance@${CONFORMANCE_VERSION} server --url http://127.0.0.1:${SERVE_PORT}/mcp --suite active --output-dir ${outDir} --verbose`,
-      exitCode: res.status ?? -1,
-      durationMs: Date.now() - t,
-      ok: res.status === 0,
+      command: `npx @modelcontextprotocol/conformance@${CONFORMANCE_VERSION} server --url http://127.0.0.1:${serve.port}/mcp --suite active --output-dir ${outDir} --verbose`,
+      exitCode: res.code,
+      timedOut: res.timedOut,
+      durationMs: res.durationMs,
+      servePort: serve.port,
+      serveChildPid: serve.child.pid,
+      ok: false, // set from parsed evidence below; CLI exit alone is not green
       note: "Suite has no bearer-token flag; token-protected 401 responses drive the verdict below.",
-      stderr: res.stderr?.slice(-3000),
-      stdoutTail: res.stdout?.slice(-2000),
+      stderr: res.stderrTail.slice(-3000),
+      stdoutTail: res.stdoutTail.slice(-2000),
+      spawnError: res.spawnError,
     };
   } finally {
-    serve.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 500));
+    await killTree(serve.child, serve.exitP);
   }
 
-  try {
-    run.resultFiles = await readdir(outDir);
-  } catch {
-    run.resultFiles = [];
-  }
   // Parse per-scenario result files: the suite writes one directory per
   // scenario containing checks.json.
-  const counts = { success: 0, failure: 0, warning: 0, scenarios: 0 };
+  const scenarios = [];
   try {
     const { readdirSync, readFileSync, statSync } = await import("node:fs");
-    for (const f of run.resultFiles) {
+    for (const f of readdirSync(outDir)) {
       const p = join(outDir, f);
       if (!statSync(p).isDirectory()) continue;
-      const checksPath = join(p, "checks.json");
-      let checks = null;
       try {
-        checks = JSON.parse(readFileSync(checksPath, "utf8"));
+        const checks = JSON.parse(readFileSync(join(p, "checks.json"), "utf8"));
+        const list = Array.isArray(checks) ? checks : (checks.checks ?? []);
+        if (list.length > 0) scenarios.push({ name: f, checks: list });
       } catch {
-        continue;
-      }
-      counts.scenarios++;
-      const list = Array.isArray(checks) ? checks : (checks.checks ?? []);
-      for (const c of list) {
-        if (c.status === "SUCCESS") counts.success++;
-        else if (c.status === "FAILURE") counts.failure++;
-        else if (c.status === "WARNING") counts.warning++;
+        scenarios.push({ name: f, checks: [] }); // unreadable scenario = failure
       }
     }
   } catch {
-    /* counts best-effort */
+    /* parse below reports zero scenarios as a failure */
   }
-  run.counts = counts;
+  run.resultFiles = await readdir(outDir).catch(() => []);
+  run.scenarioCount = scenarios.length;
+  run.scenarios = scenarios.length;
+  const evidence = conformanceEvidence(scenarios);
+  run.counts = { success: evidence.success, failure: evidence.failure, warning: evidence.warning, scenarios: scenarios.length };
+  run.evidence = { ok: evidence.ok, reason: evidence.reason };
+  run.ok =
+    run.exitCode === 0 &&
+    !run.timedOut &&
+    !run.spawnError &&
+    evidence.ok === true;
+  if (!run.ok && evidence.reason) run.evidenceReason = evidence.reason;
 
   const summary = {
     script: "conformance.mjs",
     tool: "@modelcontextprotocol/conformance",
     version: CONFORMANCE_VERSION,
-    configPath,
+    configPath: stagedConfig,
     outputDir: outDir,
     runs: [run],
     ok: run.ok,
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
-  await writeFile(join(resultsDir, "external-conformance.json"), JSON.stringify(summary, null, 2) + "\n");
-  console.log(JSON.stringify(summary));
-  process.exit(summary.ok ? 0 : 1);
+  await finish(summary);
 }
 
-main().catch((cause) => {
-  console.error(String(cause));
-  process.exit(1);
+main().catch(async (cause) => {
+  const summary = {
+    script: "conformance.mjs",
+    ok: false,
+    error: String(cause?.stack ?? cause).slice(-2000),
+    at: new Date().toISOString(),
+  };
+  await finish(summary);
 });
