@@ -44,6 +44,7 @@ export type {
   ApprovalRejection,
 } from "./permissions/approvals.js";
 export { validateArguments } from "./router/validate.js";export type { ValidationResult } from "./router/validate.js";
+export { discoverSkillsFromDirectory } from "./discovery/auto-discovery.js";
 export { BundleRegistry } from "./bundles/bundles.js";
 export type { Bundle } from "./bundles/bundles.js";
 export {

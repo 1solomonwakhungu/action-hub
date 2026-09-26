@@ -46,6 +46,20 @@ export class Catalog {
     return ids.size;
   }
 
+  /** Drops every action of the given kind (e.g. skills). Used for replace-on-refresh. */
+  removeKind(kind: ActionKind): number {
+    const ids = [...this.#byId.values()]
+      .filter((record) => record.kind === kind)
+      .map((record) => record.id);
+    for (const id of ids) {
+      const record = this.#byId.get(id);
+      if (!record) continue;
+      this.#byId.delete(id);
+      this.#byServer.get(record.serverId)?.delete(id);
+    }
+    return ids.length;
+  }
+
   listByServer(serverId: string): ActionRecord[] {
     const ids = this.#byServer.get(serverId);
     if (!ids) return [];
