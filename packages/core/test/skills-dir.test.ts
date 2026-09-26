@@ -83,9 +83,9 @@ test("skills discovered from a directory carry the body as instructions on load"
   assert.match(loaded.description ?? "", /Rotate via vault/);
 });
 
-test("duplicate ids in a skills dir are deterministic and warned, unreadable files are skipped", async () => {
+test("colliding skill ids keep every skill: first keeps its id, later ones get a deterministic suffix", async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-dir-"));
-  for (const sub of ["a-dup", "b-dup"]) {
+  for (const sub of ["a-dup", "b-dup", "c-dup"]) {
     const skillDir = join(dir, sub);
     await mkdir(skillDir, { recursive: true });
     await writeFile(
@@ -107,11 +107,19 @@ test("duplicate ids in a skills dir are deterministic and warned, unreadable fil
   const warnings: string[] = [];
   const skills = await discoverSkillsFromDirectory(dir, "custom", (m) => warnings.push(m));
 
-  // Deterministic winner: "a-dup" sorts before "b-dup"; the loser is warned.
-  assert.equal(skills.filter((s) => s.id === "skill:same-skill").length, 1);
+  // No silent loss: three same-named skills produce three distinct ids.
+  const ids = skills.map((s) => s.id).sort();
+  assert.deepEqual(ids, ["skill:same-skill", "skill:same-skill-2", "skill:same-skill-3"]);
+  // The first (path-sorted) skill keeps the original id and content.
   assert.match(skills.find((s) => s.id === "skill:same-skill")?.description ?? "", /Body of a-dup/);
+  assert.match(skills.find((s) => s.id === "skill:same-skill-2")?.description ?? "", /Body of b-dup/);
+  assert.match(skills.find((s) => s.id === "skill:same-skill-3")?.description ?? "", /Body of c-dup/);
+  // One warning per collision, naming both source paths.
   assert.ok(
     warnings.some((w) => w.includes('duplicate skill id "skill:same-skill"') && w.includes("a-dup") && w.includes("b-dup")),
+  );
+  assert.ok(
+    warnings.some((w) => w.includes('duplicate skill id "skill:same-skill"') && w.includes("a-dup") && w.includes("c-dup")),
   );
 
   // An unreadable file is skipped with a warning instead of aborting the scan.

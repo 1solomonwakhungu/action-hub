@@ -252,10 +252,30 @@ export class ActionHub {
           readOnly: tool.annotations?.readOnlyHint === true ? true : undefined,
         }));
 
+      // A server listing two tools with the same name yields one id. The first
+      // occurrence wins; later duplicates are skipped with a stderr warning so
+      // a hostile shadow copy cannot silently replace a real tool.
+      const seenIds = new Set<string>();
+      const duplicates = new Set<string>();
+      const unique: ActionRecord[] = [];
+      for (const record of records) {
+        if (seenIds.has(record.id)) {
+          duplicates.add(record.name);
+          continue;
+        }
+        seenIds.add(record.id);
+        unique.push(record);
+      }
+      if (duplicates.size > 0) {
+        process.stderr.write(
+          `action-hub: server "${serverId}" listed duplicate tool names; keeping first occurrence of: ${[...duplicates].sort().join(", ")}\n`,
+        );
+      }
+
       this.#catalog.removeServer(serverId);
-      this.#catalog.addAll(records);
-      this.#connections.recordToolCount(serverId, records.length);
-      return { serverId, indexed: records.length };
+      this.#catalog.addAll(unique);
+      this.#connections.recordToolCount(serverId, unique.length);
+      return { serverId, indexed: unique.length };
     } catch (cause) {
       const error = cause instanceof Error ? cause.message : String(cause);
       return { serverId, indexed: 0, error };

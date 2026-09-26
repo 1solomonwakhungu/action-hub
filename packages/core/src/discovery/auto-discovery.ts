@@ -658,6 +658,26 @@ async function scanSkillDirectory(
   const entries = await readdir(dir, { withFileTypes: true });
   // Deterministic winner for duplicate ids: first entry by name wins.
   const sorted = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  // Collision-safe placement: the first skill keeps its id; later skills that
+  // normalize to the same id get a deterministic `-2`, `-3`, … suffix (scan
+  // order is stable), so no skill is silently dropped.
+  const placeSkill = (skill: DiscoveredSkill, path: string): void => {
+    if (!seenIds.has(skill.id)) {
+      seenIds.set(skill.id, path);
+      discovered.push(skill);
+      return;
+    }
+    const base = skill.id;
+    const keptPath = seenIds.get(base)!;
+    let n = 2;
+    while (seenIds.has(`${base}-${n}`)) n++;
+    const renamed = `${base}-${n}`;
+    seenIds.set(renamed, path);
+    onWarning?.(
+      `duplicate skill id "${base}" ("${keptPath}" and "${path}"): keeping "${keptPath}", renaming "${path}" to "${renamed}"`,
+    );
+    discovered.push({ ...skill, id: renamed });
+  };
   for (const entry of sorted) {
     const fullPath = join(dir, entry.name);
     if (entry.isDirectory()) {
@@ -674,15 +694,7 @@ async function scanSkillDirectory(
         continue;
       }
       const skill = parseSkillContent(content, skillMdPath, client);
-      const previous = seenIds.get(skill.id);
-      if (previous) {
-        onWarning?.(
-          `duplicate skill id "${skill.id}": "${previous}" wins over "${skillMdPath}"`,
-        );
-        continue;
-      }
-      seenIds.set(skill.id, skillMdPath);
-      discovered.push(skill);
+      placeSkill(skill, skillMdPath);
     } else if (entry.isFile()) {
       const ext = extname(entry.name);
       if (ext === ".md" || ext === ".mdc") {
@@ -695,13 +707,7 @@ async function scanSkillDirectory(
           continue;
         }
         const skill = parseSkillContent(content, fullPath, client);
-        const previous = seenIds.get(skill.id);
-        if (previous) {
-          onWarning?.(`duplicate skill id "${skill.id}": "${previous}" wins over "${fullPath}"`);
-          continue;
-        }
-        seenIds.set(skill.id, fullPath);
-        discovered.push(skill);
+        placeSkill(skill, fullPath);
       }
     }
   }
