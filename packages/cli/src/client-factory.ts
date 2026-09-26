@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { classifyDownstreamError, ToolError } from "@action-hub/core";
+import { classifyDownstreamError, connectWithDeadline, ToolError } from "@action-hub/core";
 import { context, propagation } from "@opentelemetry/api";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { StringDecoder } from "node:string_decoder";
@@ -47,7 +47,7 @@ export interface SdkClientFactoryOptions {
 export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpClientFactory = (
   options = {},
 ) => {
-  return async (config: ServerConfig) => {
+  return async (config: ServerConfig, factoryOptions?: { signal?: AbortSignal }) => {
     const activeHeaders = new AsyncLocalStorage<Record<string, string> | undefined>();
     const client = new Client(CLIENT_INFO, { capabilities: {} });
     const transport = buildTransport(config, options, () => activeHeaders.getStore());
@@ -69,7 +69,12 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     };
 
     try {
-      await client.connect(transport);
+      await connectWithDeadline(
+      client,
+      transport,
+      factoryOptions?.signal,
+      (cause: unknown) => describeConnectFailure(config, cause),
+    );
     } catch (cause) {
       throw describeConnectFailure(config, cause);
     }

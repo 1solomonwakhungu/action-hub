@@ -15,6 +15,7 @@ import {
   type ServerConfig,
   type TokenStore,
   ToolError,
+  connectWithDeadline,
 } from "@action-hub/core";
 import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
@@ -35,7 +36,7 @@ export interface SdkClientFactoryOptions {
 export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpClientFactory = (
   options = {},
 ) =>
-  async (config: ServerConfig) => {
+  async (config: ServerConfig, factoryOptions?: { signal?: AbortSignal }) => {
     const activeHeaders = new AsyncLocalStorage<Record<string, string> | undefined>();
     const client = new Client(CLIENT_INFO, { capabilities: {} });
     const transport = buildTransport(config, options, () => activeHeaders.getStore());
@@ -50,7 +51,7 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
       priorOnClose?.();
     };
 
-    await client.connect(transport);
+    await connectWithDeadline(client, transport, factoryOptions?.signal);
 
     return {
       async listTools(callOptions?: CallToolOptions) {

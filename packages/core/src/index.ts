@@ -15,6 +15,7 @@ export type { SemanticScorer } from "./search/search.js";
 export { LocalSemanticIndex, createLocalSemanticScorer } from "./search/semantic.js";
 export type { LocalSemanticOptions, SemanticIndexStats } from "./search/semantic.js";
 export { ConnectionManager } from "./servers/connection-manager.js";
+export { connectWithDeadline } from "./servers/activation-deadline.js";
 export {
   classifyDownstreamError,
   isTransportFailure,
