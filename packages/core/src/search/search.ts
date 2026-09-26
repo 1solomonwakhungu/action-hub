@@ -54,6 +54,10 @@ export class SearchEngine {
   }
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchHit[]> {
+    // Invalidate the memoized corpus work BEFORE any early return: otherwise
+    // a generation change followed by an empty-candidate or empty-query
+    // search would retain the stale memo indefinitely (37 MiB at 15k docs).
+    this.#invalidateIfChanged();
     const limit = options.limit ?? DEFAULT_LIMIT;
     const candidates = this.#catalog.filter(options);
     const terms = tokenize(query);
@@ -99,13 +103,30 @@ export class SearchEngine {
    * records in the same order — the cache only removes repeated tokenization
    * and repeated whole-corpus accumulation when the catalog has not changed.
    */
-  #statsFor(candidates: readonly ActionRecord[]): CorpusStats {
+  /** Drops the whole memo when the catalog generation has changed. */
+  #invalidateIfChanged(): void {
     const generation = this.#catalog.generation;
-    if (generation !== this.#tokensGeneration) {
-      // Catalog changed: drop stale per-record tokens (and deleted ids) wholesale.
-      this.#tokensCache.clear();
-      this.#tokensGeneration = generation;
-    }
+    if (generation === this.#tokensGeneration) return;
+    this.#tokensCache.clear();
+    this.#fullStats = undefined;
+    this.#tokensGeneration = generation;
+  }
+
+  /** Test-only observation point for the memo (never used in production paths). */
+  get memoSizeForTest(): number {
+    return this.#tokensCache.size;
+  }
+
+  /**
+   * Corpus stats for a candidate set, memoized across queries.
+   *
+   * Bit-identical to the uncached path: `buildStats` still runs over the same
+   * records in the same order — the cache only removes repeated tokenization
+   * and repeated whole-corpus accumulation when the catalog has not changed.
+   */
+  #statsFor(candidates: readonly ActionRecord[]): CorpusStats {
+    this.#invalidateIfChanged();
+    const generation = this.#catalog.generation;
     // Fast path: the candidate set IS the whole catalog (the server's default
     // search path passes no filters). Reuse the stats wholesale.
     const full =

@@ -107,16 +107,38 @@ const QUERIES = [
   "term55 term2",
 ];
 
-test("memoized search is bit-identical to the reference per-query path", () => {
+test("memoized search is bit-identical to the reference per-query path", async () => {
   const catalog = makeCatalog(600);
   const engine = new SearchEngine(catalog);
   for (const query of QUERIES) {
     const expected = referenceRank(catalog.all(), query, 10);
-    const got = engine.search(query).then((hits) =>
-      hits.map((hit) => ({ id: hit.id, score: hit.score })),
-    );
-    return got.then((actual) => assert.deepEqual(actual, expected));
+    const actual = (await engine.search(query)).map((hit) => ({ id: hit.id, score: hit.score }));
+    assert.deepEqual(actual, expected);
   }
+});
+
+test("stale memo is released after full corpus removal even with early-return searches", async () => {
+  const catalog = makeCatalog(500);
+  const engine = new SearchEngine(catalog);
+  await engine.search(QUERIES[0]); // warm the memo
+  assert.ok(engine.memoSizeForTest > 0);
+
+  // Remove every server, then drive BOTH early-return paths.
+  for (const serverId of catalog.serverIds()) catalog.removeServer(serverId);
+  assert.deepEqual(await engine.search(""), []); // empty-query early return
+  assert.deepEqual(await engine.search(QUERIES[0]), []); // empty-candidates early return
+  assert.equal(engine.memoSizeForTest, 0, "stale memo must be dropped before the early returns");
+
+  // Re-adding records must rank exactly like a fresh engine.
+  const fresh = new SearchEngine(catalog);
+  for (let i = 0; i < 40; i += 1) {
+    catalog.add(makeRecord(10_000 + i, mulberry32(99)));
+  }
+  const got = (await engine.search(QUERIES[2])).map((hit) => ({ id: hit.id, score: hit.score }));
+  const expected = referenceRank(catalog.all(), QUERIES[2], 10);
+  assert.deepEqual(got, expected);
+  const freshGot = (await fresh.search(QUERIES[2])).map((hit) => ({ id: hit.id, score: hit.score }));
+  assert.deepEqual(got, freshGot);
 });
 
 test("warm cache returns identical results and survives catalog mutation", async () => {
