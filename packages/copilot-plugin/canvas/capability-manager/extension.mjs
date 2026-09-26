@@ -43,14 +43,14 @@ const canvas = createCanvas({
   id: "capability-manager",
   displayName: "Capability Manager",
   description:
-    "Control center for Action Hub: connected MCP servers, health and trust, indexed action counts, search testing, invocation history, and context savings.",
+    "Control center for Action Hub: connected MCP servers, health and trust, indexed action counts, search testing, invocation history, context savings, harness configuration snippets, and indexed skills.",
 
   inputSchema: {
     type: "object",
     properties: {
       tab: {
         type: "string",
-        enum: ["servers", "actions", "search", "history"],
+        enum: ["servers", "actions", "search", "history", "harnesses"],
         description: "Which panel to show first. Defaults to servers.",
       },
     },
@@ -73,7 +73,7 @@ const canvas = createCanvas({
       inputSchema: {
         type: "object",
         properties: {
-          tab: { type: "string", enum: ["servers", "actions", "search", "history"] },
+          tab: { type: "string", enum: ["servers", "actions", "search", "history", "harnesses"] },
         },
         required: ["tab"],
       },
