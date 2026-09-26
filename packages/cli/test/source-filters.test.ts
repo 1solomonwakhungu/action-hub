@@ -46,6 +46,17 @@ test("import and migrate reject unknown --source before running (exit 1, config 
     assert.equal(badMigrate.status, 1);
     assert.match(badMigrate.stderr, /Unknown --source value "bogus"/);
     assert.ok(!existsSync(configFile), "migrate must not write config for unknown source");
+
+    // --source present but without a value: must not run unfiltered either.
+    const missingImport = runCli(["import", "--source"], home);
+    assert.equal(missingImport.status, 1);
+    assert.match(missingImport.stderr, /Missing value for --source/);
+    assert.ok(!existsSync(configFile), "import must not run for missing --source value");
+
+    const missingMigrate = runCli(["migrate", "--source", "--write", "--json"], home);
+    assert.equal(missingMigrate.status, 1);
+    assert.match(missingMigrate.stderr, /Missing value for --source/);
+    assert.ok(!existsSync(configFile), "migrate must not write config for missing --source value");
   } finally {
     await rm(home, { recursive: true, force: true });
   }
