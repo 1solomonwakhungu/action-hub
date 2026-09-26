@@ -25,7 +25,21 @@ import { createHubRuntime, createMcpServer, type HubRuntime } from "./index.js";
 const MCP_PATH = "/mcp";
 const HEALTH_PATH = "/health";
 
+/**
+ * The hub's inbound credential. Deleted from this process's environment right
+ * after it is read, and stripped again in the stdio client factories, so a
+ * downstream MCP server subprocess can never inherit the token that grants
+ * access to the hub itself.
+ */
+export const HUB_HTTP_TOKEN_ENV_VAR = "ACTION_HUB_HTTP_TOKEN";
+
+/** Default cap on a single authenticated request body. */
+export const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
+
 export interface HttpServerOptions {
+  /** Reject request bodies larger than this (default 4 MiB) with 413. */
+  maxBodyBytes?: number;
+
   /** Port to bind. Default 6290; pass 0 for an ephemeral port. */
   port?: number;
   /** Bind address. Default 127.0.0.1 — loopback only. */
@@ -45,10 +59,25 @@ export interface HttpServerHandle {
   close(): Promise<void>;
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
+export function readBoundedBody(req: IncomingMessage, maxBytes: number): Promise<string | null> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    let overflow = false;
+    req.on("data", (chunk: Buffer) => {
+      if (overflow) return; // already over the cap; discard the remainder
+      size += chunk.length;
+      if (size > maxBytes) {
+        overflow = true;
+        chunks.length = 0;
+        // Stop buffering and drop the rest of the stream instead of growing
+        // process memory without bound.
+        req.resume();
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("error", reject);
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
   });
@@ -82,14 +111,21 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   const port = options.port ?? 6290;
   const host = options.host ?? "127.0.0.1";
 
-  let token = options.token ?? process.env["ACTION_HUB_HTTP_TOKEN"] ?? "";
+  let token = options.token ?? process.env[HUB_HTTP_TOKEN_ENV_VAR] ?? "";
   const generated = token === "";
   if (generated) token = randomBytes(24).toString("hex");
   if (generated) {
     process.stderr.write(`action-hub serve: generated bearer token: ${token}\n`);
   }
 
+  // The token has been read; scrub it from this process's environment BEFORE
+  // the hub runtime spawns any downstream stdio MCP server, so no child ever
+  // inherits the credential that authorizes access to this hub.
+  delete process.env[HUB_HTTP_TOKEN_ENV_VAR];
+
   const runtime: HubRuntime = await createHubRuntime({ control: false });
+
+  const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
 
   // Stateless mode: each POST gets its own McpServer + transport pair so
   // concurrent requests cannot collide JSON-RPC ids or misroute responses.
@@ -125,7 +161,11 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
     }
 
     if (req.method === "POST") {
-      const raw = await readBody(req);
+      const raw = await readBoundedBody(req, maxBodyBytes);
+      if (raw === null) {
+        sendJson(res, 413, { error: `Request body exceeds the ${maxBodyBytes}-byte limit` });
+        return;
+      }
       let parsedBody: unknown;
       try {
         parsedBody = JSON.parse(raw);

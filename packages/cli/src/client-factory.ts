@@ -3,6 +3,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { context, propagation } from "@opentelemetry/api";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { HUB_HTTP_TOKEN_ENV_VAR } from "@action-hub/copilot-mcp";
 import {
   applyNodeMemoryLimit,
   createHttpAuthBinding,
@@ -164,9 +165,12 @@ function describeConnectFailure(config: ServerConfig, cause: unknown): Error {
   return cause instanceof Error ? cause : new Error(String(cause));
 }
 
-function inheritableEnv(): Record<string, string> {
+export function inheritableEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
+    // Defense in depth: the hub's inbound bearer credential must never reach
+    // a downstream MCP server subprocess (mirrors the scrub in http-server.ts).
+    if (key === HUB_HTTP_TOKEN_ENV_VAR) continue;
     if (typeof value === "string") out[key] = value;
   }
   return out;
