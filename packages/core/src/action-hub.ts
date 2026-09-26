@@ -249,7 +249,7 @@ export class ActionHub {
           description: tool.description,
           inputSchema: tool.inputSchema ?? {},
           trust,
-          readOnly: (tool as { annotations?: { readOnlyHint?: boolean } }).annotations?.readOnlyHint === true ? true : undefined,
+          readOnly: tool.annotations?.readOnlyHint === true ? true : undefined,
         }));
 
       this.#catalog.removeServer(serverId);
