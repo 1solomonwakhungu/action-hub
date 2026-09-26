@@ -125,26 +125,49 @@ function attachSanitizedStderr(
   const decoder = new StringDecoder("utf8");
   let pending = "";
   let flushed = false;
+  /** True while we are discarding an over-long line (fail closed). */
+  let discarding = false;
 
   const flush = (): void => {
     if (flushed) return;
     flushed = true;
-    const tail = pending + decoder.end();
+    const tail = discarding ? "" : pending + decoder.end();
     pending = "";
     if (tail.length > 0) emit(sanitizeErrorForServer(config, tail));
   };
 
   stream.on("data", (chunk: Buffer | string) => {
     pending += decoder.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+
+    if (discarding) {
+      // An over-long line is being discarded wholesale: a configured secret
+      // crossing the cap boundary must never be emitted in fragments.
+      const resume = pending.indexOf("\n");
+      if (resume >= 0) {
+        pending = pending.slice(resume + 1);
+        discarding = false;
+      } else {
+        pending = "";
+        return;
+      }
+    }
+
     let newlineIndex: number;
     while ((newlineIndex = pending.indexOf("\n")) >= 0) {
       const line = pending.slice(0, newlineIndex);
       pending = pending.slice(newlineIndex + 1);
       emit(`${sanitizeErrorForServer(config, line)}\n`);
     }
-    if (pending.length > MAX_PENDING_STDERR_BYTES) {
-      emit(sanitizeErrorForServer(config, pending));
+
+    // Cap is measured in bytes, not JS characters. Exceeding it fails
+    // closed: the sanitized first part is emitted followed by a truncation
+    // marker, and the rest of that logical line is discarded up to the next
+    // newline — a configured secret straddling the boundary can never be
+    // revealed as a fragment pair.
+    if (Buffer.byteLength(pending, "utf8") > MAX_PENDING_STDERR_BYTES) {
+      emit(`${sanitizeErrorForServer(config, pending)} [stderr line truncated]\n`);
       pending = "";
+      discarding = true;
     }
   });
   stream.on("end", flush);

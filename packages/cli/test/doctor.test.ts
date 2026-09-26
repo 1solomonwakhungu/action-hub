@@ -40,6 +40,21 @@ test("doctor output contains no secret sentinels from server config", async () =
           },
         },
         {
+          id: "cap-straddle",
+          transport: {
+            type: "stdio",
+            command: "node",
+            // Writes 8193 spaces plus the first half of the secret (crossing
+            // the 8KB cap boundary), pauses, then the rest + newline. The
+            // over-long line must be truncated fail-closed at the cap.
+            args: [
+              "-e",
+              "process.stderr.write(' '.repeat(8193)+process.env.API_TOKEN.slice(0,6));setTimeout(()=>{process.stderr.write(process.env.API_TOKEN.slice(6)+'\\n');process.stderr.write('SAFE_LINE_OK\\n');process.exit(0);},50);",
+            ],
+            env: { API_TOKEN: "SPLIT_SECRET_12345" },
+          },
+        },
+        {
           id: "split-echo",
           transport: {
             type: "stdio",
