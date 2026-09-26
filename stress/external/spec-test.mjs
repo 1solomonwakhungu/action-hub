@@ -87,8 +87,8 @@ function runSpec(args, label, extraEnv, runOutDir) {
   // wrapper — an exit-0 wrapper over a 401-run is never green.
   try {
     const files = readdirSync(runOutDir).filter((f) => f.endsWith(".json"));
-    run.reportFiles = files;
-    const latest = files.sort().pop();
+    run.reportFiles = [...files];
+    const latest = [...files].sort().pop();
     const report = JSON.parse(readFileSync(join(runOutDir, latest), "utf8"));
     run.verdict = report.verdict?.code ?? null;
     run.counts = report.counts ?? null;

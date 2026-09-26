@@ -22,6 +22,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { aggregateRuns } from "./verdict.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -117,6 +118,7 @@ async function main() {
     }
     runs.push({
       label: "inspector-smoke",
+      requiresSummary: true,
       exitCode: smoke.status,
       summary: smokeSummary,
       stderr: smoke.stderr?.slice(0, 2000),
@@ -156,9 +158,11 @@ async function main() {
         label: "k6",
         tool: "k6",
         profile,
+        requiresSummary: true,
         exitCode: k6Exit.code,
         durationMs: Date.now() - started,
         summaryExport: summaryOut,
+        summary: { ok: k6Exit.code === 0, exitCode: k6Exit.code },
         stderr: k6Exit.stderr,
       });
     }
@@ -179,6 +183,7 @@ async function main() {
       }
       runs.push({
         label: "mcp-fuzzer",
+        requiresSummary: true,
         exitCode: f.status,
         durationMs: Date.now() - started,
         summary: fSummary,
@@ -202,6 +207,7 @@ async function main() {
       }
       runs.push({
         label: "mcp-spec-test",
+        requiresSummary: true,
         exitCode: s.status,
         durationMs: Date.now() - started,
         summary: sSummary,
@@ -214,24 +220,18 @@ async function main() {
     await new Promise((r) => setTimeout(r, 500));
   }
 
+  const verdict = aggregateRuns(runs);
   const summary = {
     script: "run-external.mjs",
     configPath,
     servePort: SERVE_PORT,
     healthy,
     runs,
+    failures: verdict.failures,
     rssSamples,
     rssPeakKb: rssSamples.length ? Math.max(...rssSamples.map((s) => s.rssKb)) : null,
     durationMs: Date.now() - t0,
-    // Overall status comes from real verdicts: every runner row must have
-    // exited 0 and, where present, its parsed summary must be ok.
-    ok:
-      healthy &&
-      runs.every(
-        (r) =>
-          (r.exitCode === 0 || r.exitCode === undefined) &&
-          (r.summary === undefined || r.summary === null || r.summary?.ok === true),
-      ),
+    ok: healthy && verdict.ok,
     at: new Date().toISOString(),
   };
   await writeFile(join(resultsDir, "external.json"), JSON.stringify(summary, null, 2) + "\n");

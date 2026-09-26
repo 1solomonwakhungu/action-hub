@@ -13,7 +13,7 @@
  *
  * Usage: node stress/external/make-fixture.mjs [--servers N] [--tools-per N]
  */
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -101,6 +101,19 @@ export ACTION_HUB_SKILLS_DIR="${outDir}/skills"
 export PI_CODING_AGENT_DIR="${outDir}/pi"
 `;
   await writeFile(join(outDir, "env.sh"), envSh);
+
+  // Pools for k6 and other drivers, derived from the actual manifests —
+  // never hard-code action ids elsewhere.
+  const first = serverIds[0];
+  const firstTools = JSON.parse(await readFile(join(outDir, "tools", `${first}.json`), "utf8")).tools;
+  await writeFile(
+    join(outDir, "actions.json"),
+    JSON.stringify(firstTools.slice(0, 20).map((t) => `${first}:${t.name}`), null, 2) + "\n",
+  );
+  const queries = [
+    ...new Set(firstTools.slice(0, 20).map((t) => t.description.split(/[:.]/)[0].toLowerCase())),
+  ];
+  await writeFile(join(outDir, "queries.json"), JSON.stringify(queries, null, 2) + "\n");
 
   const summary = {
     script: "make-fixture.mjs",

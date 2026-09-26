@@ -54,22 +54,18 @@ function mulberry32(seed) {
 const rand = mulberry32(42);
 
 const QUERIES = new SharedArray("queries", function () {
-  const fallback = ["show me recent crm records", "find billing invoices", "search inventory items"];
-  try {
-    if (__ENV.K6_QUERIES) return JSON.parse(open(__ENV.K6_QUERIES));
-  } catch {
-    /* fall back */
-  }
-  return fallback;
+  // Default pool is the one make-fixture.mjs generates from the actual
+  // manifests — never a hard-coded action id.
+  const path = __ENV.K6_QUERIES ?? "../.generated/external/queries.json";
+  const parsed = JSON.parse(open(path));
+  if (!Array.isArray(parsed) || parsed.length === 0) fail(`empty query pool: ${path}`);
+  return parsed;
 });
 const ACTIONS = new SharedArray("actions", function () {
-  const fallback = ["fixture-00:list_crm_000"];
-  try {
-    if (__ENV.K6_ACTIONS) return JSON.parse(open(__ENV.K6_ACTIONS));
-  } catch {
-    /* fall back */
-  }
-  return fallback;
+  const path = __ENV.K6_ACTIONS ?? "../.generated/external/actions.json";
+  const parsed = JSON.parse(open(path));
+  if (!Array.isArray(parsed) || parsed.length === 0) fail(`empty action pool: ${path}`);
+  return parsed;
 });
 
 const params = {
@@ -133,8 +129,8 @@ export const options = Object.assign(
       // Fail the run when JSON-RPC-level success rate drops below 99% or
       // request errors appear — not just on HTTP status.
       checks: [`rate>0.99`],
-      // Recording thresholds — computed into the summary; loose enough not to
-      // fail a run whose result we still want to report.
+  // Recording thresholds — computed into the summary; loose enough not to
+  // fail a run whose result we still want to report.
       "op_initialize": [`p(50)<2000`, `p(95)<5000`, `p(99)<10000`],
       "op_tools_list": [`p(50)<2000`, `p(95)<5000`, `p(99)<10000`],
       "op_search": [`p(50)<2000`, `p(95)<5000`, `p(99)<10000`],
@@ -148,7 +144,15 @@ export const options = Object.assign(
           quick: { executor: "constant-arrival-rate", rate: 20, timeUnit: "1s", duration: "15s", preAllocatedVUs: 20, maxVUs: 50 },
         },
       }
-    : {
+    : profile === "steps"
+      ? {
+          scenarios: {
+            step50: { executor: "ramping-arrival-rate", startRate: 5, timeUnit: "1s", stages: [{ duration: "20s", target: 10 }, { duration: "20s", target: 10 }], preAllocatedVUs: 20, maxVUs: 60 },
+            step100: { executor: "ramping-arrival-rate", startRate: 10, timeUnit: "1s", stages: [{ duration: "20s", target: 20 }, { duration: "20s", target: 20 }], preAllocatedVUs: 40, maxVUs: 120, startTime: "45s" },
+            step200: { executor: "ramping-arrival-rate", startRate: 20, timeUnit: "1s", stages: [{ duration: "20s", target: 40 }, { duration: "20s", target: 40 }], preAllocatedVUs: 80, maxVUs: 240, startTime: "90s" },
+          },
+        }
+      : {
         scenarios: {
           ramp: {
             executor: "ramping-vus",
