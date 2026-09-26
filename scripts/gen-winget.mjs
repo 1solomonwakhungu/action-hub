@@ -64,7 +64,6 @@ Moniker: action-hub
 Tags:
   - mcp
   - cli
-  - copilot
   - developer-tools
 ManifestType: defaultLocale
 ManifestVersion: ${MANIFEST_VERSION}

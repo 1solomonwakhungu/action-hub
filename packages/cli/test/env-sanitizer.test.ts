@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { inheritableEnv } from "../dist/client-factory.js";
-import { inheritableEnv as serverInheritableEnv } from "../../copilot-plugin/server/dist/sdk-client.js";
-import { HUB_HTTP_TOKEN_ENV_VAR } from "../../copilot-plugin/server/dist/http-server.js";
+import { inheritableEnv as serverInheritableEnv } from "../../plugin/server/dist/sdk-client.js";
+import { HUB_HTTP_TOKEN_ENV_VAR } from "../../plugin/server/dist/http-server.js";
 
 // Regression for PR 31 rework: the hub's inbound bearer credential
 // (ACTION_HUB_HTTP_TOKEN) must never reach a downstream MCP server

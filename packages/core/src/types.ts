@@ -6,7 +6,7 @@ import type { OAuthClientConfig } from "./auth/types.js";
  *
  * Nothing in this file may reference a specific agent host. The catalog,
  * search, and routing layers are intentionally host-neutral so the same
- * engine can back a Copilot plugin, a Claude Code MCP server, or any other
+ * engine can back an MCP server, a Claude Code integration, or any other
  * MCP-compatible client.
  */
 

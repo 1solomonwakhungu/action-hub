@@ -33,7 +33,7 @@ test("createHubRuntime serves directory skills added after a warm cache was buil
   try {
     // Run 1: cold start with Alpha only; builds and warms the cache.
     await writeSkill(skillsDir, "Alpha Skill", "Step 1: alpha.");
-    const run1 = await createHubRuntime({ control: false });
+    const run1 = await createHubRuntime();
     await run1.refreshed;
     const hits1 = await run1.hub.search("alpha");
     assert.ok(hits1.some((h) => h.id === "skill:alpha-skill"));
@@ -42,7 +42,7 @@ test("createHubRuntime serves directory skills added after a warm cache was buil
     // Run 2: Beta is added after the cache was written. The warm cache must
     // not hide it: replaceSkills reconciles the always-live skill set.
     await writeSkill(skillsDir, "Beta Skill", "Step 1: beta.");
-    const run2 = await createHubRuntime({ control: false });
+    const run2 = await createHubRuntime();
     await run2.refreshed;
     const hits2 = await run2.hub.search("beta");
     assert.ok(hits2.some((h) => h.id === "skill:beta-skill"));
@@ -54,7 +54,7 @@ test("createHubRuntime serves directory skills added after a warm cache was buil
 
     // Run 3: removal — deleting the Alpha directory drops it from the catalog.
     await rm(join(skillsDir, "alpha-skill"), { recursive: true, force: true });
-    const run3 = await createHubRuntime({ control: false });
+    const run3 = await createHubRuntime();
     await run3.refreshed;
     const hits3 = await run3.hub.search("alpha");
     assert.ok(!hits3.some((h) => h.id === "skill:alpha-skill"));

@@ -1,4 +1,4 @@
-import { runServer } from "@action-hub/copilot-mcp";
+import { runServer } from "@action-hub/mcp-server";
 import { resolvePath } from "../config-loader.js";
 
 export interface StartOptions {

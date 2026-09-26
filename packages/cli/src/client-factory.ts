@@ -6,7 +6,7 @@ import { classifyDownstreamError, ToolError } from "@action-hub/core";
 import { context, propagation } from "@opentelemetry/api";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { StringDecoder } from "node:string_decoder";
-import { HUB_HTTP_TOKEN_ENV_VAR } from "@action-hub/copilot-mcp";
+import { HUB_HTTP_TOKEN_ENV_VAR } from "@action-hub/mcp-server";
 import {
   applyNodeMemoryLimit,
   createHttpAuthBinding,

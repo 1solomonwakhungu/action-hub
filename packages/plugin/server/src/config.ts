@@ -102,25 +102,6 @@ function parseApprovalTtl(value: unknown): number {
   return Math.min(Math.round(value), MAX_APPROVAL_TTL_SECONDS) * 1000;
 }
 
-/**
- * Validates a single server entry that did not come from the config file —
- * notably one supplied by the capability manager canvas.
- *
- * The canvas is untrusted input, so a candidate entry goes through exactly the
- * same parser the on-disk config does before it is registered or persisted.
- */
-export function parseServerEntry(entry: unknown, label = "server"): ServerConfig {
-  if (!isRecord(entry)) {
-    throw new Error(`${label} must be a JSON object`);
-  }
-  const id = entry["id"];
-  if (typeof id !== "string" || id.length === 0) {
-    throw new Error(`${label}.id must be a non-empty string`);
-  }
-  const transport = parseTransport(entry["transport"], "transport", label);
-  return parseServerFields(entry, id, transport);
-}
-
 export function parseServers(value: unknown, label: string): ServerConfig[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) {
@@ -388,7 +369,7 @@ export function rawServers(config: Record<string, unknown>): Record<string, unkn
 
 /**
  * Persists a raw config document atomically, matching the snapshot writer, so
- * a concurrently reading canvas can never observe a half-written file.
+ * a concurrently reading process can never observe a half-written file.
  */
 export async function writeRawConfig(
   path: string,

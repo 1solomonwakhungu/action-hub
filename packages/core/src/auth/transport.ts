@@ -29,7 +29,7 @@ export interface HttpAuthBinding {
 /**
  * Builds the auth layer for one server, or nothing when it needs none.
  *
- * Both hosts — the CLI and the Copilot plugin server — construct MCP SDK
+ * Both hosts — the CLI and the MCP server — construct MCP SDK
  * transports, and both need identical token handling. The SDK glue differs
  * between them; the OAuth wiring does not, so it lives here where it can be
  * tested without an SDK, a socket, or a browser.

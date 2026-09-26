@@ -17,7 +17,7 @@ downstream server.
   the server exposed exactly one tool (`action_hub`), indexed 14 downstream
   tools, and completed a full search → load → execute cycle. Execute returned
   real file contents.
-- Snapshot written to the canvas cache path with correct server state, tool
+- Snapshot written to the catalog cache path with correct server state, tool
   counts, invocation history, and a context estimate (1,843 eager tokens
   versus 600 for the hub, on a single small server).
 
@@ -26,11 +26,8 @@ downstream server.
 - `packages/core` — catalog persistence, BM25 search, dependency-free local
   semantic scoring, connection manager, permission policy, argument validator,
   bundles, and the `ActionHub` façade
-- `packages/copilot-plugin` — plugin manifest, `.mcp.json`, skill, meta-MCP
-  server, and the Capability Manager canvas
-- Interactive canvas controls — enable/disable, trust changes, live search
-  testing, and add-a-server, routed through a localhost control endpoint on the
-  running hub
+- `packages/plugin` — plugin manifest, `.mcp.json`, skill, and the meta-MCP
+  server for any MCP host
 - `docs/architecture.md`, `docs/roadmap.md`, README, MIT license
 
 ## Next
@@ -40,7 +37,7 @@ In priority order, with rationale in `docs/roadmap.md`:
 Catalog persistence is done: the catalog is cached to
 `$XDG_CACHE_HOME/action-hub/catalog.json` (falling back to `~/.cache`), keyed
 by a hash of the server config and a schema version, served on startup, and
-re-indexed in the background. The cache file is a superset of the canvas
+re-indexed in the background. The cache file is a superset of the diagnostics
 snapshot, so both stay in sync from one atomic, per-instance-serialised write
 (unique temp file plus rename); the directory is `0700` and the file `0600`.
 
@@ -52,9 +49,9 @@ Semantic scoring is done: `LocalSemanticIndex` is enabled by default at weight
 0.2 and guarded against the 91-action evaluation corpus without regressing exact
 matches.
 
-Interactive canvas controls are done: enable/disable, trust changes, live search
-testing, and add-a-server are routed through an authenticated localhost control
-plane owned by the running hub.
+Server changes (enable/disable, trust, adding servers) are done through the
+`action-hub` CLI — `import`, `doctor`, and `auth` — rather than an interactive
+control plane.
 
 ## Notes for future sessions
 

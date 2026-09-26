@@ -7,7 +7,7 @@ Action Hub incorporates OpenTelemetry instrumentation across its core operations
 ## Design Principles
 
 1. **Runtime Agnostic & Zero Lock-in**  
-   `@action-hub/core` depends exclusively on `@opentelemetry/api`. When no OpenTelemetry SDK is initialized in the host application, all tracing calls are zero-overhead no-ops. Host applications (CLI, Copilot plugin server, desktop hosts) retain complete ownership over exporter configuration, sampling rules, and resource detectors.
+   `@action-hub/core` depends exclusively on `@opentelemetry/api`. When no OpenTelemetry SDK is initialized in the host application, all tracing calls are zero-overhead no-ops. Host applications (CLI, MCP server, desktop hosts) retain complete ownership over exporter configuration, sampling rules, and resource detectors.
 
 2. **Strict Privacy & Low Cardinality**  
    Span attributes capture operational health, latency, payload sizes, token savings, and error categories. They deliberately omit:

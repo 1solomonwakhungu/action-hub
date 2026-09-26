@@ -2,8 +2,8 @@
 
 Action Hub ships as **standalone, zero-dependency executables** built with
 [Node's Single Executable Application (SEA)](https://nodejs.org/api/single-executable-applications.html)
-support. Each binary embeds the Node runtime, the developer CLI, and the Copilot
-meta-MCP server, so end users run `action-hub` without installing Node.
+support. Each binary embeds the Node runtime, the developer CLI, and the MCP
+server, so end users run `action-hub` without installing Node.
 
 ## Why Node SEA
 
@@ -103,5 +103,5 @@ submission is merged.
 
 npm distribution is unchanged. The `@action-hub/cli` package still exposes the
 `action-hub` bin via `dist/index.js`, and the meta-MCP server via
-`@action-hub/copilot-mcp`. The standalone binaries are an additional channel,
+`@action-hub/mcp-server`. The standalone binaries are an additional channel,
 not a replacement.

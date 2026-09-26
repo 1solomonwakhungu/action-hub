@@ -138,7 +138,7 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   // inherits the credential that authorizes access to this hub.
   delete process.env[HUB_HTTP_TOKEN_ENV_VAR];
 
-  const runtime: HubRuntime = await createHubRuntime({ control: false });
+  const runtime: HubRuntime = await createHubRuntime();
 
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
 

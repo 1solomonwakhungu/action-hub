@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
 import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
-import { runDaemonServer } from "@action-hub/copilot-mcp";
+import { runDaemonServer } from "@action-hub/mcp-server";
 import { resolvePath } from "../config-loader.js";
 
 const START_TIMEOUT_MS = 15_000;

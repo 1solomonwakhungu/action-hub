@@ -1,4 +1,4 @@
-import { startHttpServer, type HttpServerHandle } from "@action-hub/copilot-mcp";
+import { startHttpServer, type HttpServerHandle } from "@action-hub/mcp-server";
 import { resolvePath } from "../config-loader.js";
 
 export interface ServeOptions {

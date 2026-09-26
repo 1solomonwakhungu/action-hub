@@ -7,7 +7,7 @@
   "type": "module",
   "workspaces": [
     "packages/core",
-    "packages/copilot-plugin/server",
+    "packages/plugin/server",
     "packages/cli"
   ],
   "engines": {
@@ -15,7 +15,7 @@
   },
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present && node --import ./test-isolation.mjs --test packages/copilot-plugin/canvas/capability-manager/*.test.mjs",
+    "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "eval": "npm run eval --workspace @action-hub/core",
     "build:bundle": "node scripts/bundle.mjs",

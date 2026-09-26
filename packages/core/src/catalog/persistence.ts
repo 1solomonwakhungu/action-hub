@@ -22,10 +22,10 @@ export const CATALOG_CACHE_VERSION = 2;
 /**
  * What gets written to disk.
  *
- * This is a superset of `HubSnapshot`: the Capability Manager canvas reads the
- * same file for diagnostics, so every field it depends on (`indexedAt`,
- * `servers`, `skills`, `context`, `history`) is preserved verbatim and the
- * cache-specific fields are additive.
+ * This is a superset of `HubSnapshot`: hosts read the same file for
+ * diagnostics, so every diagnostic field (`indexedAt`, `servers`, `skills`,
+ * `context`, `history`) is preserved verbatim and the cache-specific fields
+ * are additive.
  */
 export interface PersistedCatalog {
   version: number;
@@ -42,7 +42,7 @@ export interface PersistedCatalog {
 /**
  * Resolves the cache location, honouring `XDG_CACHE_HOME` before falling back
  * to `~/.cache`. `ACTION_HUB_CACHE` overrides both and points at the file
- * itself, which is what the tests and the canvas use.
+ * itself, which is what the tests use.
  */
 export function defaultCatalogCachePath(env: NodeJS.ProcessEnv = process.env): string {
   const explicit = env["ACTION_HUB_CACHE"];
@@ -207,7 +207,7 @@ export class CatalogCache {
   /**
    * Atomic, serialised write.
    *
-   * The canvas polls this path on a timer and must never observe a half-written
+   * Readers may poll this path on a timer and must never observe a half-written
    * file, so the payload is written to a temp file and renamed into place —
    * rename is atomic on a single filesystem. Two things make it safe under the
    * concurrency the host actually produces (an unawaited write after every

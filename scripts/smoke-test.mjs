@@ -114,7 +114,7 @@ function checkDaemonLifecycle(bin) {
 }
 
 // Boots the bundled MCP server over stdio and runs a minimal JSON-RPC
-// handshake. This is the load-bearing check that the Copilot MCP entry point
+// handshake. This is the load-bearing check that the MCP server entry point
 // was bundled into the binary correctly.
 function checkMcpHandshake(bin) {
   return new Promise((resolvePromise) => {

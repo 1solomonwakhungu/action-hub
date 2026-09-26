@@ -6,7 +6,7 @@ import type { CliConfig } from "./config-loader.js";
 /**
  * Persists a raw config document atomically with owner-only permissions.
  *
- * Mirrors the server's writeRawConfigFile (packages/copilot-plugin/server/src/config.ts):
+ * Mirrors the server's writeRawConfigFile (packages/plugin/server/src/config.ts):
  * temp file + rename so a concurrent reader can never observe a half-written
  * file, and mode 0o600 because configs can contain credentials.
  *
