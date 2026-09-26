@@ -1,7 +1,8 @@
 // Deterministic generator for the Action Hub stress corpus (10,000 tools).
 // Emits into stress/.generated/:
 //   tools/<serverId>.json        one manifest per fake server (44 total)
-//   tools-queries.json           1,000 queries in the v2 mix
+//   stress/.generated/tools-queries.json  1,000 queries in the v2 mix (direct array,
+//                                   same shape as skills-queries.json)
 //   results/gen-tools.json       machine-readable summary (also last stdout line)
 //
 // Usage: node stress/gen-tools.mjs [--seed 0x5337c0de] [--out-dir stress/.generated/tools]
@@ -461,9 +462,12 @@ function buildQueries(manifests, serverDescs) {
   // Filler vocabulary safe against the whole corpus
   const corpusTokens = new Set();
   for (const m of manifests) {
-    corpusTokens.add(...tokenize(m.serverId));
-    for (const t of m.tools) { corpusTokens.add(...tokenize(t.name)); corpusTokens.add(...tokenize(t.description)); }
-    corpusTokens.add(...tokenize(serverDescs[m.serverId]));
+    for (const t of tokenize(m.serverId)) corpusTokens.add(t);
+    for (const t of m.tools) {
+      for (const t2 of tokenize(t.name)) corpusTokens.add(t2);
+      for (const t2 of tokenize(t.description)) corpusTokens.add(t2);
+    }
+    for (const t of tokenize(serverDescs[m.serverId])) corpusTokens.add(t);
   }
   const FILLER = FILLER_CANDIDATES.filter((w) => !corpusTokens.has(w));
 
@@ -719,9 +723,12 @@ function validate(manifests, queries, serverDescs, staleRemoved, finalFiles) {
   // (tokens minus STOPWORDS; name words, description, serverId, server desc)
   const corpusIndexed = new Set();
   for (const m of manifests) {
-    corpusIndexed.add(...tokenize(m.serverId));
-    corpusIndexed.add(...tokenize(serverDescs[m.serverId]));
-    for (const t of m.tools) { corpusIndexed.add(...tokenize(t.name)); corpusIndexed.add(...tokenize(t.description)); }
+    for (const t of tokenize(m.serverId)) corpusIndexed.add(t);
+    for (const t of tokenize(serverDescs[m.serverId])) corpusIndexed.add(t);
+    for (const t of m.tools) {
+      for (const t2 of tokenize(t.name)) corpusIndexed.add(t2);
+      for (const t2 of tokenize(t.description)) corpusIndexed.add(t2);
+    }
   }
   for (const q of queries) {
     if (q.subtype !== 'no-match') continue;
@@ -789,9 +796,12 @@ function main() {
   for (const m of manifests) {
     writeFileSync(join(OUT_DIR, `${m.serverId}.json`), JSON.stringify(m, null, 2));
   }
-  writeFileSync(join(OUT_DIR, 'tools-queries.json'), JSON.stringify({ generatedBy: 'stress/gen-tools.mjs', seed: SEED, totalQueries: queries.length, queries }, null, 2));
+  // Contract: queries are a direct array at stress/.generated/tools-queries.json
+  // (same shape as skills-queries.json). Never inside the manifest directory —
+  // make-config scans tools/*.json as fake-server manifests.
+  writeFileSync(resolve('stress/.generated/tools-queries.json'), JSON.stringify(queries, null, 2));
 
-  const finalFiles = readdirSync(OUT_DIR).filter((f) => f.endsWith('.json') && f !== 'tools-queries.json');
+  const finalFiles = readdirSync(OUT_DIR).filter((f) => f.endsWith('.json'));
   const { violations, minDistractors } = validate(manifests, queries, serverDescs, staleRemoved, finalFiles);
 
   const bySubtype = {};
@@ -822,8 +832,12 @@ function main() {
     ok: violations.length === 0,
   };
   writeFileSync(join(RESULTS_DIR, 'gen-tools.json'), JSON.stringify(summary, null, 2));
-  console.log(JSON.stringify(summary, null, 2));
+  // Contract: last stdout line is a single-line machine-readable JSON summary.
+  const summaryLine = JSON.stringify(summary);
+  console.log(summaryLine);
   if (!summary.ok) process.exit(1);
+  // Smoke assertion: the last stdout line parses as JSON.
+  JSON.parse(summaryLine.trim());
 }
 function idExists(manifests, id) {
   const i = id.indexOf(':');
