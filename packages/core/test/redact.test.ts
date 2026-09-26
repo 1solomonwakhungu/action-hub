@@ -9,6 +9,13 @@ test("redact helpers cover credential-bearing flag, header, URL and record forms
     { label: "--github-token VALUE", run: () => redactArgs(["--github-token", "ghp_1234567890"]), expect: ["--github-token", "[redacted]"] },
     { label: "--api-key=inline", run: () => redactArgs(["--api-key=sk-1234567890"]), expect: ["--api-key=[redacted]"] },
     { label: "--session VALUE", run: () => redactArgs(["--session", "s3ssionvalue"]), expect: ["--session", "[redacted]"] },
+    { label: "--pwd VALUE", run: () => redactArgs(["--pwd", "SENTINEL_PWD_35"]), expect: ["--pwd", "[redacted]"] },
+    { label: "attached -HName: value", run: () => redactArgs(["-HX-API-Key:SENTINEL_SHORT"]), expect: ["-HX-API-Key: [redacted]"] },
+    { label: "-H=Name:value", run: () => redactArgs(["-H=X-API-Key:SENTINEL_SHORT"]), expect: ["-H=X-API-Key: [redacted]"] },
+    { label: "backstop known prefix", run: () => redactArg("--model-file=sk-abcdefghijklmnopqrstuv"), expect: "--model-file=[redacted]" },
+    { label: "backstop long run", run: () => redactArg("AbCdEf123456789012345678901234"), expect: "[redacted]" },
+    { label: "backstop keeps paths", run: () => redactArg("/very/long/path/that/exceeds/twentyfour/chars"), expect: "/very/long/path/that/exceeds/twentyfour/chars" },
+    { label: "backstop keeps URLs", run: () => redactArg("https://example.com/a/very/long/path/segment/here"), expect: "https://example.com/a/very/long/path/segment/here" },
     // (b) header forms keep the header name
     { label: "--header VALUE", run: () => redactArgs(["--header", "X-API-Key: secretvalue"]), expect: ["--header", "X-API-Key: [redacted]"] },
     { label: "-H VALUE", run: () => redactArgs(["-H", "Authorization: Bearer abc"]), expect: ["-H", "Authorization: Bearer [redacted]"] },

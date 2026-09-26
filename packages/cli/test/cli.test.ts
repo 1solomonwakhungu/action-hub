@@ -69,6 +69,9 @@ test("import and migrate redact every secret sentinel from discovery output", as
     HEADER: "SENTINEL_HEADER_35",
     USERINFO: "SENTINEL_USERINFO_35",
     INVALID_URL: "SENTINEL_INVALID_URL_35",
+    PWD: "SENTINEL_PWD_35",
+    ATTACHED_HEADER: "SENTINEL_SHORT_HEADER_35",
+    RAW_SECRET: "rawsecret12345678901234567890abcd",
   };
   const tempHome = resolve(tmpdir(), `action-hub-import-redact-${Date.now()}`);
   const cursorDir = join(tempHome, ".cursor");
@@ -95,6 +98,18 @@ test("import and migrate redact every secret sentinel from discovery output", as
         },
         "invalid-url": {
           url: `not-a-valid-url?token=${sentinels.INVALID_URL}`,
+        },
+        "pwd-flag": {
+          command: "node",
+          args: ["server.js", "--pwd", sentinels.PWD],
+        },
+        "attached-header": {
+          command: "node",
+          args: ["server.js", `-HX-API-Key:${sentinels.ATTACHED_HEADER}`],
+        },
+        "raw-secret": {
+          command: "node",
+          args: ["server.js", "--serve-data", sentinels.RAW_SECRET],
         },
       },
     }),

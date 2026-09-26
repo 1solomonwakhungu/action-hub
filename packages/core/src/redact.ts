@@ -13,23 +13,45 @@ import type { HttpTransport, ServerConfig } from "./types.js";
  */
 
 /** A flag name (with leading dashes) that carries a credential value. */
-const SENSITIVE_NAME_RE = /(token|secret|pass(word|wd)?|api[-_]?key|auth|credential|cookie|session)/i;
+const SENSITIVE_NAME_RE = /(token|secret|pass(word|wd)?|pwd|api[-_]?key|auth|credential|cookie|session)/i;
 
 const HEADER_FLAG_RE = /^-{1,2}h(?:eader)?$/i;
 
 /** Matches `Name: value` header arguments; the name is kept, the value dropped. */
-const BARE_HEADER_RE = /^([A-Za-z0-9-]+):\s*(.+)$/;
+const BARE_HEADER_RE = /^([A-Za-z0-9-]+):\s+(.+)$/;
+
+/** Extracts a header name from `Name: value` or `Name:value` (no URL ambiguity). */
+const HEADER_NAME_RE = /^([A-Za-z0-9-]+):(?!\/\/)(.*)$/s;
 
 /** Matches credential-bearing schemes in inline credential values. */
 const CREDENTIAL_VALUE_RE = /\b(Bearer|Basic)\s+\S+/gi;
+
+/** Known secret value prefixes (OpenAI, GitHub, Slack, AWS, GitLab). */
+const KNOWN_PREFIX_RE = /(?:sk-|ghp_|gho_|github_pat_|xox|AKIA|glpat-)[A-Za-z0-9_\-.+/=]{6,}/g;
+
+/** Long opaque runs that are plausible raw secrets. */
+const RAW_SECRET_RUN_RE = /[A-Za-z0-9_\-.+/=]{24,}/g;
+
+/** Fail-closed backstop: redact raw-secret-looking values without a flag. */
+function redactRawSecrets(text: string): string {
+  let out = text.replace(KNOWN_PREFIX_RE, REDACTED);
+  out = out.replace(RAW_SECRET_RUN_RE, (run) => {
+    // Keep URLs and file paths intact; everything else fails closed.
+    if (run.includes("://") || run.startsWith("/") || run.startsWith("./") || run.startsWith("../")) {
+      return run;
+    }
+    return REDACTED;
+  });
+  return out;
+}
 
 /**
  * Redact a header-style value while keeping the header name when one is
  * present (`X-API-Key: sk-...` -> `X-API-Key: [redacted]`).
  */
 function redactHeaderValue(value: string): string {
-  const bare = BARE_HEADER_RE.exec(value);
-  const withName = bare ? `${bare[1]}: ` : "";
+  const bare = HEADER_NAME_RE.exec(value);
+  const withName = bare && bare[1] !== undefined ? `${bare[1]}: ` : "";
   return `${withName}${REDACTED}`;
 }
 
@@ -47,13 +69,14 @@ function redactCredentialValues(text: string): string {
 export function redactArg(arg: string): string {
   const bare = BARE_HEADER_RE.exec(arg);
   if (bare && bare[1] !== undefined && bare[2] !== undefined) {
-    return `${bare[1]}: ${redactCredentialValues(bare[2]) === bare[2] ? REDACTED : redactCredentialValues(bare[2])}`;
+    const value = redactCredentialValues(bare[2]);
+    return `${bare[1]}: ${value === bare[2] ? REDACTED : redactRawSecrets(value)}`;
   }
   const eq = arg.indexOf("=");
   if (eq > 0 && SENSITIVE_NAME_RE.test(arg.slice(0, eq))) {
     return `${arg.slice(0, eq + 1)}${REDACTED}`;
   }
-  return redactCredentialValues(arg);
+  return redactRawSecrets(redactCredentialValues(arg));
 }
 
 /**
@@ -75,6 +98,11 @@ export function redactArgs(args?: string[]): string[] | undefined {
       }
       return REDACTED;
     }
+    const attachedShortHeader = /^-H([^=].*)$/s.exec(arg);
+    if (attachedShortHeader && attachedShortHeader[1] !== undefined) {
+      // Attached short-header form: -HName: value (value dropped, name kept).
+      return `-H${redactHeaderValue(attachedShortHeader[1])}`;
+    }
     const flag = /^(--?[^=\s]+)(?:=(.*))?$/s.exec(arg);
     if (flag && flag[1] !== undefined) {
       const name = flag[1];
@@ -87,7 +115,7 @@ export function redactArgs(args?: string[]): string[] | undefined {
         }
         redactNext = true;
       }
-      return arg;
+      return redactRawSecrets(arg);
     }
     return redactArg(arg);
   });
