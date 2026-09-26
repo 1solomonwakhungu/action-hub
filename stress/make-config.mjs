@@ -46,7 +46,7 @@ const envExports = [];
 const httpProcesses = [];
 
 for (const [i, file] of files.entries()) {
-  const manifestPath = relative(root, join(toolsDir, file));
+  const manifestPath = join(toolsDir, file); // absolute: survives any launcher cwd
   const manifest = JSON.parse(readFileSync(join(toolsDir, file), "utf8"));
   const serverArgs = [serverPath, "--manifest", manifestPath];
   const name = manifest.serverId ?? manifest.name ?? file.replace(/\.json$/, "");

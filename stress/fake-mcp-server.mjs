@@ -94,10 +94,65 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- chaos bookkeeping -------------------------------------------------------
 
-let requestsServed = 0;
+let requestsReceived = 0;
+let responsesDelivered = 0;
+let crashArmed = false;
+
+/**
+ * Count a received JSON-RPC request. Returns true when this request reached
+ * the crash-after limit; callers must refuse any further work beyond N.
+ * Crash delivery is handled by the transport send hook below, so the Nth
+ * response is fully written before the process exits.
+ */
+function serveRequest() {
+  if (crashArmed) return false;
+  requestsReceived += 1;
+  if (crashAfter !== undefined && requestsReceived >= crashAfter) {
+    crashArmed = true;
+  }
+  return true;
+}
+
+function refusalResult() {
+  return {
+    content: [{ type: "text", text: "chaos: crash-after limit reached; refusing further requests" }],
+    isError: true,
+  };
+}
+
+function maybeCrashAfterDelivery() {
+  if (crashAfter !== undefined && responsesDelivered >= crashAfter) {
+    process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${responsesDelivered} completed responses\n`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Wrap a transport so a response is only counted as served once its write
+ * completed. Everything else (onmessage/onerror/onclose assignment by the
+ * SDK, sessionId) passes through unchanged. Used for stdio and per-request
+ * HTTP transports alike.
+ */
+function withDeliveryCounting(inner) {
+  return new Proxy(inner, {
+    get(target, prop, recv) {
+      if (prop === "send") {
+        return async (msg) => {
+          const result = await target.send(msg);
+          if (msg && typeof msg === "object" && msg.id !== undefined && !("method" in msg)) {
+            responsesDelivered += 1;
+            maybeCrashAfterDelivery();
+          }
+          return result;
+        };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
 // Deterministic PRNG (mulberry32): seeded from --seed, CHAOS_SEED, or
-// chaos seed=N; every probabilistic draw (hang-rate, errorRate) uses it so
-// identical (manifest, seed) pairs replay the same behavior sequence.
 function mulberry32(seed) {
   let a = seed >>> 0;
   return () => {
@@ -109,22 +164,13 @@ function mulberry32(seed) {
   };
 }
 
-const SEED = Number(chaos.get("seed") ?? args["seed"] ?? process.env.CHAOS_SEED ?? 1);
-const rand = mulberry32(Number.isFinite(SEED ? SEED : NaN) ? SEED : 1);
-const SEED_VALUE = Number.isFinite(SEED) ? SEED : 1;
-
-function serveRequest() {
-  requestsServed += 1;
-  if (crashAfter !== undefined && requestsServed >= crashAfter) {
-    // Crash AFTER the response for this request is written: the Nth counted
-    // request completes (its reply is flushed to the client), then the
-    // process exits. setTimeout(0) runs after the reply write.
-    setTimeout(() => {
-      process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${crashAfter} served requests\n`);
-      process.exit(1);
-    }, 25);
-  }
+const SEED_RAW = chaos.get("seed") ?? args["seed"] ?? process.env.CHAOS_SEED ?? "1";
+const SEED = Number(SEED_RAW);
+if (!Number.isFinite(SEED)) {
+  process.stderr.write(`chaos: invalid seed ${JSON.stringify(SEED_RAW)}; using 1\n`);
 }
+const SEED_VALUE = Number.isFinite(SEED) ? SEED : 1;
+const rand = mulberry32(SEED_VALUE);
 
 function toolBehavior(name) {
   const tool = manifest.tools.find((t) => t.name === name);
@@ -146,12 +192,12 @@ function buildTools() {
 
 function registerHandlers(server) {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    serveRequest();
+    if (!serveRequest()) return refusalResult();
     return { tools: buildTools() };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    serveRequest();
+    if (!serveRequest()) return refusalResult();
     const tool = manifest.tools.find((t) => t.name === request.params.name);
     // Unknown tool names are rejected with an isError result, consistent
     // with real servers (a plain ok:true would hide router defects).
@@ -182,7 +228,7 @@ function registerHandlers(server) {
   });
 
   server.setRequestHandler(PingRequestSchema, async () => {
-    serveRequest();
+    if (!serveRequest()) return refusalResult();
     return {};
   });
 }
@@ -192,7 +238,7 @@ function registerHandlers(server) {
 async function runStdio() {
   const server = new Server({ name: serverId, version: "0.0.0" }, { capabilities: { tools: {} } });
   registerHandlers(server);
-  const transport = new StdioServerTransport();
+  const transport = withDeliveryCounting(new StdioServerTransport());
   await server.connect(transport);
   // Exit when the client closes the session so spawnSync callers get a
   // clean exit code instead of an orphan; serve until then.
@@ -228,7 +274,7 @@ function runHttp() {
 
     // Stateless Streamable HTTP: a fresh transport + server per POST request
     // (SDK stateless pattern). GET/DELETE are rejected with 405.
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    const transport = withDeliveryCounting(new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }));
     res.on("close", () => {
       void transport.close().catch(() => {});
     });
