@@ -19,6 +19,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildIsolatedEnv } from "./isolation.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -37,15 +38,9 @@ const configPath = resolve(
     : join(genDir, "servers.json"),
 );
 
-const isolatedEnv = {
-  ...process.env,
-  HOME: join(genDir, "home"),
-  XDG_CACHE_HOME: join(genDir, "cache"),
-  XDG_CONFIG_HOME: join(genDir, "config"),
+const { env: isolatedEnv } = buildIsolatedEnv({
   ACTION_HUB_CONFIG: configPath,
-  ACTION_HUB_SKILLS_DIR: join(genDir, "skills"),
-  PI_CODING_AGENT_DIR: join(genDir, "pi"),
-};
+});
 
 async function waitHealthy(port) {
   const deadline = Date.now() + 30_000;

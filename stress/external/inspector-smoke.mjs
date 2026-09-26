@@ -24,6 +24,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildIsolatedEnv } from "./isolation.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -41,16 +42,11 @@ const port = Number(cliFlag("--port", 41710));
 const token = "stress-external-token-0f1e2d3c";
 
 // Full isolation per contract hard rules.
-const isolatedEnv = {
-  ...process.env,
-  HOME: join(genDir, "home"),
-  XDG_CACHE_HOME: join(genDir, "cache"),
-  XDG_CONFIG_HOME: join(genDir, "config"),
+const { env: isolatedEnv } = buildIsolatedEnv({
   ACTION_HUB_CONFIG: configPath,
   ACTION_HUB_SKILLS_DIR: join(genDir, "skills"),
-  PI_CODING_AGENT_DIR: join(genDir, "pi"),
   ACTION_HUB_HTTP_TOKEN: token,
-};
+});
 
 const CLI = ["npx", "--yes", `@modelcontextprotocol/inspector@${INSPECTOR_VERSION}`, "--cli"];
 
