@@ -251,11 +251,42 @@ test("invalid seed: fails loudly with a final summary", { timeout: 60_000 }, () 
   assert.ok(/Invalid --seed/.test(summary.error ?? ""));
 });
 
-// Full small-scale integration: prompt completion + machine-readable last line.
-test("small-scale end-to-end run completes promptly with ok summary", { timeout: 900_000 }, () => {
+test("results-artifact write failure => ok:false, nonzero exit, last JSON line intact", { timeout: 60_000 }, () => {
   const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
+  const gen = mkdtempSync(join(tmpdir(), "cli-scale-artifact-"));
+  // Pre-occupy <generated>/results with a FILE so mkdirSync/writeFileSync fail.
+  writeFileSync(join(gen, "results"), "occupied");
+  const r = spawnSync(process.execPath, [script, "--scale", "bogus", "--generated", gen], {
+    encoding: "utf8",
+    cwd: import.meta.dirname,
+    timeout: 30_000,
+  });
+  assert.equal(r.status, 1, "artifact write failure must exit nonzero");
+  const lines = (r.stdout ?? "").split("\n").filter((l) => l.trim().length > 0);
+  const summary = JSON.parse(lines[lines.length - 1]);
+  assert.equal(summary.ok, false, "artifact write failure must flip ok to false");
+  assert.ok(/results artifact write failed/.test(summary.error ?? ""), "error must name the artifact failure");
+  rmSync(gen, { recursive: true, force: true });
+});
+
+// Full small-scale integration against a FIXTURE-FREE generated dir: this
+// forces the fallback path (ambient stress/.generated state must not be able
+// to silently select shared mode and mask a broken fallback).
+test("small-scale end-to-end run (forced fixture-free fallback) completes with ok summary", { timeout: 1_800_000 }, () => {
+  const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
+  const emptyGenerated = mkdtempSync(join(tmpdir(), "cli-scale-fallback-"));
+  // The CLI dist is a build product: on a truly clean clone (no node_modules,
+  // no dist) build it once so the regression runs the real binary instead of
+  // failing on a missing file.
+  if (!existsSync(resolvePath(import.meta.dirname, "..", "packages", "cli", "dist", "index.js"))) {
+    const repo = resolvePath(import.meta.dirname, "..");
+    const ci = spawnSync("npm", ["ci", "--no-audit", "--no-fund"], { cwd: repo, encoding: "utf8", timeout: 600_000 });
+    assert.equal(ci.status, 0, "npm ci must succeed on a clean clone: " + (ci.stderr ?? "").slice(-300));
+    const build = spawnSync("npm", ["run", "build", "--workspaces"], { cwd: repo, encoding: "utf8", timeout: 600_000 });
+    assert.equal(build.status, 0, "workspace build must succeed: " + (build.stderr ?? "").slice(-300));
+  }
   const t0 = performance.now();
-  const r = spawnSync(process.execPath, [script, "--scale", "small", "--seed", "7"], {
+  const r = spawnSync(process.execPath, [script, "--scale", "small", "--seed", "7", "--generated", emptyGenerated], {
     encoding: "utf8",
     cwd: import.meta.dirname,
     timeout: 800_000,
@@ -270,9 +301,10 @@ test("small-scale end-to-end run completes promptly with ok summary", { timeout:
   assert.ok(summary.fixtures, "summary must record observed fixture counts");
   // Shared corpus = the contract fleet (44/10,000/5,000) at any --scale;
   // self-generated small fixtures = 8/200/40.
-  const expectedFleetCounts = summary.fixtures.source === "shared"
-    ? { servers: 44, tools: 10_000, skills: 5_000 }
-    : { servers: 8, tools: 200, skills: 40 };
+  // This run is FORCED fallback: the counts must be the small self-generated
+  // fleet, never the shared corpus.
+  assert.equal(summary.fixtures.source, "self-generated");
+  const expectedFleetCounts = { servers: 8, tools: 200, skills: 40 };
   assert.deepEqual(
     { servers: summary.fixtures.servers, tools: summary.fixtures.tools, skills: summary.fixtures.skills },
     expectedFleetCounts,

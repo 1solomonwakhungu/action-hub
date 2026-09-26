@@ -40,8 +40,8 @@ import { performance } from "node:perf_hooks";
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, "..");
 const CLI = join(REPO_ROOT, "packages", "cli", "dist", "index.js");
-const GENERATED = join(SCRIPT_DIR, ".generated");
-const RESULTS_DIR = join(GENERATED, "results");
+const GENERATED_DEFAULT = join(SCRIPT_DIR, ".generated");
+
 const SHARED_FAKE_SERVER = join(SCRIPT_DIR, "fake-mcp-server.mjs");
 
 const SLOW_MS = 2_000;              // flag any step slower than this
@@ -59,6 +59,9 @@ const opt = (name, fallback) => {
   return i !== -1 && argv[i + 1] !== undefined ? argv[i + 1] : fallback;
 };
 
+// Fixture root: overridable so regressions can force the fixture-free
+// fallback path regardless of ambient generated state.
+const GENERATED = resolve(opt("generated", GENERATED_DEFAULT));
 const SCALE = opt("scale", "small");
 const SEED_ARG = opt("seed");
 // Seed 0 is valid; only an unparseable value is rejected (checked in main so a
@@ -255,7 +258,7 @@ let env = null; // assigned in runAll(); per-run isolation roots
 // Every path-bearing isolation variable, per /tmp/action-hub-stress/ISOLATION.md.
 // All resolve under the sandbox home, which itself lives under the run root.
 const ISOLATION_PATH_VARS = [
-  "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+  "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMPDIR", "TMP", "TEMP",
   "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
   "ACTION_HUB_CONFIG", "ACTION_HUB_CACHE", "ACTION_HUB_SKILLS_DIR",
   "ACTION_HUB_DAEMON_DIR", "ACTION_HUB_CREDENTIALS", "ACTION_HUB_CONTROL",
@@ -276,12 +279,16 @@ function isoEnv({ home, configPath } = {}, baseEnv = process.env) {
     home = env.home;
   }
   const under = (rel) => join(home, rel);
+  const tmp = join(home, "tmp");
   return {
     ...baseEnv,
     HOME: home,
     USERPROFILE: home,
     APPDATA: under(join("AppData", "Roaming")),
     LOCALAPPDATA: under(join("AppData", "Local")),
+    TMPDIR: tmp,
+    TMP: tmp,
+    TEMP: tmp,
     XDG_CACHE_HOME: under(".cache"),
     XDG_CONFIG_HOME: under(".config"),
     XDG_STATE_HOME: under(join(".local", "state")),
@@ -365,10 +372,15 @@ function spawnStep(argv, { cwd, configPath, home, timeoutMs = STEP_TIMEOUT_MS } 
   try {
     // Direct invocations without a run root (tests) get a throwaway sandbox.
     const sandboxHome = home ?? (env ? env.home : mkdtempSync(join(tmpdir(), "cli-scale-step-")));
+    const childEnv = isoEnv({ home: sandboxHome, configPath });
+    // Sentinel on the FINAL env of EVERY spawn, after configPath overrides:
+    // every path-bearing var must resolve inside the run root. An unrooted
+    // configPath (the import-target bug class) fails the run here.
+    if (env) assertIsoEnv(childEnv, env.runRoot);
     res = spawnSync(argv[0], argv.slice(1), {
       encoding: "utf8",
       cwd: cwd ?? sandboxHome,
-      env: isoEnv({ home: sandboxHome, configPath }),
+      env: childEnv,
       maxBuffer: 256 * 1024 * 1024,
       timeout: timeoutMs,
     });
@@ -528,7 +540,8 @@ function buildCodexToml(servers) {
 function phaseImportMigrate({ perConfig }) {
   // Fresh empty target config for --write; discovery input comes from the
   // isolated fake HOME, not from the curated fixture config.
-  const importConfigPath = join(GENERATED, "import-target-servers.json");
+  // Live configs (including migration targets) must live inside the run root.
+  const importConfigPath = join(env.runRoot, "import-target-servers.json");
   writeFileSync(importConfigPath, JSON.stringify({ autoDiscover: false, servers: [] }));
 
   const planted = plantHarnessConfigs(env.home, perConfig);
@@ -659,6 +672,21 @@ function phaseHarnessInstall() {
 function emitSummary(totalMs, error = null) {
   const steps = results.map(({ stdout, stderr, ...rest }) => rest);
   const stepOk = steps.every((s) => s.ok === undefined || s.ok === true);
+  // The results artifact is a required product: if it cannot be written, the
+  // run is NOT ok (no false green), while the compact JSON stays the final
+  // stdout line.
+  let writeError = null;
+  const resultsPath = join(GENERATED, "results", "cli-scale.json");
+  try {
+    mkdirSync(dirname(resultsPath), { recursive: true });
+    writeFileSync(resultsPath, "PENDING");
+  } catch (writeErr) {
+    writeError = "results artifact write failed: " + writeErr.message;
+    console.error(writeError);
+  }
+  // Report every failure mode: measured/setup errors AND artifact write
+  // failure must both surface in the final summary.
+  const finalError = [error, writeError].filter(Boolean).join("; ") || null;
   const summary = {
     scale: SCALE,
     seed: SEED,
@@ -667,16 +695,20 @@ function emitSummary(totalMs, error = null) {
     totalMs,
     steps,
     flags,
-    error,
-    // A run with failed measured commands (or a setup/verification exception)
-    // is NOT ok, and main() exits nonzero on it.
-    ok: stepOk && error === null,
+    ...(finalError ? { error: finalError } : {}),
+    // A run with failed measured commands, a setup/verification exception, or
+    // an unwritable results artifact is NOT ok; main() exits nonzero on it.
+    ok: stepOk && finalError === null,
   };
-  try {
-    mkdirSync(RESULTS_DIR, { recursive: true });
-    writeFileSync(join(RESULTS_DIR, "cli-scale.json"), JSON.stringify(summary, null, 2) + "\n");
-  } catch (writeErr) {
-    console.error("could not write results file: " + writeErr.message);
+  if (writeError === null) {
+    try {
+      writeFileSync(resultsPath, JSON.stringify(summary, null, 2) + "\n");
+    } catch (writeErr) {
+      // The file appeared then failed (rare): mark the run not-ok and surface.
+      summary.error = "results artifact write failed: " + writeErr.message;
+      summary.ok = false;
+      console.error(summary.error);
+    }
   }
   console.log("\n--- per-step measurements ---");
   for (const s of steps) {
@@ -787,7 +819,8 @@ async function runAll() {
   }
   rmSync(runRoot, { recursive: true, force: true });
   const home = join(runRoot, "home");
-  for (const d of [home, join(home, ".cache"), join(home, ".config"), join(home, "skills"), join(runRoot, "logs")]) {
+  const skillsDir = join(home, "skills"); // fallback skill fixtures; corpus travels via config.skills
+  for (const d of [home, join(home, ".cache"), join(home, ".config"), skillsDir, join(runRoot, "logs")]) {
     mkdirSync(d, { recursive: true });
   }
   env = { runRoot, home };
