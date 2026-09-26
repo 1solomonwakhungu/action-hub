@@ -21,17 +21,22 @@ async function withTempHome(
   }
 }
 
-/** Capture console.log output produced by harnessCommand. */
+/** Capture console.log/console.error output produced by harnessCommand. */
 async function captureLogs(fn: () => Promise<unknown>): Promise<string> {
   const logs: string[] = [];
   const origLog = console.log;
+  const origError = console.error;
   console.log = (...args: unknown[]) => {
+    logs.push(args.join(" "));
+  };
+  console.error = (...args: unknown[]) => {
     logs.push(args.join(" "));
   };
   try {
     await fn();
   } finally {
     console.log = origLog;
+    console.error = origError;
   }
   return logs.join("\n");
 }
@@ -252,4 +257,75 @@ test("win32 targets resolve under APPDATA", async () => {
     if (savedAppData === undefined) delete process.env.APPDATA;
     else process.env.APPDATA = savedAppData;
   }
+});
+
+test("snippet under node uses bare node, never an absolute node path", async () => {
+  await withTempHome(async () => {
+    const out = await captureLogs(() =>
+      harnessCommand("cursor", { mode: "export", json: true }),
+    );
+    const doc = JSON.parse(out) as {
+      mcpServers?: Record<string, { command: string; args: string[] }>;
+    };
+    const entry = doc.mcpServers?.["action-hub"];
+    assert.ok(entry, "action-hub entry present");
+    assert.equal(entry.command, "node", "command is bare node, resolved on PATH");
+    assert.equal(entry.args.at(-1), "start");
+  });
+});
+
+test("harness --node overrides the node command in the snippet", async () => {
+  await withTempHome(async () => {
+    const out = await captureLogs(() =>
+      harnessCommand("cursor", {
+        mode: "export",
+        json: true,
+        node: "/opt/nvm/versions/node/v22/bin/node",
+      }),
+    );
+    const doc = JSON.parse(out) as {
+      mcpServers?: Record<string, { command: string }>;
+    };
+    assert.equal(
+      doc.mcpServers?.["action-hub"]?.command,
+      "/opt/nvm/versions/node/v22/bin/node",
+      "--node path replaces bare node",
+    );
+  });
+});
+
+test("pi install honors PI_CODING_AGENT_DIR and writes mcp.json there", async () => {
+  await withTempHome(async (_home, tempDir) => {
+    const agentDir = join(tempDir, "agent");
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      await captureLogs(() => harnessCommand("pi", { mode: "install", write: true }));
+      const doc = JSON.parse(await readFile(join(agentDir, "mcp.json"), "utf8")) as {
+        mcpServers?: Record<string, { command: string; args: string[] }>;
+      };
+      const entry = doc.mcpServers?.["action-hub"];
+      assert.ok(entry, "action-hub entry written to $PI_CODING_AGENT_DIR/mcp.json");
+      assert.equal(entry.command, "node");
+      assert.equal(entry.args.at(-1), "start");
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
+});
+
+test("pi default config path is ~/.pi/agent/mcp.json when env is unset", async () => {
+  await withTempHome(async (home) => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    delete process.env.PI_CODING_AGENT_DIR;
+    try {
+      assert.equal(
+        HARNESS_DEFS.pi.configPath(home),
+        join(home, ".pi", "agent", "mcp.json"),
+      );
+    } finally {
+      if (prev !== undefined) process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
 });

@@ -29,10 +29,17 @@ const writeFileP = promisify(writeFile);
  *     the original)
  *   - `--config <path>` is exported as ACTION_HUB_CONFIG in the snippet
  *
- * The emitted server command runs this CLI itself (`action-hub start`), so it
- * works both from a repo checkout (node <realpath of CLI entry>, start) and a
- * standalone binary (process.execPath, start when running as a single
- * executable application).
+ * The emitted server command runs this CLI itself (`action-hub start`):
+ *   - standalone SEA binary: command is the binary itself (process.execPath)
+ *   - running under node: command is literally `node` (never an absolute
+ *     node path — some harnesses spawn snippets in environments with a
+ *     different/absent node) with args [<realpath of CLI entry>, start]
+ *   - `--node <path>` overrides the node command for GUI harnesses that
+ *     cannot find node on PATH (e.g. nvm installs)
+ *
+ * When the snippet uses `node` (non-SEA), a one-time stderr note reminds the
+ * user it relies on node being on the harness's PATH and how to pin it via
+ * `--node $(which node)`. The note is suppressed by --json (machine output).
  */
 
 export type HarnessName =
@@ -41,6 +48,7 @@ export type HarnessName =
   | "cursor"
   | "codex"
   | "opencode"
+  | "pi"
   | "vscode";
 
 export const SUPPORTED_HARNESSES: readonly HarnessName[] = [
@@ -49,6 +57,7 @@ export const SUPPORTED_HARNESSES: readonly HarnessName[] = [
   "cursor",
   "codex",
   "opencode",
+  "pi",
   "vscode",
 ];
 
@@ -59,6 +68,8 @@ export interface HarnessOptions {
   json?: boolean;
   configPath?: string;
   mode?: HarnessMode;
+  /** Override the node command used in snippets (GUI harnesses off-PATH). */
+  node?: string;
 }
 
 /** command/args pair used by most harnesses and by the TOML (codex) writer. */
@@ -78,12 +89,17 @@ interface HarnessDef {
   format: "json" | "toml";
   /** Top-level key under which MCP server entries live (JSON harnesses). */
   serversKey: string;
+  /** Optional one-time stderr note (e.g. a required companion install). */
+  note?: string;
 }
 
 /** Build the command that runs this CLI's `start` subcommand. */
-async function cliServerEntry(configPath?: string): Promise<ServerEntry> {
-  // Standalone (SEA) binary: process.execPath, start.
-  // Node entrypoint: node <realpath of this CLI>, start.
+async function cliServerEntry(
+  configPath?: string,
+  nodePath?: string,
+): Promise<{ entry: ServerEntry; inSea: boolean }> {
+  // Standalone (SEA) binary: the binary itself, start.
+  // Node entrypoint: bare `node` <realpath of this CLI>, start.
   let sea: { isSea?: () => boolean } | undefined;
   try {
     sea = (await import("node:sea")) as { isSea?: () => boolean };
@@ -91,14 +107,20 @@ async function cliServerEntry(configPath?: string): Promise<ServerEntry> {
     /* Node without node:sea */
   }
   const inSea = typeof sea?.isSea === "function" && sea.isSea();
-  const args = inSea
-    ? ["start"]
-    : [realpathSync(process.argv[1] ?? "action-hub"), "start"];
-  const entry: ServerEntry = { command: process.execPath, args };
+  const entry: ServerEntry = inSea
+    ? // The SEA binary is the action-hub executable itself.
+      { command: process.execPath, args: ["start"] }
+    : {
+        // Bare command resolved on the harness's PATH; an absolute
+        // process.execPath would break when the harness env has a
+        // different (or no) node install.
+        command: nodePath ?? "node",
+        args: [realpathSync(process.argv[1] ?? "action-hub"), "start"],
+      };
   if (configPath) {
     entry.env = { ACTION_HUB_CONFIG: configPath };
   }
-  return entry;
+  return { entry, inSea };
 }
 
 function defaultConfigPath(): string {
@@ -160,6 +182,21 @@ export const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
       join(home, ".config", "opencode", "opencode.json"),
     format: "json",
     serversKey: "mcp",
+  },
+  pi: {
+    // pi (pi-mcp-adapter >= 2.37.0) reads <agentDir>/mcp.json. The agent dir
+    // is $PI_CODING_AGENT_DIR when set, else ~/.pi/agent. The adapter itself
+    // is a separate install: `pi install npm:pi-mcp-adapter`.
+    label: "pi",
+    configPath: (_home: string) => {
+      const agentDir =
+        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+      return join(agentDir, "mcp.json");
+    },
+    format: "json",
+    serversKey: "mcpServers",
+    /** pi only loads MCP servers through the adapter. */
+    note: "pi loads MCP servers via the pi-mcp-adapter; install it with: pi install npm:pi-mcp-adapter",
   },
   vscode: {
     label: "VS Code",
@@ -377,7 +414,10 @@ export async function harnessCommand(
     );
   }
 
-  const serverEntry = await cliServerEntry(options.configPath);
+  const { entry: serverEntry, inSea } = await cliServerEntry(
+    options.configPath,
+    options.node,
+  );
 
   if (mode === "install") {
     const filePath = def.configPath(homedir());
@@ -393,6 +433,12 @@ export async function harnessCommand(
       );
     }
     console.log(`Wrote Action Hub MCP server to ${filePath} for ${def.label}.`);
+    if (def.note) console.error(`note: ${def.note}`);
+    if (!inSea) {
+      console.error(
+        `note: the snippet uses "${serverEntry.command}" from PATH; if ${def.label} cannot find it, rerun with --node $(which node)`,
+      );
+    }
     return 0;
   }
 
@@ -420,6 +466,12 @@ export async function harnessCommand(
     console.log(
       `\n# To write this automatically, run: action-hub harness ${target} install --write`,
     );
+    if (def.note) console.error(`note: ${def.note}`);
+    if (!inSea) {
+      console.error(
+        `note: the snippet uses "${serverEntry.command}" from PATH; if ${def.label} cannot find it, rerun with --node $(which node)`,
+      );
+    }
   }
   return 0;
 }
@@ -442,6 +494,8 @@ Options:
   --write         Required for install mode; confirms in-place writes.
   --config <path> Point the harness at a specific Action Hub config file
                   (exported as ACTION_HUB_CONFIG in the snippet).
+  --node <path>   Override the node command in snippets (for GUI harnesses
+                  that cannot find node on PATH, e.g. nvm installs).
   --json          (export, JSON targets only) Print only the JSON document,
                   no commentary. Rejected for TOML targets (codex).
 

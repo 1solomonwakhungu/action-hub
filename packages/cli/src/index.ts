@@ -294,6 +294,7 @@ async function main(): Promise<void> {
           write: Boolean(parsedArgs["write"]),
           json: Boolean(parsedArgs["json"]),
           configPath,
+          node: typeof parsedArgs["node"] === "string" ? parsedArgs["node"] : undefined,
         });
         break;
       }
