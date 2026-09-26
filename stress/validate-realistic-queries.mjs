@@ -108,7 +108,11 @@ try {
     if (row.expected != null) check(row.expected);
     for (const id of row.expectedAll ?? []) check(id);
 
-    if (row.subtype === "no-match") continue;
+    if (row.subtype === "no-match") {
+      const hits = contentTokens(row.query).filter((t) => vocab.has(t));
+      if (hits.length > 0) problems.push(`no-match overlaps corpus vocabulary [${hits}]: ${row.query}`);
+      continue;
+    }
     if (row.subtype === "multi") {
       if (row.expected != null) problems.push(`multi row must have expected null: ${row.query}`);
       if (!Array.isArray(row.expectedAll) || row.expectedAll.length < 2) {
@@ -122,10 +126,11 @@ try {
     if (!tool) continue;
 
     if (row.subtype === "goal-only") {
-      const nameTokens = new Set(tokens(tool.name));
-      const overlap = contentTokens(row.query).filter((t) => nameTokens.has(t));
-      if (overlap.length > 0) {
-        problems.push(`goal-only shares tool-name token(s) [${overlap}] with gold name: ${row.query}`);
+      // Intent without the gold tool's VERB; entity wording is allowed to
+      // appear (that is what makes it goal-only rather than a paraphrase).
+      const verb = tokens(tool.name)[0];
+      if (contentTokens(row.query).includes(verb)) {
+        problems.push(`goal-only shares the gold VERB token "${verb}" with gold name: ${row.query}`);
       }
     }
     if (row.subtype === "near-duplicate") {

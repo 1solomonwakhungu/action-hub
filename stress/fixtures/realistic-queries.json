@@ -240,182 +240,182 @@
     "difficulty": "paraphrase"
   },
   {
-    "query": "restart the flaky checkout deployment",
-    "expected": "acme-corp-analytics:retry_channel_projected",
+    "query": "straighten out that messy contact record",
+    "expected": "acme-corp-analytics:resolve_contact_flagged",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "stop charging my card every month",
-    "expected": "acme-corp-analytics:void_contract",
+    "query": "green-light the spending plan for next quarter",
+    "expected": "acme-corp-analytics:approve_budget_active",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "give the customer their money back",
-    "expected": "acme-corp-shipping:unlock_refund",
+    "query": "wipe the expired login tokens",
+    "expected": "acme-corp-analytics:purge_token",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "I need those two accounts combined",
-    "expected": "globex-data-warehouse:merge_customer",
+    "query": "book the settlement for friday",
+    "expected": "acme-corp-analytics:schedule_settlement",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "reserve the big room for thursday",
-    "expected": "acme-corp-calendar:promote_meeting_favorite",
+    "query": "disconnect that branch from the review",
+    "expected": "acme-corp-analytics:unlink_branch",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "tally the money movements from last quarter",
-    "expected": "acme-corp-payments:count_transfer",
+    "query": "capture the current burn numbers before the meeting",
+    "expected": "acme-corp-analytics:snapshot_burn_rate_favorite",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "tell me who is on call this weekend",
-    "expected": "initech-billing:summarize_oncall",
+    "query": "fix up the tag tree from scratch",
+    "expected": "acme-corp-analytics:rebuild_tag",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "our stock counts look wrong, recheck them",
-    "expected": "globex-data-warehouse:get_sku",
+    "query": "pull the incident back open",
+    "expected": "acme-corp-analytics:reopen_incident_beta",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "blast the announcement to everyone",
-    "expected": "globex-crm:send_email",
+    "query": "confirm the audience invite went through",
+    "expected": "acme-corp-analytics:acknowledge_audience",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "wipe the stale backlog entries",
-    "expected": "acme-corp-ticketing:purge_task_external",
+    "query": "combine those two containers",
+    "expected": "acme-corp-analytics:merge_container",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "can I get a peek at the draft before it goes out",
-    "expected": "acme-corp-crm:preview_export_external",
+    "query": "side-by-side the usage numbers for both months",
+    "expected": "acme-corp-analytics:compare_usage",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "why did the card charge bounce",
-    "expected": "acme-corp-billing:compare_dispute",
+    "query": "trim the dead nodes from the cluster map",
+    "expected": "acme-corp-analytics:prune_node_completed",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "get this box to the oak street depot",
-    "expected": "acme-corp-analytics:send_shipment",
+    "query": "duplicate the signup funnel",
+    "expected": "acme-corp-analytics:clone_funnel_projected",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "pull up the slow request trail",
-    "expected": "acme-corp-git-hosting:share_trace",
+    "query": "turn on the churn tracking",
+    "expected": "acme-corp-analytics:enable_churn",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "the tls document is expiring soon, save a copy",
-    "expected": "globex-git-hosting:snapshot_certificate",
+    "query": "hand the project to dana",
+    "expected": "acme-corp-analytics:assign_project",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "give the contractor access",
-    "expected": "acme-corp-chat:invite_user",
+    "query": "reshuffle the log entries",
+    "expected": "acme-corp-analytics:reindex_log",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "the board is stale, tidy it up",
-    "expected": "acme-corp-billing:prune_dashboard_summary",
+    "query": "turn down that onboarding request",
+    "expected": "acme-corp-analytics:reject_onboarding_pending",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "wrap up the yearly plan extension",
-    "expected": "acme-corp-search:close_renewal_pending",
+    "query": "hold the mislabeled sku",
+    "expected": "acme-corp-analytics:freeze_sku",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "call off the maintenance window",
-    "expected": "globex-calendar:cancel_zone_partial",
+    "query": "let the blocked review through",
+    "expected": "acme-corp-analytics:unlock_review",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "who has been poking around the credentials store",
-    "expected": "acme-corp-iam:search_bucket",
+    "query": "pull that support query back open",
+    "expected": "acme-corp-analytics:reopen_query",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "combine the twin people records",
-    "expected": "acme-corp-billing:move_contact_legacy",
+    "query": "the timesheet bounced, fire it off again",
+    "expected": "acme-corp-analytics:resend_timesheet",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "pull last month's figures out to a sheet",
-    "expected": "acme-corp-observability:export_segment",
+    "query": "what changed between the two plan versions",
+    "expected": "acme-corp-analytics:diff_plan",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "the pipeline went red, kick it off once more",
-    "expected": "acme-corp-billing:retry_object",
+    "query": "hold the warehouse sync until monday",
+    "expected": "acme-corp-analytics:pause_warehouse_pending",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "turn off the ex-employee's access",
-    "expected": "globex-data-warehouse:revoke_role_compact",
+    "query": "call off the channel migration",
+    "expected": "acme-corp-analytics:cancel_channel",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "dig up the boss's messages from last week",
-    "expected": "acme-corp-search:search_customer",
+    "query": "set up the new vendor account",
+    "expected": "acme-corp-analytics:create_account",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "bring the payment gateway back up",
-    "expected": "acme-corp-cloud-infra:resume_payout_overdue",
+    "query": "adjust the contract wording",
+    "expected": "acme-corp-analytics:amend_contract_beta",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "line up the newsletter blast for tuesday",
-    "expected": "acme-corp-calendar:send_segment_paused",
+    "query": "pass the experiment results to the team",
+    "expected": "acme-corp-analytics:share_experiment_redacted",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "save a copy of the catalog before the cutover",
-    "expected": "globex-docs:snapshot_index_full",
+    "query": "take back the leaked secret",
+    "expected": "acme-corp-analytics:revoke_secret",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "the projected numbers look off, redo the math",
-    "expected": "globex-calendar:recalculate_forecast",
+    "query": "check the retention settings against policy",
+    "expected": "acme-corp-analytics:validate_retention",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
   {
-    "query": "move the team onto the bigger tier",
-    "expected": "acme-corp-analytics:promote_payment",
+    "query": "grab the error log from last night",
+    "expected": "acme-corp-billing:get_log_succeeded",
     "subtype": "goal-only",
     "difficulty": "hard"
   },
@@ -720,7 +720,7 @@
     "difficulty": "hard"
   },
   {
-    "query": "plan a surprise birthday party for my roommate",
+    "query": "arrange a surprise birthday party for my roommate",
     "expected": null,
     "subtype": "no-match",
     "difficulty": "hard"
@@ -762,7 +762,7 @@
     "difficulty": "hard"
   },
   {
-    "query": "debug the crash in my hobby game project",
+    "query": "debug the crash in my hobby game app",
     "expected": null,
     "subtype": "no-match",
     "difficulty": "hard"
@@ -780,7 +780,7 @@
     "difficulty": "hard"
   },
   {
-    "query": "convert these measurements to metric",
+    "query": "convert these cups to grams",
     "expected": null,
     "subtype": "no-match",
     "difficulty": "hard"

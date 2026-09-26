@@ -42,6 +42,59 @@ function argNum(name, dflt) {
   if (v === undefined) return dflt;
   return v.startsWith('0x') ? parseInt(v, 16) : Number(v);
 }
+  const FORBIDDEN_PAIRS = [
+    ['bring', 'rule'], // invite_policy -> "bring in rule"
+    ['erase', 'attrition'], // purge_metric -> "erase for good attrition"
+    ['tie', 'parcel'], // link_shipment -> "tie parcel"
+    ['elevate', 'hours'], // promote_timesheet -> "elevate hours log"
+    ['okay', 'lens'], // approve_photo -> "okay lens"
+    ['hold', 'pass'], // pause_boarding pass -> "put on hold pass"
+    ['ship', 'staffer'], // send_employee -> "ship staffer"
+    ['unfasten', 'allocation'], // detach_budget -> "unfasten allocation"
+  ];
+  const hasAll = (text, toks) => {
+    const words = new Set(tokenize(text));
+    return toks.every((t) => words.has(t));
+  };
+  const findCollocations = (text) =>
+    FORBIDDEN_PAIRS.filter((pair) => hasAll(text, pair)).map((pair) => pair.join('+'));
+
+// --self-test: the collocation gate MUST catch every known-bad reviewer
+// example and MUST NOT catch natural queries. Run: node stress/gen-tools.mjs --self-test
+const SELF_TEST_BAD = [
+  'Please bring in rule whenever convenient.',
+  'Can you erase for good attrition when you get a chance?',
+  'Please tie parcel whenever convenient.',
+  'Please elevate hours log whenever convenient.',
+  'Any chance you can okay lens today?',
+  'Can you put on hold pass when you get a chance?',
+  'Please ship staffer whenever convenient.',
+  'Please unfasten allocation today.',
+];
+const SELF_TEST_GOOD = [
+  'Could someone sign off on the rollout today, in the observability system?',
+  'Please wipe out the stale backlog entries.',
+  'Could you hook up the new peripheral for me?',
+  'Any chance you can take back the leaked secret today?',
+  'Please circle back on the onboarding rule with the team.',
+  'Could you unhook the printer from the network?',
+  'Please bump up the storage quota before the launch.',
+  'Could someone erase the scratch disk today?',
+];
+function selfTestCollocation() {
+  const badCaught = SELF_TEST_BAD.map((q) => findCollocations(q).length > 0);
+  const goodFlagged = SELF_TEST_GOOD.map((q) => findCollocations(q).length > 0);
+  const ok = badCaught.every(Boolean) && goodFlagged.every((f) => !f);
+  console.log(JSON.stringify({ selfTest: 'collocation-gate', ok, badCaught, goodFlagged }));
+  process.exitCode = ok ? 0 : 1;
+  return ok;
+}
+
+if (process.argv.includes('--self-test')) {
+  selfTestCollocation();
+  process.exit(process.exitCode ?? 0);
+}
+
 const SEED = argNum('--seed', 0x5337c0de) >>> 0;
 const OUT_DIR = resolve(argValue('--out-dir') ?? 'stress/.generated/tools');
 const RESULTS_DIR = resolve('stress/.generated/results');
@@ -171,25 +224,25 @@ const VERB_SYN = {
   merge: ['combine', 'join'], export: ['download', 'copy out'],
   validate: ['check', 'double check'], preview: ['look over', 'show'],
   publish: ['release', 'put out'], cancel: ['call off', 'abort'],
-  retry: ['rerun', 'try again'], approve: ['sign off on', 'okay'],
+  retry: ['rerun', 'try again'], approve: ['sign off on'],
   reject: ['turn down', 'decline'], close: ['wrap up', 'finish'],
   reopen: ['open again', 'reactivate'], clone: ['duplicate', 'copy'],
   diff: ['compare', 'contrast'], sync: ['reconcile', 'sync up'],
   rotate: ['cycle', 'swap out'], revoke: ['withdraw', 'take back'],
-  send: ['dispatch', 'ship'], schedule: ['book', 'slot in'],
-  acknowledge: ['confirm', 'own'], escalate: ['raise', 'flag'],
-  count: ['tally up', 'count out'], summarize: ['recap', 'sum up'],
+  send: ['dispatch'], schedule: ['book', 'slot in'],
+  acknowledge: ['confirm', 'own'], escalate: ['raise'],
+  count: ['tally up'], summarize: ['recap', 'sum up'],
   compare: ['weigh', 'measure'], enable: ['turn on', 'switch on'],
-  disable: ['turn off', 'switch off'], pause: ['freeze', 'hold'],
+  disable: ['turn off', 'switch off'], pause: ['freeze'],
   resume: ['unpause', 'pick back up'], transfer: ['hand over', 'wire'],
-  attach: ['fasten', 'hook up'], detach: ['unhook', 'unfasten'],
-  link: ['connect', 'tie'], unlink: ['disconnect', 'untie'],
+  attach: ['hook up'], detach: ['unhook'],
+  link: ['connect'], unlink: ['disconnect'],
   resolve: ['settle', 'close out'], split: ['carve up', 'split apart'],
-  purge: ['wipe out', 'erase for good'], rollback: ['roll back', 'undo'],
-  promote: ['elevate', 'bump up'], invite: ['bring in', 'recruit'],
+  purge: ['wipe out'], rollback: ['roll back', 'undo'],
+  promote: ['bump up'], invite: ['recruit'],
   verify: ['double check', 'authenticate'], resend: ['send again', 'fire off again'],
   share: ['circulate', 'hand out'], lock: ['seal', 'shut'],
-  unlock: ['unseal', 'open'], freeze: ['halt', 'put on hold'],
+  unlock: ['unseal', 'open'], freeze: ['halt'],
   unfreeze: ['thaw', 'unpause'], finalize: ['nail down', 'wrap up'],
   void: ['nullify', 'cancel out'], reindex: ['reshuffle', 'refresh'],
   rebuild: ['reassemble', 'reconstruct'], recalculate: ['recompute', 'redo the math'],
@@ -865,8 +918,15 @@ function main() {
     for (const t of tokenize(d.org.replace(/-/g, ' '))) toolVocab.add(t);
   }
   for (const t of ['system', 'recent', 'convenient']) toolVocab.add(t);
-  const toolLint = { debris: 0, doubleSpace: 0, malformed: 0, unknownVocab: 0, ambiguous: 0 };
+  const toolLint = { debris: 0, doubleSpace: 0, malformed: 0, unknownVocab: 0, ambiguous: 0, collocation: 0 };
+
+  // Collocation gate: vocabulary-only lint is NOT naturalness — a
+  // grammatical template over valid words can still produce nonsense pairs
+  // ("okay lens", "ship staffer", "erase for good attrition"). These token
+  // sets must NEVER co-occur in an emitted query; each entry is a known-bad
+  // reviewer finding kept as a permanent regression.
   const unknownSamples = [];
+  const badCollocationSamples = [];
   for (const clean of paraphraseClean) {
     // Debris = two consecutive prepositions (mid-sentence deletion class).
     if (/\b(?:for|against|with|of|to|in)\s+(?:for|against|with|of|to|in)\b/i.test(clean)) toolLint.debris += 1;
@@ -896,6 +956,11 @@ function main() {
     return ![...goldTokens].some((t) => tokenize(q.query).includes(t));
   }).length;
   toolLint.ambiguous = ambiguousCount;
+  for (const clean of paraphraseClean) {
+    const hits = findCollocations(clean);
+    toolLint.collocation += hits.length;
+    if (hits.length > 0) badCollocationSamples.push(clean + ' [' + hits.join(',') + ']');
+  }
   const toolLintTotal = Object.values(toolLint).reduce((a, b) => a + b, 0);
 
   const emittedParaphrases = queries.filter((q) => q.subtype === 'paraphrase');
@@ -906,7 +971,7 @@ function main() {
   console.log('--- FX13 tool lint counts (clean text, gate = all zero) ---');
   console.log(JSON.stringify(toolLint));
   if (toolLintTotal > 0) {
-    throw new Error(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
+    throw new Error(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')} collocation: ${badCollocationSamples.slice(0, 10).join(' | ')}`);
   }
   writeFileSync(
     join(RESULTS_DIR, 'query-quality-tools.json'),
