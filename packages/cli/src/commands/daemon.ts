@@ -26,6 +26,8 @@ const START_TIMEOUT_MS = 15_000;
 const DEFAULT_START_TIMEOUT_MS = 120_000;
 const NO_PROGRESS_TIMEOUT_MS = 15_000;
 const PROGRESS_LOG_INTERVAL_MS = 2_000;
+/** Grace for a concurrently started sibling daemon to become ready after our own child failed. */
+const CONCURRENT_START_GRACE_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 const MAX_RESPONSE_BYTES = 8 * 1024;
 
@@ -173,10 +175,22 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
 
   for (;;) {
     if (spawnError) {
+      // Another concurrent start may have won the race even though ours
+      // failed to spawn — report success if a daemon is already ready.
+      if (await waitForAnotherDaemon(paths)) {
+        return 0;
+      }
       console.error(`Could not start Action Hub daemon: ${spawnError.message}`);
       return 1;
     }
     if (childExited) {
+      // Concurrent starts are allowed: if OUR child exited but a daemon is
+      // already answering (e.g. a sibling start won the lock), succeed. The
+      // sibling may still be mid-startup, so poll briefly instead of a single
+      // probe.
+      if (await waitForAnotherDaemon(paths)) {
+        return 0;
+      }
       console.error(
         `Action Hub daemon exited during startup (code ${childExitCode ?? "signal"}). See ${paths.log}`,
       );
@@ -217,7 +231,26 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   }
 
   console.error(`Action Hub daemon did not become ready. See ${paths.log}`);
+  if (await waitForAnotherDaemon(paths)) return 0;
   return 1;
+}
+
+/**
+ * After our own child failed to spawn or exited during startup, another
+ * concurrently started daemon may still win and become ready — poll briefly
+ * (bounded) before declaring failure. Returns the winning pid, if any.
+ */
+async function waitForAnotherDaemon(paths: DaemonPaths): Promise<number | undefined> {
+  const deadline = Date.now() + CONCURRENT_START_GRACE_MS;
+  for (;;) {
+    const ready = await daemonReady(paths);
+    if (ready?.ok) {
+      console.log(`Action Hub daemon is already running (pid ${ready.pid}).`);
+      return ready.pid;
+    }
+    if (Date.now() >= deadline) return undefined;
+    await delay(100);
+  }
 }
 
 export async function daemonStatusCommand(options: DaemonOptions = {}): Promise<number> {
