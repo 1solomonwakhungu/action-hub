@@ -3,50 +3,44 @@
 How to connect Action Hub to the AI harnesses and editors it supports.
 
 Action Hub ships a Model Context Protocol (MCP) server. Every harness below
-speaks MCP over stdio, so wiring one up means pointing its MCP configuration at
-the bundled server script:
+speaks MCP over stdio, and two stdio entry forms are valid:
 
-```
-<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js
-```
+- the bundled server script
+  `<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js`, or
+- the CLI entrypoint `<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js`
+  with the `start` argument (this is the form the `action-hub harness`
+  command emits).
 
-Auto-configuration commands are not shipped yet, so this guide uses manual
-config entries — copy the snippet for your harness, substitute the absolute
+The fastest path is automatic setup with the `action-hub harness` command
+(see the next section). If your harness is not covered by that command, or
+you prefer to manage the config yourself, use the manual snippets in the
+sections below — copy the snippet for your harness, substitute the absolute
 path, and restart. The supported harnesses: Claude Code, Claude Desktop,
 Cursor, VS Code, Codex, OpenCode, Zed, and Windsurf.
 
 ## Automatic setup
 
-As of the `harness` command, most harnesses can be configured for you. The
-exact grammar (from `action-hub harness --help`):
+Most harnesses can be configured for you by the `action-hub harness` command.
+The shape:
 
-```
-action-hub harness <target> [export|install]
+- `action-hub harness <target>` prints the target's config snippet
+  (`export` mode, the default).
+- `action-hub harness <target> install --write` writes the snippet into the
+  harness config file. `install` requires `--write` as a safety guard.
+- `--config <path>` points the harness at a specific Action Hub config file
+  (exported as `ACTION_HUB_CONFIG` in the snippet).
+- `--json` applies to JSON targets only — it prints just the JSON document.
+  For TOML targets such as `codex`, `--json` is rejected with a clear error.
 
-Targets:
-  claude-code      Claude Code
-  claude-desktop   Claude Desktop
-  cursor           Cursor
-  codex            Codex CLI
-  opencode         OpenCode
-  vscode           VS Code
-
-Modes:
-  export          Print the config snippet (default).
-  install         Write the snippet into the harness config file.
-                  Requires --write as a safety guard.
-
-Options:
-  --write         Required for install mode; confirms in-place writes.
-  --config <path> Point the harness at a specific Action Hub config file
-                  (exported as ACTION_HUB_CONFIG in the snippet).
-  --json          (export) Print only the JSON document, no commentary.
-```
+Targets: `claude-code`, `claude-desktop`, `cursor`, `codex`, `opencode`,
+`vscode`. (Run `action-hub harness --help` for the current exact grammar.)
 
 `export` prints the snippet for you to paste; `install` writes it into the
-harness config file and requires `--write`. Before touching a config,
-`install` writes a timestamped `.bak` copy of the file (e.g.
-`mcp.json.bak-20260926T090000Z`), so the original is always recoverable.
+harness config file and requires `--write`. When an existing config file is
+present, `install` first writes a timestamped backup of it, named
+`<file>.bak-<ISO timestamp>` (for example
+`mcp.json.bak-2026-09-26T08-24-51-422Z`), so the original is always
+recoverable. A first install has no original file, so no backup is created.
 
 ```bash
 action-hub harness claude-code                 # print the Claude Code snippet
