@@ -5,7 +5,7 @@ import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
 import { ConnectionManager, type ConnectionManagerOptions } from "./servers/connection-manager.js";
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
-import { ApprovalRegistry, type ApprovalRegistryOptions } from "./permissions/approvals.js";
+import { ApprovalRegistry, fingerprintArguments, type ApprovalRegistryOptions } from "./permissions/approvals.js";
 import { validateArguments } from "./router/validate.js";
 import {
   ActionHubTelemetry,
@@ -30,6 +30,7 @@ import type {
   SearchOptions,
   ServerConfig,
   ServerState,
+  ResultCacheOptions,
 } from "./types.js";
 
 export interface ActionHubOptions {
@@ -77,11 +78,15 @@ export interface ActionHubOptions {
   approvals?: ApprovalRegistryOptions;
   /** Circuit breaker, heartbeat, restart backoff, and memory-limit defaults. */
   resilience?: ConnectionManagerOptions;
+  /** Idempotent-read result cache configuration. */
+  resultCache?: ResultCacheOptions;
 }
 
 export interface ExecuteOptions {
   /** Token returned by a previous gated execute of this exact call. */
   approvalToken?: string;
+  /** Bypass the idempotent-read result cache for this call. */
+  noCache?: boolean;
 }
 
 export interface IndexResult {
@@ -121,6 +126,24 @@ export class ActionHub {
   readonly #semanticIndex?: LocalSemanticIndex;
   readonly #approvals: ApprovalRegistry;
   readonly #telemetry: ActionHubTelemetry;
+  readonly #resultCache = new Map<string, { content: unknown; expiresAt: number }>();
+  readonly #cacheEnabled: boolean;
+  readonly #cacheTtlMs: number;
+  readonly #cacheMaxEntries: number;
+
+  /** Tool-name prefixes conventionally denoting side-effect-free reads. */
+  static readonly #READ_PREFIXES = [
+    "get_",
+    "list_",
+    "read_",
+    "describe_",
+    "fetch_",
+    "search_",
+    "find_",
+    "query_",
+    "inspect_",
+    "check_",
+  ];
 
   constructor(options: ActionHubOptions) {
     this.#connections = new ConnectionManager(
@@ -149,6 +172,9 @@ export class ActionHub {
     this.#historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
     this.#denyOnApprovalRequired = options.denyOnApprovalRequired ?? false;
     this.#approvals = new ApprovalRegistry(options.approvals ?? {});
+    this.#cacheEnabled = options.resultCache?.enabled ?? true;
+    this.#cacheTtlMs = options.resultCache?.ttlMs ?? 60_000;
+    this.#cacheMaxEntries = options.resultCache?.maxEntries ?? 500;
   }
 
   get catalog(): Catalog {
@@ -223,6 +249,7 @@ export class ActionHub {
           description: tool.description,
           inputSchema: tool.inputSchema ?? {},
           trust,
+          readOnly: (tool as { annotations?: { readOnlyHint?: boolean } }).annotations?.readOnlyHint === true ? true : undefined,
         }));
 
       this.#catalog.removeServer(serverId);
@@ -578,6 +605,39 @@ export class ActionHub {
           }
         }
 
+        const cacheable =
+          this.#cacheEnabled &&
+          !options.noCache &&
+          !options.approvalToken &&
+          !decision.requiresApproval &&
+          (record.readOnly === true || ActionHub.#READ_PREFIXES.some((p) => record.name.startsWith(p)));
+        if (cacheable) {
+          const cacheKey = `${actionId}:${fingerprintArguments(args)}`;
+          const cached = this.#resultCache.get(cacheKey);
+          if (cached && Date.now() < cached.expiresAt) {
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS, "success");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "ok");
+            span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_DURATION_MS, 0);
+            span.setAttribute("action_hub.cached", true);
+            span.setStatus({ code: SpanStatusCode.OK });
+            this.#record({
+              actionId,
+              serverId: record.serverId,
+              startedAt,
+              durationMs: 0,
+              ok: true,
+              cached: true,
+            });
+            return {
+              ok: true,
+              actionId,
+              content: cached.content,
+              durationMs: 0,
+              cached: true,
+            };
+          }
+        }
+
         try {
           const serverConfig = this.#connections.getConfig(record.serverId);
           const timeoutMs = serverConfig?.timeoutMs ?? this.#defaultTimeoutMs;
@@ -614,6 +674,15 @@ export class ActionHub {
             ok: true,
             ...(approved ? { approval: "approved" as const } : {}),
           });
+          if (cacheable) {
+            const cacheKey = `${actionId}:${fingerprintArguments(args)}`;
+            this.#resultCache.set(cacheKey, { content, expiresAt: Date.now() + this.#cacheTtlMs });
+            while (this.#resultCache.size > this.#cacheMaxEntries) {
+              const oldest = this.#resultCache.keys().next().value;
+              if (oldest === undefined) break;
+              this.#resultCache.delete(oldest);
+            }
+          }
           return { ok: true, actionId, content, durationMs };
         } catch (cause) {
           const durationMs = Date.now() - start;
@@ -654,6 +723,11 @@ export class ActionHub {
         }
       },
     );
+  }
+
+  /** Clears all cached idempotent-read results. */
+  clearResultCache(): void {
+    this.#resultCache.clear();
   }
 
   /** Outstanding, unexpired approval tokens. Diagnostics only. */
