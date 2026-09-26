@@ -76,22 +76,62 @@ const child = spawn(command, args, {
 });
 let sawStdout = false;
 let killed = false;
+let childExitCode = null;
+let killSequenceDone = false;
+const maybeFinish = () => {
+  // Only exit once any started kill sequence has fully completed (escalation
+  // sent AND the downstream process group verified dead) — otherwise a
+  // grandchild with a SIGTERM handler could outlive the supervisor.
+  if (killed && !killSequenceDone) return;
+  process.exit(childExitCode ?? 1);
+};
+const groupAlive = () => {
+  if (isWindows) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (err) {
+    return err && err.code !== "ESRCH";
+  }
+};
 const killTree = (signal) => {
   if (killed) return;
   killed = true;
-  const escalate = () => {
-    setTimeout(() => {
-      try {
-        if (isWindows) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
-        else process.kill(-child.pid, "SIGKILL");
-      } catch {}
-    }, 1000).unref?.();
-  };
   try {
-    if (isWindows) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
-    else process.kill(-child.pid, signal);
+    if (isWindows) {
+      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+    } else {
+      process.kill(-child.pid, signal);
+    }
   } catch {}
-  escalate();
+  // Ref'd on purpose: the supervisor must stay alive to send the escalation
+  // and verify the group is actually gone before exiting.
+  const escalate = setTimeout(() => {
+    try {
+      if (isWindows) {
+        const tk = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+        tk.on("exit", () => { killSequenceDone = true; maybeFinish(); });
+        tk.on("error", () => { killSequenceDone = true; maybeFinish(); });
+      } else {
+        process.kill(-child.pid, "SIGKILL");
+        killSequenceDone = true;
+      }
+    } catch {}
+    maybeFinish();
+  }, 1000);
+  // After escalation, poll (bounded) until the whole group is dead, then exit.
+  const reapDeadline = Date.now() + 5000;
+  const reap = setInterval(() => {
+    if (!groupAlive()) {
+      clearInterval(reap);
+      killSequenceDone = true;
+      maybeFinish();
+    } else if (Date.now() > reapDeadline) {
+      clearInterval(reap);
+      killSequenceDone = true;
+      maybeFinish();
+    }
+  }, 50);
 };
 if (deadlineMs > 0) {
   const t = setTimeout(() => { if (!sawStdout) { killTree("SIGKILL"); } }, deadlineMs);
@@ -109,7 +149,11 @@ child.stderr.on("data", (chunk) => process.stderr.write(chunk));
 child.stdout.on("error", () => {});
 child.stderr.on("error", () => {});
 child.on("error", () => process.exit(1));
-child.on("exit", (code) => process.exit(code ?? 1));
+child.on("exit", (code) => {
+  childExitCode = code;
+  // Do NOT exit here when a kill sequence is in flight — wait for it.
+  maybeFinish();
+});
 process.on("exit", () => { if (!killed) killTree("SIGTERM"); });
 `;
 

@@ -1,30 +1,42 @@
-// Doctor fixture: a healthy minimal MCP server that also spawns a
-// TERM-ignoring grandchild and records both PIDs to the file named by
-// TREE_PIDS_FILE. Used to prove the doctor kills the entire downstream
-// process tree (not just the direct child) before it returns.
-import { appendFileSync } from "node:fs";
+// Doctor fixture: a healthy minimal MCP server whose grandchild stays INSIDE
+// the downstream process group (spawned without detached), ignores SIGTERM
+// via an installed handler, and is kept alive by a durable setInterval (not
+// by an inherited pipe). The server only answers initialize AFTER the
+// grandchild has signalled readiness, so by the time the doctor can connect,
+// the escape-avoidance state is fully in place. Both PIDs are recorded to
+// TREE_PIDS_FILE; the doctor must kill the whole tree.
+import { appendFileSync, writeFileSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-
 const pidFile = process.env["TREE_PIDS_FILE"];
+const grandchildReadyFile = pidFile ? `${pidFile}.ready` : undefined;
+
 if (pidFile && process.argv[2] !== "child") {
-  // Record this server's PID and spawn a grandchild that ignores SIGTERM and
-  // hangs on stdin. Record the grandchild PID too.
   appendFileSync(pidFile, `${process.pid}\n`);
+  // NOT detached: the grandchild inherits the server's process group, so only
+  // a group-wide signal can reach it.
   const grandchild = spawn(process.execPath, [import.meta.filename, "child"], {
-    detached: true,
-    stdio: ["pipe", "ignore", "ignore"],
+    detached: false,
+    stdio: ["ignore", "ignore", "ignore"],
   });
   grandchild.unref();
   appendFileSync(pidFile, `${grandchild.pid}\n`);
-}
-
-if (process.argv[2] === "child") {
+  // Wait for the grandchild to confirm its SIGTERM handler is installed
+  // before serving MCP traffic, so the leak window is deterministic.
+  const deadline = Date.now() + 5000;
+  while (!existsSync(grandchildReadyFile) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
+} else if (process.argv[2] === "child") {
   process.on("SIGTERM", () => {
     // Deliberately ignores SIGTERM; only a group SIGKILL can end it.
   });
-  process.stdin.resume();
-} else {
+  // Durable handle: keeps the event loop alive regardless of any pipe.
+  setInterval(() => {}, 1000);
+  if (grandchildReadyFile) writeFileSync(grandchildReadyFile, "ready\n");
+}
+
+if (process.argv[2] !== "child") {
   const rl = createInterface({ input: process.stdin });
   let buffered = "";
   process.stdin.on("data", (chunk) => {
