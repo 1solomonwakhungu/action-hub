@@ -16,7 +16,8 @@
  * Usage: node stress/external/spec-test.mjs [--config <servers.json>]
  */
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,6 +26,7 @@ const repoRoot = resolve(here, "..", "..");
 const genDir = resolve(here, "..", ".generated", "external");
 const resultsDir = resolve(here, "..", ".generated", "results");
 const reportsDir = join(genDir, "spec-test");
+const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
 const SPEC_VERSION = "0.1.5";
 const SERVE_PORT = 41713;
 const token = "stress-external-token-0f1e2d3c";
@@ -45,6 +47,8 @@ const isolatedEnv = {
   ACTION_HUB_SKILLS_DIR: join(genDir, "skills"),
   PI_CODING_AGENT_DIR: join(genDir, "pi"),
   MCP_DISABLE_TELEMETRY: "1",
+  // serve must accept the exact token the suite sends via -t.
+  ACTION_HUB_HTTP_TOKEN: token,
 };
 
 async function waitHealthy(port) {
@@ -61,24 +65,50 @@ async function waitHealthy(port) {
   return false;
 }
 
-function runSpec(args, label, extraEnv) {
+function runSpec(args, label, extraEnv, runOutDir) {
   const started = Date.now();
   const res = spawnSync(
     "npx",
     ["--yes", `@hasmcp/mcp-spec-test@${SPEC_VERSION}`, ...args],
     { encoding: "utf8", env: { ...isolatedEnv, ...extraEnv }, timeout: 30 * 60_000 },
   );
-  return {
+  const run = {
     label,
     command: ["npx", `@hasmcp/mcp-spec-test@${SPEC_VERSION}`, ...args].join(" "),
     tool: "@hasmcp/mcp-spec-test",
     version: SPEC_VERSION,
     exitCode: res.status ?? -1,
-    ok: res.status === 0,
+    reportDir: runOutDir,
     durationMs: Date.now() - started,
     stdoutTail: res.stdout?.slice(-2000),
     stderr: res.stderr?.slice(-3000),
   };
+  // Parse the suite's own JSON report; auth-blocked or failed cases fail the
+  // wrapper — an exit-0 wrapper over a 401-run is never green.
+  try {
+    const files = readdirSync(runOutDir).filter((f) => f.endsWith(".json"));
+    run.reportFiles = files;
+    const latest = files.sort().pop();
+    const report = JSON.parse(readFileSync(join(runOutDir, latest), "utf8"));
+    run.verdict = report.verdict?.code ?? null;
+    run.counts = report.counts ?? null;
+    run.notVerifiedReasons = (report.cases?.notVerified ?? []).slice(0, 10).map((c) => ({
+      section: c.section,
+      reason: (c.reason ?? c.detail ?? "").slice(0, 200),
+    }));
+    const authBlocked = (report.cases?.notVerified ?? []).filter((c) =>
+      /401|unauthor|auth/i.test(`${c.reason ?? ""}${c.detail ?? ""}`),
+    ).length;
+    run.authBlockedCases = authBlocked;
+    run.ok =
+      run.exitCode === 0 &&
+      (report.counts?.failed ?? 1) === 0 &&
+      authBlocked === 0;
+  } catch (cause) {
+    run.ok = false;
+    run.parseError = String(cause).slice(0, 200);
+  }
+  return run;
 }
 
 async function main() {
@@ -97,9 +127,10 @@ async function main() {
   ].join(" ");
   runs.push(
     runSpec(
-      ["-c", cmd, "--output", "json", "--output-folder", reportsDir],
+      ["-c", cmd, "--output", "json", "--output-folder", join(reportsDir, `stdio-${runStamp}`)],
       "stdio",
       {},
+      join(reportsDir, `stdio-${runStamp}`),
     ),
   );
 
@@ -117,10 +148,11 @@ async function main() {
           "-u", `http://127.0.0.1:${SERVE_PORT}/mcp`,
           "-t", token,
           "--output", "json",
-          "--output-folder", reportsDir,
+          "--output-folder", join(reportsDir, `http-${runStamp}`),
         ],
         "http",
         {},
+        join(reportsDir, `http-${runStamp}`),
       ),
     );
   } finally {

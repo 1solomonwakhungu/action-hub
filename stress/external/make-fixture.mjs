@@ -20,6 +20,7 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
 const outDir = resolve(here, "..", ".generated", "external");
+const resultsDir = resolve(here, "..", ".generated", "results");
 
 function argNum(name, fallback) {
   const i = process.argv.indexOf(name);
@@ -101,15 +102,17 @@ export PI_CODING_AGENT_DIR="${outDir}/pi"
 `;
   await writeFile(join(outDir, "env.sh"), envSh);
 
-  console.log(
-    JSON.stringify({
-      script: "make-fixture.mjs",
-      servers: serverCount,
-      toolsPerServer: toolsPer,
-      totalTools: serverCount * toolsPer,
-      outDir,
-    }),
-  );
+  const summary = {
+    script: "make-fixture.mjs",
+    servers: serverCount,
+    toolsPerServer: toolsPer,
+    totalTools: serverCount * toolsPer,
+    outDir,
+    at: new Date().toISOString(),
+  };
+  await mkdir(resultsDir, { recursive: true });
+  await writeFile(join(resultsDir, "external-make-fixture.json"), JSON.stringify(summary, null, 2) + "\n");
+  console.log(JSON.stringify(summary));
 }
 
 main().catch((cause) => {

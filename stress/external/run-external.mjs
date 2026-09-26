@@ -122,41 +122,91 @@ async function main() {
       stderr: smoke.stderr?.slice(0, 2000),
     });
 
-    // 3b. k6 load.
+    // 3b. k6 load (async spawn so the RSS sampler keeps ticking).
     if (hasFlag("--k6")) {
       const profile = hasFlag("--k6-full") ? "full" : "quick";
       const summaryOut = join(resultsDir, "external-k6-summary.json");
       const started = Date.now();
-      const k6 = spawnSync(K6_BIN, ["run", "--summary-export", summaryOut, join(here, "k6-mcp.js")], {
-        encoding: "utf8",
-        env: {
-          ...isolatedEnv,
-          K6_URL: `http://127.0.0.1:${SERVE_PORT}`,
-          K6_TOKEN: token,
-          K6_PROFILE: profile,
-        },
-        timeout: 20 * 60_000,
+      const k6Exit = await new Promise((resolveK6) => {
+        const child = spawn(
+          K6_BIN,
+          ["run", "--summary-export", summaryOut, join(here, "k6-mcp.js")],
+          {
+            env: {
+              ...isolatedEnv,
+              K6_URL: `http://127.0.0.1:${SERVE_PORT}`,
+              K6_TOKEN: token,
+              K6_PROFILE: profile,
+            },
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+        let stderr = "";
+        child.stderr.on("data", (chunk) => {
+          stderr += chunk;
+          if (stderr.length > 100_000) stderr = stderr.slice(-50_000);
+        });
+        const timer = setTimeout(() => child.kill("SIGKILL"), 20 * 60_000);
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          resolveK6({ code, stderr: stderr.slice(-3000) });
+        });
       });
       runs.push({
         label: "k6",
         tool: "k6",
         profile,
-        exitCode: k6.status,
+        exitCode: k6Exit.code,
         durationMs: Date.now() - started,
         summaryExport: summaryOut,
-        stderr: k6.stderr?.slice(-3000),
+        stderr: k6Exit.stderr,
       });
     }
 
-    // 3c. mcp-fuzzer (python venv) — wired once the venv exists.
+    // 3c. mcp-fuzzer (python venv).
     if (hasFlag("--fuzz")) {
-      const venvPy = "/tmp/action-hub-stress/venv/bin/python";
-      runs.push({ label: "mcp-fuzzer", status: "runner-not-wired-yet", venv: venvPy });
+      const started = Date.now();
+      const f = spawnSync("node", [join(here, "fuzz.mjs"), "--config", configPath, "--runs", String(process.env["FUZZ_RUNS"] ?? 10)], {
+        encoding: "utf8",
+        env: isolatedEnv,
+        timeout: 40 * 60_000,
+      });
+      let fSummary = null;
+      try {
+        fSummary = JSON.parse(f.stdout.trim().split("\n").pop());
+      } catch {
+        /* recorded raw */
+      }
+      runs.push({
+        label: "mcp-fuzzer",
+        exitCode: f.status,
+        durationMs: Date.now() - started,
+        summary: fSummary,
+        stderr: f.stderr?.slice(-2000),
+      });
     }
 
-    // 3d. @hasp/mcp-spec-test (npx) — wired in its own runner.
+    // 3d. @hasmcp/mcp-spec-test (npx).
     if (hasFlag("--spec")) {
-      runs.push({ label: "mcp-spec-test", status: "runner-not-wired-yet" });
+      const started = Date.now();
+      const s = spawnSync("node", [join(here, "spec-test.mjs"), "--config", configPath], {
+        encoding: "utf8",
+        env: isolatedEnv,
+        timeout: 40 * 60_000,
+      });
+      let sSummary = null;
+      try {
+        sSummary = JSON.parse(s.stdout.trim().split("\n").pop());
+      } catch {
+        /* recorded raw */
+      }
+      runs.push({
+        label: "mcp-spec-test",
+        exitCode: s.status,
+        durationMs: Date.now() - started,
+        summary: sSummary,
+        stderr: s.stderr?.slice(-2000),
+      });
     }
   } finally {
     clearInterval(sampler);
@@ -173,7 +223,15 @@ async function main() {
     rssSamples,
     rssPeakKb: rssSamples.length ? Math.max(...rssSamples.map((s) => s.rssKb)) : null,
     durationMs: Date.now() - t0,
-    ok: runs.every((r) => r.exitCode === 0 || r.exitCode === undefined || r.status !== undefined),
+    // Overall status comes from real verdicts: every runner row must have
+    // exited 0 and, where present, its parsed summary must be ok.
+    ok:
+      healthy &&
+      runs.every(
+        (r) =>
+          (r.exitCode === 0 || r.exitCode === undefined) &&
+          (r.summary === undefined || r.summary === null || r.summary?.ok === true),
+      ),
     at: new Date().toISOString(),
   };
   await writeFile(join(resultsDir, "external.json"), JSON.stringify(summary, null, 2) + "\n");

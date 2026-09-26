@@ -19,6 +19,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -30,6 +31,7 @@ const FUZZER = process.env["FUZZER_BIN"] ?? "/tmp/action-hub-stress/venv/bin/mcp
 const FUZZER_VERSION = "0.7.0";
 const SERVE_PORT = 41712;
 const token = "stress-external-token-0f1e2d3c";
+const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
 
 function argNum(name, fallback) {
   const i = process.argv.indexOf(name);
@@ -53,6 +55,8 @@ const isolatedEnv = {
   ACTION_HUB_CONFIG: configPath,
   ACTION_HUB_SKILLS_DIR: join(genDir, "skills"),
   PI_CODING_AGENT_DIR: join(genDir, "pi"),
+  // serve must accept the exact token the fuzzer client sends.
+  ACTION_HUB_HTTP_TOKEN: token,
   // mcp-fuzzer auth (http target): Authorization: Bearer <token>
   MCP_API_KEY: token,
   MCP_PREFIX: "Bearer",
@@ -74,13 +78,13 @@ async function waitHealthy(port) {
 
 function runFuzzer(args, label, extraEnv) {
   const started = Date.now();
-  const outDir = join(genDir, `fuzz-${label}`);
+  const outDir = join(genDir, `fuzz-${label}-${runStamp}`);
   const res = spawnSync(FUZZER, [...args, "--output-dir", outDir, "--log-level", "ERROR"], {
     encoding: "utf8",
     env: { ...isolatedEnv, ...extraEnv },
     timeout: 30 * 60_000,
   });
-  return {
+  const run = {
     label,
     command: [FUZZER, ...args].join(" "),
     tool: "mcp-fuzzer",
@@ -93,6 +97,26 @@ function runFuzzer(args, label, extraEnv) {
     stderr: res.stderr?.slice(-3000),
     stdoutTail: res.stdout?.slice(-1500),
   };
+  // Parse the fuzzer's own report: an auth-blocked or zero-tool run is a
+  // failure, not a pass.
+  try {
+    const rs = JSON.parse(readFileSync(join(outDir, "run_summary.json"), "utf8"));
+    run.blockedReason = rs.blocked_reason ?? (rs.status === "blocked" ? "blocked" : null);
+    run.toolCount = rs.tool_discovery?.tool_count ?? rs.tools?.total ?? null;
+    const findings = rs.findings ?? {};
+    run.findingCounts = {
+      total: findings.total ?? (findings.by_category ? Object.values(findings.by_category).reduce((a, b) => a + b, 0) : 0),
+      byCategory: findings.by_category ?? {},
+    };
+    run.ok =
+      run.exitCode === 0 &&
+      !run.blockedReason &&
+      (run.toolCount === null || run.toolCount > 0);
+  } catch {
+    run.ok = false;
+    run.parseError = "run_summary.json missing or unreadable";
+  }
+  return run;
 }
 
 async function startServe() {

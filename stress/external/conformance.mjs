@@ -25,6 +25,7 @@ const repoRoot = resolve(here, "..", "..");
 const genDir = resolve(here, "..", ".generated", "external");
 const resultsDir = resolve(here, "..", ".generated", "results");
 const outDir = join(genDir, "conformance");
+const CONFORMANCE_VERSION = "0.1.16"; // pinned per contract reproducibility rule
 const SERVE_PORT = 41714;
 const token = "stress-external-token-0f1e2d3c";
 
@@ -80,7 +81,7 @@ async function main() {
       "npx",
       [
         "--yes",
-        "@modelcontextprotocol/conformance",
+        `@modelcontextprotocol/conformance@${CONFORMANCE_VERSION}`,
         "server",
         "--url",
         `http://127.0.0.1:${SERVE_PORT}/mcp`,
@@ -95,7 +96,8 @@ async function main() {
     run = {
       label: "http-server-suite",
       tool: "@modelcontextprotocol/conformance",
-      command: `npx @modelcontextprotocol/conformance server --url http://127.0.0.1:${SERVE_PORT}/mcp --suite active --output-dir ${outDir} --verbose`,
+      version: CONFORMANCE_VERSION,
+      command: `npx @modelcontextprotocol/conformance@${CONFORMANCE_VERSION} server --url http://127.0.0.1:${SERVE_PORT}/mcp --suite active --output-dir ${outDir} --verbose`,
       exitCode: res.status ?? -1,
       durationMs: Date.now() - t,
       ok: res.status === 0,
@@ -113,10 +115,30 @@ async function main() {
   } catch {
     run.resultFiles = [];
   }
+  // Parse per-scenario result files for SUCCESS/FAILURE counts.
+  const counts = { success: 0, failure: 0, warning: 0, scenarios: 0 };
+  try {
+    const { readdirSync, readFileSync, statSync } = await import("node:fs");
+    for (const f of run.resultFiles) {
+      const p = join(outDir, f);
+      if (!statSync(p).isFile() || !f.endsWith(".json")) continue;
+      const d = JSON.parse(readFileSync(p, "utf8"));
+      counts.scenarios++;
+      for (const c of d.checks ?? []) {
+        if (c.status === "SUCCESS") counts.success++;
+        else if (c.status === "FAILURE") counts.failure++;
+        else if (c.status === "WARNING") counts.warning++;
+      }
+    }
+  } catch {
+    /* counts best-effort */
+  }
+  run.counts = counts;
 
   const summary = {
     script: "conformance.mjs",
     tool: "@modelcontextprotocol/conformance",
+    version: CONFORMANCE_VERSION,
     configPath,
     outputDir: outDir,
     runs: [run],

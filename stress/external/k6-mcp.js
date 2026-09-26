@@ -24,7 +24,7 @@
  * (op_initialize, op_tools_list, op_search, op_load, op_execute).
  */
 import http from "k6/http";
-import { check, sleep } from "k6";
+import { check, fail, sleep } from "k6";
 import { Trend } from "k6/metrics";
 import { SharedArray } from "k6/data";
 
@@ -87,6 +87,40 @@ function rpc(method, rpcParams, op) {
   return res;
 }
 
+/**
+ * A response is only a success when HTTP 200 AND the JSON-RPC envelope carries
+ * no error (Action Hub returns application failures inside HTTP 200). The SDK
+ * requires both Accept types but then answers SSE (`event: message` +
+ * `data: {...}`), so parse that envelope too.
+ */
+function parseEnvelope(res) {
+  try {
+    return res.json();
+  } catch {
+    /* fall through to SSE */
+  }
+  const text = String(res.body ?? "");
+  for (const line of text.split("\n")) {
+    if (line.startsWith("data:")) {
+      try {
+        return JSON.parse(line.slice(5).trim());
+      } catch {
+        /* keep scanning */
+      }
+    }
+  }
+  return null;
+}
+
+function rpcOk(res) {
+  if (res.status !== 200) return false;
+  const body = parseEnvelope(res);
+  if (!body) return false;
+  if (body.error) return false;
+  if (body.result?.isError === true) return false;
+  return true;
+}
+
 function hubCall(payload, op) {
   return rpc("tools/call", { name: "action_hub", arguments: payload }, op);
 }
@@ -96,6 +130,9 @@ export const options = Object.assign(
   {
     summaryTrendStats: ["avg", "min", "med", "max", "p(50)", "p(90)", "p(95)", "p(99)"],
     thresholds: {
+      // Fail the run when JSON-RPC-level success rate drops below 99% or
+      // request errors appear — not just on HTTP status.
+      checks: [`rate>0.99`],
       // Recording thresholds — computed into the summary; loose enough not to
       // fail a run whose result we still want to report.
       "op_initialize": [`p(50)<2000`, `p(95)<5000`, `p(99)<10000`],
@@ -140,27 +177,35 @@ export const options = Object.assign(
 export default function () {
   const r = rand();
 
+  // Query/action pools are records `{query: "..."}` / action-id strings per the
+  // contract; normalize defensively so a wrong shape fails loudly instead of
+  // sending objects as query text.
+  const rawQ = QUERIES[Math.floor(r * QUERIES.length)];
+  const query = typeof rawQ === "string" ? rawQ : String(rawQ?.query ?? "");
+  if (!query) fail("empty query in pool");
+  const rawAction = ACTIONS[Math.floor(r * ACTIONS.length)];
+  const actionId = typeof rawAction === "string" ? rawAction : String(rawAction?.action_id ?? rawAction?.id ?? "");
+  if (!actionId) fail("empty action_id in pool");
+
   // 1. initialize
   const init = rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "k6", version: "0" } }, "initialize");
-  check(init, { "initialize 200": (res) => res.status === 200 });
+  check(init, { "initialize rpc-ok": () => rpcOk(init) });
 
   // 2. tools/list
   const list = rpc("tools/list", {}, "tools_list");
-  check(list, { "tools/list 200": (res) => res.status === 200 });
+  check(list, { "tools/list rpc-ok": () => rpcOk(list) });
 
   // 3. action_hub search with a seeded random query
-  const q = QUERIES[Math.floor(r * QUERIES.length)];
-  const search = hubCall({ operation: "search", query: q, limit: 10 }, "search");
-  check(search, { "search 200": (res) => res.status === 200 });
+  const search = hubCall({ operation: "search", query, limit: 10 }, "search");
+  check(search, { "search rpc-ok": () => rpcOk(search) });
 
   // 4. load one action id
-  const actionId = ACTIONS[Math.floor(r * ACTIONS.length)];
   const load = hubCall({ operation: "load", action_id: actionId }, "load");
-  check(load, { "load 200": (res) => res.status === 200 });
+  check(load, { "load rpc-ok": () => rpcOk(load) });
 
   // 5. execute the same action (fixture tools are read-only, cheap)
-  const exec = hubCall({ operation: "execute", action_id: actionId, arguments: { q } }, "execute");
-  check(exec, { "execute 200": (res) => res.status === 200 });
+  const exec = hubCall({ operation: "execute", action_id: actionId, arguments: { q: query } }, "execute");
+  check(exec, { "execute rpc-ok": () => rpcOk(exec) });
 
   sleep(0.2);
 }
