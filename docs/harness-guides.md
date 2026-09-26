@@ -1,223 +1,90 @@
 # Harness Guides
 
-How to connect Action Hub to the coding agents and editors it supports.
+How to connect Action Hub to the harnesses and editors it supports.
 
-Two ways to run Action Hub against a harness:
+## What a harness is
 
-- **Shared daemon (recommended)** — start one hub, then point every harness at
-  the same connection. One hub serves many harnesses at once. See
-  [Shared daemon setup](#shared-daemon-setup).
-- **Per-harness config** — add the Action Hub MCP server directly to each
-  harness's config file. See the sections below.
+A **harness** is the coding agent or editor that talks to Action Hub. Action Hub
+ships a CLI (`ah`) with a `harness` group of commands that installs or updates
+the right MCP / extension configuration for each supported harness, so agent
+sessions automatically see Action Hub's tools.
 
-In both cases the harness talks to the same MCP server entry point:
-
-```
-<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js
-```
-
-Replace `<ABSOLUTE_PATH_TO_ACTION_HUB>` with the absolute path of your Action
-Hub checkout (for example `/Users/me/Projects/action-hub`). Absolute paths are
-required — harnesses launch MCP servers from their own working directory.
-
----
-
-## Shared daemon setup
-
-The daemon is a single long-running hub process that many harnesses can share.
+Check the current list at any time:
 
 ```bash
-# 1. Start the hub in the background
-action-hub daemon start
-
-# 2. Connect each harness to it
-action-hub connect
+ah harness list
 ```
 
-After `daemon start`, run `action-hub connect` — that is the command each
-harness session uses to join the shared hub. Because one daemon serves many
-harnesses, you only configure the connection once per harness and every session
-sees the same tools.
+Currently supported: `claude-code`, `claude-desktop`, `cursor`, `codex`,
+`opencode`, `pi`, `vscode`. (Zed is not yet wired into the CLI — see the
+notes at the end.)
 
 ---
 
 ## Claude Code
 
-Config file: `~/.claude.json` (the project-level `mcpServers` object; the CLI
-also manages this via `claude mcp add`).
-
-```json
-{
-  "mcpServers": {
-    "action-hub": {
-      "command": "node",
-      "args": [
-        "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-      ]
-    }
-  }
-}
+```bash
+ah harness claude-code
 ```
 
-Restart any open Claude Code session, then run `/mcp` inside Claude Code to
-confirm the Action Hub server is connected.
+This edits Claude Code's MCP config (`~/.claude.json` project-level `mcpServers`)
+so Action Hub appears as an MCP server. Restart any open Claude Code session,
+then run `/mcp` inside Claude Code to confirm the Action Hub server is
+connected and its tools are listed.
 
 ## Claude Desktop
 
-Config file (macOS): `~/Library/Application Support/Claude/claude_desktop_config.json`
-(Linux: `~/.config/Claude/claude_desktop_config.json`).
-
-```json
-{
-  "mcpServers": {
-    "action-hub": {
-      "command": "node",
-      "args": [
-        "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-      ]
-    }
-  }
-}
+```bash
+ah harness claude-desktop
 ```
 
-Quit and reopen Claude Desktop fully (⌘Q, not just closing the window), then
-check Settings → Developer → MCP servers.
+Writes the Action Hub MCP server entry into Claude Desktop's
+`claude_desktop_config.json`. Quit and reopen Claude Desktop fully (⌘Q, not
+just closing the window), then check Settings → Developer → MCP servers.
 
 ## Cursor
 
-Config file: `~/.cursor/mcp.json` (user scope) or `.cursor/mcp.json`
-(project scope).
-
-```json
-{
-  "mcpServers": {
-    "action-hub": {
-      "command": "node",
-      "args": [
-        "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-      ]
-    }
-  }
-}
+```bash
+ah harness cursor
 ```
 
-Restart Cursor or reload the window, then open Cursor Settings → MCP to verify
-the server is enabled.
-
-## VS Code
-
-Config file: `.vscode/mcp.json` (project scope) or
-`~/Library/Application Support/Code/User/mcp.json` (user scope, macOS).
-
-```json
-{
-  "servers": {
-    "action-hub": {
-      "command": "node",
-      "args": [
-        "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-      ]
-    }
-  }
-}
-```
-
-Reload the VS Code window (Developer: Reload Window) and check the MCP panel
-for Action Hub.
+Adds the Action Hub MCP server to Cursor's `mcp.json`
+(`~/.cursor/mcp.json` or project `.cursor/mcp.json` depending on scope).
+Restart Cursor or reload the window, then open
+Cursor Settings → MCP to verify the server is green/enabled.
 
 ## Codex
 
-Config file: `~/.codex/config.toml`.
-
-```toml
-[mcp_servers.action-hub]
-command = "node"
-args = [
-  "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-]
+```bash
+ah harness codex
 ```
 
-Restart any running Codex session so it picks up the new server.
+Configures Action Hub for OpenAI Codex CLI via Codex's MCP config
+(`~/.codex/config.toml`). Restart any running Codex session so it picks up the
+new server.
+
+## VS Code
+
+```bash
+ah harness vscode
+```
+
+Installs/updates the Action Hub VS Code extension or writes the MCP server
+config, depending on your Action Hub build. Reload the VS Code window
+(Developer: Reload Window) afterward and check the extension/MCP panel for
+Action Hub.
 
 ## OpenCode / Pi
 
-OpenCode config file: `~/.config/opencode/opencode.json`.
-
-```json
-{
-  "mcp": {
-    "action-hub": {
-      "type": "local",
-      "command": [
-        "node",
-        "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-      ]
-    }
-  }
-}
-```
-
-Pi reads the same style of MCP server config from its provider config
-(`~/.config/pi/config.json`); add the equivalent entry with the same
-`command`/`args` pair above. Restart the running agent session (a new `pi` or
-`opencode` process) so it discovers the Action Hub tools.
-
-## Zed
-
-Config file: `~/.zed/settings.json` (add to the top-level object).
-
-```json
-{
-  "context_servers": {
-    "action-hub": {
-      "source": "custom",
-      "command": "node",
-      "args": [
-        "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-      ]
-    }
-  }
-}
-```
-
-Zed applies settings changes immediately; open the context servers panel to
-verify the Action Hub server starts.
-
-## Windsurf
-
-Config file (macOS): `~/.codeium/windsurf/mcp_config.json`
-(Linux: `~/.codeium/windsurf/mcp_config.json`).
-
-```json
-{
-  "mcpServers": {
-    "action-hub": {
-      "command": "node",
-      "args": [
-        "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"
-      ]
-    }
-  }
-}
-```
-
-Restart Windsurf or reload the window, then check the MCP servers panel for
-Action Hub.
-
----
-
-## Importing existing MCP servers
-
-If you already use other MCP servers in a harness, you can pull them into
-Action Hub once instead of re-adding them everywhere:
-
 ```bash
-action-hub import --write
+ah harness opencode
+# or
+ah harness pi
 ```
 
-`import` reads your existing harness configs and copies their MCP server
-entries into Action Hub. The `--write` flag persists the result; without it the
-import only previews what would be imported.
+OpenCode and Pi both read MCP-style config from their own provider directories;
+the CLI writes the matching entry for each. Restart the running agent session
+(a new `pi` or `opencode` process) so it discovers the Action Hub tools.
 
 ---
 
@@ -227,21 +94,51 @@ From any harness, ask the agent to run a trivial Action Hub tool. From the CLI
 side you can sanity-check registration with:
 
 ```bash
-action-hub doctor
+ah harness list
 ```
-
-`doctor` validates your configuration and checks connectivity to each
-registered server.
 
 ## Troubleshooting
 
 - **Server not showing up** — the config file may live in a different scope
-  (user vs project). Check the exact path for your harness above.
-- **Server fails to start** — run
-  `node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js`
-  by hand to see the error, and confirm the file exists (`npm install &&
-  npm run build` in the repo if it doesn't).
-- **Stale config after moving the repo** — the snippets use absolute paths, so
-  update them after moving or renaming the checkout.
-- **Duplicate entries** — remove any older manual entry before adding the
-  config above.
+  (user vs project). Re-run the harness command and check the path it reports.
+- **Stale config after moving the repo** — if Action Hub was installed from a
+  path that changed, re-run the harness command to rewrite absolute paths.
+- **Duplicate entries** — if you previously configured a harness by hand,
+  remove the manual entry before re-running the command.
+
+## Zed (not yet supported by `ah harness`)
+
+Zed is not currently in the CLI's harness list, so there is no `ah harness
+zed` command. You can still wire Action Hub into Zed manually by adding the
+same MCP server entry the other harnesses use to Zed's `settings.json` under
+`context_servers`. This is untested/unsupported by the CLI — expect to manage
+it by hand until a dedicated harness command ships (see `docs/roadmap.md`).
+
+## Using the shared daemon (recommended for multiple harnesses)
+
+Instead of launching a separate server process per harness, run one hub daemon
+and point every harness at the same endpoint:
+
+```bash
+action-hub daemon start
+```
+
+Then set the command in each harness config to:
+
+```bash
+action-hub connect
+```
+
+`connect` bridges the harness's stdio to the running daemon, so one hub serves
+many harnesses without duplicate processes or duplicated auth.
+
+## Importing your existing MCP servers
+
+If you already have MCP servers configured in Claude Desktop, Cursor, VS Code,
+or elsewhere, pull them into Action Hub once:
+
+```bash
+action-hub import --write
+```
+
+This is a one-time migration; afterwards manage everything through Action Hub.
