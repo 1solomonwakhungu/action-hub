@@ -25,12 +25,15 @@
  * consumed as-is; otherwise this script generates its own smaller fleet in
  * the same format so it can run standalone today.
  *
- * Usage: node stress/cli-scale.mjs [--scale small|full] [--seed 1337] [--keep]
+ * Usage: node stress/cli-scale.mjs [--scale small|full] [--seed 1337]
+ * (seed 0 is valid; unknown --scale values fail loudly with a final summary)
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { userInfo } from "node:os";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 
@@ -56,8 +59,11 @@ const opt = (name, fallback) => {
   return i !== -1 && argv[i + 1] !== undefined ? argv[i + 1] : fallback;
 };
 
-const SCALE = opt("scale", "small") === "full" ? "full" : "small";
-const SEED = Number.parseInt(opt("seed", "1337"), 10) || 1337;
+const SCALE = opt("scale", "small");
+const SEED_ARG = opt("seed");
+// Seed 0 is valid; only an unparseable value is rejected (checked in main so a
+// final JSON summary is always emitted).
+const SEED = SEED_ARG !== undefined ? Number.parseInt(SEED_ARG, 10) : 1337;
 
 // ---------------------------------------------------------------------------
 // Deterministic fixture generation
@@ -78,7 +84,9 @@ const pick = (arr) => arr[Math.floor(rng() * arr.length)];
 
 const SCALES = {
   small: { servers: 8, toolsPerServer: 25, bigServers: 0, bigTools: 0, skills: 40, harnessServersPerConfig: 500 },
-  full: { servers: 40, toolsPerServer: 200, bigServers: 4, bigTools: 500, skills: 5000, harnessServersPerConfig: 2000 },
+  // Exactly the contract fleet: 40 servers x 200 tools + 4 big servers x 500
+  // tools = 44 manifests / 10,000 tools / 5,000 skills.
+  full: { servers: 44, toolsPerServer: 200, bigServers: 4, bigTools: 500, skills: 5000, harnessServersPerConfig: 2000 },
 };
 
 /** Build tool manifests in the contract format; returns the server ids. */
@@ -217,10 +225,25 @@ const FAKE_STDIO_SERVER = [
 ].join("\n") + "\n";
 
 async function main() {
-  console.log("action-hub cli-scale stress — scale=" + SCALE + " seed=" + SEED);
   const t0 = performance.now();
-  await runAll();
-  emitSummary(Math.round(performance.now() - t0));
+  let error = null;
+  try {
+    if (SCALE !== "small" && SCALE !== "full") {
+      throw new Error("Unknown --scale value: " + SCALE + " (expected small|full)");
+    }
+    if (!Number.isFinite(SEED)) {
+      throw new Error("Invalid --seed value: " + SEED_ARG);
+    }
+    console.log("action-hub cli-scale stress — scale=" + SCALE + " seed=" + SEED);
+    await runAll();
+  } catch (err) {
+    error = String((err && err.stack) || err);
+    console.error("cli-scale run failed: " + error);
+  }
+  // The contract requires the final JSON summary on stdout as the last line
+  // even when setup/verification fails, and a nonzero exit when ok is false.
+  const ok = emitSummary(Math.round(performance.now() - t0), error);
+  if (!ok) process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -229,60 +252,177 @@ async function main() {
 
 let env = null; // assigned in runAll(); per-run isolation roots
 
-function isoEnv(configPath) {
+// Every path-bearing isolation variable, per /tmp/action-hub-stress/ISOLATION.md.
+// All resolve under the sandbox home, which itself lives under the run root.
+const ISOLATION_PATH_VARS = [
+  "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+  "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+  "ACTION_HUB_CONFIG", "ACTION_HUB_CACHE", "ACTION_HUB_SKILLS_DIR",
+  "ACTION_HUB_DAEMON_DIR", "ACTION_HUB_CREDENTIALS", "ACTION_HUB_CONTROL",
+  "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR",
+];
+
+/**
+ * ONE complete isolated environment for every child. Inherited values for the
+ * checklist vars are always replaced (never forwarded), for every platform:
+ * HOME and the Windows equivalents (USERPROFILE/APPDATA/LOCALAPPDATA) are all
+ * pinned to the sandbox, so a Windows-style HOME-absent caller cannot leak the
+ * real user profile into discovery or homedir().
+ * baseEnv defaults to process.env but is injectable for the sentinel test.
+ */
+function isoEnv({ home, configPath } = {}, baseEnv = process.env) {
+  if (!home) {
+    if (!env) throw new Error("isoEnv called before run root assignment and without an explicit home");
+    home = env.home;
+  }
+  const under = (rel) => join(home, rel);
   return {
-    ...process.env,
-    HOME: env.home,
-    XDG_CACHE_HOME: env.xdgCache,
-    XDG_CONFIG_HOME: env.xdgConfig,
-    ACTION_HUB_CONFIG: configPath,
-    ACTION_HUB_SKILLS_DIR: env.skillsDir,
-    PI_CODING_AGENT_DIR: join(env.home, "pi-agent"),
+    ...baseEnv,
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: under(join("AppData", "Roaming")),
+    LOCALAPPDATA: under(join("AppData", "Local")),
+    XDG_CACHE_HOME: under(".cache"),
+    XDG_CONFIG_HOME: under(".config"),
+    XDG_STATE_HOME: under(join(".local", "state")),
+    XDG_DATA_HOME: under(join(".local", "share")),
+    ACTION_HUB_CONFIG: configPath ?? under("servers.json"),
+    ACTION_HUB_CACHE: under(join(".cache", "action-hub", "catalog.json")),
+    ACTION_HUB_SKILLS_DIR: under("skills"),
+    ACTION_HUB_DAEMON_DIR: under("daemon"),
+    ACTION_HUB_CREDENTIALS: under("credentials.json"),
+    ACTION_HUB_CONTROL: under("control.sock"),
+    CODEX_HOME: under(".codex"),
+    CLAUDE_CONFIG_DIR: under(".claude"),
+    PI_CODING_AGENT_DIR: under("pi-agent"),
   };
+}
+
+/** Separator-safe containment: is `child` inside `parent`? (path.relative) */
+function pathContains(parent, child) {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/** Sentinel: every path-bearing isolation var must resolve inside `home`. */
+function assertIsoEnv(childEnv, home) {
+  const violations = [];
+  for (const name of ISOLATION_PATH_VARS) {
+    const val = childEnv[name];
+    if (val === undefined) { violations.push(name + " unset"); continue; }
+    if (!pathContains(home, val)) {
+      violations.push(name + "=" + val + " outside " + home);
+    }
+  }
+  if (violations.length > 0) {
+    throw new Error("isolation sentinel violated: " + violations.join("; "));
+  }
+}
+
+/**
+ * Owner-state guard (revised ISOLATION.md): refuse only when the run root
+ * would sit inside the owner's REAL app-state or harness config locations —
+ * never merely for being under home (os.tmpdir() is under USERPROFILE on
+ * Windows). The real home comes from os.userInfo(), independently of $HOME.
+ */
+const OWNER_PROTECTED_DIRS = [
+  ".cache/action-hub", ".config/action-hub", ".action-hub",
+  "Library/Caches/action-hub", "Library/Application Support/action-hub",
+  "AppData/Roaming/action-hub", "AppData/Local/action-hub",
+  ".claude", ".claude.json", ".codex", ".cursor", ".copilot", ".pi", ".vscode",
+];
+
+function insideOwnerProtectedState(runRoot, realHome) {
+  const absRoot = resolve(runRoot);
+  const absHome = resolve(realHome);
+  for (const rel of OWNER_PROTECTED_DIRS) {
+    const protectedDir = join(absHome, rel);
+    if (pathContains(protectedDir, absRoot)) return protectedDir;
+  }
+  return null;
 }
 
 const results = [];
 const flags = [];
+let fixtureSource = "self-generated"; // set in runAll()
+let summaryFixtures = null; // observed fleet counts, set in runAll()
 function flagSlow(step) {
   if (step.ms > SLOW_MS) flags.push({ kind: "slow", step: step.step, ms: step.ms });
   if ((step.stdoutBytes ?? 0) > LARGE_OUTPUT_BYTES) flags.push({ kind: "large-output", step: step.step, bytes: step.stdoutBytes });
 }
 
-function runCli(stepName, args, { configPath, cwd } = {}) {
+// Bounded per-step timeout: no step may hang the run (MUST-FIX 3).
+const STEP_TIMEOUT_MS = 300_000;
+
+/**
+ * Bounded, normalized child spawn. Spawn errors, signals and timeouts all
+ * become failed steps (ok:false with an error field) instead of throwing or
+ * hanging. Exported for the child-failure/timeout regressions.
+ */
+function spawnStep(argv, { cwd, configPath, home, timeoutMs = STEP_TIMEOUT_MS } = {}) {
   const t0 = performance.now();
-  const res = spawnSync(process.execPath, [CLI, ...args], {
-    encoding: "utf8",
-    cwd: cwd ?? env.home,
-    env: isoEnv(configPath),
-    maxBuffer: 256 * 1024 * 1024,
-  });
-  const step = {
-    step: stepName,
-    argv: "action-hub " + args.join(" "),
-    ms: Math.round(performance.now() - t0),
-    exit: res.status,
-    stdoutBytes: res.stdout ? Buffer.byteLength(res.stdout) : 0,
-    stderrBytes: res.stderr ? Buffer.byteLength(res.stderr) : 0,
-    ok: res.status === 0,
-    stdout: res.stdout,
-    stderr: res.stderr,
-  };
-  if (res.stdout) writeFileSync(join(env.runRoot, "logs", step.step.replace(/[\/ ]+/g, "_") + "-" + results.length + ".out"), res.stdout);
-  if (res.stderr) writeFileSync(join(env.runRoot, "logs", step.step.replace(/[\/ ]+/g, "_") + "-" + results.length + ".err"), res.stderr);
+  let res;
+  try {
+    // Direct invocations without a run root (tests) get a throwaway sandbox.
+    const sandboxHome = home ?? (env ? env.home : mkdtempSync(join(tmpdir(), "cli-scale-step-")));
+    res = spawnSync(argv[0], argv.slice(1), {
+      encoding: "utf8",
+      cwd: cwd ?? sandboxHome,
+      env: isoEnv({ home: sandboxHome, configPath }),
+      maxBuffer: 256 * 1024 * 1024,
+      timeout: timeoutMs,
+    });
+  } catch (spawnErr) {
+    return { argv: argv.join(" "), ms: 0, ok: false, error: "spawn failed: " + spawnErr.message };
+  }
+  const step = { argv: argv.join(" "), ms: Math.round(performance.now() - t0) };
+  if (res.error) {
+    step.ok = false;
+    const timedOut = res.error.code === "ETIMEDOUT" || /timed out/i.test(String(res.error.message));
+    step.error = (timedOut ? "timeout after " + timeoutMs + "ms: " : "spawn error: ") + res.error.message;
+    step.timedOut = timedOut;
+  } else if (res.signal) {
+    step.ok = false;
+    step.error = "killed by signal " + res.signal + (res.signal === "SIGTERM" ? " (likely step timeout)" : "");
+  } else {
+    step.exit = res.status;
+    step.ok = res.status === 0;
+    step.stdout = res.stdout ?? "";
+    step.stderr = res.stderr ?? "";
+    step.stdoutBytes = Buffer.byteLength(step.stdout);
+    step.stderrBytes = Buffer.byteLength(step.stderr);
+  }
+  return step;
+}
+
+function runCli(stepName, args, { configPath, cwd } = {}) {
+  const step = spawnStep([process.execPath, CLI, ...args], { configPath, cwd });
+  step.step = stepName;
+  step.argv = "action-hub " + args.join(" ");
+  if (step.stdout && env) writeFileSync(join(env.runRoot, "logs", step.step.replace(/[\/ ]+/g, "_") + "-" + results.length + ".out"), step.stdout);
+  if (step.stderr && env) writeFileSync(join(env.runRoot, "logs", step.step.replace(/[\/ ]+/g, "_") + "-" + results.length + ".err"), step.stderr);
   results.push(step);
   flagSlow(step);
   return step;
 }
 
-function loadQueries(name, fallback) {
+function loadQueries(name, { fallback = [], required = false } = {}) {
   const p = join(GENERATED, name);
-  if (existsSync(p)) {
-    try {
-      const raw = JSON.parse(readFileSync(p, "utf8"));
-      return raw.queries ?? (Array.isArray(raw) ? raw : fallback);
-    } catch { return fallback; }
+  if (!existsSync(p)) {
+    if (required) throw new Error("required query artifact missing: " + name);
+    return fallback;
   }
-  return fallback;
+  let raw;
+  try {
+    raw = JSON.parse(readFileSync(p, "utf8"));
+  } catch (err) {
+    // Malformed generated JSON is a fixture defect: fail loudly rather than
+    // silently swapping in fallback queries and mislabeling the evidence.
+    throw new Error("malformed query artifact " + name + ": " + err.message);
+  }
+  const qs = raw.queries ?? (Array.isArray(raw) ? raw : null);
+  if (!Array.isArray(qs)) throw new Error("query artifact " + name + " has no queries array");
+  return qs;
 }
 
 // ---------------------------------------------------------------------------
@@ -308,8 +448,8 @@ function phaseCliBenchmarks({ configPath, serverIds }) {
     const stepSize = Math.max(1, Math.floor(qs.length / n));
     return qs.filter((_, i) => i % stepSize === 0).slice(0, n);
   };
-  const toolQueries = loadQueries("tools-queries.json", ["list crm contacts", "invoices export", "pipelines reports"]);
-  const skillQueries = loadQueries("skills-queries.json", []);
+  const toolQueries = loadQueries("tools-queries.json", { fallback: ["list crm contacts", "invoices export", "pipelines reports"], required: fixtureSource === "shared" });
+  const skillQueries = loadQueries("skills-queries.json", { fallback: [], required: fixtureSource === "shared" });
   for (const q of sample(toolQueries.map((x) => (typeof x === "string" ? x : x.query)), 10)) {
     runCli("cli.test-search", ["test-search", q], opts);
   }
@@ -433,13 +573,24 @@ function padTomlServers(path, count, targetBytes) {
     out += 'args = ["' + id + '"]\n';
     out += 'env = { PADDING = "' + "x".repeat(256) + '" }\n';
   }
-  while (Buffer.byteLength(out) < targetBytes) {
-    out += '\n[mcp_servers.padding.' + String(out.length).padStart(6, "0") + ']\n';
-    out += 'command = "/bin/echo"\n';
-    out += 'args = ["pad"]\n';
+  // Linear padding: track byte growth incrementally with bounded chunks
+  // (the previous whole-string Buffer.byteLength per iteration was quadratic
+  // and CPU-bound the parent for minutes at 10 MB).
+  let len = Buffer.byteLength(out);
+  if (len < targetBytes) {
+    const filler = "x".repeat(1024);
+    let i = 0;
+    while (len < targetBytes) {
+      const chunk = '\n[mcp_servers.padding.' + String(i).padStart(6, "0") + ']\n' +
+        'command = "/bin/echo"\n' +
+        'args = ["' + filler + '"]\n';
+      out += chunk;
+      len += Buffer.byteLength(chunk);
+      i++;
+    }
   }
   writeFileSync(path, out);
-  return Buffer.byteLength(out);
+  return len;
 }
 
 function phaseHarnessInstall() {
@@ -457,21 +608,13 @@ function phaseHarnessInstall() {
 
   // harness cursor install --write (HOME=cursorHome)
   const t0 = performance.now();
-  const r1 = spawnSync(process.execPath, [CLI, "harness", "cursor", "install", "--write"], {
-    encoding: "utf8", cwd: cursorHome,
-    env: { ...process.env, HOME: cursorHome, XDG_CACHE_HOME: join(env.runRoot, "xdg-cache"), XDG_CONFIG_HOME: join(env.runRoot, "xdg-config"), PI_CODING_AGENT_DIR: join(cursorHome, "pi-agent") },
-    maxBuffer: 256 * 1024 * 1024,
+  const step1 = spawnStep([process.execPath, CLI, "harness", "cursor", "install", "--write"], {
+    cwd: cursorHome,
+    home: cursorHome,
+    configPath: join(env.home, "servers.json"),
   });
-  const step1 = {
-    step: "cli.harness-cursor-install",
-    argv: "action-hub harness cursor install --write (10MB mcp.json)",
-    ms: Math.round(performance.now() - t0),
-    exit: r1.status,
-    stdoutBytes: r1.stdout ? Buffer.byteLength(r1.stdout) : 0,
-    stderrBytes: r1.stderr ? Buffer.byteLength(r1.stderr) : 0,
-    ok: r1.status === 0,
-    stdout: r1.stdout, stderr: r1.stderr,
-  };
+  step1.step = "cli.harness-cursor-install";
+  step1.argv = "action-hub harness cursor install --write (10MB mcp.json)";
   results.push(step1); flagSlow(step1);
 
   // Verify: .bak created, JSON still parses, action-hub entry present, originals intact.
@@ -487,22 +630,13 @@ function phaseHarnessInstall() {
   };
   if (!step1.verify.merged || !bakOk) step1.ok = false;
 
-  const t2 = performance.now();
-  const r2 = spawnSync(process.execPath, [CLI, "harness", "codex", "install", "--write"], {
-    encoding: "utf8", cwd: codexHome,
-    env: { ...process.env, HOME: codexHome, XDG_CACHE_HOME: join(env.runRoot, "xdg-cache"), XDG_CONFIG_HOME: join(env.runRoot, "xdg-config"), PI_CODING_AGENT_DIR: join(codexHome, "pi-agent") },
-    maxBuffer: 256 * 1024 * 1024,
+  const step2 = spawnStep([process.execPath, CLI, "harness", "codex", "install", "--write"], {
+    cwd: codexHome,
+    home: codexHome,
+    configPath: join(env.home, "servers.json"),
   });
-  const step2 = {
-    step: "cli.harness-codex-install",
-    argv: "action-hub harness codex install --write (10MB config.toml)",
-    ms: Math.round(performance.now() - t2),
-    exit: r2.status,
-    stdoutBytes: r2.stdout ? Buffer.byteLength(r2.stdout) : 0,
-    stderrBytes: r2.stderr ? Buffer.byteLength(r2.stderr) : 0,
-    ok: r2.status === 0,
-    stdout: r2.stdout, stderr: r2.stderr,
-  };
+  step2.step = "cli.harness-codex-install";
+  step2.argv = "action-hub harness codex install --write (10MB config.toml)";
   results.push(step2); flagSlow(step2);
 
   const tomlAfter = readFileSync(tomlPath, "utf8");
@@ -522,19 +656,28 @@ function phaseHarnessInstall() {
 // Summary
 // ---------------------------------------------------------------------------
 
-function emitSummary(totalMs) {
+function emitSummary(totalMs, error = null) {
   const steps = results.map(({ stdout, stderr, ...rest }) => rest);
+  const stepOk = steps.every((s) => s.ok === undefined || s.ok === true);
   const summary = {
     scale: SCALE,
     seed: SEED,
     thresholds: { slowMs: SLOW_MS, largeOutputBytes: LARGE_OUTPUT_BYTES },
+    fixtures: summaryFixtures,
     totalMs,
     steps,
     flags,
-    ok: steps.every((s) => s.ok === undefined || s.ok === true),
+    error,
+    // A run with failed measured commands (or a setup/verification exception)
+    // is NOT ok, and main() exits nonzero on it.
+    ok: stepOk && error === null,
   };
-  mkdirSync(RESULTS_DIR, { recursive: true });
-  writeFileSync(join(RESULTS_DIR, "cli-scale.json"), JSON.stringify(summary, null, 2) + "\n");
+  try {
+    mkdirSync(RESULTS_DIR, { recursive: true });
+    writeFileSync(join(RESULTS_DIR, "cli-scale.json"), JSON.stringify(summary, null, 2) + "\n");
+  } catch (writeErr) {
+    console.error("could not write results file: " + writeErr.message);
+  }
   console.log("\n--- per-step measurements ---");
   for (const s of steps) {
     if (s.note !== undefined) { console.log("[note] " + s.step + ": " + s.note); continue; }
@@ -549,16 +692,69 @@ function emitSummary(totalMs) {
   console.log("\n--- flags (slow > " + SLOW_MS + "ms, output > " + LARGE_OUTPUT_BYTES + "B) ---");
   console.log(flags.length === 0 ? "(none)" : JSON.stringify(flags, null, 2));
   console.log(JSON.stringify(summary));
+  return summary.ok;
 }
 
 // Exposed for stress/cli-scale.test.mjs (determinism + fake-server handshake).
-export const __test = { writeToolManifests, buildConfigSkills, writeSkillFixtures, FAKE_STDIO_SERVER, SCALES, reseed: (seed) => { rng = mulberry32(seed); } };
+export const __test = {
+  writeToolManifests, buildConfigSkills, writeSkillFixtures, FAKE_STDIO_SERVER, SCALES,
+  isoEnv, assertIsoEnv, ISOLATION_PATH_VARS, spawnStep, padTomlServers, padJsonServers,
+  pathContains, insideOwnerProtectedState,
+  observeFleet, validateFleet, expectedFleet,
+  reseed: (seed) => { rng = mulberry32(seed); },
+};
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((err) => {
     console.error(String((err && err.stack) || err));
     process.exit(1);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Fleet observation + validation (MUST-FIX 2)
+// ---------------------------------------------------------------------------
+
+/** Read the config and count the ACTUAL server/tool/skill corpus. */
+function observeFleet(configPath) {
+  const cfg = JSON.parse(readFileSync(configPath, "utf8"));
+  if (!Array.isArray(cfg.servers) || cfg.servers.length === 0) {
+    throw new Error("fixture config has no servers");
+  }
+  let tools = 0;
+  for (const srv of cfg.servers) {
+    const args = (srv.transport && srv.transport.args) || [];
+    const i = args.indexOf("--manifest");
+    if (i === -1 || !args[i + 1]) {
+      throw new Error("server " + srv.id + " has no --manifest arg in its transport");
+    }
+    const manifestPath = resolve(REPO_ROOT, args[i + 1]);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (!Array.isArray(manifest.tools) || manifest.tools.length === 0) {
+      throw new Error("manifest for server " + srv.id + " (" + manifestPath + ") has no tools");
+    }
+    tools += manifest.tools.length;
+  }
+  const skills = Array.isArray(cfg.skills) ? cfg.skills.length : 0;
+  return { servers: cfg.servers.length, tools, skills };
+}
+
+/** Fail loudly unless the observed corpus is exactly the expected fleet. */
+function validateFleet(observed, expected) {
+  for (const k of ["servers", "tools", "skills"]) {
+    if (observed[k] !== expected[k]) {
+      throw new Error("fixture fleet mismatch: observed " + k + "=" + observed[k] + ", expected " + expected[k]);
+    }
+  }
+}
+
+function expectedFleet() {
+  // Shared corpus IS the contract fleet regardless of --scale (there is no
+  // small shared corpus); only the self-generated fallback differs.
+  if (fixtureSource === "shared" || SCALE === "full") {
+    return { servers: 44, tools: 10_000, skills: 5_000 };
+  }
+  return { servers: 8, tools: 200, skills: 40 }; // small fallback fleet
 }
 
 // ---------------------------------------------------------------------------
@@ -581,30 +777,62 @@ async function runAll() {
 
   // Isolated run root under stress/.generated/cli-scale/ (never committed).
   const runRoot = join(GENERATED, "cli-scale");
+  // Owner-state guard (revised ISOLATION.md): refuse only when the run root
+  // lands inside the owner's real app-state/harness dirs; being under home
+  // alone is fine (os.tmpdir() is under USERPROFILE on Windows).
+  const realHome = userInfo().homedir;
+  const protectedDir = insideOwnerProtectedState(runRoot, realHome);
+  if (protectedDir) {
+    throw new Error("refusing to run: run root " + runRoot + " is inside owner-protected " + protectedDir);
+  }
   rmSync(runRoot, { recursive: true, force: true });
   const home = join(runRoot, "home");
-  const xdgCache = join(runRoot, "xdg-cache");
-  const xdgConfig = join(runRoot, "xdg-config");
-  const skillsDir = join(runRoot, "skills");
-  for (const d of [home, xdgCache, xdgConfig, skillsDir, join(runRoot, "logs")]) mkdirSync(d, { recursive: true });
-  env = { runRoot, home, xdgCache, xdgConfig, skillsDir };
-  env = { runRoot, home, xdgCache, xdgConfig, skillsDir };
+  for (const d of [home, join(home, ".cache"), join(home, ".config"), join(home, "skills"), join(runRoot, "logs")]) {
+    mkdirSync(d, { recursive: true });
+  }
+  env = { runRoot, home };
+
+  // Sentinel: the env every child will get must be fully sandboxed.
+  assertIsoEnv(isoEnv({ home }), home);
 
   // Fixtures: prefer the shared generators' corpus in stress/.generated
   // (tools/*.json + skills/ + servers.json from make-config.mjs); fall back to
-  // self-generated small fixtures in the same contract format.
+  // self-generated small fixtures in the same contract format. Shared fixtures
+  // are validated (every manifest parses and has tools; query artifacts exist);
+  // a partial or stale corpus fails loudly instead of producing mislabeled
+  // evidence.
   const sharedToolsDir = join(GENERATED, "tools");
   const sharedServersJson = join(GENERATED, "servers.json");
   const sharedSkills = join(GENERATED, "skills");
-  const sharedReady = existsSync(sharedServersJson) && existsSync(sharedToolsDir) &&
+  let serverIds, configSkills, configPath;
+  const sharedCandidates = existsSync(sharedServersJson) && existsSync(sharedToolsDir) &&
     readdirSync(sharedToolsDir).some((f) => f.endsWith(".json") && f !== "tools-queries.json");
-  let serverIds, configSkills, configPath, skillSlugs;
-  if (sharedReady) {
-    env.skillsDir = sharedSkills;
+  if (sharedCandidates) {
+    fixtureSource = "shared";
     console.log("using shared fixtures from stress/.generated (tools + skills + servers.json)");
     const base = JSON.parse(readFileSync(sharedServersJson, "utf8"));
+    if (!Array.isArray(base.servers) || base.servers.length === 0) {
+      throw new Error("shared servers.json has no servers array");
+    }
+    // Validate every configured server's manifest (parses, has tools).
+    for (const srv of base.servers) {
+      const args = (srv.transport && srv.transport.args) || [];
+      const i = args.indexOf("--manifest");
+      if (i === -1) throw new Error("shared config server " + srv.id + " has no --manifest arg");
+      const manifest = JSON.parse(readFileSync(resolve(REPO_ROOT, args[i + 1]), "utf8"));
+      if (!Array.isArray(manifest.tools) || manifest.tools.length === 0) {
+        throw new Error("shared manifest for " + srv.id + " has no tools");
+      }
+    }
+    // Skills tree + query artifacts are required in shared mode.
+    if (!existsSync(sharedSkills) || readdirSync(sharedSkills).filter((d) => existsSync(join(sharedSkills, d, "SKILL.md"))).length === 0) {
+      throw new Error("shared skills tree missing or empty at " + sharedSkills);
+    }
+    loadQueries("tools-queries.json", { required: true });
+    loadQueries("skills-queries.json", { required: true });
+
     serverIds = base.servers.map((srv) => srv.id);
-    // Merge the 5K skills corpus into the config so `list --kind skill` and
+    // Merge the skills corpus into the config so `list --kind skill` and
     // test-search exercise them (make-config emits servers only).
     configSkills = parseSkillFrontmatters(sharedSkills);
     configPath = join(runRoot, "servers-with-skills.json");
@@ -635,13 +863,26 @@ async function runAll() {
     }, null, 2));
   }
 
-  const totalTools = cfg.servers * (cfg.servers > cfg.bigServers && cfg.bigServers > 0
-    ? (cfg.toolsPerServer * (cfg.servers - cfg.bigServers) + cfg.bigTools * cfg.bigServers) / cfg.servers
-    : cfg.toolsPerServer);
-  console.log("fixtures: " + cfg.servers + " servers, ~" + totalTools + " tools, " + configSkills.length + " skills, " +
+  // Derive ACTUAL counts from the selected fixtures and fail loudly on any
+  // mismatch with the expected fleet (full = exactly 44/10,000/5,000).
+  const observed = observeFleet(configPath);
+  const expected = expectedFleet();
+  validateFleet(observed, expected);
+  summaryFixtures = { source: fixtureSource, ...observed };
+  console.log("fixtures (" + fixtureSource + "): " + observed.servers + " servers, " +
+    observed.tools + " tools, " + observed.skills + " skills, " +
     cfg.harnessServersPerConfig + " servers per harness config for import/migrate");
 
-  phaseCliBenchmarks({ configPath, serverIds });
-  phaseImportMigrate({ perConfig: cfg.harnessServersPerConfig });
-  phaseHarnessInstall();
+  try {
+    phaseCliBenchmarks({ configPath, serverIds });
+    phaseImportMigrate({ perConfig: cfg.harnessServersPerConfig });
+    phaseHarnessInstall();
+  } finally {
+    // Best-effort cleanup of fake servers OUR worktree spawned (path-scoped so
+    // other agents' identically-named processes are untouched).
+    try {
+      spawnSync("/usr/bin/pkill", ["-f", join(REPO_ROOT, "stress", "fake-mcp-server.mjs")]);
+      spawnSync("/usr/bin/pkill", ["-f", join(runRoot, "fake-stdio-server.mjs")]);
+    } catch { /* best effort */ }
+  }
 }
