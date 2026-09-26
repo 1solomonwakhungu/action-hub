@@ -3,6 +3,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { context, propagation } from "@opentelemetry/api";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { StringDecoder } from "node:string_decoder";
 import { HUB_HTTP_TOKEN_ENV_VAR } from "@action-hub/copilot-mcp";
 import {
   applyNodeMemoryLimit,
@@ -51,11 +52,7 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
 
     if (config.transport.type === "stdio") {
       const stdioTransport = transport as StdioClientTransport;
-      stdioTransport.stderr?.on("data", (chunk: Buffer | string) => {
-        const safe = sanitizeErrorForServer(config, chunk.toString());
-        if (options.onWarning) options.onWarning(`${config.id}: ${safe.trimEnd()}`);
-        else process.stderr.write(safe);
-      });
+      attachSanitizedStderr(stdioTransport, config, options);
     }
 
     try {
@@ -93,6 +90,67 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     } satisfies McpClient;
   };
 };
+
+/**
+ * Buffer cap for a child stderr line without newlines. Beyond this the
+ * partial line is sanitized and flushed as-is rather than buffering
+ * unboundedly (fail closed: an over-long line is more likely to carry
+ * secrets than to be meaningful output).
+ */
+const MAX_PENDING_STDERR_BYTES = 8 * 1024;
+
+/**
+ * Pipe a stdio server's stderr and re-emit it sanitized.
+ *
+ * Sanitization is line-buffered, not per-chunk: a secret the child writes in
+ * pieces (or that Node splits across chunk boundaries) must be assembled
+ * before exact-value replacement runs. UTF-8 sequences split across chunks
+ * are decoded correctly via StringDecoder; a final partial line is flushed
+ * when the stream ends or closes. The listener stays attached for the
+ * transport's lifetime so the SDK's PassThrough is always drained.
+ */
+function attachSanitizedStderr(
+  transport: StdioClientTransport,
+  config: ServerConfig,
+  options: SdkClientFactoryOptions,
+): void {
+  const stream = transport.stderr;
+  if (!stream) return;
+
+  const emit = (safe: string): void => {
+    if (options.onWarning) options.onWarning(`${config.id}: ${safe.trimEnd()}`);
+    else process.stderr.write(safe);
+  };
+
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  let flushed = false;
+
+  const flush = (): void => {
+    if (flushed) return;
+    flushed = true;
+    const tail = pending + decoder.end();
+    pending = "";
+    if (tail.length > 0) emit(sanitizeErrorForServer(config, tail));
+  };
+
+  stream.on("data", (chunk: Buffer | string) => {
+    pending += decoder.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    let newlineIndex: number;
+    while ((newlineIndex = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, newlineIndex);
+      pending = pending.slice(newlineIndex + 1);
+      emit(`${sanitizeErrorForServer(config, line)}\n`);
+    }
+    if (pending.length > MAX_PENDING_STDERR_BYTES) {
+      emit(sanitizeErrorForServer(config, pending));
+      pending = "";
+    }
+  });
+  stream.on("end", flush);
+  stream.on("close", flush);
+  stream.on("error", flush);
+}
 
 function buildTransport(
   config: ServerConfig,
