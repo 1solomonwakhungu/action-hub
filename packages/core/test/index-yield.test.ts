@@ -100,14 +100,12 @@ test("indexAll embeds cooperatively: yields between chunks and serves the event 
   // 8000 documents at chunk size 250 => at least 31 chunk boundaries.
   assert.ok(yields.length >= 31, `expected >= 31 yields, got ${yields.length}`);
   assert.ok(ticks > 0, "event loop heartbeat never fired during indexAll");
-  // Bounded stall (FX/D1-R3): preprocessing is chunked too, so time to the
-  // first yield — and every max event-loop stall between heartbeats — is
-  // bounded by roughly one chunk of work plus scheduler noise, not by the
-  // corpus size. 250ms leaves >50x headroom over the measured chunk cost
-  // (a chunk of 250 wordy records describes/embeds in ~2-4ms).
-  const timeToFirstYield = yields[0] - t0;
-  assert.ok(timeToFirstYield < 250, `first yield took ${timeToFirstYield.toFixed(1)}ms — preprocessing is not chunked`);
-  assert.ok(maxStallMs < 250, `max event-loop stall was ${maxStallMs.toFixed(1)}ms during indexAll`);
+  // Wall-clock stall bounds live in stress/index-stall-bench.mjs (generous,
+  // contention-tolerant thresholds in a dedicated perf script) after the
+  // in-suite absolute bound went red under root-suite CPU contention
+  // (D1-R4). Here we keep the structural evidence: many yields + a live
+  // heartbeat prove the rebuild did not run as one blocking pass.
+  assert.ok(ticks > 5, `heartbeat fired only ${ticks} times during indexAll`);
 });
 
 test("a search during a paused rebuild stays bounded and the event loop stays live", async () => {
@@ -125,19 +123,48 @@ test("a search during a paused rebuild stays bounded and the event loop stays li
   while (gate.paused() === 0) await new Promise((done) => setImmediate(done));
   assert.equal(hub.catalog.size, 2 * PER_SERVER, "catalog is populated while the semantic rebuild is still parked");
 
-  // The catalog is empty mid-rebuild here, so every candidate would be a
-  // "changed" record: the pre-rework build lazily embedded all of them in one
-  // synchronous pass. With the fix the scorer refuses to embed while a
-  // rebuild is in flight, so the search stays bounded.
+  // Deterministic boundedness evidence (D1-R4): with the fix, the scorer
+  // refuses to embed while a rebuild is in flight, so the semantic channel
+  // contributes EXACTLY zero — the paused search's ids AND scores must be
+  // identical to a pure-BM25 (semanticScorer: null) reference over the same
+  // catalog. The pre-rework build lazily embedded the whole corpus here,
+  // producing nonzero semantic scores and a different ranking. No wall-clock
+  // thresholds: those went red under root-suite CPU contention with no
+  // correctness regression (measured separately in stress/index-stall-bench.mjs).
   let served = false;
   setImmediate(() => (served = true));
-  const started = performance.now();
-  const hits = await hub.search("deploy pipeline stage 3", { limit: 5 });
-  const elapsed = performance.now() - started;
-  assert.ok(Array.isArray(hits), "search must complete during the rebuild");
-  assert.ok(elapsed < 250, `search during rebuild took ${elapsed.toFixed(1)}ms — lazy full-corpus embed starved the loop`);
+  const paused = await hub.search("deploy pipeline stage 3", { limit: 5 });
+  assert.ok(Array.isArray(paused), "search must complete during the rebuild");
   await new Promise((done) => setImmediate(done));
   assert.ok(served, "setImmediate never fired — event loop starved during search");
+
+  const { factory: referenceFactory } = makeFactory(bigClients(PER_SERVER));
+  const reference = new ActionHub({
+    servers: makeServers(),
+    clientFactory: referenceFactory,
+    semanticScorer: null,
+  });
+  await reference.indexAll();
+  const lexical = await reference.search("deploy pipeline stage 3", { limit: 5 });
+  assert.deepEqual(
+    paused.map((hit) => hit.id),
+    lexical.map((hit) => hit.id),
+    "paused-rebuild search ranking diverged from pure BM25 — lazy embedding ran during the rebuild",
+  );
+  // Score-level proof: the hub's engine emits normalized blended scores
+  // (lexical*(1-w) + semantic*w, w=0.2) while the reference emits raw BM25.
+  // With the semantic channel contributing exactly zero, paused/reference is
+  // ONE constant ratio across every hit; any lazy embedding would give
+  // per-document semantic scores and break the constancy.
+  const ratios = paused.map((hit, i) => hit.score / lexical[i].score);
+  const k = ratios[0];
+  assert.ok(Number.isFinite(k) && k > 0, "paused/reference score ratio must be finite and positive");
+  ratios.forEach((r, i) => {
+    assert.ok(
+      Math.abs(r - k) < 1e-9,
+      `score ratio varies at rank ${i} (${r} vs ${k}) — lazy embedding ran during the rebuild`,
+    );
+  });
 
   gate.releaseAll();
   gate.auto();

@@ -219,5 +219,19 @@ test("microbench: warm per-query cost collapses (no per-query corpus tokenizatio
       `cold/warm per-doc cost ${coldPerDoc.toFixed(4)} vs ${warmPerDoc.toFixed(4)} (${JSON.stringify(timings)})`,
     );
   }
-  assert.ok(timings[1].warmMs < 60, `warm 10k-doc query took ${timings[1].warmMs.toFixed(2)}ms`);
+  // Contention-tolerant bounds only (D1-R4): absolute wall-clock thresholds
+  // went red under normal root-suite CPU contention with no regression. The
+  // warm path is the same scan as cold minus tokenization/stats, so same-run
+  // relative bounds carry the information:
+  //  - warm 10k must scale sub-quadratically vs warm 2k (it is O(n), ~5x);
+  //  - warm 10k must stay below half the cold 10k cost (the collapsed
+  //    constant is the actual claim).
+  assert.ok(
+    timings[1].warmMs < timings[0].warmMs * 10,
+    `warm 10k (${timings[1].warmMs.toFixed(2)}ms) vs warm 2k (${timings[0].warmMs.toFixed(2)}ms) scaled too steeply`,
+  );
+  assert.ok(
+    timings[1].warmMs < timings[1].coldMs * 0.5,
+    `warm 10k (${timings[1].warmMs.toFixed(2)}ms) not clearly below cold 10k (${timings[1].coldMs.toFixed(2)}ms)`,
+  );
 });
