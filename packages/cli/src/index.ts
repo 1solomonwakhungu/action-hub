@@ -332,7 +332,14 @@ async function main(): Promise<void> {
       case "daemon": {
         const subcommand = positional[0];
         if (subcommand === "start") {
-          exitCode = await daemonStartCommand({ configPath });
+          const startTimeoutVal =
+            typeof parsedArgs["start-timeout"] === "string"
+              ? Number.parseInt(parsedArgs["start-timeout"], 10)
+              : undefined;
+          exitCode = await daemonStartCommand({
+            configPath,
+            ...(Number.isFinite(startTimeoutVal) ? { startTimeoutMs: startTimeoutVal } : {}),
+          });
         } else if (subcommand === "status") {
           exitCode = await daemonStatusCommand({ configPath });
         } else if (subcommand === "stop") {
