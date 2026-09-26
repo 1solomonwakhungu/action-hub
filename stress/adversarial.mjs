@@ -317,10 +317,13 @@ writeFileSync(
 // ---------------------------------------------------------------------------
 // Load into ActionHub in-process with a fake clientFactory.
 // ---------------------------------------------------------------------------
-function withTimeout(promise, ms, label) {
+async function withTimeout(promise, ms, label) {
   let timer;
   try {
-    return Promise.race([
+    // await INSIDE the try: the finally block must run only after the race
+    // settles, otherwise clearTimeout would fire synchronously and disable
+    // timeout enforcement entirely.
+    return await Promise.race([
       promise,
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error(`TIMEOUT after ${ms}ms in ${label}`)), ms);
@@ -418,6 +421,7 @@ const stats = {
   skillsLoadMs: load.skillsMs ?? null,
   skillsDiscovered: load.skillsDiscovered ?? null,
   skillDiscoveryWarnings: load.discoverWarnings ?? null,
+  skillIdCollisions: load.discoverWarnings ?? null,
   cases: [],
   notes: [],
 };
@@ -428,8 +432,10 @@ if (load.hub) {
 
   // Per-case isolation: an isolated hub per case holding ONLY that case's
   // tools, so index time and crash status are attributable to the case.
+  // Skill attribution is NOT per-case: skills live in the aggregate
+  // "skills-directory" row below (see the note in stress/adversarial-SAMPLE.md).
   for (const c of cases) {
-    const row = { name: c.name, toolCount: c.tools.length, skillCount: c.skills.length };
+    const row = { name: c.name, toolCount: c.tools.length, skillCount: 0 };
     const caseTools = manifest.tools.filter((t) => c.tools.includes(t.name));
     try {
       const caseHub = new ActionHub({
@@ -452,8 +458,10 @@ if (load.hub) {
   }
 
   // Skills directory, isolated: discovery + registration time and crash status.
+  // Aggregate-only: all generated skills (regardless of which tool case they
+  // thematically belong to) are measured together in this single row.
   try {
-    const row = { name: "skills-directory", toolCount: 0, skillCount: skills.length };
+    const row = { name: "skills-directory", aggregateOnly: true, toolCount: 0, skillCount: skills.length };
     const skillsHub = new ActionHub({
       servers: [config],
       clientFactory: async () => new FakeClient([]),
@@ -672,7 +680,13 @@ if (stats.contextSanity && stats.contextSanity.bytesPerEstimatedToken < 1) {
   surprises.push(`eagerTokensEstimate looks inflated: ${stats.context.eagerTokensEstimate} tokens for ${stats.contextSanity.catalogJsonBytes}B of catalog JSON (${stats.contextSanity.bytesPerEstimatedToken} B/token)`);
 }
 if (stats.skillDiscoveryWarnings) {
-  surprises.push(`${stats.skillDiscoveryWarnings} skills silently dropped at discovery (duplicate normalized ids, e.g. zero-width name collisions)`);
+  const renamed = (load.discoverWarningSample ?? []).some((w) => w.includes("renaming")) ||
+    stats.skillIdCollisions > 0;
+  if (stats.skillsDiscovered !== null && stats.skillsDiscovered < stats.skillCount) {
+    surprises.push(`${stats.skillCount - stats.skillsDiscovered} skills silently dropped at discovery`);
+  } else if (renamed) {
+    surprises.push(`${stats.skillDiscoveryWarnings} skill id collisions resolved by deterministic suffix rename (no skills dropped)`);
+  }
 }
 for (const [label, probeRes] of Object.entries(stats.unicodeProbes ?? {})) {
   if (probeRes.crashed) surprises.push(`unicode probe "${label}" crashed: ${probeRes.error}`);
