@@ -26,6 +26,23 @@ test("daemon shares one hub across authenticated clients and recovers stale stat
     ...process.env,
     ACTION_HUB_DAEMON_DIR: daemonDir,
     ACTION_HUB_CONFIG: configPath,
+    // F20: keep spawned CLI children inside the temp root too — the complete
+    // ISOLATION.md checklist, with file-shaped vars pointing at files.
+    HOME: root,
+    USERPROFILE: root,
+    APPDATA: join(root, "AppData", "Roaming"),
+    LOCALAPPDATA: join(root, "AppData", "Local"),
+    XDG_CACHE_HOME: join(root, ".cache"),
+    XDG_CONFIG_HOME: join(root, ".config"),
+    XDG_STATE_HOME: join(root, ".local", "state"),
+    XDG_DATA_HOME: join(root, ".local", "share"),
+    ACTION_HUB_CACHE: join(root, ".cache", "action-hub", "catalog.json"),
+    ACTION_HUB_CREDENTIALS: join(root, ".local", "state", "credentials.json"),
+    ACTION_HUB_CONTROL: join(root, "control.json"),
+    ACTION_HUB_SKILLS_DIR: join(root, "skills"),
+    PI_CODING_AGENT_DIR: join(root, "pi"),
+    CODEX_HOME: join(root, ".codex"),
+    CLAUDE_CONFIG_DIR: join(root, ".claude"),
   });
 
   await mkdir(daemonDir, { recursive: true, mode: 0o700 });
@@ -64,6 +81,45 @@ test("daemon shares one hub across authenticated clients and recovers stale stat
   const previousConfig = process.env["ACTION_HUB_CONFIG"];
   process.env["ACTION_HUB_DAEMON_DIR"] = daemonDir;
   process.env["ACTION_HUB_CONFIG"] = configPath;
+  // F20: the daemon child inherits this process's environment; pin the
+  // complete ISOLATION.md checklist at this temp root so the catalog cache,
+  // skills dir, config discovery and harness dirs can never reach the real
+  // user home.
+  const isolationNames = [
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_DATA_HOME",
+    "ACTION_HUB_CACHE",
+    "ACTION_HUB_CREDENTIALS",
+    "ACTION_HUB_CONTROL",
+    "ACTION_HUB_SKILLS_DIR",
+    "PI_CODING_AGENT_DIR",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+  ] as const;
+  const previousIsolation = isolationNames.map(
+    (name) => [name, process.env[name]] as const,
+  );
+  process.env["HOME"] = root;
+  process.env["USERPROFILE"] = root;
+  process.env["APPDATA"] = join(root, "AppData", "Roaming");
+  process.env["LOCALAPPDATA"] = join(root, "AppData", "Local");
+  process.env["XDG_CACHE_HOME"] = join(root, ".cache");
+  process.env["XDG_CONFIG_HOME"] = join(root, ".config");
+  process.env["XDG_STATE_HOME"] = join(root, ".local", "state");
+  process.env["XDG_DATA_HOME"] = join(root, ".local", "share");
+  process.env["ACTION_HUB_CACHE"] = join(root, ".cache", "action-hub", "catalog.json");
+  process.env["ACTION_HUB_CREDENTIALS"] = join(root, ".local", "state", "credentials.json");
+  process.env["ACTION_HUB_CONTROL"] = join(root, "control.json");
+  process.env["ACTION_HUB_SKILLS_DIR"] = join(root, "skills");
+  process.env["PI_CODING_AGENT_DIR"] = join(root, "pi");
+  process.env["CODEX_HOME"] = join(root, ".codex");
+  process.env["CLAUDE_CONFIG_DIR"] = join(root, ".claude");
 
   const clients: Client[] = [];
   try {
@@ -116,6 +172,9 @@ test("daemon shares one hub across authenticated clients and recovers stale stat
     }
     restoreEnv("ACTION_HUB_DAEMON_DIR", previousDir);
     restoreEnv("ACTION_HUB_CONFIG", previousConfig);
+    for (const [name, value] of previousIsolation) {
+      restoreEnv(name, value);
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
