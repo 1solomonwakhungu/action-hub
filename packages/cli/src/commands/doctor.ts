@@ -15,6 +15,12 @@ export interface DoctorOptions {
   checkConnectivity?: boolean;
 }
 
+/** Settle delay before a retry attempt (deterministic, bounded). */
+const RETRY_SETTLE_MS = 250;
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function describeTransport(transport: ServerConfig["transport"]): string {
   if (transport.type === "stdio") {
     return `${transport.command} ${(redactArgs(transport.args) ?? []).join(" ")}`;
@@ -72,43 +78,77 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
 
   try {
     console.log("\nServer Connectivity & Indexing Status:");
-    const indexResults = await hub.indexAll();
+    // Deterministic rule (F17): a fleet with flapping servers used to make the
+    // doctor exit 0 or 1 depending on check timing — a single-shot index or
+    // health probe could land inside a flap window. Each server therefore gets
+    // a bounded number of attempts (one retry after a settle delay) and the
+    // probes run serially, so the exit code is explainable: 1 iff any enabled
+    // server is still down at check time after the retry.
+    const indexResults: { serverId: string; indexed: number; error?: string; attempts: number }[] = [];
+    for (const res of await hub.indexAll()) {
+      if (res.error && config.servers.find((s) => s.id === res.serverId)?.enabled !== false) {
+        await delay(RETRY_SETTLE_MS);
+        const retry = await hub.indexServer(res.serverId);
+        indexResults.push({ ...retry, attempts: 2 });
+        continue;
+      }
+      indexResults.push({ ...res, attempts: 1 });
+    }
 
     for (const res of indexResults) {
       const srv = config.servers.find((s) => s.id === res.serverId);
       const transportType = srv?.transport.type ?? "unknown";
       // Secret-bearing args and URL query values are redacted for display.
       const transportDesc = srv ? describeTransport(srv.transport) : "";
+      // Distinguish a server that came back on the retry from one that is
+      // still down after it — the label must not claim recovery that the
+      // final attempt did not deliver.
+      const attemptNote =
+        res.attempts > 1 ? (res.error ? " (still failing after retry)" : " (recovered on retry)") : "";
 
       if (res.error) {
         criticalFailures++;
-        console.log(`  ✖ [${res.serverId}] (${transportType}) ${transportDesc}`);
+        console.log(`  ✖ [${res.serverId}] (${transportType}) ${transportDesc}${attemptNote}`);
         // Error text may echo the server's own configuration (URLs, args,
         // env); every secret value is redacted before printing.
         console.log(`    Error: ${srv ? sanitizeErrorForServer(srv, res.error) : res.error}`);
       } else {
-        console.log(`  ✔ [${res.serverId}] (${transportType}) ${res.indexed} tools indexed`);
+        console.log(`  ✔ [${res.serverId}] (${transportType}) ${res.indexed} tools indexed${attemptNote}`);
       }
     }
 
     // 5. Latency & Health Probing
     if (options.checkConnectivity !== false && indexResults.some((r) => !r.error)) {
       console.log("\nProbing Server Latency & Health:");
-      const healthResults = await hub.checkAllHealth();
+      // Serial, bounded, one retry: probe each enabled server once; on a
+      // failure, settle briefly and probe once more. The final attempt decides.
+      const healthResults = [];
+      for (const srv of config.servers) {
+        const first = await hub.checkHealth(srv.id);
+        if (first.status === "ready" || first.status === "disabled") {
+          healthResults.push({ ...first, attempts: 1 });
+          continue;
+        }
+        await delay(RETRY_SETTLE_MS);
+        const second = await hub.checkHealth(srv.id);
+        healthResults.push({ ...second, attempts: 2 });
+      }
       for (const h of healthResults) {
         const srv = config.servers.find((s) => s.id === h.serverId);
         if (srv?.enabled === false || h.status === "disabled") {
           console.log(`  ℹ [${h.serverId}] intentionally disabled; health probe skipped`);
           continue;
         }
+        const attemptNote =
+          h.attempts > 1 ? (h.status === "ready" ? " (recovered on retry)" : ` (${h.attempts} attempts)`) : "";
         if (h.status === "ready") {
-          console.log(`  ✔ [${h.serverId}] Status: ${h.status} (${h.latencyMs ?? 0}ms latency)`);
+          console.log(`  ✔ [${h.serverId}] Status: ${h.status} (${h.latencyMs ?? 0}ms latency)${attemptNote}`);
         } else {
           criticalFailures++;
           const detail = h.error
             ? (srv ? sanitizeErrorForServer(srv, h.error) : h.error)
             : "";
-          console.log(`  ✖ [${h.serverId}] Status: ${h.status} ${detail ? `(${detail})` : ""}`);
+          console.log(`  ✖ [${h.serverId}] Status: ${h.status} (${h.attempts} attempts) ${detail ? `(${detail})` : ""}`);
         }
       }
     }
