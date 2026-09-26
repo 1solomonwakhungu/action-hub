@@ -692,6 +692,10 @@ export class ActionHub {
           span.setAttribute(ACTION_HUB_ATTRIBUTES.STATUS, "ok");
           span.setAttribute(ACTION_HUB_ATTRIBUTES.EXECUTION_DURATION_MS, durationMs);
           span.setAttribute(ACTION_HUB_ATTRIBUTES.RESPONSE_PAYLOAD_SIZE_BYTES, respSize);
+          // A successful downstream call proves the transport is alive: reset
+          // the execute-failure streak so isolated connection failures between
+          // healthy calls cannot accumulate into an open circuit.
+          this.#connections.recordSuccess(record.serverId, durationMs);
           if (approved) {
             span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS, "approved");
           }
@@ -720,6 +724,15 @@ export class ActionHub {
           const message = cause instanceof Error ? cause.message : String(cause);
           const isTimeout = message.includes("timed out after");
           const isCircuit = message.includes("Circuit breaker open");
+
+          // Feed transport/connection failures back into the circuit breaker.
+          // reportExecuteFailure counts only errors tagged at the client
+          // boundary as transport-level (see isTransportFailure): JSON-RPC
+          // error responses and isError results from a live server are ignored,
+          // and the breaker's recovery (drop + restart) never blocks on close.
+          if (!isTimeout && !isCircuit) {
+            await this.#connections.reportExecuteFailure(record.serverId, cause, message);
+          }
 
           span.setAttribute(
             ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS,

@@ -4,7 +4,9 @@ import { ConnectionManager } from "../dist/servers/connection-manager.js";
 import { computeRestartBackoffMs } from "../dist/servers/restart-backoff.js";
 import { applyNodeMemoryLimit, isNodeStdioCommand } from "../dist/servers/node-memory.js";
 import type { ServerConfig } from "../dist/types.js";
-import { FakeClient } from "./fakes.ts";
+import { FakeClient, makeFactory } from "./fakes.ts";
+import { ActionHub } from "../dist/action-hub.js";
+import type { McpClient } from "../dist/types.js";
 
 class FakeClock {
   nowMs = 1_000_000;
@@ -482,4 +484,291 @@ test("Node memory limit injection skips non-Node commands and existing flags", (
   assert.equal(isNodeStdioCommand("node.exe"), true);
   assert.equal(isNodeStdioCommand("C:\\\\Program Files\\\\nodejs\\\\node.exe"), true);
   assert.equal(isNodeStdioCommand("python"), false);
+});
+
+// ---------------------------------------------------------------------------
+// F16: execute-time connection errors trip the circuit breaker
+// ---------------------------------------------------------------------------
+
+// Helper: calls through the manager's wrapped client and returns the thrown cause.
+async function clientWrapperCall(manager: ConnectionManager, id: string, tool: string): Promise<unknown> {
+  const client = await manager.activate(id);
+  try {
+    await client.callTool(tool, {});
+    throw new Error("expected callTool to reject");
+  } catch (cause) {
+    if (cause instanceof Error && cause.message === "expected callTool to reject") throw cause;
+    return cause;
+  }
+}
+
+test("transport failures are positively marked; uncoded/unknown errors are never tagged", async () => {
+  const { isTransportFailure, markTransportFailure, ToolError } = await import("../dist/servers/connection-manager.js");
+  assert.equal(isTransportFailure(new Error("Not connected to Slack workspace. Authenticate this integration first.")), false, "uncoded plain error text is never transport");
+  assert.equal(isTransportFailure(markTransportFailure(new Error("Not connected"))), true, "positively marked error is transport");
+  assert.equal(isTransportFailure(new ToolError("tool failed")), false, "ToolError is never transport");
+  const clock = new FakeClock();
+  const client = new FakeClient([
+    { name: "t1", description: "dies at transport layer", inputSchema: { type: "object" } },
+    { name: "t2", description: "returns a JSON-RPC error", inputSchema: { type: "object" } },
+  ]);
+  let mode: "transport" | "epipe" | "jsonrpc" = "transport";
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async (...args: unknown[]) => {
+    if (mode === "epipe") {
+      const e: Error & { errno?: string } = new Error("write EPIPE");
+      e.errno = "EPIPE";
+      throw e;
+    }
+    if (mode === "transport") throw new Error("Stdio transport closed unexpectedly");
+    const e: Error & { code?: number } = new Error("Not connected to Slack workspace. Authenticate this integration first.");
+    e.code = -32000;
+    throw e;
+  };
+  const manager = new ConnectionManager((async () => client) as unknown as Parameters<typeof ConnectionManager["prototype"]["activate"]> extends never ? never : never, [server("t")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  await manager.activate("t");
+  mode = "transport";
+  const transportCause = await clientWrapperCall(manager, "t", "t1").catch((c) => c);
+  assert.equal(transportCause instanceof Error, true);
+  assert.equal(isTransportFailure(transportCause), false, "uncoded plain error must NOT be tagged (positive rule only)");
+  mode = "epipe";
+  const epipeCause = await clientWrapperCall(manager, "t", "t1").catch((c) => c);
+  assert.equal(isTransportFailure(epipeCause), true, "transport errno is positively tagged by the wrapper backstop");
+  mode = "jsonrpc";
+  const jsonrCause = await clientWrapperCall(manager, "t", "t2").catch((c) => c);
+  assert.equal(isTransportFailure(jsonrCause), false, "coded JSON-RPC error must NOT be tagged");
+});
+
+test("reportExecuteFailure: consecutive marked transport failures open the circuit, release the client, and restart after cooldown", async () => {
+  const clock = new FakeClock();
+  let alive = true; // the child dies mid-flight after a healthy start
+  const underlying = new FakeClient([{ name: "ping", description: "pings", inputSchema: { type: "object" } }], () => {
+    if (!alive) {
+      // Simulates the adapter's positive marking of a dead transport.
+      const e = new Error("Not connected");
+      (e as Error & { errno?: string }).errno = "EPIPE";
+      throw e;
+    }
+    return "ok:ping";
+  });
+  const factory = async (): Promise<McpClient> => {
+    if (!alive) throw new Error("spawn failed: child process exited with code 1");
+    return underlying;
+  };
+  const manager = new ConnectionManager(factory, [server("dead")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  await manager.activate("dead");
+  assert.equal(manager.states()[0]!.circuitState, "closed");
+  alive = false;
+  let lastCause: unknown;
+  for (let i = 0; i < 3; i++) {
+    lastCause = await clientWrapperCall(manager, "dead", "ping");
+    await manager.reportExecuteFailure("dead", lastCause, (lastCause as Error).message);
+  }
+  const open = manager.states()[0]!;
+  assert.equal(open.circuitState, "open");
+  assert.equal(open.consecutiveFailures, 3);
+  assert.equal(underlying.closed, true, "stale client must be released once the breaker opens");
+  assert.ok(open.nextRestartAt !== undefined, "a restart must be scheduled");
+  await clock.advance(3_000); // restart fires while the server is still dead
+  assert.equal(manager.states()[0]!.circuitState, "open");
+  alive = true;
+  await clock.advance(4_000); // failed attempt re-armed the cooldown; clear it fully
+  await clock.drain();
+  const recovered = manager.states()[0]!;
+  assert.equal(recovered.circuitState, "closed");
+  assert.equal(recovered.consecutiveFailures, 0);
+});
+
+test("a successful execute resets the failure streak (alternating failures must not open the circuit)", async () => {
+  const clock = new FakeClock();
+  let fail = true;
+  const client = new FakeClient([{ name: "flaky_pipe", description: "alternates", inputSchema: { type: "object" } }]);
+  const rawCall = client.callTool.bind(client);
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async (...args: unknown[]) => {
+    if (fail) {
+      fail = false;
+      const e: Error & { errno?: string } = new Error("write EPIPE");
+      e.errno = "EPIPE";
+      throw e;
+    }
+    fail = true;
+    return rawCall(args[0] as string, args[1] as Record<string, unknown>, args[2]);
+  };
+  const manager = new ConnectionManager(async () => client, [server("alt")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  await manager.activate("alt");
+  for (let i = 0; i < 3; i++) {
+    const cause = await clientWrapperCall(manager, "alt", "flaky_pipe");
+    await manager.reportExecuteFailure("alt", cause, (cause as Error).message);
+    // successful call in between resets the streak
+    const wrapped = await manager.activate("alt");
+    await wrapped.callTool("flaky_pipe", {});
+    manager.recordSuccess("alt", 1);
+  }
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "closed", "alternating failures are not consecutive");
+  assert.equal(st.consecutiveFailures, 0);
+  assert.equal(client.closed, false);
+});
+
+test("free-form tool error text can never open the circuit (JSON-RPC coded errors are tool-level)", async () => {
+  const clock = new FakeClock();
+  const client = new FakeClient([{ name: "send_message", description: "slack-like", inputSchema: { type: "object" } }]);
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async () => {
+    const e: Error & { code?: number } = new Error("Not connected to Slack workspace. Authenticate this integration first.");
+    e.code = -32000; // live server JSON-RPC error response
+    throw e;
+  };
+  const manager = new ConnectionManager(async () => client, [server("live")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  await manager.activate("live");
+  for (let i = 0; i < 5; i++) {
+    const cause = await clientWrapperCall(manager, "live", "send_message");
+    await manager.reportExecuteFailure("live", cause, (cause as Error).message);
+  }
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "closed", "tool-level error text must not trip the breaker");
+  assert.equal(st.consecutiveFailures, 0);
+  assert.equal(client.closed, false, "a live server's client must be retained");
+});
+
+test("a threshold execute failure returns promptly even when close() never settles", async () => {
+  const clock = new FakeClock();
+  const client = new FakeClient([{ name: "t", description: "d", inputSchema: { type: "object" } }]);
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async () => {
+    const e: Error & { errno?: string } = new Error("Stdio transport closed unexpectedly");
+    e.errno = "ERR_STREAM_DESTROYED"; // positive transport signal
+    throw e;
+  };
+  (client as unknown as { close: () => Promise<void> }).close = () => new Promise<void>(() => {}); // never settles
+  // Real timers: the bounded background close must not need a clock advance.
+  const manager = new ConnectionManager(async () => client, [server("stuck")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+    now: clock.now, random: clock.random,
+  });
+  await manager.activate("stuck");
+  const cause = await clientWrapperCall(manager, "stuck", "t");
+  const t0 = Date.now();
+  await manager.reportExecuteFailure("stuck", cause, "Stdio transport closed unexpectedly");
+  await manager.reportExecuteFailure("stuck", cause, "Stdio transport closed unexpectedly");
+  // Third failure opens the circuit and must not hang on the never-settling close.
+  await manager.reportExecuteFailure("stuck", cause, "Stdio transport closed unexpectedly");
+  assert.ok(Date.now() - t0 < 250, "threshold failure must return without awaiting close");
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "open");
+  assert.ok(st.nextRestartAt !== undefined, "restart scheduled despite unbounded close");
+  assert.equal(client.closed, false, "close is left to the bounded background task");
+});
+
+test("execute-time connection errors trip the breaker without waiting for the heartbeat", async () => {
+  const clock = new FakeClock();
+  let calls = 0;
+  const factory = async (): Promise<McpClient> => {
+    calls += 1;
+    return new FakeClient([
+      { name: "do_thing", description: "does a thing", inputSchema: { type: "object" } },
+    ], (name) => {
+      calls += 1;
+      if (calls <= 2) return `ok:${name}`;
+      // Simulates the adapter positively marking a dead transport.
+      const e = new Error("Not connected");
+      (e as Error & { errno?: string }).errno = "EPIPE";
+      throw e;
+    });
+  };
+  const hub = new ActionHub({
+    servers: [server("dead")],
+    clientFactory: factory,
+    resilience: {
+      failureThreshold: 3,
+      cooldownMs: 3_000,
+      heartbeat: { enabled: false },
+      restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+      now: clock.now,
+      random: clock.random,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+    defaultTimeoutMs: 5_000,
+  });
+  await hub.indexAll();
+
+  // Calls 1-2 succeed, then the child dies: every later call fails instantly.
+  const good = await hub.execute("dead:do_thing", {});
+  assert.equal(good.ok, true);
+  for (let i = 0; i < 3; i++) {
+    const result = await hub.execute("dead:do_thing", {});
+    assert.equal(result.ok, false);
+  }
+  const [broken] = hub.serverStates();
+  assert.equal(broken!.circuitState, "open");
+  assert.ok(broken!.nextRestartAt !== undefined, "restart scheduled from execute failures");
+
+  // Free-form uncoded error text from a live server must NOT trip the breaker:
+  // 3 plain "Not connected" tool errors leave the circuit closed.
+  const textyClient = new FakeClient([
+    { name: "chatty", description: "fails with text", inputSchema: { type: "object" } },
+  ], () => { throw new Error("Not connected to Slack workspace. Authenticate this integration first."); });
+  const texty = new ActionHub({
+    servers: [server("chatty")],
+    clientFactory: makeFactory({ chatty: textyClient }).factory,
+    resilience: {
+      failureThreshold: 3,
+      cooldownMs: 3_000,
+      heartbeat: { enabled: false },
+      now: clock.now,
+      random: clock.random,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+    defaultTimeoutMs: 5_000,
+  });
+  await texty.indexAll();
+  for (let i = 0; i < 5; i++) {
+    const r = await texty.execute("chatty:chatty", {});
+    assert.equal(r.ok, false);
+  }
+  const [textyState] = texty.serverStates();
+  assert.equal(textyState!.circuitState, "closed", "uncoded tool error text must not trip the breaker");
+  assert.equal(textyClient.closed, false);
+  texty.close();
+
+  // A tool-level isError result from a live server must NOT trip the breaker.
+  const erroringClient = new FakeClient([
+    { name: "flaky", description: "returns isError", inputSchema: { type: "object" } },
+  ], () => ({ isError: true, content: [{ type: "text", text: "nope" }] }));
+  const live = new ActionHub({
+    servers: [server("live")],
+    clientFactory: makeFactory({ live: erroringClient }).factory,
+    resilience: {
+      failureThreshold: 3,
+      cooldownMs: 3_000,
+      heartbeat: { enabled: false },
+      now: clock.now,
+      random: clock.random,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+    defaultTimeoutMs: 5_000,
+  });
+  await live.indexAll();
+  for (let i = 0; i < 5; i++) {
+    await live.execute("live:flaky", {});
+  }
+  const [liveState] = live.serverStates();
+  assert.equal(liveState!.circuitState, "closed", "tool isError must not trip the breaker");
+  assert.equal(erroringClient.closed, false);
+  hub.close();
+  live.close();
 });

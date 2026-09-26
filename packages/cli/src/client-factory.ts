@@ -1,6 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { classifyDownstreamError, ToolError } from "@action-hub/core";
 import { context, propagation } from "@opentelemetry/api";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { StringDecoder } from "node:string_decoder";
@@ -55,6 +57,17 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
       attachSanitizedStderr(stdioTransport, config, options);
     }
 
+    // Positively track transport closure so callTool rejections can be
+    // classified as transport-level (F16): a dead transport is exactly where
+    // the SDK surfaces plain, uncoded errors that must trip the breaker,
+    // while tool-level failures must not.
+    let transportClosed = false;
+    const priorOnClose = transport.onclose?.bind(transport);
+    transport.onclose = () => {
+      transportClosed = true;
+      priorOnClose?.();
+    };
+
     try {
       await client.connect(transport);
     } catch (cause) {
@@ -76,9 +89,25 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
 
       async callTool(name: string, args: Record<string, unknown>, callOptions?: CallToolOptions) {
         return activeHeaders.run(callOptions?.headers, async () => {
-          const response = await client.callTool({ name, arguments: args });
+          const response = await client
+            .callTool({ name, arguments: args })
+            .catch((cause: unknown) => {
+            // A coded McpError from a LIVE transport is a JSON-RPC error
+            // response — tool-level, even when its code/message looks like a
+            // connection error (a listening server can throw
+            // McpError(-32000, "Connection closed") from application code).
+            // But the same McpError arriving after transport.onclose is the
+            // SDK surfacing a real closed transport, so it is classified
+            // (and marked) with the non-spoofable transportClosed evidence.
+            if (cause instanceof McpError && !transportClosed) throw cause;
+            // Positively-identified transport failures are marked for the
+            // circuit breaker; unknown/uncoded errors stay unmarked.
+            throw classifyDownstreamError(cause, transportClosed);
+          });
           if (response.isError === true) {
-            throw new Error(renderError(response.content));
+            // Tool-level failure from a live server: typed so the circuit
+            // breaker can never confuse it with a dead transport.
+            throw new ToolError(renderError(response.content));
           }
           return response.content;
         });

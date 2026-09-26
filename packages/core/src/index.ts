@@ -15,6 +15,13 @@ export type { SemanticScorer } from "./search/search.js";
 export { LocalSemanticIndex, createLocalSemanticScorer } from "./search/semantic.js";
 export type { LocalSemanticOptions, SemanticIndexStats } from "./search/semantic.js";
 export { ConnectionManager } from "./servers/connection-manager.js";
+export {
+  classifyDownstreamError,
+  isTransportFailure,
+  markTransportFailure,
+  ToolError,
+  TRANSPORT_ERRNOS,
+} from "./servers/transport-errors.js";
 export type {
   CircuitBreakerOptions,
   ConnectionManagerHooks,
