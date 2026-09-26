@@ -6,6 +6,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { HUB_HTTP_TOKEN_ENV_VAR } from "./http-server.js";
 import {
   applyNodeMemoryLimit,
+  classifyDownstreamError,
   createHttpAuthBinding,
   type CallToolOptions,
   type JsonSchema,
@@ -13,7 +14,9 @@ import {
   type McpClientFactory,
   type ServerConfig,
   type TokenStore,
+  ToolError,
 } from "@action-hub/core";
+import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 const CLIENT_INFO = { name: "action-hub", version: "0.1.0" } as const;
 
@@ -37,6 +40,16 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     const client = new Client(CLIENT_INFO, { capabilities: {} });
     const transport = buildTransport(config, options, () => activeHeaders.getStore());
 
+    // Positively track transport closure so callTool rejections can be
+    // classified as transport-level (F16): tool-level failures must never
+    // trip the breaker, a dead transport must.
+    let transportClosed = false;
+    const priorOnClose = transport.onclose?.bind(transport);
+    transport.onclose = () => {
+      transportClosed = true;
+      priorOnClose?.();
+    };
+
     await client.connect(transport);
 
     return {
@@ -54,9 +67,30 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
 
       async callTool(name: string, args: Record<string, unknown>, callOptions?: CallToolOptions) {
         return activeHeaders.run(callOptions?.headers, async () => {
-          const response = await client.callTool({ name, arguments: args });
+          const response = await client
+            .callTool({ name, arguments: args })
+            .catch((cause: unknown) => {
+            // The SDK signals a closed transport as McpError -32000
+            // "Connection closed" — that code is itself the positive
+            // transport-level signal.
+            if (
+              cause instanceof McpError &&
+              (cause as McpError).code === -32000 &&
+              /connection closed/i.test((cause as McpError).message)
+            ) {
+              throw classifyDownstreamError(cause, true);
+            }
+            // Any other coded McpError is a JSON-RPC error response from a
+            // live server: tool-level, never counts against the breaker.
+            if (cause instanceof McpError) throw cause;
+            // Positively-identified transport failures are marked for the
+            // circuit breaker; unknown/uncoded errors stay unmarked.
+            throw classifyDownstreamError(cause, transportClosed);
+          });
           if (response.isError === true) {
-            throw new Error(renderError(response.content));
+            // Tool-level failure from a live server: typed so the circuit
+            // breaker can never confuse it with a dead transport.
+            throw new ToolError(renderError(response.content));
           }
           return response.content;
         });

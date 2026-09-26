@@ -502,15 +502,23 @@ async function clientWrapperCall(manager: ConnectionManager, id: string, tool: s
   }
 }
 
-test("transport failures are tagged at the client boundary; JSON-RPC coded errors are not", async () => {
-  const { isTransportFailure } = await import("../dist/servers/connection-manager.js");
+test("transport failures are positively marked; uncoded/unknown errors are never tagged", async () => {
+  const { isTransportFailure, markTransportFailure, ToolError } = await import("../dist/servers/connection-manager.js");
+  assert.equal(isTransportFailure(new Error("Not connected to Slack workspace. Authenticate this integration first.")), false, "uncoded plain error text is never transport");
+  assert.equal(isTransportFailure(markTransportFailure(new Error("Not connected"))), true, "positively marked error is transport");
+  assert.equal(isTransportFailure(new ToolError("tool failed")), false, "ToolError is never transport");
   const clock = new FakeClock();
   const client = new FakeClient([
     { name: "t1", description: "dies at transport layer", inputSchema: { type: "object" } },
     { name: "t2", description: "returns a JSON-RPC error", inputSchema: { type: "object" } },
   ]);
-  let mode: "transport" | "jsonrpc" = "transport";
+  let mode: "transport" | "epipe" | "jsonrpc" = "transport";
   (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async (...args: unknown[]) => {
+    if (mode === "epipe") {
+      const e: Error & { errno?: string } = new Error("write EPIPE");
+      e.errno = "EPIPE";
+      throw e;
+    }
     if (mode === "transport") throw new Error("Stdio transport closed unexpectedly");
     const e: Error & { code?: number } = new Error("Not connected to Slack workspace. Authenticate this integration first.");
     e.code = -32000;
@@ -524,17 +532,25 @@ test("transport failures are tagged at the client boundary; JSON-RPC coded error
   mode = "transport";
   const transportCause = await clientWrapperCall(manager, "t", "t1").catch((c) => c);
   assert.equal(transportCause instanceof Error, true);
-  assert.equal(isTransportFailure(transportCause), true, "plain transport error must be tagged");
+  assert.equal(isTransportFailure(transportCause), false, "uncoded plain error must NOT be tagged (positive rule only)");
+  mode = "epipe";
+  const epipeCause = await clientWrapperCall(manager, "t", "t1").catch((c) => c);
+  assert.equal(isTransportFailure(epipeCause), true, "transport errno is positively tagged by the wrapper backstop");
   mode = "jsonrpc";
   const jsonrCause = await clientWrapperCall(manager, "t", "t2").catch((c) => c);
   assert.equal(isTransportFailure(jsonrCause), false, "coded JSON-RPC error must NOT be tagged");
 });
 
-test("reportExecuteFailure: consecutive transport failures open the circuit, release the client, and restart after cooldown", async () => {
+test("reportExecuteFailure: consecutive marked transport failures open the circuit, release the client, and restart after cooldown", async () => {
   const clock = new FakeClock();
   let alive = true; // the child dies mid-flight after a healthy start
   const underlying = new FakeClient([{ name: "ping", description: "pings", inputSchema: { type: "object" } }], () => {
-    if (!alive) throw new Error("Not connected"); // dead child: transport-level
+    if (!alive) {
+      // Simulates the adapter's positive marking of a dead transport.
+      const e = new Error("Not connected");
+      (e as Error & { errno?: string }).errno = "EPIPE";
+      throw e;
+    }
     return "ok:ping";
   });
   const factory = async (): Promise<McpClient> => {
@@ -575,7 +591,12 @@ test("a successful execute resets the failure streak (alternating failures must 
   const client = new FakeClient([{ name: "flaky_pipe", description: "alternates", inputSchema: { type: "object" } }]);
   const rawCall = client.callTool.bind(client);
   (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async (...args: unknown[]) => {
-    if (fail) { fail = false; throw new Error("write EPIPE"); }
+    if (fail) {
+      fail = false;
+      const e: Error & { errno?: string } = new Error("write EPIPE");
+      e.errno = "EPIPE";
+      throw e;
+    }
     fail = true;
     return rawCall(args[0] as string, args[1] as Record<string, unknown>, args[2]);
   };
@@ -625,7 +646,9 @@ test("a threshold execute failure returns promptly even when close() never settl
   const clock = new FakeClock();
   const client = new FakeClient([{ name: "t", description: "d", inputSchema: { type: "object" } }]);
   (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async () => {
-    throw new Error("Stdio transport closed unexpectedly");
+    const e: Error & { errno?: string } = new Error("Stdio transport closed unexpectedly");
+    e.errno = "ERR_STREAM_DESTROYED"; // positive transport signal
+    throw e;
   };
   (client as unknown as { close: () => Promise<void> }).close = () => new Promise<void>(() => {}); // never settles
   // Real timers: the bounded background close must not need a clock advance.
@@ -658,7 +681,10 @@ test("execute-time connection errors trip the breaker without waiting for the he
     ], (name) => {
       calls += 1;
       if (calls <= 2) return `ok:${name}`;
-      throw new Error("Not connected");
+      // Simulates the adapter positively marking a dead transport.
+      const e = new Error("Not connected");
+      (e as Error & { errno?: string }).errno = "EPIPE";
+      throw e;
     });
   };
   const hub = new ActionHub({
@@ -688,6 +714,35 @@ test("execute-time connection errors trip the breaker without waiting for the he
   const [broken] = hub.serverStates();
   assert.equal(broken!.circuitState, "open");
   assert.ok(broken!.nextRestartAt !== undefined, "restart scheduled from execute failures");
+
+  // Free-form uncoded error text from a live server must NOT trip the breaker:
+  // 3 plain "Not connected" tool errors leave the circuit closed.
+  const textyClient = new FakeClient([
+    { name: "chatty", description: "fails with text", inputSchema: { type: "object" } },
+  ], () => { throw new Error("Not connected to Slack workspace. Authenticate this integration first."); });
+  const texty = new ActionHub({
+    servers: [server("chatty")],
+    clientFactory: makeFactory({ chatty: textyClient }).factory,
+    resilience: {
+      failureThreshold: 3,
+      cooldownMs: 3_000,
+      heartbeat: { enabled: false },
+      now: clock.now,
+      random: clock.random,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+    defaultTimeoutMs: 5_000,
+  });
+  await texty.indexAll();
+  for (let i = 0; i < 5; i++) {
+    const r = await texty.execute("chatty:chatty", {});
+    assert.equal(r.ok, false);
+  }
+  const [textyState] = texty.serverStates();
+  assert.equal(textyState!.circuitState, "closed", "uncoded tool error text must not trip the breaker");
+  assert.equal(textyClient.closed, false);
+  texty.close();
 
   // A tool-level isError result from a live server must NOT trip the breaker.
   const erroringClient = new FakeClient([

@@ -15,6 +15,19 @@ import {
   DEFAULT_BACKOFF_JITTER,
   DEFAULT_BACKOFF_MAX_MS,
 } from "./restart-backoff.js";
+import {
+  isTransportFailure,
+  markTransportFailure,
+  TRANSPORT_ERRNOS,
+  ToolError,
+} from "./transport-errors.js";
+
+export {
+  classifyDownstreamError,
+  isTransportFailure,
+  markTransportFailure,
+  ToolError,
+} from "./transport-errors.js";
 
 export interface CircuitBreakerOptions {
   failureThreshold?: number;
@@ -83,24 +96,6 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
  * makes a hundred configured integrations free until used.
  */
 /**
- * Marker set on errors thrown by a wrapped client's callTool that could not
- * have come from the tool/JSON-RPC layer: no numeric error code (a JSON-RPC
- * error response always carries one) and no McpError type. Only such errors
- * are transport/connection failures for the circuit breaker; free-form tool
- * error text can never open the circuit.
- */
-const TRANSPORT_FAILURE = Symbol("action-hub.transportFailure");
-
-/** True when `cause` was tagged as a transport-level callTool failure. */
-export function isTransportFailure(cause: unknown): boolean {
-  return (
-    typeof cause === "object" &&
-    cause !== null &&
-    TRANSPORT_FAILURE in (cause as Record<symbol, unknown>)
-  );
-}
-
-/**
  * Wraps a client so execute-time callTool rejections are classified at the
  * boundary instead of by message text. Errors carrying a numeric `code` or an
  * McpError-style type are JSON-RPC/tool-layer responses from a live server
@@ -114,16 +109,9 @@ function tagTransportFailures(client: McpClient): McpClient {
       try {
         return await client.callTool(name, args, options);
       } catch (cause) {
-        const code = (cause as { code?: unknown } | null)?.code;
-        const name_ = (cause as { name?: unknown } | null)?.name;
-        const toolLayer =
-          typeof code === "number" || code === "TOOL_ERROR" || name_ === "McpError";
-        if (!toolLayer && cause instanceof Error) {
-          try {
-            (cause as unknown as Record<symbol, unknown>)[TRANSPORT_FAILURE] = true;
-          } catch {
-            // A frozen error cannot be tagged; treat as tool-layer.
-          }
+        const errno = (cause as { errno?: unknown } | null)?.errno;
+        if (typeof errno === "string" && TRANSPORT_ERRNOS.has(errno)) {
+          throw markTransportFailure(cause as Error);
         }
         throw cause;
       }
