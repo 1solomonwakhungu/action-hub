@@ -944,3 +944,47 @@ test("setEnabled(false) during an in-flight activation leaves status disabled wi
   assert.equal(st.consecutiveFailures, 0, "manual shutdown records no failure");
   assert.equal(st.circuitState, "closed");
 });
+
+test("a cooperative factory's abort rejection is bookkept exactly once (1,2,3)", async () => {
+  const clock = new FakeClock();
+  const factory = (_config: ServerConfig, options?: { signal?: AbortSignal }): Promise<McpClient> =>
+    new Promise((_, reject) => {
+      options?.signal?.addEventListener("abort", () => reject(new Error("activation aborted")), { once: true });
+    });
+  const manager = new ConnectionManager(factory, [{ ...server("coop"), timeoutMs: 100 }], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  for (let i = 0; i < 3; i++) {
+    const attempt = manager.activate("coop").catch((e: Error) => e.message);
+    await clock.advance(200);
+    await attempt;
+    const st = manager.states()[0]!;
+    assert.equal(st.consecutiveFailures, i + 1, `timeout ${i + 1} must count exactly once`);
+  }
+  assert.equal(manager.states()[0]!.circuitState, "open", "opens on exactly the 3rd timeout");
+});
+
+test("connectWithDeadline: never-settling client.close still closes the transport and returns promptly", async () => {
+  const keepAlive = setTimeout(() => {}, 10_000); // bounded-close timers are unref'd by design
+  const { connectWithDeadline } = await import("../dist/servers/activation-deadline.js");
+  let transportClosed = false;
+  const controller = new AbortController();
+  const client = {
+    connect: () =>
+      new Promise<void>((_, reject) => {
+        controller.signal.addEventListener("abort", () => reject(new Error("activation timed out")), { once: true });
+      }),
+    close: () => new Promise<void>(() => undefined), // never settles
+  };
+  const transport = { close: async () => { transportClosed = true; } };
+  const t0 = Date.now();
+  const attempt = connectWithDeadline(client, transport, controller.signal).catch((e: Error) => e.message);
+  setTimeout(() => controller.abort(new Error("activation timed out")), 50);
+  const message = await attempt;
+  assert.match(message, /timed out/);
+  assert.equal(transportClosed, true, "transport.close must run even when client.close never settles");
+  assert.ok(Date.now() - t0 < 3_500, "bounded close must not wait on the never-settling close");
+  clearTimeout(keepAlive);
+});

@@ -400,6 +400,21 @@ export class ConnectionManager {
     });
 
     let pendingRef: Promise<McpClient> | undefined;
+    // Deadline bookkeeping must happen EXACTLY once regardless of which
+    // rejection arrives first: a cooperative factory rejects on the abort
+    // (inner catch) before the timer race rejects (outer catch).
+    let deadlineBookkept = false;
+    const bookkeepDeadline = (message: string): void => {
+      if (deadlineBookkept) return;
+      deadlineBookkept = true;
+      entry.generation += 1;
+      if (entry.pending === pendingRef) entry.pending = undefined;
+      this.recordFailure(serverId, message);
+      entry.status = "unreachable";
+      // Schedule AFTER the pending handle is cleared: scheduleRestart
+      // refuses while a pending activation exists.
+      this.#scheduleRestart(entry);
+    };
     const pending = (async (): Promise<McpClient> => {
       try {
         const client = await this.#factory(config, { signal: controller.signal });
@@ -429,15 +444,17 @@ export class ConnectionManager {
       } catch (cause) {
         clearDeadline();
         if (entry.pending === pendingRef) entry.pending = undefined;
+        // Deadline bookkeeping is centralized (bookkeepDeadline is
+        // exactly-once) and takes precedence: a cooperative factory's abort
+        // rejection arrives HERE before the timer race rejects. Manual
+        // shutdown aborts are skipped entirely (no failure recorded, no
+        // status overwrite).
+        if (controller.signal.aborted && !isShutdownAbort(controller.signal)) {
+          bookkeepDeadline(cause instanceof Error ? cause.message : String(cause));
+          throw cause;
+        }
         if (entry.generation !== generation) throw cause;
         this.recordFailure(serverId, cause instanceof Error ? cause.message : String(cause));
-        // A deadline miss must never gate startup again: until a deliberate
-        // retry succeeds, the server is unreachable (same surface state as a
-        // tripped breaker). Circuit accumulation still applies. Manual
-        // shutdown aborts must not overwrite disabled/inactive state.
-        if (controller.signal.aborted && !isShutdownAbort(controller.signal)) {
-          entry.status = "unreachable";
-        }
         this.#scheduleRestart(entry);
         throw cause;
       }
@@ -450,18 +467,9 @@ export class ConnectionManager {
     } catch (cause) {
       const deadlineExpired = controller.signal.aborted && !isShutdownAbort(controller.signal);
       if (deadlineExpired) {
-        // The inner catch is skipped by the generation bump below, so THIS
-        // catch owns the deadline bookkeeping exactly once: a failure
-        // recorded through the same circuit/restart state machine as any
-        // other activation failure (F27 — repeated timeouts must trip the
-        // breaker, not just flip a status field).
-        entry.generation += 1;
-        if (entry.pending === pendingRef) entry.pending = undefined;
-        this.recordFailure(serverId, cause instanceof Error ? cause.message : String(cause));
-        entry.status = "unreachable";
-        // Schedule AFTER the pending handle is cleared: scheduleRestart
-        // refuses while a pending activation exists.
-        this.#scheduleRestart(entry);
+        // The factory may have rejected on the abort BEFORE this timer race
+        // did (inner catch) — bookkeepDeadline is exactly-once either way.
+        bookkeepDeadline(cause instanceof Error ? cause.message : String(cause));
       }
       if (controller.signal.aborted) {
         // Deadline or manual shutdown: drop the pending handle so a later
