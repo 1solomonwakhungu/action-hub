@@ -47,24 +47,11 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     const client = new Client(CLIENT_INFO, { capabilities: {} });
     const transport = buildTransport(config, options, () => activeHeaders.getStore());
 
-<<<<<<< Updated upstream
     try {
       await client.connect(transport);
     } catch (cause) {
       throw describeConnectFailure(config, cause);
     }
-=======
-  return {
-    async listTools() {
-      const response = await client.listTools();
-      return response.tools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema as JsonSchema | undefined,
-        annotations: (tool as any).annotations,
-      }));
-    },
->>>>>>> Stashed changes
 
     return {
       async listTools(callOptions?: CallToolOptions) {
@@ -74,6 +61,7 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema as JsonSchema | undefined,
+            annotations: (tool as { annotations?: { readOnlyHint?: boolean } }).annotations,
           }));
         });
       },
