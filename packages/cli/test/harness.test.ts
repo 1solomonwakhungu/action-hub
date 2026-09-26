@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { rmSync } from "node:fs";
 import { parse as tomlParse } from "smol-toml";
 import { harnessCommand, HARNESS_DEFS } from "../dist/commands/harness.js";
 
@@ -21,16 +23,24 @@ async function withTempHome(
   }
 }
 
-/** Capture console.log/console.error output produced by harnessCommand. */
-async function captureLogs(fn: () => Promise<unknown>): Promise<string> {
-  const logs: string[] = [];
+/** Capture stdout (console.log) and stderr (console.error) separately. */
+interface CapturedOutput {
+  stdout: string;
+  stderr: string;
+}
+
+async function captureOutput(
+  fn: () => Promise<unknown>,
+): Promise<CapturedOutput> {
+  const out: string[] = [];
+  const err: string[] = [];
   const origLog = console.log;
   const origError = console.error;
   console.log = (...args: unknown[]) => {
-    logs.push(args.join(" "));
+    out.push(args.join(" "));
   };
   console.error = (...args: unknown[]) => {
-    logs.push(args.join(" "));
+    err.push(args.join(" "));
   };
   try {
     await fn();
@@ -38,7 +48,7 @@ async function captureLogs(fn: () => Promise<unknown>): Promise<string> {
     console.log = origLog;
     console.error = origError;
   }
-  return logs.join("\n");
+  return { stdout: out.join("\n"), stderr: err.join("\n") };
 }
 
 test("harness export prints valid JSON with an action-hub entry", async () => {
@@ -47,10 +57,10 @@ test("harness export prints valid JSON with an action-hub entry", async () => {
     await mkdir(join(home, ".cursor"), { recursive: true });
     await writeFile(cfg, JSON.stringify({ mcpServers: { other: { command: "foo" } } }));
 
-    const out = await captureLogs(() =>
+    const { stdout } = await captureOutput(() =>
       harnessCommand("cursor", { mode: "export", json: true }),
     );
-    const doc = JSON.parse(out) as {
+    const doc = JSON.parse(stdout) as {
       mcpServers?: Record<string, { command: string; args: string[] }>;
     };
     const entry = doc.mcpServers?.["action-hub"];
@@ -62,10 +72,10 @@ test("harness export prints valid JSON with an action-hub entry", async () => {
 
 test("harness opencode entry uses the documented local schema", async () => {
   await withTempHome(async () => {
-    const out = await captureLogs(() =>
+    const { stdout } = await captureOutput(() =>
       harnessCommand("opencode", { mode: "export", json: true }),
     );
-    const doc = JSON.parse(out) as {
+    const doc = JSON.parse(stdout) as {
       mcp?: Record<string, { type?: string; command?: unknown; environment?: Record<string, string> }>;
     };
     const entry = doc.mcp?.["action-hub"];
@@ -80,10 +90,10 @@ test("harness export is cwd-independent", async () => {
     const prevCwd = process.cwd();
     process.chdir(tempDir); // unrelated cwd with no action-hub checkout
     try {
-      const out = await captureLogs(() =>
+      const { stdout } = await captureOutput(() =>
         harnessCommand("cursor", { mode: "export", json: true }),
       );
-      const doc = JSON.parse(out) as { mcpServers?: Record<string, { args: string[] }> };
+      const doc = JSON.parse(stdout) as { mcpServers?: Record<string, { args: string[] }> };
       const args = doc.mcpServers?.["action-hub"]?.args ?? [];
       assert.ok(args.at(-1) === "start", "entry resolves regardless of cwd");
       assert.ok(
@@ -109,7 +119,7 @@ test("harness install updates the action-hub entry in place and writes a .bak", 
         },
       }),
     );
-    await captureLogs(() => harnessCommand("cursor", { mode: "install", write: true }));
+    await captureOutput(() => harnessCommand("cursor", { mode: "install", write: true }));
 
     const doc = JSON.parse(await readFile(cfg, "utf8")) as {
       mcpServers: Record<string, { command: string; args: string[] }>;
@@ -175,7 +185,7 @@ test("codex install emits TOML that parses, with a proper env table", async () =
   await withTempHome(async (home) => {
     const customConfig = join(home, "custom-servers.json");
     await writeFile(customConfig, "{}\n");
-    await captureLogs(() =>
+    await captureOutput(() =>
       harnessCommand("codex", {
         mode: "install",
         write: true,
@@ -209,7 +219,7 @@ test("harness returns 1 for unknown targets and ungated installs (no process.exi
   });
 });
 
-test("harness export never echoes existing config secrets", async () => {
+test("harness export never echoes existing config secrets (stdout and stderr)", async () => {
   await withTempHome(async (home) => {
     const cfg = join(home, ".cursor", "mcp.json");
     await mkdir(join(home, ".cursor"), { recursive: true });
@@ -221,11 +231,13 @@ test("harness export never echoes existing config secrets", async () => {
       }),
     );
     for (const json of [true, false]) {
-      const out = await captureLogs(() =>
+      const { stdout, stderr } = await captureOutput(() =>
         harnessCommand("cursor", { mode: "export", json }),
       );
-      assert.ok(!out.includes("SENTINEL_API_KEY"), `--json=${json}: key not echoed`);
-      assert.ok(!out.includes("sk-secret-do-not-print"), `--json=${json}: value not echoed`);
+      for (const channel of [stdout, stderr]) {
+        assert.ok(!channel.includes("SENTINEL_API_KEY"), `--json=${json}: key not echoed`);
+        assert.ok(!channel.includes("sk-secret-do-not-print"), `--json=${json}: value not echoed`);
+      }
     }
   });
 });
@@ -261,10 +273,10 @@ test("win32 targets resolve under APPDATA", async () => {
 
 test("snippet under node uses bare node, never an absolute node path", async () => {
   await withTempHome(async () => {
-    const out = await captureLogs(() =>
+    const { stdout } = await captureOutput(() =>
       harnessCommand("cursor", { mode: "export", json: true }),
     );
-    const doc = JSON.parse(out) as {
+    const doc = JSON.parse(stdout) as {
       mcpServers?: Record<string, { command: string; args: string[] }>;
     };
     const entry = doc.mcpServers?.["action-hub"];
@@ -276,20 +288,24 @@ test("snippet under node uses bare node, never an absolute node path", async () 
 
 test("harness --node overrides the node command in the snippet", async () => {
   await withTempHome(async () => {
-    const out = await captureLogs(() =>
+    const { stdout, stderr } = await captureOutput(() =>
       harnessCommand("cursor", {
         mode: "export",
         json: true,
         node: "/opt/nvm/versions/node/v22/bin/node",
       }),
     );
-    const doc = JSON.parse(out) as {
+    const doc = JSON.parse(stdout) as {
       mcpServers?: Record<string, { command: string }>;
     };
     assert.equal(
       doc.mcpServers?.["action-hub"]?.command,
       "/opt/nvm/versions/node/v22/bin/node",
       "--node path replaces bare node",
+    );
+    assert.ok(
+      !stderr.includes("from PATH"),
+      "PATH note is not emitted when --node pins the binary",
     );
   });
 });
@@ -300,7 +316,7 @@ test("pi install honors PI_CODING_AGENT_DIR and writes mcp.json there", async ()
     const prev = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = agentDir;
     try {
-      await captureLogs(() => harnessCommand("pi", { mode: "install", write: true }));
+      await captureOutput(() => harnessCommand("pi", { mode: "install", write: true }));
       const doc = JSON.parse(await readFile(join(agentDir, "mcp.json"), "utf8")) as {
         mcpServers?: Record<string, { command: string; args: string[] }>;
       };
@@ -326,6 +342,75 @@ test("pi default config path is ~/.pi/agent/mcp.json when env is unset", async (
       );
     } finally {
       if (prev !== undefined) process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
+});
+
+test("valueless or empty --node exits 1 with a usage error before any mutation", async () => {
+  const bin = resolve("dist/index.js");
+  const env = { ...process.env, HOME: join(tmpdir(), `action-hub-node-flag-${Date.now()}`) };
+  try {
+    for (const argv of [["harness", "cursor", "--node", "--json"], ["harness", "cursor", "--node", ""]]) {
+      const res = spawnSync("node", [bin, ...argv], { encoding: "utf8", env });
+      assert.equal(res.status, 1, `exit 1 for: ${argv.join(" ")}`);
+      assert.match(res.stderr ?? "", /Missing value for --node/);
+      assert.equal((res.stdout ?? "").trim(), "", "no snippet printed");
+    }
+  } finally {
+    rmSync(env.HOME, { recursive: true, force: true });
+  }
+});
+
+test("notes print on stderr in every mode; --json only quiets stdout", async () => {
+  await withTempHome(async (home) => {
+    const agentDir = join(home, "agent");
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      // Install (non-JSON): notes on stderr, stdout has the success line.
+      const inst = await captureOutput(() =>
+        harnessCommand("pi", { mode: "install", write: true }),
+      );
+      assert.ok(inst.stdout.includes("Wrote Action Hub"), "install stdout line");
+      assert.ok(inst.stderr.includes("pi-mcp-adapter"), "adapter note on stderr");
+      assert.ok(inst.stderr.includes("from PATH"), "PATH note on stderr");
+
+      // Export --json: stdout is pure JSON, notes still on stderr.
+      const exp = await captureOutput(() =>
+        harnessCommand("pi", { mode: "export", json: true }),
+      );
+      JSON.parse(exp.stdout); // must parse as JSON on stdout alone
+      assert.ok(exp.stderr.includes("pi-mcp-adapter"), "notes survive --json on stderr");
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
+    }
+  });
+});
+
+test("pi env resolution matches pi getAgentDir: blank treated as unset, tilde expanded", async () => {
+  await withTempHome(async (home) => {
+    const prev = process.env.PI_CODING_AGENT_DIR;
+    try {
+      // Blank / whitespace-only env is treated as unset.
+      for (const blank of ["", "   "]) {
+        process.env.PI_CODING_AGENT_DIR = blank;
+        assert.equal(
+          HARNESS_DEFS.pi.configPath(home),
+          join(home, ".pi", "agent", "mcp.json"),
+          `blank env (${JSON.stringify(blank)}) falls back to default`,
+        );
+      }
+      // A leading ~ expands to the provided home dir.
+      process.env.PI_CODING_AGENT_DIR = "~/.custom-pi-agent";
+      assert.equal(
+        HARNESS_DEFS.pi.configPath(home),
+        join(home, ".custom-pi-agent", "mcp.json"),
+        "tilde expands to home",
+      );
+    } finally {
+      if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = prev;
     }
   });
 });

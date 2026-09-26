@@ -37,9 +37,10 @@ const writeFileP = promisify(writeFile);
  *   - `--node <path>` overrides the node command for GUI harnesses that
  *     cannot find node on PATH (e.g. nvm installs)
  *
- * When the snippet uses `node` (non-SEA), a one-time stderr note reminds the
- * user it relies on node being on the harness's PATH and how to pin it via
- * `--node $(which node)`. The note is suppressed by --json (machine output).
+ * When the snippet uses the bare `node` default (non-SEA, no `--node`), a
+ * stderr note explains that node is resolved on the harness's PATH and how
+ * to pin it via `--node <absolute path to node>`. Notes go to stderr and
+ * print in every mode (--json only quiets stdout).
  */
 
 export type HarnessName =
@@ -184,13 +185,19 @@ export const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
     serversKey: "mcp",
   },
   pi: {
-    // pi (pi-mcp-adapter >= 2.37.0) reads <agentDir>/mcp.json. The agent dir
-    // is $PI_CODING_AGENT_DIR when set, else ~/.pi/agent. The adapter itself
-    // is a separate install: `pi install npm:pi-mcp-adapter`.
+    // pi (pi-mcp-adapter >= 2.37.0) reads <agentDir>/mcp.json. Match pi's
+    // getAgentDir semantics: a non-empty PI_CODING_AGENT_DIR overrides the
+    // default (a leading ~ expands to the home dir); otherwise ~/.pi/agent.
+    // The adapter itself is a separate install: `pi install npm:pi-mcp-adapter`.
     label: "pi",
-    configPath: (_home: string) => {
-      const agentDir =
-        process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    configPath: (home: string) => {
+      const override = process.env.PI_CODING_AGENT_DIR?.trim();
+      let agentDir = join(home, ".pi", "agent");
+      if (override) {
+        agentDir = override.startsWith("~")
+          ? join(home, override.slice(1))
+          : override;
+      }
       return join(agentDir, "mcp.json");
     },
     format: "json",
@@ -393,6 +400,23 @@ function fail(message: string): number {
   return 1;
 }
 
+/** Post-action stderr notes (adapter prerequisite, node PATH hint). */
+function printNotes(
+  def: HarnessDef,
+  serverEntry: ServerEntry,
+  inSea: boolean,
+  nodePath?: string,
+): void {
+  if (def.note) console.error(`note: ${def.note}`);
+  // Only the bare `node` default depends on the harness's PATH: an explicit
+  // --node already pins the binary, and a SEA binary is the executable itself.
+  if (!inSea && !nodePath) {
+    console.error(
+      `note: the snippet runs "node" from PATH; if ${def.label} cannot find it, rerun with --node <absolute path to node>`,
+    );
+  }
+}
+
 export async function harnessCommand(
   target: string,
   options: HarnessOptions,
@@ -433,12 +457,7 @@ export async function harnessCommand(
       );
     }
     console.log(`Wrote Action Hub MCP server to ${filePath} for ${def.label}.`);
-    if (def.note) console.error(`note: ${def.note}`);
-    if (!inSea) {
-      console.error(
-        `note: the snippet uses "${serverEntry.command}" from PATH; if ${def.label} cannot find it, rerun with --node $(which node)`,
-      );
-    }
+    printNotes(def, serverEntry, inSea, options.node);
     return 0;
   }
 
@@ -466,13 +485,8 @@ export async function harnessCommand(
     console.log(
       `\n# To write this automatically, run: action-hub harness ${target} install --write`,
     );
-    if (def.note) console.error(`note: ${def.note}`);
-    if (!inSea) {
-      console.error(
-        `note: the snippet uses "${serverEntry.command}" from PATH; if ${def.label} cannot find it, rerun with --node $(which node)`,
-      );
-    }
   }
+  printNotes(def, serverEntry, inSea, options.node);
   return 0;
 }
 
@@ -496,8 +510,8 @@ Options:
                   (exported as ACTION_HUB_CONFIG in the snippet).
   --node <path>   Override the node command in snippets (for GUI harnesses
                   that cannot find node on PATH, e.g. nvm installs).
-  --json          (export, JSON targets only) Print only the JSON document,
-                  no commentary. Rejected for TOML targets (codex).
+  --json          (export, JSON targets only) Print only the JSON document
+                  on stdout. Rejected for TOML targets (codex).
 
 Examples:
   action-hub harness cursor                 # print Cursor's mcp.json snippet
