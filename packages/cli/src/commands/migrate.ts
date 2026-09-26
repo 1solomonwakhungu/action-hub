@@ -7,7 +7,7 @@ import {
   type DiscoveredSkill,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
-import { rawConfigDocument, writeConfigAtomic } from "../config-writer.js";
+import { rawConfigDocument, validateRawServersShape, writeConfigAtomic } from "../config-writer.js";
 
 /** Harness source filters accepted by the migrate command (servers, skills, and plugins). */
 export const MIGRATE_SOURCE_FILTERS = [
@@ -174,6 +174,9 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
     // Preserve existing raw config to retain top-level settings like approvalTtlSeconds,
     // autoDiscover, and unexpanded environment variable references in servers.
     const raw = rawConfigDocument(currentConfig);
+    // Fail closed: a malformed servers array is never filtered or coerced —
+    // this throws and the original bytes are left untouched.
+    validateRawServersShape(raw, currentConfig.path);
 
     const existingRawServers: Record<string, unknown>[] = Array.isArray(raw["servers"])
       ? (raw["servers"].filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null))

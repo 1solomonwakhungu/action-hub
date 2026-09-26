@@ -3,6 +3,8 @@ import { test } from "node:test";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { importCommand } from "../dist/commands/import.js";
 
 // Regression for PR (P11): `import --write` must merge discovered servers
@@ -134,3 +136,46 @@ for (const scenario of [
     }
   });
 }
+
+// Regression for reviewer-2 HIGH: migrate --write must also fail closed on a
+// malformed servers array. This is a real CLI spawn (node dist/index.js), not
+// an in-process call, so the actual exit code is asserted.
+test("migrate --write via CLI spawn fails closed on malformed servers", async () => {
+  const tempHome = await mkdtemp(resolve(tmpdir(), "action-hub-migrate-bad-"));
+  const originalHome = process.env["HOME"];
+  process.env["HOME"] = tempHome;
+  const configPath = join(tempHome, "config", "servers.json");
+  try {
+    await mkdir(join(tempHome, "config"), { recursive: true });
+    const originalBytes = JSON.stringify({
+      servers: ["KEEP_SENTINEL"],
+      skills: [{ id: "keep-skill" }],
+      custom: "keep",
+    });
+    await writeFile(configPath, originalBytes);
+
+    const cliPath = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+    const child = spawn(process.execPath, [
+      cliPath,
+      "migrate",
+      "--type",
+      "mcps",
+      "--write",
+      "--json",
+      "--config",
+      configPath,
+    ], { env: { ...process.env, HOME: tempHome }, cwd: tempHome });
+
+    const code = await new Promise<number | null>((resolveExit, rejectSpawn) => {
+      child.on("error", rejectSpawn);
+      child.on("exit", (exitCode) => resolveExit(exitCode));
+    });
+
+    assert.equal(code, 1, `expected exit 1, got ${code}`);
+    assert.equal(await readFile(configPath, "utf8"), originalBytes, "config bytes changed");
+  } finally {
+    if (originalHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = originalHome;
+    await rm(tempHome, { recursive: true, force: true });
+  }
+});
