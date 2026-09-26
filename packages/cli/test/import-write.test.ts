@@ -36,12 +36,12 @@ test("import --write preserves skills and custom keys; writes with mode 600", as
     // Deliberately lax pre-existing permissions; the writer must tighten to 600.
     await writeFile(configPath, JSON.stringify(existingConfig, null, 2), { mode: 0o644 });
 
-    // Discovery fixture: a claude-desktop config under the temp HOME so
-    // discoverMcpServers() finds a server to merge in.
-    const claudeDir = join(tempHome, "Library", "Application Support", "Claude");
-    await mkdir(claudeDir, { recursive: true });
+    // Discovery fixture: a Cursor config under the temp HOME — .cursor/mcp.json
+    // is scanned on every OS, unlike the OS-specific Claude Desktop paths.
+    const cursorDir = join(tempHome, ".cursor");
+    await mkdir(cursorDir, { recursive: true });
     await writeFile(
-      join(claudeDir, "claude_desktop_config.json"),
+      join(cursorDir, "mcp.json"),
       JSON.stringify({
         mcpServers: {
           "fixture-weather": {
@@ -116,10 +116,10 @@ for (const scenario of [
       await writeFile(configPath, originalBytes);
 
       if (scenario.withDiscoveryFixture) {
-        const claudeDir = join(tempHome, "Library", "Application Support", "Claude");
-        await mkdir(claudeDir, { recursive: true });
+        const cursorDir = join(tempHome, ".cursor");
+        await mkdir(cursorDir, { recursive: true });
         await writeFile(
-          join(claudeDir, "claude_desktop_config.json"),
+          join(cursorDir, "mcp.json"),
           JSON.stringify({ mcpServers: { "fixture-weather": { command: "npx" } } }),
         );
       }
