@@ -390,7 +390,7 @@ async function dispatch(
           status: "approval_required",
           action_id: approval.actionId,
           server: approval.serverId,
-          name: approval.name,
+          name: hardenText(approval.name, SEARCH_SUMMARY_MAX_BYTES),
           trust: approval.trust,
           reason: approval.reason,
           arguments_summary: approval.argumentsSummary,
