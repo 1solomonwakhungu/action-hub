@@ -16,9 +16,9 @@ import {
   DEFAULT_BACKOFF_MAX_MS,
 } from "./restart-backoff.js";
 import {
+  errorHasTransportCode,
   isTransportFailure,
   markTransportFailure,
-  TRANSPORT_ERRNOS,
   ToolError,
 } from "./transport-errors.js";
 
@@ -109,8 +109,7 @@ function tagTransportFailures(client: McpClient): McpClient {
       try {
         return await client.callTool(name, args, options);
       } catch (cause) {
-        const errno = (cause as { errno?: unknown } | null)?.errno;
-        if (typeof errno === "string" && TRANSPORT_ERRNOS.has(errno)) {
+        if (errorHasTransportCode(cause, 0)) {
           throw markTransportFailure(cause as Error);
         }
         throw cause;

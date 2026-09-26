@@ -55,19 +55,30 @@ export function isTransportFailure(cause: unknown): boolean {
 
 /**
  * Adapter-side classifier for a rejected callTool. ToolError passes through
- * untouched; errors positively identified as transport (the transport closed,
- * or a transport errno) are marked; everything else — including coded JSON-RPC
- * errors from a live server and unknown/uncoded errors — stays unmarked and
- * never counts against the breaker.
+ * untouched; errors positively identified as transport are marked:
+ *   - the transport closed (transportClosed), or
+ *   - a known transport code/errno is found on the error itself or within a
+ *     bounded cause chain (Node's fetch wraps network failures as
+ *     TypeError("fetch failed") whose cause carries code="ECONNREFUSED" and
+ *     a numeric errno).
+ * Everything else — coded JSON-RPC errors from a live server, HTTP status
+ * errors, unknown/uncoded errors — stays unmarked and never counts against
+ * the breaker.
  */
 export function classifyDownstreamError(cause: unknown, transportClosed: boolean): unknown {
   if (cause instanceof ToolError) return cause;
-  const errno = (cause as { errno?: unknown } | null)?.errno;
-  if (
-    transportClosed ||
-    (typeof errno === "string" && TRANSPORT_ERRNOS.has(errno))
-  ) {
+  if (transportClosed || errorHasTransportCode(cause, 0)) {
     return markTransportFailure(cause);
   }
   return cause;
+}
+
+/** Bounded walk of an error's cause chain looking for a known transport
+ * code/errno. Does not infer from message text. */
+export function errorHasTransportCode(cause: unknown, depth: number): boolean {
+  if (depth > 3 || typeof cause !== "object" || cause === null) return false;
+  const node = cause as { code?: unknown; errno?: unknown; cause?: unknown };
+  if (typeof node.code === "string" && TRANSPORT_ERRNOS.has(node.code)) return true;
+  if (typeof node.errno === "string" && TRANSPORT_ERRNOS.has(node.errno)) return true;
+  return errorHasTransportCode(node.cause, depth + 1);
 }

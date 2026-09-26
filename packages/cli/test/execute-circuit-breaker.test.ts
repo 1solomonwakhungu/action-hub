@@ -14,10 +14,15 @@ const CWD = resolve(import.meta.dirname, "..", "..", "..");
 function makeHub(mode: string, threshold = 3) {
   const config: ServerConfig = {
     id: "f16",
-    transport: { type: "stdio", command: process.execPath, args: [SERVER_SCRIPT], cwd: CWD },
+    transport: {
+      type: "stdio",
+      command: process.execPath,
+      args: [SERVER_SCRIPT],
+      cwd: CWD,
+      env: { F16_MODE: mode }, // per-child env: no process-global mutation
+    },
     trust: "trusted",
   };
-  process.env.F16_MODE = mode;
   const hub = new ActionHub({
     servers: [config],
     clientFactory: createSdkClientFactory(),
@@ -29,21 +34,25 @@ function makeHub(mode: string, threshold = 3) {
 
 test("isError tool text that looks like a connection error never trips the breaker (real adapter, real child)", async () => {
   const hub = makeHub("isError");
-  const results = await hub.indexAll();
-  assert.equal(results[0]!.error, undefined);
-  for (let i = 0; i < 5; i++) {
-    const r = await hub.execute("f16:send_message", {});
-    assert.equal(r.ok, false, "isError tool call must surface as a failed execute");
+  try {
+    const results = await hub.indexAll();
+    assert.equal(results[0]!.error, undefined);
+    for (let i = 0; i < 5; i++) {
+      const r = await hub.execute("f16:send_message", {});
+      assert.equal(r.ok, false, "isError tool call must surface as a failed execute");
+    }
+    const [state] = hub.serverStates();
+    assert.equal(state!.circuitState, "closed", "tool-level isError text must never open the circuit");
+    assert.equal(state!.consecutiveFailures, 0);
+    assert.equal(state!.status !== "unreachable", true);
+  } finally {
+    await hub.close();
   }
-  const [state] = hub.serverStates();
-  assert.equal(state!.circuitState, "closed", "tool-level isError text must never open the circuit");
-  assert.equal(state!.consecutiveFailures, 0);
-  assert.equal(state!.status !== "unreachable", true);
-  hub.close();
 });
 
 test("a dead stdio child trips the breaker via the real adapter without waiting for the heartbeat", async () => {
   const hub = makeHub("ok_then_exit");
+  try {
   await hub.indexAll();
   const first = await hub.execute("f16:send_message", {});
   assert.equal(first.ok, true);
@@ -59,5 +68,7 @@ test("a dead stdio child trips the breaker via the real adapter without waiting 
   assert.equal(opened, true, "a closed transport must open the circuit");
   const [finalState] = hub.serverStates();
   assert.ok(finalState!.nextRestartAt !== undefined, "restart scheduled after the breaker opens");
-  hub.close();
+  } finally {
+    await hub.close();
+  }
 });
