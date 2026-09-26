@@ -92,13 +92,14 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
           const response = await client
             .callTool({ name, arguments: args })
             .catch((cause: unknown) => {
-            // Any coded McpError is a JSON-RPC error response — tool-level,
-            // even when its code/message looks like a connection error: a
-            // listening server can throw McpError(-32000, "Connection closed")
-            // from application code. Real transport closure is tracked via
-            // transport.onclose and the cause chain (fetch failed ->
-            // ECONNREFUSED), never inferred from code/message alone.
-            if (cause instanceof McpError) throw cause;
+            // A coded McpError from a LIVE transport is a JSON-RPC error
+            // response — tool-level, even when its code/message looks like a
+            // connection error (a listening server can throw
+            // McpError(-32000, "Connection closed") from application code).
+            // But the same McpError arriving after transport.onclose is the
+            // SDK surfacing a real closed transport, so it is classified
+            // (and marked) with the non-spoofable transportClosed evidence.
+            if (cause instanceof McpError && !transportClosed) throw cause;
             // Positively-identified transport failures are marked for the
             // circuit breaker; unknown/uncoded errors stay unmarked.
             throw classifyDownstreamError(cause, transportClosed);

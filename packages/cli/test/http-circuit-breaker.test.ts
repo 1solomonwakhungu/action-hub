@@ -73,6 +73,34 @@ test("a stopped Streamable HTTP server opens the breaker via the fetch-failure c
   }
 });
 
+test("request-socket drop with the listener up opens the breaker via UND_ERR_SOCKET", async () => {
+  const scratch = mkdtempSync(`${tmpdir()}/f16http-`);
+  const server = startHttpServer("drop", scratch);
+  const hub = makeHttpHub(server.url);
+  try {
+    const results = await hub.indexAll();
+    assert.equal(results[0]!.indexed, 1, "indexed while the listener is up");
+    // Every tools/call socket is destroyed server-side: undici rejects with
+    // TypeError("fetch failed") -> SocketError("other side closed",
+    // code="UND_ERR_SOCKET"). The listener itself stays up.
+    const second = await hub.execute("httpx:send_message", {});
+    assert.equal(second.ok, false);
+    let s1 = hub.serverStates()[0]!;
+    assert.equal(s1.circuitState, "closed");
+    assert.equal(s1.consecutiveFailures, 1, "UND_ERR_SOCKET cause chain counts as failure 1");
+    await hub.execute("httpx:send_message", {});
+    assert.equal(hub.serverStates()[0]!.consecutiveFailures, 2);
+    await hub.execute("httpx:send_message", {});
+    const s3 = hub.serverStates()[0]!;
+    assert.equal(s3.circuitState, "open", "breaker opens on exactly the 3rd consecutive socket drop");
+    assert.equal(s3.consecutiveFailures, 3);
+  } finally {
+    await hub.close();
+    server.kill();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
 test("a live server throwing McpError(-32000, 'Connection closed') never opens the breaker", async () => {
   const scratch = mkdtempSync(`${tmpdir()}/f16http-`);
   const server = startHttpServer("mcp32000", scratch);

@@ -57,17 +57,24 @@ test("a dead stdio child trips the breaker via the real adapter without waiting 
   const first = await hub.execute("f16:send_message", {});
   assert.equal(first.ok, true);
   // Child exits after its first accepted call: the next executes hit a
-  // closed transport (SDK McpError -32000 "Connection closed", then plain
-  // "Not connected") — both positively transport-level.
-  let opened = false;
-  for (let i = 0; i < 6; i++) {
-    const r = await hub.execute("f16:send_message", {}).catch(() => ({ ok: false }));
-    if (hub.serverStates()[0]!.circuitState === "open") { opened = true; break; }
-    assert.equal(r.ok, false);
-  }
-  assert.equal(opened, true, "a closed transport must open the circuit");
-  const [finalState] = hub.serverStates();
-  assert.ok(finalState!.nextRestartAt !== undefined, "restart scheduled after the breaker opens");
+  // closed transport. The first failed call surfaces as SDK McpError -32000
+  // "Connection closed" WITH transportClosed=true (counted), then plain
+  // "Not connected" — the breaker must open on EXACTLY the 3rd consecutive
+  // failed call (threshold 3, no earlier, no loop-until-open).
+  const second = await hub.execute("f16:send_message", {});
+  assert.equal(second.ok, false, "first call after child death must fail");
+  let s1 = hub.serverStates()[0]!;
+  assert.equal(s1.circuitState, "closed");
+  assert.equal(s1.consecutiveFailures, 1, "SDK -32000 with transportClosed counts as failure 1");
+  await hub.execute("f16:send_message", {});
+  let s2 = hub.serverStates()[0]!;
+  assert.equal(s2.circuitState, "closed");
+  assert.equal(s2.consecutiveFailures, 2);
+  await hub.execute("f16:send_message", {});
+  const s3 = hub.serverStates()[0]!;
+  assert.equal(s3.circuitState, "open", "breaker opens on exactly the 3rd consecutive failed call");
+  assert.equal(s3.consecutiveFailures, 3);
+  assert.ok(s3.nextRestartAt !== undefined, "restart scheduled after the breaker opens");
   } finally {
     await hub.close();
   }

@@ -25,6 +25,13 @@ const httpServer = createServer(async (req, res) => {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   const body = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+  if (mode === "drop" && body?.method === "tools/call") {
+    // Transport break without closing the listener: destroy the request
+    // socket so the client sees SocketError("other side closed",
+    // code="UND_ERR_SOCKET") — initialize/tools-list keep working.
+    req.socket.destroy();
+    return;
+  }
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   await buildApp().connect(transport);
   await transport.handleRequest(req, res, body);

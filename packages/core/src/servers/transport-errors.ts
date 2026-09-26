@@ -29,6 +29,10 @@ export const TRANSPORT_ERRNOS: ReadonlySet<string> = new Set([
   "ECONNREFUSED",
   "ENOTFOUND",
   "ERR_STREAM_DESTROYED",
+  // undici connection-failure codes surfaced inside TypeError("fetch failed")
+  // cause chains. Deliberately NOT response/tool timeout codes (F26).
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
 ]);
 
 /** Marks an error as a positively-identified transport failure. Adapters call
