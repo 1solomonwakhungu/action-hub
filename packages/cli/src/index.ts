@@ -9,6 +9,7 @@ import { testSearchCommand } from "./commands/test-search.js";
 import { listCommand } from "./commands/list.js";
 import { bundlesCommand } from "./commands/bundles.js";
 import { startCommand } from "./commands/start.js";
+import { serveCommand } from "./commands/serve.js";
 import {
   connectCommand,
   daemonStartCommand,
@@ -34,6 +35,7 @@ COMMANDS:
   list                List all registered tools, skills, and bundles
   bundle              Inspect registered action bundles
   start               Start an isolated Action Hub MCP server in foreground stdio mode
+  serve               Serve the Action Hub MCP server over streamable HTTP (127.0.0.1, bearer-token protected)
   connect             Proxy stdio to the shared Action Hub daemon
   daemon <command>    Manage the shared daemon: start, status, or stop
 
@@ -71,6 +73,7 @@ EXAMPLES:
   action-hub list --server github
   action-hub bundle --load triage-issue
   action-hub start
+  action-hub serve --port 6290
   action-hub daemon start
   action-hub connect
 `);
@@ -209,6 +212,15 @@ async function main(): Promise<void> {
       case "start": {
         exitCode = await startCommand({
           configPath,
+        });
+        break;
+      }
+
+      case "serve": {
+        const portVal = typeof parsedArgs["port"] === "string" ? Number.parseInt(parsedArgs["port"], 10) : undefined;
+        exitCode = await serveCommand({
+          configPath,
+          port: Number.isFinite(portVal) ? portVal : undefined,
         });
         break;
       }
