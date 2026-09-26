@@ -318,10 +318,19 @@ writeFileSync(
 // Load into ActionHub in-process with a fake clientFactory.
 // ---------------------------------------------------------------------------
 function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    sleep(ms).then(() => { throw new Error(`TIMEOUT after ${ms}ms in ${label}`); }),
-  ]);
+  let timer;
+  try {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`TIMEOUT after ${ms}ms in ${label}`)), ms);
+      }),
+    ]);
+  } finally {
+    // Cancel the losing timer so a successful run exits promptly instead of
+    // lingering until the timeout fires.
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 const config = {
@@ -347,7 +356,9 @@ async function run() {
   const t1 = performance.now();
   const hubResult = { hub: null, t0, t1 };
   try {
+    const tIdx0 = performance.now();
     const indexResult = await withTimeout(hub.indexAll(), 120_000, "indexAll");
+    hubResult.indexAllMs = Math.round(performance.now() - tIdx0);
     hubResult.indexResult = indexResult;
 
     // Load the skills directory through the real discovery path.
@@ -381,7 +392,6 @@ async function run() {
 }
 
 const load = await run();
-const totalIndexMs = Math.round(performance.now() - (load.t0 ?? 0));
 
 // ---------------------------------------------------------------------------
 // Per-case measurements.
@@ -400,7 +410,9 @@ const stats = {
   toolCount: manifest.tools.length,
   skillCount: skills.length,
   hubConstructMs: load.t1 ? Math.round(load.t1 - (load.t0 ?? load.t1)) : null,
-  indexAllMs: totalIndexMs,
+  // Pure indexAll time for the combined catalog (excludes hub construction,
+  // skill discovery, and skill registration — those are reported separately).
+  indexAllMs: load.indexAllMs ?? null,
   indexResult: load.indexResult,
   indexedTotal: (load.indexResult ?? []).reduce((a, r) => a + (r.indexed ?? 0), 0),
   skillsLoadMs: load.skillsMs ?? null,
@@ -414,9 +426,74 @@ if (load.hub) {
   const hub = load.hub;
   const catalogSize = hub.catalog.all().length;
 
-  // Per-case: does the case's entry appear in search, and how big is search output?
+  // Per-case isolation: an isolated hub per case holding ONLY that case's
+  // tools, so index time and crash status are attributable to the case.
   for (const c of cases) {
-    const row = { name: c.name, crashed: false };
+    const row = { name: c.name, toolCount: c.tools.length, skillCount: c.skills.length };
+    const caseTools = manifest.tools.filter((t) => c.tools.includes(t.name));
+    try {
+      const caseHub = new ActionHub({
+        servers: [config],
+        clientFactory: async () => new FakeClient(caseTools),
+        policy: { autoApproveAtOrAbove: "blocked" },
+        resultCache: { enabled: false },
+      });
+      const i0 = performance.now();
+      const res = await withTimeout(caseHub.indexAll(), 60_000, `indexAll[${c.name}]`);
+      row.indexMs = Math.round(performance.now() - i0);
+      row.indexed = res.reduce((a, r) => a + (r.indexed ?? 0), 0);
+      row.crashed = false;
+      await caseHub.close?.();
+    } catch (err) {
+      row.crashed = true;
+      row.error = String(err?.message ?? err);
+    }
+    stats.cases.push(row);
+  }
+
+  // Skills directory, isolated: discovery + registration time and crash status.
+  try {
+    const row = { name: "skills-directory", toolCount: 0, skillCount: skills.length };
+    const skillsHub = new ActionHub({
+      servers: [config],
+      clientFactory: async () => new FakeClient([]),
+      policy: { autoApproveAtOrAbove: "blocked" },
+      resultCache: { enabled: false },
+    });
+    const warnings = [];
+    const s0 = performance.now();
+    const discovered = await withTimeout(
+      discoverSkillsFromDirectory(join(ADV_DIR, "skills"), "custom", (m) => warnings.push(m)),
+      60_000,
+      "skills-directory",
+    );
+    skillsHub.registerSkills(
+      discovered.map((s) => ({
+        id: s.id,
+        name: s.name,
+        serverId: s.sourceClient ?? "skills",
+        summary: s.summary,
+        description: s.description,
+        tags: s.tags,
+        trust: s.trust ?? "trusted",
+      })),
+    );
+    row.indexMs = Math.round(performance.now() - s0);
+    row.indexed = discovered.length;
+    row.crashed = false;
+    stats.cases.push(row);
+    await skillsHub.close?.();
+  } catch (err) {
+    stats.cases.push({ name: "skills-directory", crashed: true, error: String(err?.message ?? err) });
+  }
+
+  // Search probes against the COMBINED catalog (labeled as such). Recall and
+  // output-size per hostile case; attribution of index behavior comes from the
+  // isolated per-case hubs above.
+  for (const c of cases) {
+    const row = stats.cases.find((r) => r.name === c.name);
+    if (!row) continue;
+    row.searchAgainst = "combined-catalog";
     try {
       const probeName = c.tools[0] ?? c.skills[0];
       // Query with a distinctive fragment of the entry id.
@@ -438,10 +515,9 @@ if (load.hub) {
         row.bloatRatio = Math.round((row.maxHitBytes / median) * 10) / 10;
       }
     } catch (err) {
-      row.crashed = true;
-      row.error = String(err?.message ?? err);
+      row.searchCrashed = true;
+      row.searchError = String(err?.message ?? err);
     }
-    stats.cases.push(row);
   }
 
   // Cross-cutting: does ONE huge entry dominate a generic query?
@@ -565,6 +641,7 @@ stats.caseCount = stats.cases.length;
 const surprises = [];
 for (const row of stats.cases) {
   if (row.crashed) surprises.push(`case ${row.name} crashed: ${row.error}`);
+  if (row.searchCrashed) surprises.push(`case ${row.name} search crashed: ${row.searchError}`);
   if (row.bloatRatio !== undefined && row.bloatRatio > 10) {
     surprises.push(`case ${row.name} bloats results: max hit ${row.maxHitBytes}B vs median ${row.medianHitBytes}B (x${row.bloatRatio})`);
   }
@@ -613,7 +690,8 @@ console.log(`  entries: ${stats.totalEntries} (${stats.toolCount} tools, ${stats
 console.log(`  hub construct: ${stats.hubConstructMs}ms, indexAll: ${stats.indexAllMs}ms, indexed: ${stats.indexedTotal}`);
 for (const row of stats.cases) {
   console.log(
-    `  ${row.name.padEnd(26)} crash=${row.crashed} search=${row.searchMs ?? "-"}ms out=${row.searchOutputBytes ?? "-"}B hits=${row.hits ?? "-"} bloat=x${row.bloatRatio ?? "-"} recall=${row.recall}`,
+    `  ${row.name.padEnd(26)} crash=${row.crashed} index=${row.indexMs ?? "-"}ms indexed=${row.indexed ?? "-"}` +
+      ` search=${row.searchMs ?? "-"}ms out=${row.searchOutputBytes ?? "-"}B hits=${row.hits ?? "-"} bloat=x${row.bloatRatio ?? "-"} recall=${row.recall}`,
   );
 }
 if (stats.genericQuery) {
