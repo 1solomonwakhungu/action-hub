@@ -138,6 +138,8 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
   };
 }
 
+export { startHttpServer, HUB_HTTP_TOKEN_ENV_VAR, type HttpServerOptions, type HttpServerHandle } from "./http-server.js";
+
 export function createMcpServer(runtime: HubRuntime): McpServer {
   const server = new McpServer({ name: "action-hub", version: "0.1.0" });
 
