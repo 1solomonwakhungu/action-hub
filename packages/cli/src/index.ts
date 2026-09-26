@@ -9,6 +9,7 @@ import { testSearchCommand } from "./commands/test-search.js";
 import { listCommand } from "./commands/list.js";
 import { bundlesCommand } from "./commands/bundles.js";
 import { startCommand } from "./commands/start.js";
+ import { harnessCommand } from "./commands/harness.js";
 import { serveCommand } from "./commands/serve.js";
 import {
   connectCommand,
@@ -53,6 +54,7 @@ COMMANDS:
   list                List all registered tools, skills, and bundles
   bundle              Inspect registered action bundles
   start               Start an isolated Action Hub MCP server in foreground stdio mode
+  harness [target]    Export or install configuration snippets for AI harnesses
   serve               Serve the Action Hub MCP server over streamable HTTP (127.0.0.1, bearer-token protected)
   connect             Proxy stdio to the shared Action Hub daemon
   daemon <command>    Manage the shared daemon: start, status, or stop
@@ -103,6 +105,14 @@ EXAMPLES:
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+
+  // `harness --help` (or bare `harness`) shows the harness-specific help,
+  // not the global help text.
+  if (args[0] === "harness" &&
+      (args.includes("--help") || args.includes("-h") || args.length === 1)) {
+    await harnessCommand("help", {});
+    return;
+  }
 
   if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     printHelp();
@@ -259,6 +269,21 @@ async function main(): Promise<void> {
 
       case "start": {
         exitCode = await startCommand({
+          configPath,
+        });
+        break;
+      }
+
+      case "harness": {
+        const target = positional[0] ?? "help";
+        const modeArg =
+          positional[1] === "export" || positional[1] === "install"
+            ? positional[1]
+            : undefined;
+        exitCode = await harnessCommand(target, {
+          mode: modeArg,
+          write: Boolean(parsedArgs["write"]),
+          json: Boolean(parsedArgs["json"]),
           configPath,
         });
         break;
