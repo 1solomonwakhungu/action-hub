@@ -157,7 +157,8 @@ action-hub/
 ├── docs/
 │   ├── architecture.md
 │   ├── releasing.md
-│   └── roadmap.md
+│   ├── roadmap.md
+│   └── harness-guides.md
 └── README.md
 ```
 
