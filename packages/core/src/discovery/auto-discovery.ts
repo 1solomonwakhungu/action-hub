@@ -11,10 +11,12 @@ import type {
 
 export { type DiscoveredServer, type DiscoveredSkill, type DiscoveredPlugin };
 
+export type CustomDiscoveryPath = string | { path: string; client: DiscoveredServer["sourceClient"] };
+
 export interface DiscoveryOptions {
   cwd?: string;
   home?: string;
-  customPaths?: string[];
+  customPaths?: CustomDiscoveryPath[];
   skipDefaults?: boolean;
 }
 
@@ -26,7 +28,11 @@ export function defaultDiscoveryLocations(
 
   if (options.customPaths) {
     for (const custom of options.customPaths) {
-      locations.push({ path: custom, client: "custom" });
+      locations.push(
+        typeof custom === "string"
+          ? { path: custom, client: "custom" }
+          : { path: custom.path, client: custom.client },
+      );
     }
   }
 
@@ -75,6 +81,38 @@ export function defaultDiscoveryLocations(
     { path: resolve(cwd, ".mcp.json"), client: "copilot" },
   );
 
+  // Codex MCP config (TOML)
+  locations.push({
+    path: resolve(home, ".codex", "config.toml"),
+    client: "codex",
+  });
+
+  // Windsurf MCP config
+  locations.push(
+    { path: resolve(home, ".codeium", "windsurf", "mcp_config.json"), client: "windsurf" },
+    { path: resolve(cwd, ".windsurf", "mcp.json"), client: "windsurf" },
+  );
+
+  // VS Code global storage based harness configs (Cline / Roo Code)
+  const globalStorageRoot =
+    os === "darwin"
+      ? resolve(home, "Library", "Application Support", "Code", "User", "globalStorage")
+      : os === "win32"
+        ? resolve(process.env["APPDATA"] ?? resolve(home, "AppData", "Roaming"), "Code", "User", "globalStorage")
+        : resolve(home, ".config", "Code", "User", "globalStorage");
+
+  locations.push(
+    {
+      path: resolve(globalStorageRoot, "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"),
+      client: "cline",
+    },
+    {
+      path: resolve(globalStorageRoot, "rooveterinaryinc.roo-cline", "settings", "mcp_settings.json"),
+      client: "roo-code",
+    },
+    { path: resolve(home, ".roo", "mcp.json"), client: "roo-code" },
+  );
+
   return locations;
 }
 
@@ -89,7 +127,7 @@ export async function discoverMcpServers(options: DiscoveryOptions = {}): Promis
   for (const { path, client } of locations) {
     try {
       const content = await readFile(path, "utf8");
-      const parsed = JSON.parse(content) as Record<string, unknown>;
+      const parsed = extname(path) === ".toml" ? parseTomlMcpServers(content) : (JSON.parse(content) as Record<string, unknown>);
       const servers = parseMcpServersBlock(parsed, path, client);
 
       for (const server of servers) {
@@ -104,6 +142,182 @@ export async function discoverMcpServers(options: DiscoveryOptions = {}): Promis
   }
 
   return discovered;
+}
+
+/**
+ * Minimal zero-dependency TOML parser for Codex `~/.codex/config.toml` MCP blocks.
+ * Extracts `[mcp_servers.<name>]` sections (plus nested `env`, `headers`, and
+ * `http_headers` subtables) into an `mcpServers` dictionary shaped like the JSON
+ * format, so the standard server normalization can consume it. Supports string,
+ * array-of-strings, boolean, number, and inline-table values, inline comments,
+ * and multiline arrays. Unknown sections and keys are ignored.
+ */
+export function parseTomlMcpServers(content: string): Record<string, unknown> {
+  const servers: Record<string, Record<string, unknown>> = {};
+  let currentServer: string | undefined;
+  let currentSubtable: Record<string, unknown> | undefined;
+
+  const lines = stripTomlComments(content).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i]?.trim() ?? "";
+    if (line.length === 0) continue;
+
+    const sectionMatch = line.match(/^\[+\s*([^\]]+?)\s*\]+$/);
+    if (sectionMatch) {
+      const section = parseTomlSectionPath(sectionMatch[1] ?? "");
+      currentServer = section?.name;
+      currentSubtable = section?.subtable;
+      if (currentServer) {
+        servers[currentServer] ??= {};
+        const server = servers[currentServer]!;
+        if (currentSubtable && section) {
+          const existing = server[section.key];
+          if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+            // Keep pre-existing inline table (e.g. env = { ... }) and merge into it.
+            currentSubtable = existing as Record<string, unknown>;
+          } else {
+            server[section.key] = currentSubtable;
+          }
+        }
+      }
+      continue;
+    }
+
+    if (!currentServer) continue;
+
+    // Multiline array: buffer lines until the closing bracket is found.
+    const eq = line.indexOf("=");
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim().replace(/^"|"$/g, "");
+    let rawValue = line.slice(eq + 1).trim();
+    if (rawValue.startsWith("[") && !rawValue.endsWith("]")) {
+      const buffer: string[] = [rawValue];
+      while (i + 1 < lines.length && !rawValue.endsWith("]")) {
+        i++;
+        rawValue = lines[i]?.trim() ?? "";
+        buffer.push(rawValue);
+      }
+      rawValue = buffer.join(" ");
+    }
+
+    const value = parseTomlValue(rawValue);
+    if (key && value !== undefined) {
+      if (currentSubtable) {
+        currentSubtable[key] = value;
+      } else {
+        servers[currentServer]![key] = value;
+      }
+    }
+  }
+
+  return { mcpServers: servers };
+}
+
+/** Strips `#` comments to end of line, respecting quoted strings. */
+function stripTomlComments(content: string): string {
+  return content
+    .split(/\r?\n/)
+    .map((line) => {
+      let inString: string | undefined;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (inString) {
+          if (ch === inString) inString = undefined;
+          continue;
+        }
+        if (ch === '"' || ch === "'") {
+          inString = ch;
+          continue;
+        }
+        if (ch === "#") return line.slice(0, i).trimEnd();
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+function parseTomlSectionPath(
+  raw: string,
+): { name: string; key: string; subtable?: Record<string, unknown> } | undefined {
+  // Supported: mcp_servers.<name>, mcp_servers.<name>.env,
+  // mcp_servers.<name>.headers, mcp_servers.<name>.http_headers
+  const match = raw.match(
+    /^mcp_servers\.\s*"?([^".]+)"?\s*(?:\.\s*(env|headers|http_headers))?$/,
+  );
+  if (!match) return undefined;
+  const name = match[1]?.trim();
+  if (!name) return undefined;
+  const key = match[2];
+  if (key === "env") {
+    return { name, key: "env", subtable: {} };
+  }
+  if (key === "headers" || key === "http_headers") {
+    return { name, key: "headers", subtable: {} };
+  }
+  return { name, key: "__server__" };
+}
+
+function parseTomlValue(raw: string): unknown {
+  if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+    return raw.slice(1, -1);
+  }
+  if (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2) {
+    return raw.slice(1, -1);
+  }
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  if (raw.startsWith("[")) {
+    const inner = raw.replace(/^\[|\]$/g, "");
+    return splitTomlCommaList(inner)
+      .map((item) => {
+        if ((item.startsWith('"') && item.endsWith('"')) || (item.startsWith("'") && item.endsWith("'"))) {
+          return item.slice(1, -1);
+        }
+        return item;
+      });
+  }
+  if (/^-?\d+(\.\d+)?$/.test(raw)) return Number(raw);
+  if (raw.startsWith("{")) {
+    // Inline table: { KEY = "value", ... }
+    const inner = raw.replace(/^\{|\}$/g, "");
+    const result: Record<string, unknown> = {};
+    for (const pair of splitTomlCommaList(inner)) {
+      const pairEq = pair.indexOf("=");
+      if (pairEq === -1) continue;
+      const pairKey = pair.slice(0, pairEq).trim().replace(/^"|"$/g, "");
+      const pairValue = parseTomlValue(pair.slice(pairEq + 1).trim());
+      if (pairKey && pairValue !== undefined) result[pairKey] = pairValue;
+    }
+    return result;
+  }
+  return undefined;
+}
+
+/** Splits a comma-separated TOML element list on commas outside quoted strings. */
+function splitTomlCommaList(inner: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let inString: string | undefined;
+  for (const ch of inner) {
+    if (inString) {
+      current += ch;
+      if (ch === inString) inString = undefined;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === ",") {
+      parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim().length > 0) parts.push(current.trim());
+  return parts.filter((p) => p.length > 0);
 }
 
 function parseMcpServersBlock(
@@ -214,7 +428,7 @@ export function defaultSkillDiscoveryLocations(
 
   if (options.customPaths) {
     for (const custom of options.customPaths) {
-      dirs.push({ dir: custom, client: "custom" });
+      dirs.push({ dir: typeof custom === "string" ? custom : custom.path, client: "custom" });
     }
   }
 
@@ -441,10 +655,11 @@ export async function discoverPlugins(options: DiscoveryOptions = {}): Promise<D
 
   if (options.customPaths) {
     for (const custom of options.customPaths) {
-      if (basename(custom) === "plugin.json") {
-        candidatePaths.push(custom);
+      const customPath = typeof custom === "string" ? custom : custom.path;
+      if (basename(customPath) === "plugin.json") {
+        candidatePaths.push(customPath);
       } else {
-        candidatePaths.push(resolve(custom, "plugin.json"));
+        candidatePaths.push(resolve(customPath, "plugin.json"));
       }
     }
   }
