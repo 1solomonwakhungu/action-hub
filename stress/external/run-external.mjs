@@ -28,7 +28,7 @@
  *   node stress/external/run-external.mjs [--config <servers.json>] [--k6] [--k6-full] [--fuzz] [--spec]
  */
 import { spawn, spawnSync } from "node:child_process";
-import { copyFile, mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, symlink, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,8 +57,10 @@ async function finish(summary) {
   await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
   try {
     await writeFile(join(resultsDir, "external.json"), JSON.stringify(summary, null, 2) + "\n");
-  } catch {
-    /* artifact best-effort; the last line still goes out */
+  } catch (writeCause) {
+    // Contract: a run that cannot persist its artifact is not green.
+    summary.ok = false;
+    summary.artifactError = String(writeCause).slice(0, 200);
   }
   console.log(JSON.stringify(summary));
   process.exit(summary.ok === true ? 0 : 1);
@@ -132,11 +134,9 @@ async function main() {
     // Skills dir: symlink inside the root -> fixture dir, so the final var is
     // contained in the root while still exercising the generated fixture.
     const stagedSkills = join(root, "skills");
-    try {
-      await unlink(stagedSkills);
-    } catch {
-      /* not present */
-    }
+    // buildIsolatedEnv pre-creates the skills dir; remove it (dir or
+    // symlink) before pointing the final var at the fixture.
+    await rm(stagedSkills, { recursive: true, force: true });
     if (skillsDir && existsSync(skillsDir)) await symlink(skillsDir, stagedSkills);
     else await mkdir(stagedSkills, { recursive: true });
     isolatedEnv["ACTION_HUB_SKILLS_DIR"] = stagedSkills;

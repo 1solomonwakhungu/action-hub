@@ -20,7 +20,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
 import { startServe, killTree, runTool } from "./serve.mjs";
-import { copyFile, symlink, unlink } from "node:fs/promises";
+import { copyFile, symlink, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -42,8 +42,10 @@ async function finish(summary) {
   await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
   try {
     await writeFile(join(resultsDir, "external-inspector.json"), JSON.stringify(summary, null, 2) + "\n");
-  } catch {
-    /* artifact best-effort */
+  } catch (writeCause) {
+    // Contract: a run that cannot persist its artifact is not green.
+    summary.ok = false;
+    summary.artifactError = String(writeCause).slice(0, 200);
   }
   console.log(JSON.stringify(summary));
   process.exit(summary.ok === true ? 0 : 1);
@@ -63,11 +65,9 @@ async function main() {
   await copyFile(configPath, stagedConfig);
   isolatedEnv["ACTION_HUB_CONFIG"] = stagedConfig;
   const stagedSkills = join(root, "skills");
-  try {
-    await unlink(stagedSkills);
-  } catch {
-    /* not present */
-  }
+  // buildIsolatedEnv pre-creates the skills dir; remove it (dir or
+  // symlink) before pointing the final var at the fixture.
+  await rm(stagedSkills, { recursive: true, force: true });
   const fixtureSkills = join(genDir, "skills");
   if (existsSync(fixtureSkills)) await symlink(fixtureSkills, stagedSkills);
   else await mkdir(stagedSkills, { recursive: true });
@@ -147,6 +147,23 @@ async function runInspector(env, args, label) {
   } catch {
     // non-JSON output recorded raw below
   }
+  // Strict evidence (R6): a parsed envelope alone is not success.
+  //  - initialize probes must return an error-free result with serverInfo;
+  //  - tools/list probes must return a non-empty tools array.
+  const isInitialize = args.includes("initialize");
+  const isToolsList = args.includes("tools/list");
+  let evidenceOk = false;
+  let evidenceReason = null;
+  if (isInitialize) {
+    evidenceOk = !!parsed && !parsed.error && !!parsed.result?.serverInfo;
+    if (!evidenceOk) evidenceReason = parsed?.error ? `initialize error: ${JSON.stringify(parsed.error).slice(0, 200)}` : "initialize returned no result.serverInfo";
+  } else if (isToolsList) {
+    const tools = parsed?.result?.tools;
+    evidenceOk = Array.isArray(tools) && tools.length > 0;
+    if (!evidenceOk) evidenceReason = `tools/list returned ${Array.isArray(tools) ? 0 : "no"} tools`;
+  } else {
+    evidenceReason = "unrecognized probe (no strict evidence rule)";
+  }
   return {
     label,
     command: [...CLI, ...args].join(" "),
@@ -154,7 +171,8 @@ async function runInspector(env, args, label) {
     exitCode: res.code,
     timedOut: res.timedOut,
     durationMs: res.durationMs,
-    ok: res.code === 0 && !res.timedOut && parsed !== null,
+    ok: res.code === 0 && !res.timedOut && evidenceOk,
+    evidenceReason,
     parsed,
     stderr: res.stderrTail.slice(-2000),
   };

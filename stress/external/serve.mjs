@@ -93,79 +93,85 @@ export async function startServe({
     });
   });
 
-  // Wait for the child to report its actual port; fail fast on early exit.
-  const port = await new Promise((resolvePort, rejectPort) => {
-    portWaiters.push(resolvePort);
-    if (sawPort) notifyPort();
-    const timer = setTimeout(() => rejectPort(new Error(`serve did not report a port in ${startTimeoutMs}ms; tail=${tail.slice(-400)}`)), startTimeoutMs);
-    const poll = setInterval(() => {
-      if (spawnError) {
-        clearTimeout(timer); clearInterval(poll);
-        rejectPort(new Error(`serve spawn error: ${spawnError}`));
-      }
-      if (exitInfo) {
-        clearTimeout(timer); clearInterval(poll);
-        rejectPort(new Error(`serve exited early code=${exitInfo.code} signal=${exitInfo.signal}; tail=${tail.slice(-400)}`));
-      }
-    }, 100);
-    portWaiters.push((value) => { clearTimeout(timer); clearInterval(poll); resolvePort(value); });
-  });
+  // Every failure after spawn must clean up the child we own.
+  try {
+    // Wait for the child to report its actual port; fail fast on early exit.
+    const port = await new Promise((resolvePort, rejectPort) => {
+      portWaiters.push(resolvePort);
+      if (sawPort) notifyPort();
+      const timer = setTimeout(() => rejectPort(new Error(`serve did not report a port in ${startTimeoutMs}ms; tail=${tail.slice(-400)}`)), startTimeoutMs);
+      const poll = setInterval(() => {
+        if (spawnError) {
+          clearTimeout(timer); clearInterval(poll);
+          rejectPort(new Error(`serve spawn error: ${spawnError}`));
+        }
+        if (exitInfo) {
+          clearTimeout(timer); clearInterval(poll);
+          rejectPort(new Error(`serve exited early code=${exitInfo.code} signal=${exitInfo.signal}; tail=${tail.slice(-400)}`));
+        }
+      }, 100);
+      portWaiters.push((value) => { clearTimeout(timer); clearInterval(poll); resolvePort(value); });
+    });
 
-  // Prove the /health endpoint belongs to THIS child: the port was parsed
-  // from this child's own stdout, the child is still alive, and the banner
-  // confirms it authenticated with this run's token.
-  if (child.exitCode !== null || child.signalCode !== null) {
-    throw new Error(`serve exited before health check; tail=${tail.slice(-400)}`);
-  }
-  if (!sawTokenLine) {
-    throw new Error(`serve did not confirm bearer-token auth; tail=${tail.slice(-400)}`);
-  }
-  let healthy = false;
-  const healthDeadline = Date.now() + startTimeoutMs;
-  while (Date.now() < healthDeadline && !exitInfo) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "stress", version: "0" } } }),
-      });
-      // The endpoint may answer application/json or an SSE stream; parse both.
-      const text = await res.text();
-      let body = null;
+    // Prove the /health endpoint belongs to THIS child: the port was parsed
+    // from this child's own stdout, the child is still alive, and the banner
+    // confirms it authenticated with this run's token.
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`serve exited before health check; tail=${tail.slice(-400)}`);
+    }
+    if (!sawTokenLine) {
+      throw new Error(`serve did not confirm bearer-token auth; tail=${tail.slice(-400)}`);
+    }
+    let healthy = false;
+    const healthDeadline = Date.now() + startTimeoutMs;
+    while (Date.now() < healthDeadline && !exitInfo) {
       try {
-        body = JSON.parse(text);
-      } catch {
-        for (const line of text.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          try {
-            body = JSON.parse(line.slice(5).trim());
-            break;
-          } catch {
-            /* keep scanning */
+        // AbortSignal bounds each probe so a wedged socket cannot hang startup.
+        const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "stress", version: "0" } } }),
+          signal: AbortSignal.timeout(5_000),
+        });
+        // The endpoint may answer application/json or an SSE stream; parse both.
+        const text = await res.text();
+        let body = null;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          for (const line of text.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            try {
+              body = JSON.parse(line.slice(5).trim());
+              break;
+            } catch {
+              /* keep scanning */
+            }
           }
         }
+        if (res.status === 200 && body?.result?.serverInfo) { healthy = true; break; }
+      } catch {
+        /* not accepting yet */
       }
-      if (res.status === 200 && body?.result?.serverInfo) { healthy = true; break; }
-    } catch {
-      /* not accepting yet */
+      await new Promise((r) => setTimeout(r, 250));
     }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  if (!healthy) {
+    if (!healthy) {
+      throw new Error(`serve on port ${port} (from its own stdout) never answered an authenticated initialize; tail=${tail.slice(-400)}`);
+    }
+    return {
+      child,
+      port,
+      env,
+      root,
+      /** Resolves with {code, signal} when the child closes. */
+      exitP,
+      /** Tail of the child's stdout+stderr for evidence. */
+      tail: () => tail,
+    };
+  } catch (cause) {
     await killTree(child, exitP);
-    throw new Error(`serve on port ${port} (from its own stdout) never answered an authenticated initialize; tail=${tail.slice(-400)}`);
+    throw cause;
   }
-
-  return {
-    child,
-    port,
-    env,
-    root,
-    /** Resolves with {code, signal} when the child closes. */
-    exitP,
-    /** Tail of the child's stdout+stderr for evidence. */
-    tail: () => tail,
-  };
 }
 
 /**

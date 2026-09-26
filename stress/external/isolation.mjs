@@ -11,10 +11,19 @@
  * are still checked against owner app-state locations.
  */
 import { userInfo, tmpdir } from "node:os";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 /** Owner locations a run must never touch. Separator-safe containment. */
+/** Every isolation var the builder replaces. assertFinalEnv checks exactly these. */
+export const SANDBOX_KEYS = [
+  "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMPDIR",
+  "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+  "ACTION_HUB_CONFIG", "ACTION_HUB_CACHE", "ACTION_HUB_SKILLS_DIR",
+  "ACTION_HUB_DAEMON_DIR", "ACTION_HUB_CREDENTIALS", "ACTION_HUB_CONTROL",
+  "PI_CODING_AGENT_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+];
+
 function insideOwnerAppState(candidate) {
   const ownerHome = userInfo().homedir || process.env["HOME"] || "";
   if (!ownerHome) throw new Error("cannot determine owner home; refusing to run");
@@ -62,17 +71,19 @@ function containedIn(root, candidate) {
 export function buildIsolatedEnv(overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), "ah-stress-iso-"));
 
-  const sandbox = {
+  const sandboxPaths = {
     HOME: join(root, "home"),
     USERPROFILE: join(root, "home"),
     APPDATA: join(root, "appdata"),
     LOCALAPPDATA: join(root, "localappdata"),
+    TMPDIR: join(root, "tmp"),
     XDG_CACHE_HOME: join(root, "cache"),
     XDG_CONFIG_HOME: join(root, "config"),
     XDG_STATE_HOME: join(root, "state"),
     XDG_DATA_HOME: join(root, "data"),
     // File-shaped vars get FILE paths, not directories.
     ACTION_HUB_CACHE: join(root, "cache", "action-hub.json"),
+    ACTION_HUB_CONFIG: join(root, "config", "servers.json"),
     ACTION_HUB_CREDENTIALS: join(root, "credentials.json"),
     ACTION_HUB_CONTROL: join(root, "control.json"),
     ACTION_HUB_SKILLS_DIR: join(root, "skills"),
@@ -81,12 +92,19 @@ export function buildIsolatedEnv(overrides = {}) {
     CODEX_HOME: join(root, "codex"),
     CLAUDE_CONFIG_DIR: join(root, "claude"),
   };
+  const sandbox = Object.fromEntries(SANDBOX_KEYS.map((key) => [key, sandboxPaths[key]]));
 
   // 1. Owner app-state refusal for sandbox vars and overrides.
   for (const value of [...Object.values(sandbox), ...Object.values(overrides)]) {
     if (typeof value !== "string") continue;
     const hit = insideOwnerAppState(value);
     if (hit) throw new Error(`isolation: ${value} lies inside owner app state ${hit}; refusing`);
+  }
+
+  // 1b. Create every directory the sandbox declares so children (and their
+  // own mkdtemp calls under TMPDIR) never hit ENOENT.
+  for (const key of ["HOME", "APPDATA", "LOCALAPPDATA", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "ACTION_HUB_SKILLS_DIR", "ACTION_HUB_DAEMON_DIR", "PI_CODING_AGENT_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR"]) {
+    mkdirSync(sandbox[key], { recursive: true });
   }
 
   // 2. ONE env: inherited base, then ALL sandbox vars REPLACE, then overrides.
@@ -105,13 +123,7 @@ export function buildIsolatedEnv(overrides = {}) {
  * generator's fresh config path). Call immediately before spawning.
  */
 export function assertFinalEnv(env, root, inputKeys = new Set()) {
-  const sandboxKeys = [
-    "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
-    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
-    "ACTION_HUB_CACHE", "ACTION_HUB_SKILLS_DIR", "ACTION_HUB_DAEMON_DIR",
-    "ACTION_HUB_CREDENTIALS", "ACTION_HUB_CONTROL", "PI_CODING_AGENT_DIR",
-    "CODEX_HOME", "CLAUDE_CONFIG_DIR",
-  ];
+  const sandboxKeys = SANDBOX_KEYS;
   for (const key of sandboxKeys) {
     const value = env[key];
     if (typeof value !== "string" || value.length === 0) continue;
@@ -123,11 +135,6 @@ export function assertFinalEnv(env, root, inputKeys = new Set()) {
     }
   }
   // Fixture input vars (config, skills dir, ...) are refused inside owner
-  // app state but allowed outside the run root.
-  for (const key of inputKeys) {
-    const value = env[key];
-    if (typeof value !== "string" || value.length === 0) continue;
-    const hit = insideOwnerAppState(value);
-    if (hit) throw new Error(`isolation: final ${key}=${value} lies inside owner app state ${hit}`);
-  }
+  // app state but may live outside the run root; sandbox defaults for the
+  // same keys have already been checked above.
 }

@@ -17,7 +17,7 @@
  * collects; the verdict is reported as-is, not massaged — a 401-driven
  * failure count therefore fails the run (ok:false), by design.
  */
-import { mkdir, readdir, writeFile, copyFile, symlink, unlink } from "node:fs/promises";
+import { mkdir, readdir, writeFile, copyFile, symlink, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,8 +37,10 @@ async function finish(summary) {
   await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
   try {
     await writeFile(join(resultsDir, "external-conformance.json"), JSON.stringify(summary, null, 2) + "\n");
-  } catch {
-    /* artifact best-effort */
+  } catch (writeCause) {
+    // Contract: a run that cannot persist its artifact is not green.
+    summary.ok = false;
+    summary.artifactError = String(writeCause).slice(0, 200);
   }
   console.log(JSON.stringify(summary));
   process.exit(summary.ok === true ? 0 : 1);
@@ -65,11 +67,9 @@ async function main() {
   await copyFile(configPath, stagedConfig);
   isolatedEnv["ACTION_HUB_CONFIG"] = stagedConfig;
   const stagedSkills = join(root, "skills");
-  try {
-    await unlink(stagedSkills);
-  } catch {
-    /* not present */
-  }
+  // buildIsolatedEnv pre-creates the skills dir; remove it (dir or
+  // symlink) before pointing the final var at the fixture.
+  await rm(stagedSkills, { recursive: true, force: true });
   const fixtureSkills = join(genDir, "skills");
   if (existsSync(fixtureSkills)) await symlink(fixtureSkills, stagedSkills);
   else await mkdir(stagedSkills, { recursive: true });

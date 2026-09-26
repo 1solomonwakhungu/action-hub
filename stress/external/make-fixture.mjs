@@ -110,6 +110,7 @@ export ACTION_HUB_CONFIG="${outDir}/servers.json"
 export ACTION_HUB_SKILLS_DIR="${outDir}/skills"
 export ACTION_HUB_DAEMON_DIR="${outDir}/daemon"
 export ACTION_HUB_CREDENTIALS="${outDir}/credentials.json"
+export ACTION_HUB_CONTROL="${outDir}/control.json"
 export PI_CODING_AGENT_DIR="${outDir}/pi"
 export CODEX_HOME="${outDir}/codex"
 export CLAUDE_CONFIG_DIR="${outDir}/claude"
@@ -155,11 +156,25 @@ export CLAUDE_CONFIG_DIR="${outDir}/claude"
     at: new Date().toISOString(),
   };
   await mkdir(resultsDir, { recursive: true });
-  await writeFile(join(resultsDir, "external-make-fixture.json"), JSON.stringify(summary, null, 2) + "\n");
+  try {
+    await writeFile(join(resultsDir, "external-make-fixture.json"), JSON.stringify(summary, null, 2) + "\n");
+  } catch (writeCause) {
+    // Contract: a run that cannot persist its artifact is not green.
+    summary.ok = false;
+    summary.artifactError = String(writeCause).slice(0, 200);
+  }
   console.log(JSON.stringify(summary));
+  if (summary.ok !== true) process.exit(1);
 }
 
 main().catch((cause) => {
-  console.error(String(cause));
+  // Failure contract: one compact JSON last line with ok:false, exit nonzero.
+  const summary = {
+    script: "make-fixture.mjs",
+    ok: false,
+    error: String(cause?.stack ?? cause).slice(-2000),
+    at: new Date().toISOString(),
+  };
+  console.log(JSON.stringify(summary));
   process.exit(1);
 });
