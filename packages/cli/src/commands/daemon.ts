@@ -1,13 +1,31 @@
 import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
-import { connect, type Socket } from "node:net";
+import { chmod, lstat, mkdir, readFile } from "node:fs/promises";import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { runDaemonServer } from "@action-hub/mcp-server";
 import { resolvePath } from "../config-loader.js";
 
 const START_TIMEOUT_MS = 15_000;
+/**
+ * Progress-aware daemon start readiness (FX10/F25):
+ * - `DEFAULT_START_TIMEOUT_MS` is the overall cap, configurable via the
+ *   `--start-timeout` flag or ACTION_HUB_DAEMON_START_TIMEOUT_MS (default 120s).
+ *   At fleet scale (10K tools + 5K skills) cold boot was measured at 120-600s,
+ *   so a fixed 15s wall made `daemon start` report "did not become ready" on
+ *   healthy, still-booting daemons.
+ * - `NO_PROGRESS_TIMEOUT_MS` is how long the start command will wait WITHOUT
+ *   any sign of life (log growth, state-file write, or a live pid) before
+ *   giving up. Any sign of progress resets this window, so a daemon that is
+ *   alive and working gets its full cap, while a hung daemon still fails fast.
+ * - If the daemon process exits during startup, we fail immediately.
+ * The readiness predicate itself is isolated in `daemonReady()` so the
+ * readiness signal can move (e.g. after reindex settles) without touching
+ * the wait loop.
+ */
+const DEFAULT_START_TIMEOUT_MS = 120_000;
+const NO_PROGRESS_TIMEOUT_MS = 15_000;
+const PROGRESS_LOG_INTERVAL_MS = 2_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 const MAX_RESPONSE_BYTES = 8 * 1024;
 
@@ -33,6 +51,59 @@ export interface DaemonOptions {
   daemonDir?: string;
   /** CLI entrypoint override for embedded callers and integration tests. */
   entryPath?: string;
+  /** Overall startup cap in ms (default 120000, env/flag overridable). */
+  startTimeoutMs?: number;
+}
+
+/** Isolated readiness predicate: a single place to change the readiness signal. */
+async function daemonReady(
+  paths: DaemonPaths,
+): Promise<{ ok: boolean; pid?: number } | undefined> {
+  const result = await probe(paths).catch(() => undefined);
+  if (!result) return undefined;
+  return { ok: result.ok, pid: result.state?.pid };
+}
+
+function daemonStartCapMs(explicit?: number): number {
+  if (explicit !== undefined && Number.isFinite(explicit) && explicit > 0) return explicit;
+  const envRaw = process.env["ACTION_HUB_DAEMON_START_TIMEOUT_MS"];
+  if (envRaw) {
+    const parsed = Number(envRaw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_START_TIMEOUT_MS;
+}
+
+function noProgressWindowMs(): number {
+  const envRaw = process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"];
+  if (envRaw) {
+    const parsed = Number(envRaw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return NO_PROGRESS_TIMEOUT_MS;
+}
+
+async function fileSize(path: string): Promise<number> {
+  try {
+    return (await lstat(path)).size;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * Best-effort read of the daemon's reindex-settle fields (PR 63: `indexing`,
+ * `indexingSettledAt`). Returns undefined when the state file does not exist
+ * or does not carry the fields (older daemons), so the wait loop never
+ * depends on them being present.
+ */
+async function readIndexingState(paths: DaemonPaths): Promise<boolean | undefined> {
+  try {
+    const raw = JSON.parse(await readFile(paths.state, "utf8")) as { indexing?: boolean };
+    return typeof raw.indexing === "boolean" ? raw.indexing : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function defaultDaemonDir(): string {
@@ -86,16 +157,61 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   child.unref();
   closeSync(logFd);
 
-  const deadline = Date.now() + START_TIMEOUT_MS;
-  while (Date.now() < deadline) {
+  // Progress-aware readiness wait (see the constants above).
+  const cap = daemonStartCapMs(options.startTimeoutMs);
+  const startedAt = Date.now();
+  const totalDeadline = startedAt + cap;
+  let lastProgressAt = startedAt;
+  let lastLogSize = -1;
+  let lastProgressPrint = startedAt;
+  let childExited = false;
+  let childExitCode: number | null = null;
+  child.once("exit", (code) => {
+    childExited = true;
+    childExitCode = code;
+  });
+
+  for (;;) {
     if (spawnError) {
       console.error(`Could not start Action Hub daemon: ${spawnError.message}`);
       return 1;
     }
-    const result = await probe(paths).catch(() => undefined);
-    if (result?.ok) {
-      console.log(`Action Hub daemon started (pid ${result.state.pid}).`);
+    if (childExited) {
+      console.error(
+        `Action Hub daemon exited during startup (code ${childExitCode ?? "signal"}). See ${paths.log}`,
+      );
+      return 1;
+    }
+
+    const ready = await daemonReady(paths);
+    if (ready?.ok) {
+      console.log(`Action Hub daemon started (pid ${ready.pid}).`);
       return 0;
+    }
+
+    const now = Date.now();
+    if (now >= totalDeadline) break;
+
+    // Any sign of life resets the no-progress window.
+    let progressed = false;
+    const logSize = await fileSize(paths.log);
+    if (logSize > lastLogSize) {
+      if (lastLogSize >= 0) progressed = true; // ignore the very first read
+      lastLogSize = logSize;
+    }
+    if (ready !== undefined) progressed = true; // state file appeared/changed
+    if (progressed) lastProgressAt = now;
+
+    if (now - lastProgressAt >= noProgressWindowMs()) break;
+
+    if (now - lastProgressPrint >= PROGRESS_LOG_INTERVAL_MS) {
+      const elapsed = Math.round((now - startedAt) / 100) / 10;
+      // Surface reindex state when the daemon publishes it (PR 63 fields,
+      // read best-effort from the state file).
+      const indexing = await readIndexingState(paths);
+      const phase = indexing === undefined ? "" : indexing ? "; reindex in progress" : "; reindex settled";
+      console.log(`Waiting for Action Hub daemon... ${elapsed}s elapsed (cap ${Math.round(cap / 1000)}s)${phase}.`);
+      lastProgressPrint = now;
     }
     await delay(50);
   }
