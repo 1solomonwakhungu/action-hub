@@ -249,6 +249,14 @@ const ENTITY_SYN = {
 // templates built from it have zero overlap with every gold by construction.
 const FILLER_CANDIDATES = ['where', 'should', 'go', 'when', 'need', 'wanted', 'them', 'quickly', 'point', 'at', 'whatever', 'handles', 'so', 'can', 'which', 'app', 'lets', 'some', 'do', 'turn', 'today', 'give', 'way', 'who', 'around', 'here', 'line', 'up', 'all', 'spots', 'please', 'right', 'away', 'quickly', 'morning', 'tonight', 'soon', 'anything', 'options', 'looking', 'trying', 'hoping', 'want', 'must', 'might', 'could', 'would', 'there', 'exists', 'place', 'spot', 'corner', 'nook'];
 
+// Documented stopword list (intake 16:56Z, from the PR 45 review): removed
+// from query tokens before no-match overlap checks. Natural function words
+// beyond this list are NOT exempt.
+const STOPWORDS = new Set(['the','a','an','of','for','to','in','on','with','and','or','how','find','my','me','i','is','what','do']);
+function contentOverlapNoStop(text, banned) {
+  return [...new Set(tokenize(text))].filter((t) => t.length >= 3 && !STOPWORDS.has(t) && banned.has(t));
+}
+
 const GOAL_TEMPLATES = [
   'where should I go when I need {V} {E}',
   'point me at whatever handles {E} so I can {V} them',
@@ -622,7 +630,11 @@ function buildQueries(manifests, serverDescs) {
       gen.push(() => {
         const vs = pick(VERB_SYN[v]); const es = pick(ENTITY_SYN[e]);
         const text = `${pick(vs.split(' '))} the ${adj} ${es.split(' ')[0]} please`;
-        if (corpusTokens.has(adj)) return null;
+        // Rule (intake 16:56Z): no-match queries must have ZERO overlap on
+        // content tokens (query tokens minus the documented stopword list)
+        // with the whole indexed corpus (tool name words, description,
+        // serverId, server description). Validated on the final emitted string.
+        if (contentOverlapNoStop(text, corpusTokens).length > 0) return null;
         return { query: text, expected: null };
       });
     }
@@ -702,6 +714,20 @@ function validate(manifests, queries, serverDescs, staleRemoved, finalFiles) {
   // (4) no numeric serials in tool names
   for (const m of manifests) for (const t of m.tools)
     if (!/^[a-z][a-z_]*[a-z]$/.test(t.name)) violations.push(`tool name has serials/invalid chars: ${m.serverId}:${t.name}`);
+
+  // (4b) no-match: zero content-token overlap with the whole indexed corpus
+  // (tokens minus STOPWORDS; name words, description, serverId, server desc)
+  const corpusIndexed = new Set();
+  for (const m of manifests) {
+    corpusIndexed.add(...tokenize(m.serverId));
+    corpusIndexed.add(...tokenize(serverDescs[m.serverId]));
+    for (const t of m.tools) { corpusIndexed.add(...tokenize(t.name)); corpusIndexed.add(...tokenize(t.description)); }
+  }
+  for (const q of queries) {
+    if (q.subtype !== 'no-match') continue;
+    const ov = contentOverlapNoStop(q.query, corpusIndexed);
+    if (ov.length > 0) violations.push(`no-match content overlap ${JSON.stringify(ov)} with corpus: ${q.query}`);
+  }
 
   // (5) stale manifests
   const expectedFiles = new Set(manifests.map((m) => `${m.serverId}.json`));
@@ -787,6 +813,7 @@ function main() {
       uniqueQueryStrings: new Set(queries.map((q) => q.query)).size === queries.length,
       unresolvedExpected: queries.filter((q) => q.expected !== null && !idExists(manifests, q.expected)).length,
       paraphraseCeiling: 0.3,
+      noMatchRule: 'zero content-token overlap with the whole indexed corpus (tool name words, description, serverId, server description) after removing the documented stopword list: ' + [...STOPWORDS].join(','),
       staleRemoved,
       minDistractors,
       violations: violations.slice(0, 20),
