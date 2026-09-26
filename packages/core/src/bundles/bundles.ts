@@ -32,6 +32,13 @@ export class BundleRegistry {
     return this.#bundles.get(id);
   }
 
+  /** Returns the bundle as pretty-printed JSON. Throws on unknown id. */
+  exportBundle(id: string): string {
+    const bundle = this.#bundles.get(id);
+    if (!bundle) throw new Error(`Unknown bundle "${id}"`);
+    return JSON.stringify(bundle, null, 2);
+  }
+
   list(): Bundle[] {
     return [...this.#bundles.values()];
   }

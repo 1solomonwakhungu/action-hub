@@ -96,6 +96,7 @@ EXAMPLES:
   action-hub test-search "create pull request" --limit 5
   action-hub list --server github
   action-hub bundle --load triage-issue
+  action-hub bundle --export <id>   Print a bundle as pretty JSON
   action-hub start
   action-hub serve --port 6290
   action-hub daemon start
@@ -260,9 +261,17 @@ async function main(): Promise<void> {
       case "bundle":
       case "bundles": {
         const loadVal = typeof parsedArgs["load"] === "string" ? parsedArgs["load"] : positional[0];
+        if (parsedArgs["export"] === true) {
+          // Present but valueless: the parser records a bare flag as `true`.
+          console.error("Error: --export requires a bundle id (usage: action-hub bundle --export <id>)");
+          exitCode = 1;
+          break;
+        }
+        const exportVal = typeof parsedArgs["export"] === "string" ? parsedArgs["export"] : undefined;
         exitCode = await bundlesCommand({
           configPath,
           load: loadVal,
+          exportId: exportVal,
         });
         break;
       }
