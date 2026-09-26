@@ -30,20 +30,94 @@
 // Output: JSON summary as the last stdout line, also written to
 // stress/.generated/results/chaos.json. Requires `npm run build` first.
 
-import { spawnSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { tmpdir, userInfo as osUserInfo } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..");
 const FAKE_SERVER = join(HERE, "fake-mcp-server.mjs");
 const GEN_DIR = join(REPO_ROOT, "stress", ".generated", "chaos");
-const MANIFEST_DIR = join(GEN_DIR, "manifests");
 const RESULTS_DIR = join(REPO_ROOT, "stress", ".generated", "results");
 const RESULTS_FILE = join(RESULTS_DIR, "chaos.json");
-const CONFIG_PATH = join(GEN_DIR, "servers.json");
+
+// CONTRACT.md hard rule 2 + intake ISOLATION.md checklist: every var is
+// REPLACED (never forwarded) under ONE fresh temp root, applied to the
+// ENTIRE process before factory/hub construction — the in-process hub and
+// all 44 spawned children (which inherit process.env) can never touch
+// owner state. A sentinel self-check refuses to run if any resolved path
+// still lies inside the real owner home (resolved independently of $HOME
+// via os.userInfo().homedir). The script exits after the run, so the
+// process.env mutation is inherently scoped.
+const tmpRoot = join(tmpdir(), `action-hub-chaos-${process.pid}-${Date.now()}`);
+for (const d of ["home", "cache", "config", "state", "data", "skills", "pi", "daemon", "credentials"]) {
+  mkdirSync(join(tmpRoot, d), { recursive: true });
+}
+function failureSummary(reason, extra = {}, code = 2) {
+  const out = { script: "chaos", ok: false, reason, findings, elapsedMs: 0, ...extra };
+  console.log(JSON.stringify(out));
+  process.exit(code);
+}
+const isolationPaths = {
+  HOME: join(tmpRoot, "home"),
+  USERPROFILE: join(tmpRoot, "home"),
+  APPDATA: join(tmpRoot, "config"),
+  LOCALAPPDATA: join(tmpRoot, "cache"),
+  XDG_CACHE_HOME: join(tmpRoot, "cache"),
+  XDG_CONFIG_HOME: join(tmpRoot, "config"),
+  XDG_STATE_HOME: join(tmpRoot, "state"),
+  XDG_DATA_HOME: join(tmpRoot, "data"),
+  ACTION_HUB_CONFIG: join(tmpRoot, "servers.json"), // live config lives in the run root
+  ACTION_HUB_CACHE: join(tmpRoot, "action-hub-cache.json"), // FILE-shaped: no EISDIR if exercised
+  ACTION_HUB_SKILLS_DIR: join(tmpRoot, "skills"),
+  ACTION_HUB_DAEMON_DIR: join(tmpRoot, "daemon"),
+  ACTION_HUB_CREDENTIALS: join(tmpRoot, "credentials.json"), // FILE-shaped
+  ACTION_HUB_CONTROL: join(tmpRoot, "control.sock"), // present on this base (control.ts)
+  PI_CODING_AGENT_DIR: join(tmpRoot, "pi"),
+};
+for (const [k, v] of Object.entries(isolationPaths)) {
+  process.env[k] = v; // REPLACE, never forward the caller's value
+}
+// Sentinel self-check: refuse to run if any isolation path resolves inside
+// the real owner's action-hub state (resolved independently of $HOME).
+// Windows-safe containment via path.relative/isAbsolute — no string
+// prefixing. The check targets the owner's ACTION-HUB state specifically
+// (not the entire home): os.tmpdir() legitimately lives under the user
+// profile on some platforms, and a whole-home refusal would reject every
+// run there. Any OTHER isolation violation still fails the check.
+const realHome = resolve(osUserInfo().homedir);
+const insideOwnerState = (p) => {
+  const r = resolve(p);
+  const ownerState = [
+    join(realHome, ".cache", "action-hub"),
+    join(realHome, ".config", "action-hub"),
+    join(realHome, ".action-hub"),
+    join(realHome, ".codex"),
+    join(realHome, ".claude"),
+  ];
+  return ownerState.some((o) => {
+    const rel = relative(o, r);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  });
+};
+function validateIsolation() {
+  for (const [k, v] of Object.entries(isolationPaths)) {
+    if (insideOwnerState(v)) {
+      console.error(`[chaos] refusing to run: ${k}=${v} resolves inside the real owner's action-hub state under ${realHome}`);
+      process.exit(2);
+    }
+    if (!v.startsWith(tmpRoot)) {
+      console.error(`[chaos] refusing to run: ${k}=${v} is outside the run root ${tmpRoot}`);
+      process.exit(2);
+    }
+  }
+}
+validateIsolation(); // initial assignment
+const isolationEnv = () => ({ ...process.env }); // children inherit the already-isolated env
+const MANIFEST_DIR = join(tmpRoot, "manifests");
+const CONFIG_PATH = join(tmpRoot, "servers.json"); // INSIDE the run root (checklist rule 1)
 const CLI_ENTRY = join(REPO_ROOT, "packages", "cli", "dist", "index.js");
 
 const SECRET = "CHAOS-SENTINEL-9f3a2b";
@@ -59,51 +133,7 @@ const HUGE_BYTES = 5 * 1024 * 1024;
 const CHAOS_SEED = 7;
 const DOCTOR_TIMEOUT_MS = 180_000;
 
-// CONTRACT.md hard rule 2 + intake ISOLATION.md checklist: every var is
-// REPLACED (never forwarded) under ONE fresh temp root, applied to the
-// ENTIRE process before factory/hub construction — the in-process hub and
-// all 44 spawned children (which inherit process.env) can never touch
-// owner state. A sentinel self-check refuses to run if any resolved path
-// still lies inside the real owner home (resolved independently of $HOME
-// via os.userInfo().homedir). The script exits after the run, so the
-// process.env mutation is inherently scoped.
-import { userInfo as osUserInfo } from "node:os";
-const tmpRoot = join(tmpdir(), `action-hub-chaos-${process.pid}-${Date.now()}`);
-for (const d of ["home", "cache", "config", "state", "data", "skills", "pi", "daemon", "credentials"]) {
-  mkdirSync(join(tmpRoot, d), { recursive: true });
-}
-const isolationPaths = {
-  HOME: join(tmpRoot, "home"),
-  USERPROFILE: join(tmpRoot, "home"),
-  APPDATA: join(tmpRoot, "config"),
-  LOCALAPPDATA: join(tmpRoot, "cache"),
-  XDG_CACHE_HOME: join(tmpRoot, "cache"),
-  XDG_CONFIG_HOME: join(tmpRoot, "config"),
-  XDG_STATE_HOME: join(tmpRoot, "state"),
-  XDG_DATA_HOME: join(tmpRoot, "data"),
-  ACTION_HUB_CONFIG: join(tmpRoot, "servers.json"), // repointed to the real config once generated
-  ACTION_HUB_CACHE: join(tmpRoot, "cache", "action-hub"),
-  ACTION_HUB_SKILLS_DIR: join(tmpRoot, "skills"),
-  ACTION_HUB_DAEMON_DIR: join(tmpRoot, "daemon"),
-  ACTION_HUB_CREDENTIALS: join(tmpRoot, "credentials"),
-  PI_CODING_AGENT_DIR: join(tmpRoot, "pi"),
-};
-for (const [k, v] of Object.entries(isolationPaths)) {
-  process.env[k] = v; // REPLACE, never forward the caller's value
-}
-// Sentinel self-check: refuse to run if any isolation path resolves inside
-// the real owner home (independent of $HOME).
-const realHome = osUserInfo().homedir;
-const resolveSafe = (p) => {
-  const r = resolve(p);
-  if (r === realHome || r.startsWith(realHome + "/")) {
-    console.error(`[chaos] refusing to run: ${r} resolves inside the real owner home ${realHome}`);
-    process.exit(2);
-  }
-  return r;
-};
-for (const v of Object.values(isolationPaths)) resolveSafe(v);
-const isolationEnv = () => ({ ...process.env }); // children inherit the already-isolated env
+
 process.on("exit", () => {
   try {
     rmSync(tmpRoot, { recursive: true, force: true });
@@ -206,11 +236,11 @@ function buildFixtures() {
 async function main() {
   if (!existsSync(join(REPO_ROOT, "packages", "core", "dist", "index.js")) || !existsSync(CLI_ENTRY)) {
     console.error("[chaos] requires built workspaces; run `npm run build` first");
-    process.exit(2);
+    failureSummary("workspaces not built (run npm run build)", { phase: "preflight" });
   }
   if (!existsSync(FAKE_SERVER)) {
     console.error(`[chaos] missing ${FAKE_SERVER} (committed by PR 46; run from a checkout of main 55dc286 or later)`);
-    process.exit(2);
+    failureSummary(`missing ${FAKE_SERVER}`, { phase: "preflight" });
   }
 
   const { ActionHub } = await import(resolve(REPO_ROOT, "packages/core/dist/index.js"));
@@ -223,6 +253,7 @@ async function main() {
   // block closes the hub and kills all child transports. Not part of a
   // normal run.
   process.env.ACTION_HUB_CONFIG = CONFIG_PATH; // real config now exists
+  validateIsolation(); // re-validate FINAL values after every assignment
   const startedAt = Date.now();
   const rssStartMB = Math.round(process.memoryUsage().rss / 1048576);
 
@@ -465,20 +496,39 @@ async function main() {
 
   // 6. doctor: bounded time with 44 servers, exits 1 (10 misbehaving), no secret.
   const doctorStart = Date.now();
-  const doctor = spawnSync("node", [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"], {
-    encoding: "utf8",
-    timeout: DOCTOR_TIMEOUT_MS,
-    env: isolationEnv(), // isolated process.env, captured after repointing
-    cwd: tmpRoot, // cross-cwd proof: not the repo root
+  // Bounded, process-tree-safe run: detached (POSIX group leader) so a
+  // timeout kills doctor AND its MCP grandchildren (TERM -> KILL
+  // escalation); the child is reaped in a finally.
+  const runDoctor = () => new Promise((resolveRun) => {
+    const child = spawn("node", [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"], {
+      env: isolationEnv(), // isolated process.env, captured after repointing
+      cwd: tmpRoot, // cross-cwd proof: not the repo root
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "", stderr = "", timedOut = false, settled = false;
+    let killer = setTimeout(() => {
+      timedOut = true;
+      const killTree = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
+      killTree("SIGTERM");
+      setTimeout(() => killTree("SIGKILL"), 3_000).unref();
+    }, DOCTOR_TIMEOUT_MS);
+    child.stdout.on("data", (c) => { stdout += String(c); });
+    child.stderr.on("data", (c) => { stderr += String(c); });
+    const finish = (info) => { if (!settled) { settled = true; clearTimeout(killer); resolveRun(info); } };
+    child.on("error", (e) => finish({ code: null, signal: null, timedOut, stdout, stderr, error: String(e) }));
+    child.on("close", (code, signal) => finish({ code, signal, timedOut, stdout, stderr }));
   });
+  const doctor = await runDoctor();
   const doctorMs = Date.now() - doctorStart;
   const doctorOut = `${doctor.stdout ?? ""}\n${doctor.stderr ?? ""}`;
   scanForSecret(doctorOut);
   summary.doctor = {
-    exitCode: doctor.status,
-    timedOut: doctor.signal === "SIGTERM",
+    exitCode: doctor.code,
+    timedOut: doctor.timedOut === true,
     durationMs: doctorMs,
-    bounded: doctor.signal !== "SIGTERM" && doctorMs < DOCTOR_TIMEOUT_MS,
+    bounded: doctor.timedOut !== true && doctorMs < DOCTOR_TIMEOUT_MS,
+    error: doctor.error,
   };
   if (!summary.doctor.bounded) {
     finding("P1", `doctor exceeded ${DOCTOR_TIMEOUT_MS}ms with ${SERVER_COUNT} servers`, `ACTION_HUB_CONFIG=${CONFIG_PATH} node ${CLI_ENTRY} doctor`);
@@ -539,13 +589,18 @@ async function main() {
   }
   // CONTRACT.md hard rule: machine-readable JSON is the LAST stdout line —
   // one compact line; the results file keeps the pretty form.
+  summary.ok =
+    Object.values(summary.verdict).every(Boolean) &&
+    findings.length === 0 &&
+    summary.hubClosedOnAllPaths === true;
   console.log(scrub(JSON.stringify(summary)));
   mkdirSync(RESULTS_DIR, { recursive: true });
   writeFileSync(RESULTS_FILE, text + "\n");
-  process.exit(0);
+  process.exit(summary.ok ? 0 : 1);
 }
 
 main().catch((err) => {
   console.error(`[chaos] fatal: ${err?.stack ?? err}`);
+  console.log(JSON.stringify({ script: "chaos", ok: false, reason: `fatal: ${String(err?.message ?? err).slice(0, 200)}`, findings, phase: "run" }));
   process.exit(1);
 });
