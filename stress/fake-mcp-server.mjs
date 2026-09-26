@@ -18,8 +18,18 @@
  *                 "behavior": { "latencyMs": 5, "errorRate": 0, "responseBytes": 512 } }] }
  *
  * Chaos keys (comma-separated key=value after --chaos):
- *   crash-after=N     after the Nth JSON-RPC request is served (reply
- *                     delivered), print a stderr note and exit(1)
+ *   crash-after=N     counts tools/call requests ONLY (initialize,
+ *                     tools/list and pings never count). Calls 1..N are
+ *                     accepted and served; calls above N are refused
+ *                     immediately with isError and never count. JSON-RPC
+ *                     ids are scoped per connection, so acceptance and
+ *                     delivery are tracked per transport instance plus id.
+ *                     Exit once all N accepted calls have settled, each as
+ *                     finished (fully delivered: stdio write callback /
+ *                     HTTP ServerResponse 'finish') or aborted (client
+ *                     went away mid-response; never counted as
+ *                     completed). The log reports completed=K aborted=M
+ *                     exactly once.
  *   hang-rate=R       per tools/call draw: never respond to that call
  *   seed=N            deterministic PRNG seed (mulberry32) for hang-rate and
  *                     errorRate draws; also accepted as --seed or CHAOS_SEED;
@@ -96,31 +106,36 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --- crash-after bookkeeping (tools/call only; see header) -------------------
 
-// json-rpc id -> { seq }; the in-flight set of accepted tools/call requests.
-const callState = new Map();
+// Accepted calls are registered per CONNECTION (each transport instance
+// gets its own conn object); JSON-RPC ids are client-scoped, so a global
+// id map would let two concurrent clients collide. Settled calls are
+// counted globally: finished = fully delivered, aborted = client went
+// away mid-response (never counted as completed).
 let acceptedCalls = 0;
-let deliveredCalls = 0;
-let finishedCalls = 0; // HTTP: ServerResponse 'finish' events observed
+let finishedCalls = 0;
+let abortedCalls = 0;
 let crashDone = false;
 
 function crashLog(reason) {
   if (crashDone) return;
   crashDone = true;
-  process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${deliveredCalls} completed tools/call responses (${reason})\n`);
+  process.stderr.write(`chaos: crash-after=${crashAfter} triggered: completed=${finishedCalls} aborted=${abortedCalls} (${reason})\n`);
   process.exit(1);
 }
 
 /**
- * Called from the tools/call handler. Returns false when this call must be
- * refused (limit reached); refused calls never enter callState and their
- * isError replies never count. Accepted calls are registered per JSON-RPC
- * id so the transport send hook can tie delivery to the exact response.
+ * Called from the tools/call handler with the connection state shared with
+ * the transport wrapper. Returns false when this call must be refused
+ * (limit reached); refused calls are not registered and their isError
+ * replies never count. Accepted calls are recorded in the connection's
+ * accepted-id set so the transport send hook can tie delivery to the
+ * exact response of THIS client.
  */
-function beginToolCall(extra) {
+function beginToolCall(extra, conn) {
   if (crashAfter === undefined) return true;
   if (acceptedCalls >= crashAfter) return false;
   acceptedCalls += 1;
-  callState.set(extra.requestId, { seq: acceptedCalls });
+  conn.acceptedIds.add(extra.requestId);
   return true;
 }
 
@@ -139,7 +154,7 @@ function refusalResult() {
  * 'finish' hook on that request's own res (captured via handleRequest),
  * never a global flag. Every SDK-assigned handler passes through.
  */
-function withCrashCounting(inner, { http = false } = {}) {
+function withCrashCounting(inner, conn, { http = false } = {}) {
   let currentRes = null;
   return new Proxy(inner, {
     get(target, prop, recv) {
@@ -149,34 +164,35 @@ function withCrashCounting(inner, { http = false } = {}) {
           if (
             crashAfter !== undefined &&
             msg && typeof msg === "object" && !("method" in msg) &&
-            callState.has(msg.id)
+            conn.acceptedIds.has(msg.id)
           ) {
-            callState.delete(msg.id);
-            deliveredCalls += 1;
+            conn.acceptedIds.delete(msg.id);
             if (http && currentRes) {
               // SSE/HTTP responses drain asynchronously (res.write may be
-              // backpressured well past send() resolving), so the exit waits
-              // for EVERY accepted response's own ServerResponse 'finish' —
-              // never just the triggering one, and never a global flag.
+              // backpressured well past send() resolving), so completion is
+              // that response's own ServerResponse 'finish'. An abort is
+              // settled truthfully as aborted, never as completed.
               const res = currentRes;
-              let counted = false;
-              const arm = (reason) => {
-                if (counted) return;
-                counted = true;
-                finishedCalls += 1;
-                if (finishedCalls >= crashAfter) crashLog(reason);
+              let settled = false;
+              const settle = (kind, reason) => {
+                if (settled) return;
+                settled = true;
+                if (kind === "finished") finishedCalls += 1;
+                else abortedCalls += 1;
+                if (finishedCalls + abortedCalls >= crashAfter) crashLog(reason);
               };
-              if (res.writableFinished) arm("finish");
+              if (res.writableFinished) settle("finished", "finish");
               else {
-                res.once("finish", () => arm("finish"));
+                res.once("finish", () => settle("finished", "finish"));
                 res.once("close", () => {
-                  if (!res.writableFinished) arm("client-abort");
+                  if (!res.writableFinished) settle("aborted", "client-abort");
                 });
               }
-            } else if (deliveredCalls >= crashAfter) {
-              // stdio: write callback = chunk handed to the pipe buffer,
-              // which survives process exit.
-              crashLog("write-drained");
+            } else {
+              // stdio: the write callback means the chunk is in the pipe
+              // buffer, which survives process exit.
+              finishedCalls += 1;
+              if (finishedCalls + abortedCalls >= crashAfter) crashLog("write-drained");
             }
           }
           return result;
@@ -232,13 +248,13 @@ function buildTools() {
   }));
 }
 
-function registerHandlers(server) {
+function registerHandlers(server, conn) {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return { tools: buildTools() };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    if (!beginToolCall(extra)) return refusalResult();
+    if (!beginToolCall(extra, conn)) return refusalResult();
     const tool = manifest.tools.find((t) => t.name === request.params.name);
     // Unknown tool names are rejected with an isError result, consistent
     // with real servers (a plain ok:true would hide router defects).
@@ -276,9 +292,10 @@ function registerHandlers(server) {
 // --- transports ----------------------------------------------------------------
 
 async function runStdio() {
+  const conn = { acceptedIds: new Set() };
   const server = new Server({ name: serverId, version: "0.0.0" }, { capabilities: { tools: {} } });
-  registerHandlers(server);
-  const transport = withCrashCounting(new StdioServerTransport());
+  registerHandlers(server, conn);
+  const transport = withCrashCounting(new StdioServerTransport(), conn);
   await server.connect(transport);
   // Exit when the client closes the session so spawnSync callers get a
   // clean exit code instead of an orphan; serve until then.
@@ -314,12 +331,13 @@ function runHttp() {
 
     // Stateless Streamable HTTP: a fresh transport + server per POST request
     // (SDK stateless pattern). GET/DELETE are rejected with 405.
-    const transport = withCrashCounting(new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }), { http: true });
+    const conn = { acceptedIds: new Set() };
+    const transport = withCrashCounting(new StreamableHTTPServerTransport({ sessionIdGenerator: undefined }), conn, { http: true });
     res.on("close", () => {
       void transport.close().catch(() => {});
     });
     const server = new Server({ name: serverId, version: "0.0.0" }, { capabilities: { tools: {} } });
-    registerHandlers(server);
+    registerHandlers(server, conn);
     try {
       await server.connect(transport);
       await transport.handleRequest(req, res, parsed);
@@ -332,7 +350,8 @@ function runHttp() {
   });
 
   httpServer.listen(httpPort, "127.0.0.1", () => {
-    process.stderr.write(`chaos: fake ${serverId} listening on http://127.0.0.1:${httpPort}/mcp\n`);
+    const actualPort = httpServer.address()?.port ?? httpPort;
+    process.stderr.write(`chaos: fake ${serverId} listening on http://127.0.0.1:${actualPort}/mcp\n`);
   });
   const shutdown = () => {
     httpServer.close(() => process.exit(0));

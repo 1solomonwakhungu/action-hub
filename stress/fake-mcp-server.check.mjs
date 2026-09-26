@@ -1,14 +1,19 @@
 #!/usr/bin/env node
-// stress/fake-mcp-server.check.mjs — crash-after concurrency regression
+// stress/fake-mcp-server.check.mjs — crash-after regression suite
 // (committed; NOT under .generated). Uses the real SDK client transports.
 //
-// Semantics under test (see fake-mcp-server.mjs header): crash-after=N
-// counts tools/call requests only. initialize + 4 concurrent 300 ms / 5 MB
-// calls with crash-after=3 must yield, over BOTH stdio and HTTP:
-//   - 3 full 5 MB successes (no truncated or timed-out response)
-//   - 1 immediate isError refusal
-//   - the next request disconnected
-//   - stderr reports exactly 3 completed tools/call responses
+// Contract under test (see fake-mcp-server.mjs header): crash-after=N
+// counts tools/call requests ONLY; ids are client-scoped; accepted calls
+// settle as finished (fully delivered) or aborted; exit + log occur exactly
+// once once all N accepted calls have settled; refusals never count.
+//
+// Cases (every wait bounded — the suite FAILS rather than hangs):
+//   1. stdio:  initialize + 4 concurrent 300 ms / 5 MB calls, crash-after=3
+//      -> 3 full successes, 1 refusal, log completed=3 aborted=0, next call rejected
+//   2. http:   same shape over StreamableHTTPClientTransport (ephemeral port)
+//   3. http:   TWO concurrent clients each issuing their FIRST tools/call
+//      with crash-after=2 (same JSON-RPC id on both connections)
+//      -> 2 full successes, server exits, log completed=2 aborted=0
 //
 // Run: node stress/fake-mcp-server.check.mjs   (from the repo root)
 
@@ -17,14 +22,15 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { connect as tcpConnect } from "node:net";
 import { tmpdir } from "node:os";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(HERE, "fake-mcp-server.mjs");
-const EXPECTED_BYTES = Number(process.env.CHECK_BYTES ?? 5_000_000);
-const CRASH_AFTER = 3;
+const EXPECTED_BYTES = 5_000_000;
+const STEP_TIMEOUT_MS = 30_000; // generous; only guards against hangs
 
 const manifestDir = mkdtempSync(join(tmpdir(), "fake-mcp-check-"));
 const manifestPath = join(manifestDir, "manifest.json");
@@ -49,34 +55,69 @@ function check(name, ok, detail = "") {
   if (!ok) failures += 1;
 }
 
-async function runScenario({ http, port }) {
+// Poll until the server accepts TCP connections (bounded); a plain socket
+// touch, not an MCP request, so it consumes no JSON-RPC calls.
+async function waitForTcp(port, label, timeoutMs = STEP_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const up = await new Promise((resolve) => {
+      const sock = tcpConnect(port, "127.0.0.1");
+      sock.once("connect", () => { sock.destroy(); resolve(true); });
+      sock.once("error", () => resolve(false));
+    });
+    if (up) return;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  throw new Error(`server not listening in time: ${label}`);
+}
+
+function withTimeout(promise, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`deadline exceeded: ${label}`)), STEP_TIMEOUT_MS);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function collectStderr(stream) {
+  let text = "";
+  stream?.on?.("data", (c) => { text += String(c); });
+  return () => text;
+}
+
+function parseCrashLog(stderrText) {
+  const m = stderrText.match(/crash-after=\d+ triggered: completed=(\d+) aborted=(\d+)/);
+  return m ? { completed: Number(m[1]), aborted: Number(m[2]) } : null;
+}
+
+async function runSingleClient({ http, port }) {
   const label = http ? "http" : "stdio";
   let child = null;
+  let stderrText = "";
   let transport;
   if (http) {
-    child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", String(port), "--chaos", `crash-after=${CRASH_AFTER}`], { stdio: ["ignore", "ignore", "pipe"] });
-    let stderrText = "";
-    child.stderr.on("data", (c) => { stderrText += String(c); });
-    await new Promise((r) => setTimeout(r, 700));
+    child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", String(port), "--chaos", "crash-after=3"], { stdio: ["ignore", "ignore", "pipe"] });
+    const collect = await collectStderr(child.stderr);
+    await withTimeout(waitForTcp(port, `http boot :${port}`), "http server boot");
     transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
-    var stderrRef = () => stderrText;
+    stderrText = collect;
   } else {
     transport = new StdioClientTransport({
       command: "node",
-      args: [SERVER, "--manifest", manifestPath, "--chaos", `crash-after=${CRASH_AFTER}`],
+      args: [SERVER, "--manifest", manifestPath, "--chaos", "crash-after=3"],
       stderr: "pipe",
     });
-    let stderrText = "";
-    transport.stderr?.on?.("data", (c) => { stderrText += String(c); });
-    var stderrRef = () => stderrText;
+    const collect = await collectStderr(transport.stderr);
+    stderrText = collect;
   }
+  const getStderr = typeof stderrText === "function" ? stderrText : () => stderrText;
 
   const client = new Client({ name: "crash-check", version: "0.0.0" });
   try {
-    await client.connect(transport);
-    // 4 concurrent calls, crash-after=3: exactly 3 accepted + 1 refusal.
-    const results = await Promise.allSettled(
-      [0, 1, 2, 3].map((i) => client.callTool({ name: "echo", arguments: { x: i } })),
+    await withTimeout(client.connect(transport), `${label}: connect`);
+    const results = await withTimeout(
+      Promise.allSettled([0, 1, 2, 3].map((i) => client.callTool({ name: "echo", arguments: { x: i } }))),
+      `${label}: 4 concurrent calls`,
     );
     const full = results.filter(
       (r) => r.status === "fulfilled" && r.value?.isError !== true &&
@@ -84,34 +125,95 @@ async function runScenario({ http, port }) {
     );
     const refused = results.filter((r) => r.status === "fulfilled" && r.value?.isError === true);
     const errored = results.filter((r) => r.status === "rejected");
-    if (errored.length > 0) {
-      for (const e of errored) process.stdout.write(`DEBUG ${label} error: ${String(e.reason).slice(0, 120)}\n`);
-    }
-    check(`${label}: 3 full ${EXPECTED_BYTES}-byte successes`, full.length === 3, `got ${full.length}`);
-    check(`${label}: 1 isError refusal`, refused.length === 1, `got ${refused.length}, errors ${errored.length}`);
-    check(`${label}: no truncated/timed-out results`, full.length + refused.length + errored.length === 4, `full=${full.length} refused=${refused.length} errored=${errored.length}`);
+    check(`${label}: 3 full ${EXPECTED_BYTES}-byte successes`, full.length === 3, `got ${full.length}, errors ${errored.length}: ${errored.map((e) => String(e.reason).slice(0, 60)).join(" | ")}`);
+    check(`${label}: 1 isError refusal`, refused.length === 1, `got ${refused.length}`);
+    check(`${label}: no truncated/timed-out results`, full.length + refused.length + errored.length === 4);
 
-    // Refused response must NOT count: stderr must say exactly 3.
-    await new Promise((r) => setTimeout(r, 800));
-    const m = stderrRef().match(/crash-after=\d+ triggered after (\d+) completed tools\/call responses/);
-    check(`${label}: log reports exactly ${CRASH_AFTER}`, m?.[1] === String(CRASH_AFTER), m?.[0] ?? "no crash log line");
+    await withTimeout(new Promise((r) => setTimeout(r, 800)), `${label}: log wait`);
+    const log = parseCrashLog(getStderr());
+    check(`${label}: log completed=3 aborted=0`, log?.completed === 3 && log?.aborted === 0, JSON.stringify(log));
 
-    // Next request after the crash: disconnected.
     try {
-      await client.callTool({ name: "echo", arguments: { x: 9 } });
+      await withTimeout(client.callTool({ name: "echo", arguments: { x: 9 } }), `${label}: post-crash call`);
       check(`${label}: post-crash call rejected`, false, "unexpectedly succeeded");
     } catch {
       check(`${label}: post-crash call rejected`, true);
     }
+  } catch (e) {
+    check(`${label}: scenario completed`, false, String(e).slice(0, 120));
   } finally {
     await client.close().catch(() => {});
     if (child) child.kill("SIGKILL");
   }
 }
 
-const port = 41390;
-await runScenario({ http: false });
-await runScenario({ http: true, port });
+async function runTwoClientCollision({ port }) {
+  const child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", String(port), "--chaos", "crash-after=2"], { stdio: ["ignore", "ignore", "pipe"] });
+  const getStderr = await collectStderr(child.stderr);
+  await withTimeout(waitForTcp(port, `two-client boot :${port}`), "two-client server boot");
+  try {
+    const transports = [0, 1].map(() => new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
+    const clients = transports.map((t) => new Client({ name: "collision-check", version: "0.0.0" }));
+    await withTimeout(Promise.all(clients.map((c, i) => c.connect(transports[i]))), "two-client connect");
+    // Both clients issue their FIRST tools/call concurrently — same JSON-RPC
+    // id (1) on both connections. State must be scoped per connection.
+    const results = await withTimeout(
+      Promise.allSettled(clients.map((c) => c.callTool({ name: "echo", arguments: { x: 0 } }))),
+      "two-client concurrent first calls",
+    );
+    const full = results.filter(
+      (r) => r.status === "fulfilled" && r.value?.isError !== true &&
+        JSON.parse(r.value.content[0].text).filler.length === EXPECTED_BYTES,
+    );
+    check("two-client: both first calls fully delivered", full.length === 2, `got ${full.length}: ${results.map((r) => r.status === "fulfilled" ? (r.value.isError ? "refused" : "ok") : String(r.reason).slice(0, 50)).join(",")}`);
+
+    await withTimeout(new Promise((r) => setTimeout(r, 1_000)), "two-client log wait");
+    const log = parseCrashLog(getStderr());
+    check("two-client: log completed=2 aborted=0 (exact)", log?.completed === 2 && log?.aborted === 0, JSON.stringify(log));
+
+    // Server must have exited.
+    await withTimeout(new Promise((r) => setTimeout(r, 500)), "exit wait");
+    const exited = ["close", "exit"].some((ev) => child.listeners(ev).length > 0) ? null : undefined;
+    const alive = child.exitCode === null && child.signalCode === null && !exited;
+    let reallyAlive = alive;
+    if (alive) {
+      reallyAlive = await withTimeout(
+        Promise.race([
+          new Promise((res) => { child.once("exit", () => res(false)); setTimeout(() => res(true), 100); }),
+        ]),
+        "exit probe",
+      );
+    }
+    check("two-client: server exited after both settled", !reallyAlive);
+  } catch (e) {
+    check("two-client: scenario completed", false, String(e).slice(0, 120));
+  } finally {
+    child.kill("SIGKILL");
+  }
+}
+
+// Ephemeral ports: ask the server to listen on 0 and read the real port
+// from its "listening on" log line.
+async function freePort() {
+  const child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", "0"], { stdio: ["ignore", "ignore", "pipe"] });
+  const getStderr = await collectStderr(child.stderr);
+  let port = null;
+  for (let i = 0; i < 50 && port === null; i++) {
+    const m = getStderr().match(/listening on http:\/\/127\.0\.0\.1:(\d+)\/mcp/);
+    if (m) port = Number(m[1]);
+    else await new Promise((r) => setTimeout(r, 100));
+  }
+  child.kill("SIGKILL");
+  if (port === null) throw new Error("could not obtain an ephemeral port");
+  return port;
+}
+
+const httpPort = await freePort();
+check("ephemeral port obtained", Number.isInteger(httpPort) && httpPort > 0, `port ${httpPort}`);
+
+await runSingleClient({ http: false });
+await runSingleClient({ http: true, port: httpPort });
+await runTwoClientCollision({ port: httpPort + 1 });
 
 process.stdout.write(failures === 0 ? "ALL CHECKS PASSED\n" : `${failures} CHECK(S) FAILED\n`);
 process.exit(failures === 0 ? 0 : 1);
