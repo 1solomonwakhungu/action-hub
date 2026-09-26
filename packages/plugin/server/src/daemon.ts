@@ -26,6 +26,10 @@ interface DaemonState {
   pid: number;
   startedAt: string;
   configPath?: string;
+  /** True while the authoritative post-startup re-index is still running. */
+  indexing: boolean;
+  /** ISO timestamp set once the re-index settles; null until then. */
+  indexingSettledAt: string | null;
   endpoint:
     | { kind: "unix"; path: string }
     | { kind: "tcp"; host: "127.0.0.1"; port: number };
@@ -145,9 +149,35 @@ export async function runDaemon(): Promise<void> {
       pid: process.pid,
       startedAt: new Date().toISOString(),
       configPath: runtime.configPath,
+      indexing: true,
+      indexingSettledAt: null,
       endpoint,
     };
     await writePrivateJson(paths.state, state);
+
+    // The hub answers from the warm cache immediately; the authoritative
+    // re-index runs behind it. Publish its settlement so hosts and the CLI can
+    // distinguish "connectable" from "index settled" without a new probe.
+    void runtime.refreshed.then(
+      () => {
+        if (stopping) return;
+        const settled: DaemonState = {
+          ...state,
+          indexing: false,
+          indexingSettledAt: new Date().toISOString(),
+        };
+        return writePrivateJson(paths.state, settled).catch(() => undefined);
+      },
+      () => {
+        if (stopping) return;
+        const failed: DaemonState = {
+          ...state,
+          indexing: false,
+          indexingSettledAt: null,
+        };
+        return writePrivateJson(paths.state, failed).catch(() => undefined);
+      },
+    );
 
     process.once("SIGINT", () => void shutdown());
     process.once("SIGTERM", () => void shutdown());

@@ -80,6 +80,17 @@ export interface ActionHubOptions {
   resilience?: ConnectionManagerOptions;
   /** Idempotent-read result cache configuration. */
   resultCache?: ResultCacheOptions;
+  /**
+   * Cooperative indexing: embeds the semantic index in chunks and hands the
+   * event loop back between chunks so accepted connections are served during
+   * (re)indexing of large catalogs. `yieldFn` is injectable for tests.
+   */
+  indexing?: {
+    /** Documents embedded per event-loop yield. Defaults to 500. */
+    chunkSize?: number;
+    /** Called between chunks. Defaults to a macrotask yield. */
+    yieldFn?: () => Promise<void>;
+  };
 }
 
 export interface ExecuteOptions {
@@ -130,6 +141,8 @@ export class ActionHub {
   readonly #cacheEnabled: boolean;
   readonly #cacheTtlMs: number;
   readonly #cacheMaxEntries: number;
+  readonly #indexChunkSize: number | undefined;
+  readonly #indexYieldFn: (() => Promise<void>) | undefined;
 
   /** Tool-name prefixes conventionally denoting side-effect-free reads. */
   static readonly #READ_PREFIXES = [
@@ -175,6 +188,8 @@ export class ActionHub {
     this.#cacheEnabled = options.resultCache?.enabled ?? true;
     this.#cacheTtlMs = options.resultCache?.ttlMs ?? 60_000;
     this.#cacheMaxEntries = options.resultCache?.maxEntries ?? 500;
+    this.#indexChunkSize = options.indexing?.chunkSize;
+    this.#indexYieldFn = options.indexing?.yieldFn;
   }
 
   get catalog(): Catalog {
@@ -203,13 +218,13 @@ export class ActionHub {
   async indexAll(): Promise<IndexResult[]> {
     const configs = this.#connections.configs().filter((config) => config.enabled !== false);
     const results = await Promise.all(configs.map((config) => this.#indexServer(config.id)));
-    this.rebuildSemanticIndex();
+    await this.#rebuildSemanticIndexCooperatively();
     return results;
   }
 
   async indexServer(serverId: string): Promise<IndexResult> {
     const result = await this.#indexServer(serverId);
-    this.rebuildSemanticIndex();
+    await this.#rebuildSemanticIndexCooperatively();
     return result;
   }
 
@@ -222,6 +237,18 @@ export class ActionHub {
    */
   rebuildSemanticIndex(): void {
     this.#semanticIndex?.index(this.#catalog.all());
+  }
+
+  /**
+   * Cooperative variant used on the async indexing paths: same result as
+   * {@link rebuildSemanticIndex}, but the event loop is served between chunks.
+   */
+  async #rebuildSemanticIndexCooperatively(): Promise<void> {
+    if (!this.#semanticIndex) return;
+    await this.#semanticIndex.indexCooperative(this.#catalog.all(), {
+      chunkSize: this.#indexChunkSize,
+      yieldFn: this.#indexYieldFn,
+    });
   }
 
   async #indexServer(serverId: string): Promise<IndexResult> {
