@@ -15,7 +15,7 @@ import {
 } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { createSdkClientFactory } from "./sdk-client.js";
-import { warn, writeSnapshot } from "./snapshot.js";
+import { warn, writeSnapshot, SnapshotDebouncer } from "./snapshot.js";
 import {
   LOAD_DESCRIPTION_MAX_BYTES,
   LOAD_SCHEMA_MAX_BYTES,
@@ -104,7 +104,25 @@ export interface HubRuntime {
   cache: CatalogCache;
   configHash: string;
   configPath: string;
+  /**
+   * Resolves when the authoritative re-index has completed and been written
+   * back. With the deferred startup refresh this stays pending until
+   * `startRefresh()` is called; `close()` awaits it only once started.
+   */
   refreshed: Promise<unknown>;
+  /**
+   * Starts the deferred re-index exactly once (subsequent calls return the
+   * same promise). Hosts call this after the MCP transport is connected so
+   * the re-index cannot steal the event loop before the server answers its
+   * first request (stress finding F23).
+   */
+  startRefresh(): Promise<unknown>;
+  /**
+   * Coalesces the post-execute snapshot writes (F18 part 2). Optional so
+   * lightweight test runtimes can omit it; dispatch falls back to the
+   * per-execute write when absent.
+   */
+  snapshotDebouncer?: Pick<SnapshotDebouncer, "markDirty" | "flush">;
   close(): Promise<void>;
 }
 
@@ -160,24 +178,40 @@ export async function createHubRuntime(): Promise<HubRuntime> {
 
   const cache = new CatalogCache({ onWarning: warn });
 
-  // A warm cache makes the hub answerable immediately; the authoritative index
-  // then runs behind it and writes the refreshed catalog back.
+  // A warm cache makes the hub answerable immediately. The authoritative
+  // re-index is DEFERRED (F23): starting it here monopolises the event loop
+  // before the MCP server answers initialize, which measured ~2 s of added
+  // first-response latency at 15K actions and erased the warm-start win.
+  // connectMcpClient starts it once the transport is connected.
   const bootstrap = await bootstrapCatalog(hub, {
     servers: config.servers,
     cache,
     onWarning: warn,
+    deferRefresh: true,
   });
 
   hub.replaceSkills(skillRecords);
 
-  bootstrap.refreshed.then(
-    (results) => {
-      for (const result of results) {
-        if (result.error) warn(`failed to index "${result.serverId}": ${result.error}`);
-      }
-    },
-    (cause: unknown) => warn(`re-index failed: ${cause instanceof Error ? cause.message : String(cause)}`),
-  );
+  // F18 part 2: coalesce the post-execute snapshot writes into at most one
+  // per interval instead of rewriting the whole catalog after every execute.
+  const snapshotDebouncer = new SnapshotDebouncer(() => writeSnapshot(hub, bootstrap.configHash, cache));
+
+  let startedRefresh: Promise<unknown> | undefined;
+  const startRefresh = (): Promise<unknown> => {
+    startedRefresh ??= bootstrap.startRefresh().then(
+      (results) => {
+        for (const result of results) {
+          if (result.error) warn(`failed to index "${result.serverId}": ${result.error}`);
+        }
+        return results;
+      },
+      (cause: unknown) => {
+        warn(`re-index failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        return [];
+      },
+    );
+    return startedRefresh;
+  };
 
   return {
     hub,
@@ -185,8 +219,13 @@ export async function createHubRuntime(): Promise<HubRuntime> {
     configHash: bootstrap.configHash,
     configPath,
     refreshed: bootstrap.refreshed,
+    startRefresh,
+    snapshotDebouncer,
     close: async () => {
-      await bootstrap.refreshed.catch(() => undefined);
+      // Await only a refresh that was actually started; a runtime that never
+      // connected must not force a full re-index at shutdown.
+      if (startedRefresh) await startedRefresh.catch(() => undefined);
+      await snapshotDebouncer.dispose();
       await hub.close();
     },
   };
@@ -206,7 +245,7 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
     },
     async (input) => {
       try {
-        return text(await dispatch(runtime.hub, input, runtime.configHash, runtime.cache));
+        return text(await dispatch(runtime.hub, input, runtime.configHash, runtime.cache, runtime.snapshotDebouncer));
       } catch (cause) {
         const message =
           cause instanceof ActionHubError || cause instanceof Error
@@ -223,6 +262,10 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
 export async function connectMcpClient(runtime: HubRuntime, transport: Transport): Promise<McpServer> {
   const server = createMcpServer(runtime);
   await server.connect(transport);
+  // The server can answer now; the authoritative re-index may contend for the
+  // event loop behind it. Memoised in the runtime, so repeated connects (HTTP,
+  // daemon) start it at most once.
+  runtime.startRefresh();
   return server;
 }
 
@@ -272,6 +315,7 @@ async function dispatch(
   input: ToolInput,
   configHash: string,
   cache: CatalogCache,
+  snapshots?: Pick<SnapshotDebouncer, "markDirty" | "flush">,
 ): Promise<unknown> {
   switch (input.operation) {
     case "search": {
@@ -363,10 +407,12 @@ async function dispatch(
         input.arguments ?? {},
         input.approval_token ? { approvalToken: input.approval_token } : {},
       );
-      // Refreshes server activation state and invocation history in the snapshot.
-      // Reuse the bootstrap cache instance so this unawaited write is serialised
-      // with the background refresh on the same promise chain.
-      void writeSnapshot(hub, configHash, cache);
+      // Marks the on-disk snapshot stale instead of rewriting the whole
+      // persisted catalog after every execute (F18 part 2); the debouncer
+      // coalesces bursts and flushes on close. Falls back to the per-execute
+      // write when the runtime provides no debouncer (lightweight tests).
+      if (snapshots) snapshots.markDirty();
+      else void writeSnapshot(hub, configHash, cache);
 
       if (result.approval) {
         const approval = result.approval;
@@ -395,6 +441,7 @@ async function dispatch(
         content: result.content,
         error: result.error,
         duration_ms: result.durationMs,
+        cached: result.cached === true,
       };
     }
   }
