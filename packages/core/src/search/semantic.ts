@@ -1,5 +1,5 @@
 import type { ActionRecord } from "../types.js";
-import { tokenize, type SemanticScorer } from "./search.js";
+import { tokenize, MAX_DOCUMENT_TOKENS, type SemanticScorer } from "./search.js";
 
 /**
  * A dependency-free semantic scorer.
@@ -542,10 +542,15 @@ function invertConcepts(
 
 function describe(record: ActionRecord): IndexedDocument {
   const terms = new Map<string, number>();
+  let added = 0;
   const add = (text: string | undefined, weight: number): void => {
     if (!text) return;
     for (const term of tokenize(text)) {
+      // Per-record cap: a hostile or accidentally huge description must not
+      // dominate the embedding (mirrors the BM25 documentTokens cap).
+      if (added >= MAX_DOCUMENT_TOKENS) return;
       terms.set(term, (terms.get(term) ?? 0) + weight);
+      added += 1;
     }
   };
 
