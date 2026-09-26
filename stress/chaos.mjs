@@ -56,19 +56,23 @@ const HUGE_BYTES = 5 * 1024 * 1024;
 const CHAOS_SEED = 7;
 const DOCTOR_TIMEOUT_MS = 180_000;
 
-// CONTRACT.md hard rule 2: every run uses isolated env dirs.
+// CONTRACT.md hard rule 2: every run uses isolated env dirs — applied to
+// the ENTIRE process (not just child spawns) before any factory/hub
+// construction, so the in-process hub and all 44 fake-server children
+// (which inherit process.env) can never touch owner state. The script
+// exits after the run, so the mutation is inherently scoped.
 const tmpRoot = join(tmpdir(), `action-hub-chaos-${process.pid}-${Date.now()}`);
 for (const d of ["home", "cache", "config", "skills", "pi"]) {
   mkdirSync(join(tmpRoot, d), { recursive: true });
 }
-const isolationEnv = () => ({
-  ...process.env,
-  HOME: join(tmpRoot, "home"),
-  XDG_CACHE_HOME: join(tmpRoot, "cache"),
-  XDG_CONFIG_HOME: join(tmpRoot, "config"),
-  ACTION_HUB_SKILLS_DIR: join(tmpRoot, "skills"),
-  PI_CODING_AGENT_DIR: join(tmpRoot, "pi"),
-});
+const GEN_CONFIG_PLACEHOLDER = join(tmpRoot, "servers.json");
+process.env.HOME = join(tmpRoot, "home");
+process.env.XDG_CACHE_HOME = join(tmpRoot, "cache");
+process.env.XDG_CONFIG_HOME = join(tmpRoot, "config");
+process.env.ACTION_HUB_CONFIG = GEN_CONFIG_PLACEHOLDER; // repointed to the real config once generated
+process.env.ACTION_HUB_SKILLS_DIR = join(tmpRoot, "skills");
+process.env.PI_CODING_AGENT_DIR = join(tmpRoot, "pi");
+const isolationEnv = () => ({ ...process.env }); // children inherit the already-isolated env
 process.on("exit", () => {
   try {
     rmSync(tmpRoot, { recursive: true, force: true });
@@ -183,6 +187,7 @@ async function main() {
 
   installSecretScan();
   const specs = buildFixtures();
+  process.env.ACTION_HUB_CONFIG = CONFIG_PATH; // real config now exists
   const startedAt = Date.now();
   const rssStartMB = Math.round(process.memoryUsage().rss / 1048576);
 
@@ -252,15 +257,20 @@ async function main() {
   for (const id of hangIds) {
     const t0 = Date.now();
     const res = await Promise.race([
-      hub.execute(`${id}:tool_0`, {}).then(
-        (r) => ({ ok: false, unexpectedSuccess: true }),
-        () => ({ ok: true, failed: true }),
+      hub.execute(`${id}:tool_0`, { x: 0 }, { noCache: true }).then(
+        (r) => ({ outcome: r.ok === true ? "unexpected-success" : "failed", result: r }),
+        (e) => ({ outcome: "failed", error: String(e?.message ?? e) }),
       ),
-      sleep(CALL_TIMEOUT_MS + 5_000).then(() => ({ hung: true })),
+      sleep(CALL_TIMEOUT_MS + 5_000).then(() => ({ outcome: "hung" })),
     ]);
     const ms = Date.now() - t0;
-    hang.samples.push({ id, durationMs: ms, hung: res.hung === true });
-    if (res.hung) {
+    hang.samples.push({ id, durationMs: ms, outcome: res.outcome, error: (res.error ?? res.result?.error ?? "").slice(0, 120) });
+    if (res.outcome === "unexpected-success") {
+      hang.bounded = false;
+      finding("P1", `call to hang-rate=1.0 server ${id} SUCCEEDED in ${ms}ms — the hang injector is broken; timeout path untested`, `hub.execute("${id}:tool_0") returned ok against a server configured to never respond`);
+      break;
+    }
+    if (res.outcome === "hung") {
       hang.bounded = false;
       finding("P1", `call to ${id} hung unbounded (>${ms}ms) despite timeoutMs=${CALL_TIMEOUT_MS}`, `hub.execute("${id}:tool_0") against hang-rate=1.0 server`);
       break;
@@ -271,44 +281,75 @@ async function main() {
     }
   }
 
-  // 3. Circuit breakers: crash-after servers trip, then recover.
-  const circuit = { opened: [], recovered: [], transitions: [], statesAfterCooldown: {}, postRecoveryExecutes: [] };
-  const everOpened = new Set();
+  // 3. Circuit breakers: per-server open -> cooldown -> recovery evidence.
+  // Note (product F16): execute-time 'Not connected' errors bypass
+  // recordFailure, so opening is driven by the 2 s heartbeat against dead
+  // children; this harness waits for that transition explicitly.
+  const circuit = { perId: {}, opened: [], recovered: [] };
   const crashIds = specs.filter((s) => (s.chaos ?? "").includes("crash-after")).map((s) => s.id);
-  for (const id of crashIds) {
-    const states = [];
-    for (let i = 0; i < 4; i++) {
-      await hub.execute(`${id}:tool_0`, {}).catch(() => {});
-      await sleep(200);
-      states.push(hub.serverStates().find((s) => s.id === id)?.circuitState ?? "unknown");
+  const stateOf = (id) => hub.serverStates().find((s) => s.id === id)?.circuitState ?? "unknown";
+
+  async function waitForState(id, want, timeoutMs) {
+    const t0 = Date.now();
+    for (;;) {
+      const st = stateOf(id);
+      if (want.includes(st)) return { state: st, ms: Date.now() - t0 };
+      if (Date.now() - t0 > timeoutMs) return { state: st, ms: Date.now() - t0, timedOut: true };
+      await sleep(400);
     }
-    circuit.transitions.push({ id, states });
-    for (const st of states) if (st === "open") everOpened.add(id);
   }
-  await sleep(CIRCUIT_COOLDOWN_MS + 1_000);
-  const stateByServer = new Map(hub.serverStates().map((s) => [s.id, s.circuitState ?? "unknown"]));
-  for (const id of crashIds) {
-    const st = stateByServer.get(id) ?? "unknown";
-    circuit.statesAfterCooldown[id] = st;
-    if (st === "open") everOpened.add(id);
-    else circuit.recovered.push(id);
+
+  // Finite crashers: kill the child by exhausting its accepted calls, then
+  // observe open -> (cooldown) -> closed, then prove a fresh execute works.
+  const finiteIds = crashIds.filter((id) => id !== "flapper");
+  for (const id of finiteIds) {
+    const rec = { id };
+    // exhaust accepted calls so the child dies (crash-after=2)
+    for (let i = 0; i < 2; i++) await hub.execute(`${id}:tool_0`, { x: i }, { noCache: true }).catch(() => {});
+    await hub.execute(`${id}:tool_0`, { x: 9 }, { noCache: true }).catch(() => {}); // ensure the crash happened
+    const opened = await waitForState(id, ["open"], 30_000);
+    rec.openedMs = opened.ms;
+    rec.opened = opened.state === "open" && !opened.timedOut;
+    if (!rec.opened) {
+      rec.error = `circuit never opened within 30s (state=${opened.state})`;
+      circuit.perId[id] = rec;
+      finding("P1", `circuit never opened for ${id} within 30s of repeated crashes (state=${opened.state})`, "stress/chaos.mjs circuit scenario; see circuit.perId");
+      continue;
+    }
+    const recovered = await waitForState(id, ["closed", "half-open"], 30_000);
+    rec.recoveredMs = recovered.ms;
+    rec.recovered = !recovered.timedOut;
+    if (!rec.recovered) {
+      rec.error = `circuit never left open within 30s (state=${recovered.state})`;
+      finding("P1", `circuit for ${id} never recovered within 30s of cooldown (state=${recovered.state})`, "stress/chaos.mjs circuit scenario; see circuit.perId");
+    } else {
+      const r = await hub.execute(`${id}:tool_0`, { x: 1 }, { noCache: true }).catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+      rec.postRecoveryOk = r.ok === true;
+      rec.postRecoveryError = (r.error ?? "").slice(0, 100);
+      if (!rec.postRecoveryOk) {
+        finding("P1", `post-recovery execute against ${id} failed after circuit closed (state=${stateOf(id)}): ${rec.postRecoveryError}`, "stress/chaos.mjs circuit scenario; see circuit.perId");
+      }
+    }
+    circuit.perId[id] = rec;
   }
-  circuit.opened = [...everOpened];
-  // Prove actual recovery: after cooldown a fresh execute must succeed for
-  // the finite crashers (a restarted process serves its first call). The
-  // flapper crashes on every call, so a re-opened circuit (protective) is
-  // the correct outcome for it, not an ok result.
-  circuit.postRecoveryExecutes = [];
-  for (const id of crashIds) {
-    const r = await hub.execute(`${id}:tool_0`, { x: 1 }, { noCache: true }).catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
-    const recovered = r.ok === true || String(r.error ?? "").includes("Circuit breaker open");
-    circuit.postRecoveryExecutes.push({ id, settled: recovered, ok: r.ok === true, error: (r.error ?? "").slice(0, 100) });
-  }
+  // Flapper: must OPEN (permanently failing server) — protective behavior.
+  for (let i = 0; i < 6; i++) await hub.execute("flapper:tool_0", { x: i }, { noCache: true }).catch(() => {});
+  const flapperOpen = await waitForState("flapper", ["open"], 30_000);
+  circuit.perId.flapper = { opened: flapperOpen.state === "open" && !flapperOpen.timedOut, state: flapperOpen.state, openedMs: flapperOpen.ms };
+  circuit.opened = crashIds.filter((id) => circuit.perId[id]?.opened);
+  circuit.recovered = finiteIds.filter((id) => circuit.perId[id]?.recovered);
   if (circuit.opened.length === 0) {
-    finding("P2", `no circuit breaker opened for crash-after servers (checked: ${crashIds.join(",")})`, "hub.serverStates() after repeated execute() against crash-after=2 servers");
+    finding("P1", `no circuit breaker opened for any crash-after server (checked: ${crashIds.join(",")})`, "stress/chaos.mjs circuit scenario; see circuit.perId");
   }
 
   // 4. Search p95 while chaos runs (flapper restarts, hung servers active).
+  // Untimed warmup first: first-use costs (disk, cache fills) must not
+  // pollute the percentile measurement.
+  const warmupStart = Date.now();
+  for (let i = 0; i < 10; i++) {
+    await hub.search(`chaos fixture tool ${i % 10}`).catch(() => {});
+  }
+  const warmupMs = Date.now() - warmupStart;
   const latencies = [];
   let searchErrors = 0;
   for (let i = 0; i < SEARCH_PROBES; i++) {
@@ -328,6 +369,8 @@ async function main() {
   summary.hang = hang;
   summary.circuit = circuit;
   summary.search = {
+    warmupQueries: 10,
+    warmupMs,
     probes: latencies.length,
     p50: percentile(latencies, 0.5),
     p95: percentile(latencies, 0.95),
@@ -361,7 +404,7 @@ async function main() {
   const doctor = spawnSync("node", [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"], {
     encoding: "utf8",
     timeout: DOCTOR_TIMEOUT_MS,
-    env: isolationEnv(),
+    env: isolationEnv(), // isolated process.env, captured after repointing
     cwd: tmpRoot, // cross-cwd proof: not the repo root
   });
   const doctorMs = Date.now() - doctorStart;
@@ -389,14 +432,24 @@ async function main() {
 
   summary.elapsedMs = Date.now() - startedAt;
   summary.secretScan = { sentinelLength: SECRET.length, prefixChecked: true, leaked };
+  const memoryBounded = summary.memory.rssPeakMB <= 1_536;
   summary.verdict = {
+    indexComplete: indexFailures.length === 0,
+    indexBounded: summary.index.bounded,
+    memoryBounded,
     hubResponsive: summary.search.p95 < 1_000 && searchErrors === 0,
     circuitBreakersOpened: circuit.opened.length > 0,
-    circuitBreakersRecovered: circuit.recovered.length >= circuit.opened.length,
+    circuitBreakersRecovered: circuit.recovered.length > 0,
     hangsBounded: hang.bounded,
     doctorBounded: summary.doctor.bounded,
     secretsContained: !leaked,
   };
+  if (!memoryBounded) {
+    finding("P1", `RSS ${summary.memory.rssPeakMB}MB exceeded 1.5GB during 5MB-response chaos`, "5 x tools/call with 5MB responses; see memory.rssPeakMB");
+  }
+  if (indexFailures.length > 0) {
+    finding("P1", `${indexFailures.length} server(s) failed to index: ${indexFailures.map((r) => r.serverId).join(",")}`, "stress/chaos.mjs index phase; see index.failures");
+  }
 
   let text = JSON.stringify(summary, null, 2);
   if (text.includes(SECRET) || text.includes(SECRET_PREFIX)) {
