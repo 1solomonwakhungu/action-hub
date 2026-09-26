@@ -10,7 +10,7 @@
  *  - process-group termination with bounded wait and SIGKILL escalation.
  */
 import { spawn } from "node:child_process";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 const here = new URL(".", import.meta.url).pathname;
 

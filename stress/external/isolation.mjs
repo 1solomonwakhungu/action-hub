@@ -1,10 +1,11 @@
 /**
  * Shared isolation for external stress runners (builder-10).
- * Implements /tmp/action-hub-stress/ISOLATION.md (rev 21:27Z): ONE env object
- * per run with every isolation var REPLACED (never inherited) under a fresh
- * temp root, owner app-state/harness escape refusal (NOT whole-home), a
- * separator-safe sentinel self-check, and a final-env validator for late
- * mutations (call assertFinalEnv right before spawning).
+ * Implements /tmp/action-hub-stress/ISOLATION.md (rev 21:27Z + R6/R7 bars):
+ * ONE env object per run with every isolation var REPLACED (never inherited)
+ * under a fresh temp root; owner app-state/harness escape refusal (NOT
+ * whole-home) using segment-safe path.relative containment; the temp base is
+ * refused BEFORE any filesystem write; a sentinel self-check over the final
+ * values; and a final-env validator for late mutations.
  *
  * Fixture paths passed via `overrides` (e.g. ACTION_HUB_CONFIG pointing at
  * stress/.generated/servers.json) are run inputs, not inherited state; they
@@ -14,17 +15,27 @@ import { userInfo, tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
-/** Owner locations a run must never touch. Separator-safe containment. */
 /** Every isolation var the builder replaces. assertFinalEnv checks exactly these. */
 export const SANDBOX_KEYS = [
-  "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMPDIR",
+  "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TMPDIR", "TMP", "TEMP",
   "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
   "ACTION_HUB_CONFIG", "ACTION_HUB_CACHE", "ACTION_HUB_SKILLS_DIR",
   "ACTION_HUB_DAEMON_DIR", "ACTION_HUB_CREDENTIALS", "ACTION_HUB_CONTROL",
   "PI_CODING_AGENT_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
 ];
 
-function insideOwnerAppState(candidate) {
+/**
+ * Segment-safe containment: `candidate` is inside `dir` only when the
+ * relative path is empty or a relative path with no '..' segment. Never a
+ * string-prefix comparison.
+ */
+export function containedIn(dir, candidate) {
+  const rel = relative(resolve(dir), resolve(String(candidate)));
+  return rel === "" || (!isAbsolute(rel) && !rel.split(/[\\/]/).includes(".."));
+}
+
+/** Owner locations a run must never touch (deterministic list + env-derived). */
+function ownerAppStateDirs() {
   const ownerHome = userInfo().homedir || process.env["HOME"] || "";
   if (!ownerHome) throw new Error("cannot determine owner home; refusing to run");
   const home = resolve(ownerHome);
@@ -42,24 +53,28 @@ function insideOwnerAppState(candidate) {
     join(home, ".copilot"),
     join(home, ".pi"),
   ];
-  // APPDATA/LOCALAPPDATA action-hub dirs (real env values when present).
+  // APPDATA/LOCALAPPDATA action-hub dirs (real inherited values when present).
   for (const key of ["APPDATA", "LOCALAPPDATA"]) {
     const base = process.env[key];
     if (base) guarded.push(join(resolve(base), "action-hub"));
   }
-  const abs = resolve(String(candidate));
-  for (const guard of guarded) {
-    const rel = relative(guard, abs);
-    if (rel === "" || (!isAbsolute(rel) && !rel.startsWith("..") && rel !== "" ? true : false) && rel !== ".." && !isAbsolute(rel)) {
-      if (rel === "" || (!isAbsolute(rel) && rel.split("..").length === 1)) return guard;
-    }
+  return guarded;
+}
+
+/** Returns the owner location containing `candidate`, or null. */
+function insideOwnerAppState(candidate) {
+  if (typeof candidate !== "string") return null;
+  const abs = resolve(candidate);
+  for (const guard of ownerAppStateDirs()) {
+    if (containedIn(guard, abs)) return guard;
   }
   return null;
 }
 
-function containedIn(root, candidate) {
-  const rel = relative(resolve(root), resolve(String(candidate)));
-  return rel === "" || (!isAbsolute(rel) && !rel.split(/[\\/]/).includes(".."));
+/** Throws when `candidate` lies inside owner app state. */
+function refuseOwnerState(label, candidate) {
+  const hit = insideOwnerAppState(candidate);
+  if (hit) throw new Error(`isolation: ${label}=${candidate} lies inside owner app state ${hit}; refusing`);
 }
 
 /**
@@ -69,14 +84,21 @@ function containedIn(root, candidate) {
  * @returns {{ env: Record<string,string>, root: string }}
  */
 export function buildIsolatedEnv(overrides = {}) {
-  const root = mkdtempSync(join(tmpdir(), "ah-stress-iso-"));
+  // Refuse a hostile temp base BEFORE creating anything in it: a hostile
+  // inherited TMPDIR must not cause a write inside owner app state.
+  const base = tmpdir();
+  refuseOwnerState("os.tmpdir()", base);
+  const root = mkdtempSync(join(base, "ah-stress-iso-"));
+  const tmp = join(root, "tmp");
 
   const sandboxPaths = {
     HOME: join(root, "home"),
     USERPROFILE: join(root, "home"),
     APPDATA: join(root, "appdata"),
     LOCALAPPDATA: join(root, "localappdata"),
-    TMPDIR: join(root, "tmp"),
+    TMPDIR: tmp,
+    TMP: tmp,
+    TEMP: tmp,
     XDG_CACHE_HOME: join(root, "cache"),
     XDG_CONFIG_HOME: join(root, "config"),
     XDG_STATE_HOME: join(root, "state"),
@@ -95,15 +117,21 @@ export function buildIsolatedEnv(overrides = {}) {
   const sandbox = Object.fromEntries(SANDBOX_KEYS.map((key) => [key, sandboxPaths[key]]));
 
   // 1. Owner app-state refusal for sandbox vars and overrides.
-  for (const value of [...Object.values(sandbox), ...Object.values(overrides)]) {
-    if (typeof value !== "string") continue;
-    const hit = insideOwnerAppState(value);
-    if (hit) throw new Error(`isolation: ${value} lies inside owner app state ${hit}; refusing`);
+  for (const [key, value] of Object.entries(sandbox)) {
+    if (key === "HOME" || key === "USERPROFILE") {
+      if (resolve(value) === resolve(userInfo().homedir)) {
+        throw new Error(`isolation: ${key} resolves to the owner home; refusing`);
+      }
+    }
+    refuseOwnerState(key, value);
+  }
+  for (const [key, value] of Object.entries(overrides)) {
+    refuseOwnerState(key, value);
   }
 
   // 1b. Create every directory the sandbox declares so children (and their
-  // own mkdtemp calls under TMPDIR) never hit ENOENT.
-  for (const key of ["HOME", "APPDATA", "LOCALAPPDATA", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "ACTION_HUB_SKILLS_DIR", "ACTION_HUB_DAEMON_DIR", "PI_CODING_AGENT_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR"]) {
+  // own mkdtemp calls under TMPDIR/TMP/TEMP) never hit ENOENT.
+  for (const key of ["HOME", "APPDATA", "LOCALAPPDATA", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "ACTION_HUB_SKILLS_DIR", "ACTION_HUB_DAEMON_DIR", "PI_CODING_AGENT_DIR", "CODEX_HOME", "CLAUDE_CONFIG_DIR"]) {
     mkdirSync(sandbox[key], { recursive: true });
   }
 
@@ -123,12 +151,10 @@ export function buildIsolatedEnv(overrides = {}) {
  * generator's fresh config path). Call immediately before spawning.
  */
 export function assertFinalEnv(env, root, inputKeys = new Set()) {
-  const sandboxKeys = SANDBOX_KEYS;
-  for (const key of sandboxKeys) {
+  for (const key of SANDBOX_KEYS) {
     const value = env[key];
     if (typeof value !== "string" || value.length === 0) continue;
-    const hit = insideOwnerAppState(value);
-    if (hit) throw new Error(`isolation: final ${key}=${value} lies inside owner app state ${hit}`);
+    refuseOwnerState(`final ${key}`, value);
     if (inputKeys.has(key)) continue; // fixture input, checked below
     if (!containedIn(root, value)) {
       throw new Error(`isolation: final ${key}=${value} escapes the run root ${root}`);
