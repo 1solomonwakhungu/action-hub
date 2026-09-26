@@ -1,47 +1,74 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { IMPORT_SOURCE_FILTERS, importCommand } from "../dist/commands/import.js";
+import { IMPORT_SOURCE_FILTERS } from "../dist/commands/import.js";
+import { MIGRATE_SOURCE_FILTERS } from "../dist/commands/migrate.js";
 
-test("import --source accepts the multi-harness filters and filters codex discoveries", async () => {
-  assert.ok(IMPORT_SOURCE_FILTERS.includes("codex"));
-  assert.ok(IMPORT_SOURCE_FILTERS.includes("windsurf"));
-  assert.ok(IMPORT_SOURCE_FILTERS.includes("cline"));
-  assert.ok(IMPORT_SOURCE_FILTERS.includes("roo-code"));
+const CLI = join(import.meta.dirname ?? ".", "..", "dist", "index.js");
 
-  const home = await mkdtemp(join(tmpdir(), "ah-source-filters-"));
-  const originalHome = process.env["HOME"];
-  const originalLog = console.log;
+/** Spawns the built CLI with an isolated temp HOME; never touches the real HOME. */
+function runCli(args: string[], tempHome: string) {
+  return spawnSync(process.execPath, [CLI, ...args], {
+    cwd: tempHome,
+    env: { ...process.env, HOME: tempHome },
+    encoding: "utf8",
+  });
+}
+
+test("source filter unions include the multi-harness sources", () => {
+  for (const source of ["codex", "windsurf", "cline", "roo-code"] as const) {
+    assert.ok(IMPORT_SOURCE_FILTERS.includes(source));
+    assert.ok(MIGRATE_SOURCE_FILTERS.includes(source));
+  }
+});
+
+test("import and migrate reject unknown --source before running (exit 1, config untouched)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ah-source-bad-"));
+  const configFile = join(home, ".config", "action-hub", "servers.json");
   try {
-    // Isolated temp HOME so the real user HOME is never read.
     await mkdir(join(home, ".codex"), { recursive: true });
     await writeFile(
       join(home, ".codex", "config.toml"),
       `[mcp_servers.docs]\ncommand = "npx"\nargs = ["-y", "mcp-server-docs"]\n`,
       "utf8",
     );
-    process.env["HOME"] = home;
 
-    const lines: string[] = [];
-    console.log = (...args: unknown[]) => {
-      lines.push(args.join(" "));
-    };
-    await importCommand({ source: "codex" });
-    console.log = originalLog;
+    const badImport = runCli(["import", "--source", "bogus"], home);
+    assert.equal(badImport.status, 1);
+    assert.match(badImport.stderr, /Unknown --source value "bogus"/);
+    assert.ok(!existsSync(configFile), "import must not run for unknown source");
 
-    const output = lines.join("\n");
-    assert.match(output, /\[docs\]/);
-    assert.match(output, /Source: codex/);
-    assert.doesNotMatch(output, /No external MCP servers found/);
+    const badMigrate = runCli(["migrate", "--source", "bogus", "--write", "--json"], home);
+    assert.equal(badMigrate.status, 1);
+    assert.match(badMigrate.stderr, /Unknown --source value "bogus"/);
+    assert.ok(!existsSync(configFile), "migrate must not write config for unknown source");
   } finally {
-    console.log = originalLog;
-    if (originalHome === undefined) {
-      delete process.env["HOME"];
-    } else {
-      process.env["HOME"] = originalHome;
-    }
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("import and migrate accept --source all (exit 0)", async () => {
+  const home = await mkdtemp(join(tmpdir(), "ah-source-all-"));
+  try {
+    await mkdir(join(home, ".codex"), { recursive: true });
+    await writeFile(
+      join(home, ".codex", "config.toml"),
+      `[mcp_servers.docs]\ncommand = "npx"\nargs = ["-y", "mcp-server-docs"]\n`,
+      "utf8",
+    );
+
+    const importAll = runCli(["import", "--source", "all"], home);
+    assert.equal(importAll.status, 0);
+    assert.match(importAll.stdout, /\[docs\]/);
+    assert.match(importAll.stdout, /Source: codex/);
+
+    const migrateAll = runCli(["migrate", "--source", "all", "--json"], home);
+    assert.equal(migrateAll.status, 0);
+  } finally {
     await rm(home, { recursive: true, force: true });
   }
 });

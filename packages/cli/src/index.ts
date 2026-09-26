@@ -21,17 +21,17 @@ import { VERSION } from "./version.js";
 import { IMPORT_SOURCE_FILTERS, type ImportSourceFilter } from "./commands/import.js";
 import { MIGRATE_SOURCE_FILTERS, type MigrateSourceFilter } from "./commands/migrate.js";
 
-/** Validates a raw --source CLI value against the allowed filter list (no `any` cast). */
+/** Validates a raw --source CLI value (including "all") against the allowed filter list. */
 function parseSourceFilter<S extends string>(
   raw: string | undefined,
   allowed: readonly S[],
-): S | undefined {
+): S | "all" | undefined {
   if (!raw) return undefined;
+  if (raw === "all") return "all";
   if (!(allowed as readonly string[]).includes(raw)) {
     console.error(
       `Unknown --source value "${raw}". Supported sources: ${allowed.join(", ")}, all`,
     );
-    process.exitCode = 1;
     return undefined;
   }
   return raw as S;
@@ -169,10 +169,16 @@ async function main(): Promise<void> {
       case "migrate": {
         const typeVal = typeof parsedArgs["type"] === "string" ? parsedArgs["type"] : undefined;
         const sourceVal = typeof parsedArgs["source"] === "string" ? parsedArgs["source"] : undefined;
+        const sourceFilter = parseSourceFilter(sourceVal, MIGRATE_SOURCE_FILTERS);
+        if (sourceVal !== undefined && sourceFilter === undefined) {
+          // Stop before invoking the command: never run an unfiltered migration.
+          exitCode = 1;
+          break;
+        }
         exitCode = await migrateCommand({
           configPath,
           type: typeVal as any,
-          source: parseSourceFilter(sourceVal, MIGRATE_SOURCE_FILTERS),
+          source: sourceFilter,
           write: Boolean(parsedArgs["write"]),
           overwrite: Boolean(parsedArgs["overwrite"]),
           json: Boolean(parsedArgs["json"]),
@@ -182,9 +188,15 @@ async function main(): Promise<void> {
 
       case "import": {
         const sourceVal = typeof parsedArgs["source"] === "string" ? parsedArgs["source"] : undefined;
+        const sourceFilter = parseSourceFilter(sourceVal, IMPORT_SOURCE_FILTERS);
+        if (sourceVal !== undefined && sourceFilter === undefined) {
+          // Stop before invoking the command: never run an unfiltered import.
+          exitCode = 1;
+          break;
+        }
         exitCode = await importCommand({
           configPath,
-          source: parseSourceFilter(sourceVal, IMPORT_SOURCE_FILTERS),
+          source: sourceFilter,
           write: Boolean(parsedArgs["write"]),
         });
         break;
