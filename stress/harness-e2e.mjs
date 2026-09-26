@@ -50,6 +50,10 @@ const RESULTS = join(GEN, "results");
 const TIMEOUT_MS = Number(arg("timeout", "240")) * 1000;
 const HARNESS_LIST = String(arg("harnesses", "pi,codex,claude,opencode")).split(",");
 const MODE = String(arg("mode", "standalone"));
+// Fault injection for the self-test: --fault daemon-start sabotages the daemon
+// spawn (state dir parent is a file -> state write must fail) to prove a daemon
+// failure gates ok:false with one failure JSON and a nonzero exit.
+const FAULT = String(arg("fault", "none"));
 const KEEP = flag("keep");
 const FILLER_SKILLS = Number(arg("filler-skills", "150"));
 const FILLER_TOOLS_PER_SERVER = Number(arg("filler-tools", "80"));
@@ -874,8 +878,14 @@ async function main() {
       }
     }
     if (summary.errors.some((e) => e.startsWith("containment:"))) throw new Error("isolation containment revalidation failed");
-    if (MODE === "daemon") env["ACTION_HUB_DAEMON_MODE"] = "1";
-    summary.fixtures.generatedServers = generatedServerCount;
+    if (MODE === "daemon") {
+      env["ACTION_HUB_DAEMON_MODE"] = "1";
+      if (FAULT === "daemon-start") {
+        writeFileSync(join(root, "daemon-blocker"), "x", "utf8");
+        env["ACTION_HUB_DAEMON_DIR"] = join(root, "daemon-blocker", "daemon"); // parent is a file
+        summary.fault = "daemon-start";
+      }
+    }
     summary.tempRoot = root; // removed in finally when !KEEP
 
     // Fleet validation: report actual indexed counts and gate full-scale runs.
@@ -929,6 +939,11 @@ async function main() {
         if (existsSync(join(env["ACTION_HUB_DAEMON_DIR"], "daemon.json"))) break;
       }
       summary.daemonStarted = existsSync(join(env["ACTION_HUB_DAEMON_DIR"], "daemon.json"));
+      if (!summary.daemonStarted) {
+        // HARD GATE (S6-R4): daemon mode must actually share a daemon; never
+        // silently fall back to per-harness standalone hubs.
+        throw new Error("daemon mode: daemon did not reach readiness (no daemon.json) within 150s");
+      }
       if (summary.daemonStarted) {
         try {
           const state = JSON.parse(readFileSync(join(env["ACTION_HUB_DAEMON_DIR"], "daemon.json"), "utf8"));
@@ -938,6 +953,9 @@ async function main() {
           summary.errors.push(`daemon state unreadable: ${cause?.message}`);
           summary.daemonStarted = false;
         }
+      }
+      if (!daemonPid || daemonPid <= 0 || !stillAlive(daemonPid)) {
+        throw new Error(`daemon mode: no valid live daemon pid recorded (got ${daemonPid})`);
       }
     }
 
@@ -949,16 +967,24 @@ async function main() {
       const inst = await installHarness(HARNESS_TARGETS[h] ?? h, env, cli);
       installs[h] = inst.status === 0;
       if (!installs[h]) summary.errors.push(`${h} install failed: ${(inst.stderr || "").slice(-300)}`);
-      if (daemonRunningCheck(summary)) {
+    }
+    // Rewiring gate: in daemon mode every harness must be rewired to connect
+    // before the concurrent run; a failure aborts instead of silently
+    // exercising standalone hubs (S6-R4).
+    if (MODE === "daemon") {
+      const rewireFailures = [];
+      for (const h of HARNESS_LIST) {
+        if (!installs[h]) continue;
+        const def = RUNNERS[h];
         if (def.configPath(env).endsWith(".json")) {
-          const rewired = useDaemonSnippet(def.configPath(env), cli);
-          if (!rewired) summary.errors.push(`${h}: daemon snippet rewiring found no start arg`);
+          if (!useDaemonSnippet(def.configPath(env), cli)) rewireFailures.push(h);
         } else if (h === "codex") {
           summary.codexDaemonToml = true; // runCodex writes connect-mode TOML directly
         } else {
-          summary.errors.push(`${h}: daemon mode rewiring unsupported for this config format`);
+          rewireFailures.push(h);
         }
       }
+      if (rewireFailures.length) throw new Error(`daemon mode: connect rewiring failed for: ${rewireFailures.join(", ")}`);
     }
     summary.installs = installs;
 
@@ -999,9 +1025,13 @@ async function main() {
     // Concurrency: 3 harnesses at once against the shared daemon
     if (MODE === "daemon") {
       const concurrent = HARNESS_LIST.filter((h) => installs[h]).slice(0, 3);
+      if (concurrent.length < 1) throw new Error("daemon mode: no installed harness to run concurrently");
       const t0 = Date.now();
       const outcomes = await Promise.all(concurrent.map((h) => runOne(h).catch((cause) => ({ harness: h, success: false, error: String(cause) }))));
-      summary.concurrency = { harnesses: concurrent, wallMs: Date.now() - t0, results: outcomes };
+      summary.concurrency = { harnesses: concurrent, expected: concurrent.length, wallMs: Date.now() - t0, results: outcomes };
+      if (outcomes.length !== concurrent.length) {
+        throw new Error(`daemon mode: concurrency produced ${outcomes.length}/${concurrent.length} results`);
+      }
     }
 
     if (daemonChild) {
@@ -1056,10 +1086,19 @@ async function main() {
     }
   }
 
+  const concurrencyOk = summary.concurrency
+    ? MODE === "daemon"
+      ? // Daemon gate (S6-R4): a shared daemon must have been exercised.
+        summary.daemonStarted === true &&
+        Number(summary.daemonPid ?? 0) > 0 &&
+        summary.concurrency.results.length === summary.concurrency.expected &&
+        summary.concurrency.results.every((h) => h.success)
+      : summary.concurrency.results.every((h) => h.success)
+    : true;
   summary.ok = summary.errors.length === 0 &&
     (summary.harnesses?.length ?? 0) > 0 &&
     summary.harnesses.every((h) => h.success) &&
-    (summary.concurrency ? summary.concurrency.results.every((h) => h.success) : true);
+    concurrencyOk;
   writeFileSync(join(RESULTS, "harness-e2e.json"), JSON.stringify(summary, null, 2), "utf8");
   console.log(JSON.stringify(summary));
   if (!summary.ok) process.exitCode = 1;
