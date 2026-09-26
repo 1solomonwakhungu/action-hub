@@ -18,6 +18,24 @@ import {
   runDaemonProcess,
 } from "./commands/daemon.js";
 import { VERSION } from "./version.js";
+import { IMPORT_SOURCE_FILTERS, type ImportSourceFilter } from "./commands/import.js";
+import { MIGRATE_SOURCE_FILTERS, type MigrateSourceFilter } from "./commands/migrate.js";
+
+/** Validates a raw --source CLI value against the allowed filter list (no `any` cast). */
+function parseSourceFilter<S extends string>(
+  raw: string | undefined,
+  allowed: readonly S[],
+): S | undefined {
+  if (!raw) return undefined;
+  if (!(allowed as readonly string[]).includes(raw)) {
+    console.error(
+      `Unknown --source value "${raw}". Supported sources: ${allowed.join(", ")}, all`,
+    );
+    process.exitCode = 1;
+    return undefined;
+  }
+  return raw as S;
+}
 
 function printHelp(): void {
   console.log(`
@@ -52,7 +70,7 @@ DAEMON:
 
 MIGRATE OPTIONS:
   --type <type>       Capability types to migrate: all, mcps, skills, plugins (default: all)
-  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, agents, all
+  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, agents, codex, windsurf, cline, roo-code, all
   --write             Commit migrated capabilities to config (default is dry-run)
   --overwrite         Overwrite existing servers or skills on ID conflict
   --json              Output plan and results in JSON format
@@ -154,7 +172,7 @@ async function main(): Promise<void> {
         exitCode = await migrateCommand({
           configPath,
           type: typeVal as any,
-          source: sourceVal as any,
+          source: parseSourceFilter(sourceVal, MIGRATE_SOURCE_FILTERS),
           write: Boolean(parsedArgs["write"]),
           overwrite: Boolean(parsedArgs["overwrite"]),
           json: Boolean(parsedArgs["json"]),
@@ -166,7 +184,7 @@ async function main(): Promise<void> {
         const sourceVal = typeof parsedArgs["source"] === "string" ? parsedArgs["source"] : undefined;
         exitCode = await importCommand({
           configPath,
-          source: sourceVal as any,
+          source: parseSourceFilter(sourceVal, IMPORT_SOURCE_FILTERS),
           write: Boolean(parsedArgs["write"]),
         });
         break;
