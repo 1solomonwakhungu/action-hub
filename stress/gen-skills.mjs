@@ -533,7 +533,13 @@ for (const s of take(400)) {
   const synOf = (word) => (domain.synonyms?.[word] ?? word).toLowerCase();
   const clean = `${pick(PARAPHRASE_OPENERS)} handle the ${synOf(object)} for our ${synOf(subject)} in ${domain.context}?`;
   paraphraseCleanTexts.push(clean);
-  const q = withNoise(clean, rand, 0.2, counters);
+  // Typo noise only: fragmentation would truncate the question into exactly
+  // the function-word debris FX13 bans ("I need to", "How do I handle").
+  let q = clean;
+  if (rand() < 0.12) {
+    counters.typo++;
+    q = applyTypo(clean, rand);
+  }
   // Invariants (review HIGH-3): paraphrases must not leak the literal target
   // name or any number. Documented overlap ceiling: a paraphrase may cover at
   // most half of the gold document's tokens (inDoc / docTokens <= 0.5) — it
