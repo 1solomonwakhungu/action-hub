@@ -128,6 +128,15 @@ export interface ActionRecord {
   /** Free-form tags contributing to lexical search. */
   tags?: string[];
   trust: TrustTier;
+  /** Declared by the upstream server (or source) as side-effect free. */
+  readOnly?: boolean;
+}
+
+/** Configuration for the idempotent-read result cache. */
+export interface ResultCacheOptions {
+  enabled?: boolean;
+  ttlMs?: number;
+  maxEntries?: number;
 }
 
 export interface SearchHit {
@@ -210,6 +219,8 @@ export interface ExecuteResult {
   content?: unknown;
   error?: string;
   durationMs: number;
+  /** True when the result was served from the idempotent-read cache. */
+  cached?: boolean;
   /**
    * Present, with `ok: false`, when the call was gated rather than failed.
    * A caller that sees this should prompt the user, not retry.
@@ -227,6 +238,8 @@ export interface InvocationRecord {
   error?: string;
   /** How the call cleared the approval gate, when one applied. */
   approval?: "required" | "approved";
+  /** True when the invocation was served from the idempotent-read cache. */
+  cached?: boolean;
 }
 
 /** Options passed to downstream MCP tool calls, including propagated trace headers. */

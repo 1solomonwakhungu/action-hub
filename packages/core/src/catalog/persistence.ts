@@ -300,6 +300,7 @@ function coerceAction(value: unknown): ActionRecord | undefined {
       ? value["tags"].filter((tag): tag is string => typeof tag === "string")
       : undefined,
     trust,
+    readOnly: value["readOnly"] === true ? true : undefined,
   };
 }
 
