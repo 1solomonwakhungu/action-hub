@@ -225,3 +225,44 @@ test("migrate --type mcps --write leaves skills and bundles untouched", async ()
     await rm(tempHome, { recursive: true, force: true });
   }
 });
+
+// Regression for reviewer-2 scoping follow-up: the inverse of the mcps test —
+// a skills-only migration must not add or rewrite the servers or bundles arrays.
+test("migrate --type skills --write leaves servers and bundles untouched", async () => {
+  const tempHome = await mkdtemp(resolve(tmpdir(), "action-hub-migrate-skills-"));
+  const originalHome = process.env["HOME"];
+  process.env["HOME"] = tempHome;
+  const configPath = join(tempHome, "config", "servers.json");
+  try {
+    await mkdir(join(tempHome, "config"), { recursive: true });
+    const originalConfig = { skills: [{ id: "keep-skill", name: "Keep" }] };
+    await writeFile(configPath, JSON.stringify(originalConfig, null, 2));
+
+    const cliPath = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+    const child = spawn(process.execPath, [
+      cliPath,
+      "migrate",
+      "--type",
+      "skills",
+      "--write",
+      "--json",
+      "--config",
+      configPath,
+    ], { env: { ...process.env, HOME: tempHome }, cwd: tempHome });
+
+    const code = await new Promise<number | null>((resolveExit, rejectSpawn) => {
+      child.on("error", rejectSpawn);
+      child.on("exit", (exitCode) => resolveExit(exitCode));
+    });
+
+    assert.equal(code, 0);
+    const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(written["skills"], originalConfig.skills, "skills array was rewritten");
+    assert.equal(written["servers"], undefined, "servers array was added");
+    assert.equal(written["bundles"], undefined, "bundles array was added");
+  } finally {
+    if (originalHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = originalHome;
+    await rm(tempHome, { recursive: true, force: true });
+  }
+});

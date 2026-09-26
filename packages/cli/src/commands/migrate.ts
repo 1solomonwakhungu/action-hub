@@ -201,9 +201,9 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
       }
     }
 
-    raw["servers"] = serverEntries;
     // Only rewrite the arrays for the capability types actually being
-    // migrated: --type mcps must not touch skills or bundles.
+    // migrated: a narrow --type must not add or rewrite the sibling arrays.
+    if (migrationTypes.includes("mcps")) raw["servers"] = serverEntries;
     if (migrationTypes.includes("skills")) raw["skills"] = mergedSkills;
     if (migrationTypes.includes("plugins")) raw["bundles"] = mergedBundles;
     if (raw["autoApproveAtOrAbove"] === undefined) {
