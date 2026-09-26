@@ -214,17 +214,27 @@ test("connect destroys the socket on handshake failure (MUST-FIX)", async () => 
     });
     const stderrChunks: Buffer[] = [];
     child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c));
-    const exitCode = await Promise.race([
-      new Promise<number | null>((done) => child.once("exit", (code) => done(code))),
-      new Promise<"timeout">((done) => setTimeout(() => done("timeout"), 15_000)),
-    ]);
-    // The fake daemon must have accepted the connection AND the CLI must have
-    // exited 1 promptly after the read timeout (a live process at this point
-    // is the hang this regression guards against).
-    assert.equal(accepted, true, "fake daemon must have accepted the connection");
-    assert.equal(exitCode, 1, `expected exit 1, got ${exitCode}; stderr=${Buffer.concat(stderrChunks).toString().slice(0, 200)}`);
-    assert.match(Buffer.concat(stderrChunks).toString(), /could not connect to daemon/);
-    if (exitCode === null) child.kill("SIGKILL");
+    let exitCode: number | null | "timeout";
+    try {
+      exitCode = await new Promise<number | null | "timeout">((done) => {
+        child.once("exit", (code) => done(code));
+        const timer = setTimeout(() => done("timeout"), 15_000);
+        timer.unref?.();
+      });
+      // The fake daemon must have accepted the connection AND the CLI must
+      // have exited 1 promptly after the read timeout (a live process at this
+      // point is the hang this regression guards against).
+      assert.equal(accepted, true, "fake daemon must have accepted the connection");
+      assert.equal(exitCode, 1, `expected exit 1, got ${exitCode}; stderr=${Buffer.concat(stderrChunks).toString().slice(0, 200)}`);
+      assert.match(Buffer.concat(stderrChunks).toString(), /could not connect to daemon/);
+    } finally {
+      // Kill and reap the child on timeout or assertion failure so a hung CLI
+      // never leaks past the test.
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await new Promise<void>((done) => child.once("exit", () => done()));
+      }
+    }
   } finally {
     server.close();
     await rm(tempDir, { recursive: true, force: true });
@@ -325,6 +335,42 @@ test("list --kind skill --server never indexes servers and still lists skills", 
       contacted = false;
     }
     assert.equal(contacted, false, "--kind skill --server X must not index MCP servers");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// Unknown-server validation must apply regardless of --kind (FX4-R re-review).
+test("list --kind skill --server missing exits 1", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-skill-missing-"));
+  const cfgPath = join(tempDir, "servers.json");
+  await writeFile(
+    cfgPath,
+    JSON.stringify({
+      servers: [],
+      skills: [{ id: "c1", name: "C1", summary: "from config", description: "config" }],
+      autoDiscover: false,
+    }),
+  );
+
+  try {
+    const savedHome = process.env["HOME"];
+    const savedSkillsDir = process.env["ACTION_HUB_SKILLS_DIR"];
+    process.env["HOME"] = tempDir;
+    process.env["ACTION_HUB_SKILLS_DIR"] = join(tempDir, "empty-skills");
+    await mkdir(join(tempDir, "empty-skills"), { recursive: true });
+    const captured = captureConsole();
+    try {
+      const code = await listCommand({ configPath: cfgPath, server: "missing", kind: "skill" });
+      assert.equal(code, 1);
+      assert.match(captured.logs.join("\n"), /server "missing" is not registered/);
+    } finally {
+      captured.restore();
+      if (savedHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = savedHome;
+      if (savedSkillsDir === undefined) delete process.env["ACTION_HUB_SKILLS_DIR"];
+      else process.env["ACTION_HUB_SKILLS_DIR"] = savedSkillsDir;
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

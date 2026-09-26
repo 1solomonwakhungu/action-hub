@@ -55,17 +55,22 @@ export async function listCommand(options: ListOptions = {}): Promise<number> {
     ];
     hub.replaceSkills(skillRecords);
 
+    // Unknown-server validation runs regardless of --kind so
+    // `list --kind skill --server missing` also fails.
+    if (options.server) {
+      const exists = config.servers.some((s) => s.id === options.server);
+      if (!exists) {
+        console.error(`Error: server "${options.server}" is not registered in the config.`);
+        return 1;
+      }
+    }
+
     if (options.kind !== "skill") {
       // kind=skill needs no MCP server contact at all — tool records would be
       // filtered out immediately — even when --server is also given. Tool kinds
       // index servers (skills are already registered locally above).
       if (options.server) {
         // F12: index only the requested server instead of the whole fleet.
-        const exists = config.servers.some((s) => s.id === options.server);
-        if (!exists) {
-          console.error(`Error: server "${options.server}" is not registered in the config.`);
-          return 1;
-        }
         const result = await hub.indexServer(options.server);
         if (result.error) {
           console.error(`Warning: indexing "${options.server}" failed: ${result.error}`);
