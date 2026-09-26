@@ -227,8 +227,11 @@ From any harness, ask the agent to run a trivial Action Hub tool. From the CLI
 side you can sanity-check registration with:
 
 ```bash
-action-hub harness list
+action-hub doctor
 ```
+
+`doctor` validates your configuration and checks connectivity to each
+registered server.
 
 ## Troubleshooting
 
