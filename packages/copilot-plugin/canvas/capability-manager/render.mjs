@@ -554,7 +554,7 @@ function actionsRows(actions, filter) {
 
   return filtered.map(a =>
     '<div class="action-item">' +
-      '<div class="action-header" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === \'none\' ? \'block\' : \'none\'">' +
+      '<div class="action-header" data-toggle>' +
         '<div><b>' + esc(a.name) + '</b> <span class="badge trust-' + esc(a.trust) + '">' + esc(a.trust) + '</span> <code style="color:var(--muted); margin-left:6px;">' + esc(a.serverId) + '</code></div>' +
         '<div style="font-size:11px; color:var(--accent);">View Schema ▾</div>' +
       '</div>' +
@@ -765,6 +765,27 @@ $("btn-check-health").addEventListener("click", async () => {
   const result = await control("check_health", {});
   report($("server-result"), result, () => "Checked health and ping latency for all servers.");
   await paint();
+});
+
+// Delegated accordion toggling for server cards (inline handlers don't parse in module CSP contexts).
+document.addEventListener("click", (event) => {
+  const header = event.target.closest(".server-head");
+  if (!header) return;
+  const section = document.getElementById("servers-" + header.dataset.id);
+  if (!section) return;
+  section.style.display = section.style.display === "none" ? "" : "none";
+  const badge = header.querySelector(".chev");
+  if (badge) badge.textContent = section.style.display === "none" ? "▸" : "▾";
+});
+
+// Delegated accordion toggling for action-header schema rows. Only headers that
+// opt in via data-toggle are collapsible; bundle headers are not.
+document.addEventListener("click", (event) => {
+  const header = event.target.closest(".action-header[data-toggle]");
+  if (!header) return;
+  const detail = header.nextElementSibling;
+  if (!detail) return;
+  detail.style.display = detail.style.display === "none" ? "" : "none";
 });
 
 async function runSearch() {

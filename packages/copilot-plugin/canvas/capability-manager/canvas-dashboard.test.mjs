@@ -45,6 +45,18 @@ test("renderPage produces complete HTML with dashboard tabs, health indicators, 
   assert.ok(html.includes("import-json"));
 });
 
+test("every inline <script> in renderPage output parses as valid JS", () => {
+  const html = renderPage("test-token-12345");
+  const scripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)];
+  assert.ok(scripts.length > 0, "expected at least one inline script");
+  for (const [, body] of scripts) {
+    assert.doesNotThrow(() => new Function(body));
+  }
+  // Header toggle wiring: actions rows are collapsible via delegated listener.
+  assert.ok(html.includes('class="action-header" data-toggle'));
+  assert.ok(scripts[0][1].includes('.action-header[data-toggle]'));
+});
+
 test("controls validation tests", async () => {
   assert.deepEqual(TRUST_TIERS, ["blocked", "untrusted", "trusted"]);
 
