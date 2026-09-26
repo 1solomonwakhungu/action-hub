@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import {
   discoverAll,
   executeMigration,
+  redactServerConfig,
   type DiscoveredPlugin,
   type DiscoveredServer,
   type DiscoveredSkill,
@@ -72,7 +73,14 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
   const { plan, mergedServers, mergedSkills, mergedBundles } = migrationResult;
 
   if (isJson) {
-    console.log(JSON.stringify({ plan, currentConfigPath: currentConfig.path }, null, 2));
+    // Display-only projection: server transports (args, env, URLs, auth) are
+    // redacted before the plan is serialized.
+    const safePlan = {
+      ...plan,
+      serversToAdd: plan.serversToAdd.map(redactServerConfig),
+      serversToUpdate: plan.serversToUpdate.map(redactServerConfig),
+    };
+    console.log(JSON.stringify({ plan: safePlan, currentConfigPath: currentConfig.path }, null, 2));
   } else {
     // Print MCP Servers
     if (migrationTypes.includes("mcps")) {
@@ -80,13 +88,13 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
       if (filteredServers.length === 0) {
         console.log("  No external MCP servers found.");
       } else {
-        for (const s of filteredServers) {
+        for (const raw of filteredServers) {
+          // Display-only projection; secret values never reach the console.
+          const t = redactServerConfig(raw).transport;
           const transport =
-            s.transport.type === "stdio"
-              ? `${s.transport.command} ${(s.transport.args ?? []).join(" ")}`
-              : s.transport.url;
-          console.log(`  • [${s.id}] (Source: ${s.sourceClient} at ${s.sourcePath})`);
-          console.log(`    Transport: ${s.transport.type} -> ${transport}`);
+            t.type === "stdio" ? `${t.command} ${(t.args ?? []).join(" ")}` : t.url;
+          console.log(`  • [${raw.id}] (Source: ${raw.sourceClient} at ${raw.sourcePath})`);
+          console.log(`    Transport: ${t.type} -> ${transport}`);
         }
       }
       console.log();

@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { discoverMcpServers, type ServerConfig } from "@action-hub/core";
+import { discoverMcpServers, redactServerConfig, type ServerConfig } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
 
 export interface ImportOptions {
@@ -23,12 +23,16 @@ export async function importCommand(options: ImportOptions = {}): Promise<number
   }
 
   for (const s of filtered) {
+    // Display-only projection: env/header values, secret-bearing args, URL
+    // query values and OAuth config are redacted before rendering.
+    const t = redactServerConfig(s).transport;
     const transport =
-      s.transport.type === "stdio"
-        ? `${s.transport.command} ${(s.transport.args ?? []).join(" ")}`
-        : s.transport.url;
+      t.type === "stdio" ? `${t.command} ${(t.args ?? []).join(" ")}` : t.url;
     console.log(`  • [${s.id}] (Source: ${s.sourceClient} at ${s.sourcePath})`);
-    console.log(`    Transport: ${s.transport.type} -> ${transport}`);
+    console.log(`    Transport: ${t.type} -> ${transport}`);
+    if (t.type === "stdio" && t.env) {
+      console.log(`    Env: ${Object.keys(t.env).join(", ")}`);
+    }
   }
 
   if (options.write) {
