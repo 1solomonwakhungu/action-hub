@@ -137,22 +137,65 @@ for (const scenario of [
   });
 }
 
-// Regression for reviewer-2 HIGH: migrate --write must also fail closed on a
-// malformed servers array. This is a real CLI spawn (node dist/index.js), not
-// an in-process call, so the actual exit code is asserted.
-test("migrate --write via CLI spawn fails closed on malformed servers", async () => {
-  const tempHome = await mkdtemp(resolve(tmpdir(), "action-hub-migrate-bad-"));
+// Regression for reviewer-2 HIGH: migrate --write must fail closed on a
+// malformed capability array. Table-driven over servers/skills/bundles since
+// migrate rewrites all three; real CLI spawn so the exit code is asserted.
+for (const field of ["servers", "skills", "bundles"] as const) {
+  test(`migrate --write via CLI spawn fails closed on malformed ${field}`, async () => {
+    const tempHome = await mkdtemp(resolve(tmpdir(), "action-hub-migrate-bad-"));
+    const originalHome = process.env["HOME"];
+    process.env["HOME"] = tempHome;
+    const configPath = join(tempHome, "config", "servers.json");
+    try {
+      await mkdir(join(tempHome, "config"), { recursive: true });
+      const originalBytes = JSON.stringify({
+        servers: field === "servers" ? ["KEEP_SENTINEL"] : [],
+        skills: field === "skills" ? ["KEEP_SKILLS"] : [{ id: "keep-skill" }],
+        bundles: field === "bundles" ? ["KEEP_BUNDLES"] : [],
+      });
+      await writeFile(configPath, originalBytes);
+
+      const cliPath = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+      const child = spawn(process.execPath, [
+        cliPath,
+        "migrate",
+        "--type",
+        "mcps",
+        "--write",
+        "--json",
+        "--config",
+        configPath,
+      ], { env: { ...process.env, HOME: tempHome }, cwd: tempHome });
+
+      const code = await new Promise<number | null>((resolveExit, rejectSpawn) => {
+        child.on("error", rejectSpawn);
+        child.on("exit", (exitCode) => resolveExit(exitCode));
+      });
+
+      assert.equal(code, 1, `expected exit 1, got ${code}`);
+      assert.equal(await readFile(configPath, "utf8"), originalBytes, "config bytes changed");
+    } finally {
+      if (originalHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = originalHome;
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+}
+
+// Regression for the intake addendum: --type mcps must not add or rewrite the
+// skills and bundles arrays at all.
+test("migrate --type mcps --write leaves skills and bundles untouched", async () => {
+  const tempHome = await mkdtemp(resolve(tmpdir(), "action-hub-migrate-scope-"));
   const originalHome = process.env["HOME"];
   process.env["HOME"] = tempHome;
   const configPath = join(tempHome, "config", "servers.json");
   try {
     await mkdir(join(tempHome, "config"), { recursive: true });
-    const originalBytes = JSON.stringify({
-      servers: ["KEEP_SENTINEL"],
-      skills: [{ id: "keep-skill" }],
-      custom: "keep",
-    });
-    await writeFile(configPath, originalBytes);
+    const originalConfig = {
+      servers: [],
+      skills: [{ id: "keep-skill", name: "Keep" }],
+    };
+    await writeFile(configPath, JSON.stringify(originalConfig, null, 2));
 
     const cliPath = fileURLToPath(new URL("../dist/index.js", import.meta.url));
     const child = spawn(process.execPath, [
@@ -171,8 +214,11 @@ test("migrate --write via CLI spawn fails closed on malformed servers", async ()
       child.on("exit", (exitCode) => resolveExit(exitCode));
     });
 
-    assert.equal(code, 1, `expected exit 1, got ${code}`);
-    assert.equal(await readFile(configPath, "utf8"), originalBytes, "config bytes changed");
+    assert.equal(code, 0);
+    const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(written["skills"], originalConfig.skills, "skills array was rewritten");
+    // Absent sibling arrays must not be added empty by an mcps-only migration.
+    assert.equal(written["bundles"], undefined, "bundles array was added");
   } finally {
     if (originalHome === undefined) delete process.env["HOME"];
     else process.env["HOME"] = originalHome;

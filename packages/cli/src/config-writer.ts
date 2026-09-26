@@ -36,14 +36,37 @@ export function validateRawServersShape(
   raw: Record<string, unknown>,
   path: string,
 ): void {
-  const value = raw["servers"];
+  validateRawIdArray(raw, "servers", path);
+}
+
+/** Capability arrays a migrate --write rewrites wholesale. */
+const CAPABILITY_ARRAY_KEYS = ["servers", "skills", "bundles"] as const;
+
+/**
+ * Validates every capability array migrate --write will rewrite. Any of them
+ * that is present must be an array of objects with non-empty string ids and
+ * no duplicates; a violation fails closed so the write never runs.
+ */
+export function validateRawCapabilityArrays(
+  raw: Record<string, unknown>,
+  path: string,
+): void {
+  for (const key of CAPABILITY_ARRAY_KEYS) validateRawIdArray(raw, key, path);
+}
+
+function validateRawIdArray(
+  raw: Record<string, unknown>,
+  key: string,
+  path: string,
+): void {
+  const value = raw[key];
   if (value === undefined) return;
   if (!Array.isArray(value)) {
-    throw new Error(`Malformed config at ${path}: "servers" must be an array, refusing to overwrite`);
+    throw new Error(`Malformed config at ${path}: "${key}" must be an array, refusing to overwrite`);
   }
   const seen = new Set<string>();
   for (const [index, entry] of value.entries()) {
-    const label = `"servers"[${index}]`;
+    const label = `"${key}"[${index}]`;
     if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
       throw new Error(`Malformed config at ${path}: ${label} must be an object, refusing to overwrite`);
     }
@@ -52,7 +75,7 @@ export function validateRawServersShape(
       throw new Error(`Malformed config at ${path}: ${label}.id must be a non-empty string, refusing to overwrite`);
     }
     if (seen.has(id)) {
-      throw new Error(`Malformed config at ${path}: duplicate server id "${id}", refusing to overwrite`);
+      throw new Error(`Malformed config at ${path}: duplicate ${key.slice(0, -1)} id "${id}", refusing to overwrite`);
     }
     seen.add(id);
   }
