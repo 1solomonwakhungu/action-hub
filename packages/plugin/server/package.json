@@ -1,8 +1,8 @@
 {
-  "name": "@action-hub/copilot-mcp",
+  "name": "@action-hub/mcp-server",
   "version": "0.1.0",
   "private": true,
-  "description": "Meta-MCP server exposing the Action Hub catalog to GitHub Copilot as a single tool",
+  "description": "Meta-MCP server exposing the Action Hub catalog to any MCP host as a single tool",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",

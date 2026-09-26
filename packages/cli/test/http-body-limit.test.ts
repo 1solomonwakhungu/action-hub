@@ -6,7 +6,7 @@ import {
   readBoundedBody,
   resolveHttpToken,
   DEFAULT_MAX_BODY_BYTES,
-} from "../../copilot-plugin/server/dist/http-server.js";
+} from "../../plugin/server/dist/http-server.js";
 
 // Regression for PR 31 rework: authenticated request bodies are bounded;
 // overflow stops buffering and is answered with 413 by the caller.

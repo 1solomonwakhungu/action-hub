@@ -1,6 +1,6 @@
 # Action Hub
 
-**An indexed, on-demand capability layer for MCP servers and skills — delivered as a GitHub Copilot plugin.**
+**An indexed, on-demand capability layer for MCP servers and skills — works with any MCP-capable agent harness.**
 
 Action Hub replaces the eager capability surface of a typical MCP setup with a lazy, searchable one. An agent can reach 100,000 actions while its permanent context holds only a single tool schema.
 
@@ -25,10 +25,10 @@ Worse, capability density actively hurts quality. A model choosing between 400 s
 Do not put the catalog in the context. Put a **search interface** to the catalog in the context.
 
 ```
-GitHub Copilot app
+Any MCP host (Copilot, Claude Code, Cursor, VS Code, Codex, pi, …)
         |
         v
-   Action Hub plugin
+   Action Hub plugin bundle
         |
         v
  Action Hub meta-MCP server
@@ -41,7 +41,7 @@ GitHub Copilot app
         +-- ~10,000 skills
 ```
 
-Copilot sees one tool. Action Hub sees everything.
+Your agent sees one tool. Action Hub sees everything.
 
 ```jsonc
 {
@@ -75,7 +75,7 @@ The project is split into two layers, and the boundary between them is load-bear
 
 ### Layer 1 — `packages/core` (runtime-agnostic)
 
-This is the actual intellectual property. It has **no dependency on Copilot** and no knowledge of the host that calls it.
+This is the actual intellectual property. It has **no dependency on any host harness** and no knowledge of the host that calls it.
 
 | Module | Responsibility |
 | --- | --- |
@@ -92,50 +92,27 @@ This is the actual intellectual property. It has **no dependency on Copilot** an
 
 Because this layer is host-neutral, the same backend can later serve Claude Code, VS Code, Zed, or any MCP-compatible client without modification.
 
-### Layer 2 — `packages/copilot-plugin` (integration)
+### Layer 2 — `packages/plugin` (integration)
 
-A GitHub Copilot plugin, matching the format the app already loads:
+An optional plugin bundle (`plugin.json` + `.mcp.json` + skill) for hosts
+that load plugin bundles; any MCP host can register the server directly:
 
 ```
-packages/copilot-plugin/
+packages/plugin/
 ├── plugin.json          # manifest: skills, agents, mcpServers
-├── .mcp.json            # registers the Action Hub meta-MCP server
+├── .mcp.json            # registers the Action Hub MCP server
 ├── skills/
 │   └── action-hub/
 │       └── SKILL.md     # teaches the model the search -> load -> execute loop
-├── server/              # the meta-MCP server (stdio)
-└── canvas/
-    └── capability-manager/
-        └── extension.mjs # interactive control center
+└── server/              # the meta-MCP server (stdio)
 ```
 
-### Why a plugin and not a fork
+### The MCP server and the plugin bundle
 
-The GitHub Copilot app is the right product surface. It already solves the expensive UX problems — parallel agent sessions, isolated git worktrees, repository and GitHub integration, diff review, terminals, browser canvases, automations, and a polished cross-platform desktop app.
-
-It cannot be forked. [`github/app`](https://github.com/github/app) is the public home for releases, documentation, issues, and discussions only; it does not contain application source, and it is licensed `© GitHub, Inc. All rights reserved.`
-
-That constraint turns out not to matter, because GitHub exposes an official extension path:
-
-- An MIT-licensed [Copilot SDK](https://github.com/github/copilot-sdk)
-- A plugin system bundling skills, MCP servers, hooks, custom agents, and canvas extensions
-- A plugin marketplace for distribution
-
-So we do not clone the app. We live inside it, use its real interface, and replace its eager capability surface with an indexed one. Cleaner, faster, legally unambiguous, and immediately distributable.
-
-## The capability manager canvas
-
-Copilot canvases render interactive UI in the app's side panel. The `capability-manager` canvas is the control center:
-
-- Installed MCP servers, with health and authentication state
-- Tools indexed per server; installed skills
-- Live search testing against the real index
-- Permission levels and trusted vs. untrusted servers
-- Tool invocation history
-- Enable / disable controls
-- Context savings and search-quality diagnostics
-
-This gives a native-feeling control surface without recreating GitHub's desktop application.
+The heart of Layer 2 is the **MCP server** — a meta-MCP server any host can
+register as one tool. The surrounding plugin bundle (manifest, skill) is
+additive packaging for hosts that load plugin bundles; hosts without such a
+system use the server directly and lose nothing.
 
 ## Repository layout
 
@@ -144,11 +121,9 @@ action-hub/
 ├── packages/
 │   ├── core/                 # Layer 1 — runtime-agnostic engine
 │   ├── cli/                  # Developer CLI + `action-hub start` (bundled into the binary)
-│   └── copilot-plugin/       # Layer 2 — Copilot integration
-│       ├── server/           #   meta-MCP server (also run in-process by the CLI)
-│       └── canvas/           #   capability-manager canvas
+│   └── plugin/               # Layer 2 — plugin bundle for MCP hosts
+│       └── server/           #   meta-MCP server (also run in-process by the CLI)
 ├── .github/
-│   ├── extensions/           # makes the canvas discoverable during development
 │   └── workflows/            # CI and standalone-binary release automation
 ├── scripts/                  # esbuild + Node SEA binary build and packaging
 ├── packaging/                # generated Homebrew / winget manifests
@@ -168,7 +143,7 @@ this way and why search must never return schemas.
 ## Install
 
 Action Hub ships as a **standalone, zero-dependency binary** — the Node runtime,
-the developer CLI, and the Copilot meta-MCP server in one executable. No system
+the developer CLI, and the MCP server in one executable. No system
 Node install is required to run it.
 
 ### Homebrew (macOS, Linux)
@@ -200,7 +175,7 @@ action-hub --version
 ```
 
 Supported targets: macOS arm64/x64, Linux x64/arm64, Windows x64. Register the
-binary as the Copilot MCP server by pointing `.mcp.json` at
+binary as the Action Hub MCP server by pointing your host's config at
 `action-hub start`. See [`docs/releasing.md`](docs/releasing.md) for how the
 binaries are built and published.
 
@@ -269,7 +244,7 @@ Early development. The interfaces described above are the target design; see [`d
 
 ## Design principles
 
-1. **The core never imports Copilot.** If it does, the abstraction has failed.
+1. **The core never imports a host harness.** If it does, the abstraction has failed.
 2. **Schemas are loaded, never broadcast.** Context is the scarcest resource.
 3. **Lazy everything.** Unused capability must cost zero.
 4. **Search quality is a testable property.** Retrieval regressions are bugs, caught by the eval suite.

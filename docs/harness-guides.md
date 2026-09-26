@@ -6,7 +6,7 @@ Action Hub ships a Model Context Protocol (MCP) server. Every harness below
 speaks MCP over stdio, and two stdio entry forms are valid:
 
 - the bundled server script
-  `<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js`, or
+  `<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js`, or
 - the CLI entrypoint `<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js`
   with the `start` argument (this is the form the `action-hub harness`
   command emits).
@@ -78,7 +78,7 @@ npm install && npm run build
 Run:
 
 ```bash
-claude mcp add action-hub -- node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js
+claude mcp add action-hub -- node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js
 ```
 
 This writes the server into `~/.claude.json`. Restart Claude Code, then check
@@ -94,7 +94,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`
   "mcpServers": {
     "action-hub": {
       "command": "node",
-      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"]
+      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js"]
     }
   }
 }
@@ -112,7 +112,7 @@ Edit `~/.cursor/mcp.json` (or `.cursor/mcp.json` in a project) and add:
   "mcpServers": {
     "action-hub": {
       "command": "node",
-      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"]
+      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js"]
     }
   }
 }
@@ -130,7 +130,7 @@ Edit `.vscode/mcp.json` in the workspace (or use
   "servers": {
     "action-hub": {
       "command": "node",
-      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"]
+      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js"]
     }
   }
 }
@@ -145,7 +145,7 @@ Edit `~/.codex/config.toml` and add:
 ```toml
 [mcp_servers.action-hub]
 command = "node"
-args = ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"]
+args = ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js"]
 ```
 
 Restart any running Codex session so it picks up the new server.
@@ -160,7 +160,7 @@ and add:
   "mcp": {
     "action-hub": {
       "type": "local",
-      "command": ["node", "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"],
+      "command": ["node", "<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js"],
       "enabled": true
     }
   }
@@ -179,7 +179,7 @@ Edit Zed's `settings.json` and add:
   "context_servers": {
     "action-hub": {
       "command": "node",
-      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"]
+      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js"]
     }
   }
 }
@@ -196,7 +196,7 @@ Edit `~/.codeium/windsurf/mcp_config.json` and add:
   "mcpServers": {
     "action-hub": {
       "command": "node",
-      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js"]
+      "args": ["<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/server/dist/index.js"]
     }
   }
 }

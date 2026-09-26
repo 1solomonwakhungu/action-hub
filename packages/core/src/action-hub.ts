@@ -862,7 +862,7 @@ export class ActionHub {
    * The full serializable catalog, ready to be written to a cache.
    *
    * A superset of `snapshot()` — the diagnostics fields are identical, so a
-   * single file can serve both the cache and the capability manager canvas.
+   * single file can serve both the cache and host-side diagnostics readers.
    */
   toPersisted(configHash: string): PersistedCatalog {
     return {
