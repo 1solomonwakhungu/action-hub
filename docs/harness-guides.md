@@ -216,16 +216,28 @@ any harness from any machine with the checkout:
 authenticated local socket. Each connection gets its own MCP session; the
 catalog, connection pool, and auth are shared process-wide.
 
-## Importing your existing MCP servers
+## Migrating your existing MCP servers and skills
 
-If you already have MCP servers configured in Claude Desktop, Cursor, VS Code,
-or elsewhere, pull them into Action Hub once:
+If you already have MCP servers and skills configured in Claude Desktop,
+Cursor, VS Code, or elsewhere, pull them into Action Hub once. Preview first
+(without `--write`) to see what would change:
 
 ```bash
-action-hub import --write
+action-hub migrate --type all
 ```
 
-(or `node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js import --write`
-if the CLI is not on your `PATH`). This writes the discovered servers and
-skills into the Action Hub config; afterwards everything is served through the
-hub.
+Then write the result:
+
+```bash
+action-hub migrate --type all --write
+```
+
+(Use `node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js migrate --type all --write`
+if the CLI is not on your `PATH`.) The migration engine discovers MCP servers,
+skills, and plugins from your local agent configurations and merges them into
+the Action Hub config, preserving entries that are already there.
+
+For servers only, `action-hub import` (preview) and `action-hub import
+--write` do a servers-only pass. Note that `import --write` does not bring in
+skills, so prefer `migrate --type all --write` when you want servers *and*
+skills.
