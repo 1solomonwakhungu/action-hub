@@ -247,24 +247,57 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
  * never became ready must not survive its own failed start as an orphan.
  */
 async function killAndReapSpawned(child: ChildProcess): Promise<void> {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-  try {
-    if (platform() !== "win32") process.kill(-child.pid, "SIGKILL");
-    child.kill("SIGKILL");
-  } catch {
-    // Already gone.
+  if (!child.pid) return;
+  const pid = child.pid;
+  const isWindows = platform() === "win32";
+  // True while ANY member of the daemon's process group still lives — direct
+  // child exit is NOT tree death, so verification must always target the
+  // group, even when the leader has already exited.
+  const groupAlive = (): boolean => {
+    if (isWindows) return false;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException)?.code !== "ESRCH";
+    }
+  };
+  const signalTree = (signal: NodeJS.Signals): void => {
+    if (isWindows) {
+      // child.kill does not kill a Windows process tree; taskkill /T /F does.
+      const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+      tk.on("error", () => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      });
+      return;
+    }
+    try {
+      process.kill(-pid, signal);
+    } catch {
+      // Leader already exited and no group members remain.
+    }
+    try {
+      child.kill(signal);
+    } catch {}
+  };
+  signalTree("SIGTERM");
+  await delay(150);
+  if (isWindows) {
+    // Await the force kill before verifying.
+    await new Promise<void>((resolve) => {
+      const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+      tk.on("exit", () => resolve());
+      tk.on("error", () => resolve());
+    });
+  } else {
+    signalTree("SIGKILL");
   }
   const deadline = Date.now() + 5_000;
   for (;;) {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    let alive = false;
-    try {
-      process.kill(child.pid, 0);
-      alive = true;
-    } catch {
-      alive = false;
-    }
-    if (!alive || Date.now() >= deadline) return;
+    if (!groupAlive()) return;
+    if (Date.now() >= deadline) return;
     await delay(50);
   }
 }

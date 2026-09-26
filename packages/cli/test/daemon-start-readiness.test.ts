@@ -170,3 +170,62 @@ test("daemon start fails on a silent daemon after the no-progress window", async
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// Reviewer-1 (PR 70 rework round 2): a daemon entry that spawns a same-group
+// TERM-ignoring grandchild and then EXITS on its own must not leak the
+// grandchild: killAndReapSpawned must verify whole-GROUP death, not just the
+// direct child's exit.
+test("failed start reaps the process group even when the daemon exits on its own", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ah-dstart-tree-"));
+  const daemonDir = join(root, "daemon");
+  const pidFile = join(root, "recorded-pids.txt");
+  await writeFile(pidFile, "");
+  const savedPidFile = process.env["TREE_PIDS_FILE"];
+  process.env["TREE_PIDS_FILE"] = pidFile;
+  try {
+    const captured = captureConsole();
+    let spawnedPid: number | undefined;
+    try {
+      const startedAt = Date.now();
+      const code = await daemonStartCommand({
+        daemonDir,
+        entryPath: resolve(testDir, "fixtures/exiting-daemon-with-grandchild.mjs"),
+        startTimeoutMs: 60_000,
+        configPath: join(root, "servers.json"),
+        onSpawn: (pid) => void (spawnedPid = pid),
+      });
+      const wall = Date.now() - startedAt;
+      assert.equal(code, 1);
+      assert.ok(wall < 15_000, `failed after ${wall}ms; expected the child-exit fast path`);
+      assert.ok(spawnedPid, "start must report the spawned daemon PID");
+
+      const recordedPids = (await readFile(pidFile, "utf8"))
+        .split("\n")
+        .map((l) => Number.parseInt(l.trim(), 10))
+        .filter((n) => Number.isSafeInteger(n) && n > 0);
+      assert.equal(recordedPids.length, 2, `expected daemon + grandchild PIDs, got ${recordedPids.join(", ")}`);
+
+      const isAlive = (pid: number): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const pollDeadline = Date.now() + 8_000;
+      let survivors = recordedPids.filter(isAlive);
+      while (survivors.length > 0 && Date.now() < pollDeadline) {
+        await new Promise((r) => setTimeout(r, 250));
+        survivors = recordedPids.filter(isAlive);
+      }
+      assert.deepEqual(survivors, [], `process group survived the failed start: ${survivors.join(", ")}`);
+    } finally {
+      captured.restore();
+    }
+  } finally {
+    if (savedPidFile === undefined) delete process.env["TREE_PIDS_FILE"];
+    else process.env["TREE_PIDS_FILE"] = savedPidFile;
+    await rm(root, { recursive: true, force: true });
+  }
+});
