@@ -66,7 +66,10 @@ export async function listCommand(options: ListOptions = {}): Promise<number> {
       if (result.error) {
         console.error(`Warning: indexing "${options.server}" failed: ${result.error}`);
       }
-    } else {
+    } else if (options.kind !== "skill") {
+      // kind=skill needs no MCP server contact at all — tool records would be
+      // filtered out immediately. Tool kinds index servers (skills are already
+      // registered locally above).
       await hub.indexAll();
     }
 

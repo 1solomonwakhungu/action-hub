@@ -321,8 +321,10 @@ async function main(): Promise<void> {
       }
 
       case "connect": {
+        const daemonDirVal = typeof parsedArgs["daemon-dir"] === "string" ? parsedArgs["daemon-dir"] : undefined;
         exitCode = await connectCommand({
           configPath,
+          daemonDir: daemonDirVal,
         });
         break;
       }

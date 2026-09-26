@@ -255,11 +255,24 @@ test("list and test-search commands execute with empty servers", async () => {
     };
     await writeFile(cfgPath, JSON.stringify(testConfig), "utf8");
 
-    const listCode = await listCommand({ configPath: cfgPath });
-    assert.equal(listCode, 0);
+    // Hermetic: listCommand probes ACTION_HUB_SKILLS_DIR (default
+    // ~/.action-hub/skills); point HOME at the temp dir.
+    const savedHome = process.env["HOME"];
+    const savedSkillsDir = process.env["ACTION_HUB_SKILLS_DIR"];
+    process.env["HOME"] = tempDir;
+    delete process.env["ACTION_HUB_SKILLS_DIR"];
+    try {
+      const listCode = await listCommand({ configPath: cfgPath });
+      assert.equal(listCode, 0);
 
-    const searchCode = await testSearchCommand("pull request", { configPath: cfgPath });
-    assert.equal(searchCode, 0);
+      const searchCode = await testSearchCommand("pull request", { configPath: cfgPath });
+      assert.equal(searchCode, 0);
+    } finally {
+      if (savedHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = savedHome;
+      if (savedSkillsDir === undefined) delete process.env["ACTION_HUB_SKILLS_DIR"];
+      else process.env["ACTION_HUB_SKILLS_DIR"] = savedSkillsDir;
+    }
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

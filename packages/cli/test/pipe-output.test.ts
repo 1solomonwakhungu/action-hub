@@ -82,12 +82,23 @@ test("list --server indexes only the requested server (F12)", async () => {
   );
 
   try {
+    // Hermetic isolation: listCommand probes ACTION_HUB_SKILLS_DIR (default
+    // ~/.action-hub/skills); point HOME at the temp dir so the test never
+    // reads real owner state.
+    const savedHome = process.env["HOME"];
+    const savedSkillsDir = process.env["ACTION_HUB_SKILLS_DIR"];
+    process.env["HOME"] = tempDir;
+    delete process.env["ACTION_HUB_SKILLS_DIR"];
     const captured = captureConsole();
     try {
       const code = await listCommand({ configPath: cfgPath, server: "srv-a" });
       assert.equal(code, 0);
     } finally {
       captured.restore();
+      if (savedHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = savedHome;
+      if (savedSkillsDir === undefined) delete process.env["ACTION_HUB_SKILLS_DIR"];
+      else process.env["ACTION_HUB_SKILLS_DIR"] = savedSkillsDir;
     }
     const spawnsA = (await readFile(countA, "utf8")).trim().split("\n").filter(Boolean);
     assert.equal(spawnsA.length, 1, `srv-a spawned once, got ${spawnsA.length}`);
@@ -133,8 +144,20 @@ test("list --kind skill registers config and directory skills (F11)", async () =
   );
 
   try {
-    const previousSkillsDir = process.env["ACTION_HUB_SKILLS_DIR"];
+    // Hermetic isolation: never probe the real owner's ~/.action-hub/skills or
+    // config paths during tests.
+    const savedEnv = {
+      HOME: process.env["HOME"],
+      XDG_CONFIG_HOME: process.env["XDG_CONFIG_HOME"],
+      XDG_CACHE_HOME: process.env["XDG_CACHE_HOME"],
+      ACTION_HUB_SKILLS_DIR: process.env["ACTION_HUB_SKILLS_DIR"],
+      ACTION_HUB_CONFIG: process.env["ACTION_HUB_CONFIG"],
+    };
+    process.env["HOME"] = tempDir;
+    process.env["XDG_CONFIG_HOME"] = join(tempDir, "xdg-config");
+    process.env["XDG_CACHE_HOME"] = join(tempDir, "xdg-cache");
     process.env["ACTION_HUB_SKILLS_DIR"] = skillsDir;
+    delete process.env["ACTION_HUB_CONFIG"];
     const captured = captureConsole();
     try {
       const code = await listCommand({ configPath: cfgPath, kind: "skill" });
@@ -145,9 +168,99 @@ test("list --kind skill registers config and directory skills (F11)", async () =
       assert.equal(code, 0);
     } finally {
       captured.restore();
-      if (previousSkillsDir === undefined) delete process.env["ACTION_HUB_SKILLS_DIR"];
-      else process.env["ACTION_HUB_SKILLS_DIR"] = previousSkillsDir;
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
     }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// Daemon connect handshake failure must not leave the socket open: a fake
+// daemon that accepts and never responds must not keep the CLI process alive.
+test("connect destroys the socket on handshake failure (MUST-FIX)", async () => {
+  const net = await import("node:net");
+  const server = net.createServer((sock) => {
+    // Accept and never respond; keep the socket open.
+    sock.on("error", () => {});
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  const port = (server.address() as { port: number }).port;
+
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-connect-"));
+  const daemonDir = join(tempDir, "daemon");
+  await mkdir(daemonDir, { recursive: true });
+  await writeFile(join(daemonDir, "daemon.json"), JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    endpoint: { kind: "tcp", host: "127.0.0.1", port },
+  }));
+  await writeFile(join(daemonDir, "auth-token"), "0".repeat(64));
+
+  try {
+    const res = spawnSync(
+      "node",
+      [cliBin, "connect", "--daemon-dir", daemonDir],
+      { encoding: "utf8", timeout: 10_000, input: "" },
+    );
+    // Must exit 1 promptly (timeout would surface as a killed process, not a
+    // clean exit) with the connection-failure message on stderr.
+    assert.equal(res.status, 1, `status=${res.status} stderr=${String(res.stderr).slice(0, 200)}`);
+    assert.match(res.stderr ?? "", /could not connect to daemon/);
+  } finally {
+    server.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// kind=skill must never contact any MCP server: tool records would be filtered
+// out immediately, so indexing the fleet is pure waste.
+test("list --kind skill never contacts MCP servers (HIGH)", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-skill-nosrv-"));
+  const countFile = join(tempDir, "count");
+  const cfgPath = join(tempDir, "servers.json");
+  await writeFile(
+    cfgPath,
+    JSON.stringify({
+      servers: [{
+        id: "srv-a",
+        transport: { type: "stdio", command: process.execPath, args: [fixture], env: { COUNT_FILE: countFile } },
+      }],
+      skills: [{ id: "c1", name: "C1", summary: "from config", description: "config" }],
+      autoDiscover: false,
+    }),
+  );
+
+  try {
+    const savedHome = process.env["HOME"];
+    const savedSkillsDir = process.env["ACTION_HUB_SKILLS_DIR"];
+    process.env["HOME"] = tempDir;
+    process.env["ACTION_HUB_SKILLS_DIR"] = join(tempDir, "empty-skills");
+    await mkdir(join(tempDir, "empty-skills"), { recursive: true });
+    const captured = captureConsole();
+    try {
+      const code = await listCommand({ configPath: cfgPath, kind: "skill" });
+      assert.equal(code, 0);
+      assert.match(captured.logs.join("\n"), /C1/);
+    } finally {
+      captured.restore();
+      if (savedHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = savedHome;
+      if (savedSkillsDir === undefined) delete process.env["ACTION_HUB_SKILLS_DIR"];
+      else process.env["ACTION_HUB_SKILLS_DIR"] = savedSkillsDir;
+    }
+    // The counting server must never have been spawned.
+    let contacted = false;
+    try {
+      await readFile(countFile, "utf8");
+      contacted = true;
+    } catch {
+      contacted = false;
+    }
+    assert.equal(contacted, false, "list --kind skill must not index MCP servers");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
