@@ -82,6 +82,66 @@ test("execute validates arguments before dispatching", async () => {
   assert.equal(clients.github.calls.length, 1);
 });
 
+test("caches idempotent reads and serves repeat calls from the cache", async () => {
+  const { hub, clients } = buildHub();
+  await hub.indexAll();
+
+  const first = await hub.execute("github:list_issues", {});
+  assert.equal(first.ok, true);
+  assert.notEqual(first.cached, true);
+  assert.equal(clients.github.calls.length, 1);
+
+  const second = await hub.execute("github:list_issues", {});
+  assert.equal(second.ok, true);
+  assert.equal(second.cached, true);
+  assert.deepEqual(second.content, first.content);
+  // The downstream client must see exactly one call for both executions.
+  assert.equal(clients.github.calls.length, 1);
+
+  hub.clearResultCache();
+  const third = await hub.execute("github:list_issues", {});
+  assert.equal(third.cached, undefined);
+  assert.equal(clients.github.calls.length, 2);
+});
+
+test("readOnlyHint annotation makes non-prefixed tools cacheable and cache hits are recorded", async () => {
+  let downstreamCalls = 0;
+  const client = {
+    listTools: async () => [
+      {
+        name: "create_report",
+        description: "Generates a report",
+        annotations: { readOnlyHint: true },
+      },
+    ],
+    callTool: async () => {
+      downstreamCalls += 1;
+      return "ok:create_report";
+    },
+    close: async () => {},
+  };
+  const hub = new ActionHub({
+    clientFactory: async () => client,
+    servers: [{ id: "rep", transport: { type: "stdio", command: "rep-mcp" }, trust: "trusted" }],
+  });
+  await hub.indexAll();
+
+  const first = await hub.execute("rep:create_report", {});
+  assert.equal(first.ok, true);
+  assert.notEqual(first.cached, true);
+  assert.equal(downstreamCalls, 1);
+
+  const second = await hub.execute("rep:create_report", {});
+  assert.equal(second.cached, true);
+  // No read prefix, so caching only happened because of readOnlyHint.
+  assert.equal(downstreamCalls, 1);
+
+  const lastEntry = hub.history()[hub.history().length - 1];
+  assert.ok(lastEntry);
+  assert.equal(lastEntry?.cached, true);
+  assert.equal(lastEntry?.ok, true);
+});
+
 test("gated servers are refused when approval is denied", async () => {
   const { hub, clients } = buildHub({ denyOnApprovalRequired: true });
   await hub.indexAll();
