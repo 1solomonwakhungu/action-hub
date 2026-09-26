@@ -28,95 +28,13 @@ import * as os from "node:os";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActionHub, createLocalSemanticScorer, parseSkillContent } from "../packages/core/dist/index.js";
+import { createSandbox, assertIsolated, main as harnessMain } from "./lib/harness.mjs";
 
 // ---- isolation (ISOLATION.md checklist, rev 21:27Z + reviewer-2 rework) ------
 // The ENTIRE setup runs inside the failure envelope (see the bottom-of-file
 // runner): any throw here produces the final JSON summary on stdout and a
 // nonzero exit. All path-bearing env vars are REPLACED under ONE fresh temp
 // root; the real owner home is derived independently of $HOME.
-function setupIsolation() {
-  const { homedir, userInfo, tmpdir } = os;
-  const realOwnerHome = userInfo().homedir ?? homedir();
-  const isInside = (child, parent) => {
-    const rel = relative(parent, child);
-    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-  };
-
-  // Owner app-state / harness dirs we must never touch. macOS + Windows Action
-  // Hub locations, plus cursor/copilot/pi harness dirs. Whole-home refusal is
-  // deliberately NOT applied: os.tmpdir() itself sits under USERPROFILE on
-  // Windows.
-  const forbiddenOwnerDirs = [
-    join(realOwnerHome, ".cache", "action-hub"),
-    join(realOwnerHome, ".config", "action-hub"),
-    join(realOwnerHome, ".action-hub"),
-    join(realOwnerHome, "Library", "Application Support", "action-hub"),
-    join(realOwnerHome, "Library", "Caches", "action-hub"),
-    join(realOwnerHome, "AppData", "Roaming", "action-hub"),
-    join(realOwnerHome, "AppData", "Local", "action-hub"),
-    join(realOwnerHome, ".claude"),
-    join(realOwnerHome, "Library", "Application Support", "Claude"),
-    join(realOwnerHome, ".codex"),
-    join(realOwnerHome, ".cursor"),
-    join(realOwnerHome, ".copilot"),
-    join(realOwnerHome, ".pi"),
-    join(realOwnerHome, ".gemini"),
-    join(realOwnerHome, ".agents"),
-  ];
-
-  // Validate the system temp dir BEFORE creating anything in it.
-  const sysTmp = resolve(tmpdir());
-  for (const forbidden of forbiddenOwnerDirs) {
-    if (isInside(sysTmp, forbidden)) {
-      throw new Error(`isolation refused: system tmpdir ${sysTmp} is inside owner state ${forbidden}`);
-    }
-  }
-
-  const isoRoot = mkdtempSync(join(sysTmp, "action-hub-eval-"));
-  for (const d of ["cache", "config", "state", "data", join("cache", "action-hub"), join("config", "action-hub"), "daemon", "credentials", "skills", "pi", "codex", "claude", "tmp"]) {
-    mkdirSync(join(isoRoot, d), { recursive: true });
-  }
-
-  // File-shaped vars get FILE paths; dir-shaped vars get DIR paths.
-  const ISO_ENV = {
-    HOME: isoRoot,
-    USERPROFILE: isoRoot,
-    APPDATA: join(isoRoot, "config"),
-    LOCALAPPDATA: join(isoRoot, "cache"),
-    TMPDIR: join(isoRoot, "tmp"),
-    TMP: join(isoRoot, "tmp"),
-    TEMP: join(isoRoot, "tmp"),
-    XDG_CACHE_HOME: join(isoRoot, "cache"),
-    XDG_CONFIG_HOME: join(isoRoot, "config"),
-    XDG_STATE_HOME: join(isoRoot, "state"),
-    XDG_DATA_HOME: join(isoRoot, "data"),
-    ACTION_HUB_CONFIG: join(isoRoot, "config", "servers.json"),
-    ACTION_HUB_CACHE: join(isoRoot, "cache", "action-hub", "catalog.json"),
-    ACTION_HUB_SKILLS_DIR: join(isoRoot, "skills"),
-    ACTION_HUB_DAEMON_DIR: join(isoRoot, "daemon"),
-    ACTION_HUB_CREDENTIALS: join(isoRoot, "credentials", "credentials.json"),
-    ACTION_HUB_CONTROL: join(isoRoot, "cache", "action-hub", "control.json"),
-    PI_CODING_AGENT_DIR: join(isoRoot, "pi"),
-    CODEX_HOME: join(isoRoot, "codex"),
-    CLAUDE_CONFIG_DIR: join(isoRoot, "claude"),
-  };
-
-  // Validate FINAL env values after assignment (sentinel self-check).
-  for (const [key, value] of Object.entries(ISO_ENV)) {
-    process.env[key] = value;
-    const resolved = resolve(value);
-    if (!isInside(resolved, isoRoot)) {
-      throw new Error(`isolation sentinel failed: ${key}=${resolved} escapes run root`);
-    }
-    for (const forbidden of forbiddenOwnerDirs) {
-      if (isInside(resolved, forbidden)) {
-        throw new Error(`isolation refused: ${key}=${resolved} is inside the owner's real state dir ${forbidden}`);
-      }
-    }
-  }
-  return isoRoot;
-}
-
 const STRESS_DIR = resolve(fileURLToPath(import.meta.url), "..");
 const GENERATED = join(STRESS_DIR, ".generated");
 const RESULTS_DIR = join(GENERATED, "results");
@@ -679,8 +597,7 @@ function validateGeneratedCorpus({ manifests, skills, queries, idMismatches }) {
   if (errors.length > 0) throw new Error(`generated corpus failed fail-closed validation:\n- ${errors.join("\n- ")}`);
 }
 
-async function main() {
-  mkdirSync(RESULTS_DIR, { recursive: true });
+async function runEval() {
 
   // --- corpus ------------------------------------------------------------------
   let manifests, skills, queries, mode = "self-fixtures";
@@ -723,6 +640,28 @@ async function main() {
     console.error(`[eval-retrieval] excluded ${excluded} queries whose gold ids are not in the catalog`);
   }
 
+  // Realistic headline set (intake FX13-R2, builder-1 PR 72): 120
+  // hand-written v2 rows. When present it is reported as the HEADLINE product
+  // numbers; the generated corpus becomes the regression table. Contract
+  // gates stay on the generated corpus (binding until the contract changes).
+  const REALISTIC_PATH = join(STRESS_DIR, "fixtures", "realistic-queries.json");
+  let realistic = null;
+  if (existsSync(REALISTIC_PATH)) {
+    const raw = JSON.parse(readFileSync(REALISTIC_PATH, "utf8"));
+    const list = Array.isArray(raw) ? raw : raw.queries;
+    // Fail closed on a malformed realistic fixture as well.
+    const rErrors = [];
+    if (list.length !== 120) rErrors.push(`expected 120 realistic rows, got ${list.length}`);
+    for (const q of list) {
+      if (typeof q.query !== "string" || q.query.trim() === "" || !("expected" in q)) { rErrors.push(`invalid realistic row: ${JSON.stringify(q).slice(0, 80)}`); break; }
+    }
+    if (rErrors.length > 0) throw new Error(`realistic fixture failed validation:\n- ${rErrors.join("\n- ")}`);
+    realistic = list;
+    console.error(`[eval-retrieval] realistic fixture loaded: ${list.length} rows`);
+  } else {
+    console.error(`[eval-retrieval] realistic fixture not present (${REALISTIC_PATH}); realistic headline section omitted`);
+  }
+
   // Engine comparison runs ALL THREE engines on ONE fixed, identical query
   // sample (reviewer-2 blocker: no side-by-side recall on different samples).
   // Gates are then computed from keyword+blend on the FULL query set.
@@ -751,6 +690,34 @@ async function main() {
     gateRows[name] = { scored: scoreEngine(rows, latencies), rows, buildMs };
     console.error(`[eval-retrieval] gates ${name} (n=${queries.length}): recall@5=${gateRows[name].scored.recallAt5?.toFixed?.(3)} p95=${gateRows[name].scored.latency.warmP95Ms}ms`);
     await hub.close?.();
+  }
+
+  // --- realistic headline runs (keyword + blend) -----------------------------------
+  let realisticReport = null;
+  if (realistic) {
+    const realisticIds = new Set([
+      ...manifests.flatMap((m) => m.tools.map((t) => `${m.serverId}:${t.name}`)),
+      ...skills.map((s) => s.id),
+    ]);
+    const rMissing = realistic.filter((q) => goldsOf(q).some((g) => !realisticIds.has(g))).length;
+    if (rMissing > 0) throw new Error(`fail-closed: ${rMissing} realistic rows reference gold ids absent from the corpus`);
+    realisticReport = { count: realistic.length, mix: countBy(realistic, (q) => q.subtype), engines: {}, gates: {} };
+    for (const name of SWEEP_ENGINES) {
+      const { hub } = await buildEngine(name, manifests, skills);
+      const { rows, latencies } = await warmAndTime(hub, realistic);
+      const all = scoreEngine(rows, latencies);
+      const bySubtype = {};
+      for (const st of Object.keys(realisticReport.mix)) {
+        const sub = rows.filter((r) => r.subtype === st);
+        if (sub.length > 0) {
+          const scored = scoreEngine(sub, latencies.filter((_, i) => rows[i].subtype === st));
+          bySubtype[st] = { n: sub.length, recallAt5: scored.recallAt5, recallAt10: scored.recallAt10, mrrAt10: scored.mrrAt10 };
+        }
+      }
+      realisticReport.engines[name] = { recallAt5: all.recallAt5, recallAt10: all.recallAt10, mrrAt10: all.mrrAt10, noMatch: all.noMatch, latency: all.latency, bySubtype };
+      await hub.close?.();
+    }
+    console.error(`[eval-retrieval] realistic: blend r@5=${realisticReport.engines.blend.recallAt5?.toFixed(3)} mrr@10=${realisticReport.engines.blend.mrrAt10?.toFixed(3)}`);
   }
 
   // --- prefix sweep ---------------------------------------------------------------
@@ -854,14 +821,25 @@ async function main() {
     sweep,
     gates: { definitions: GATES, checks: gateChecks, tokenSavings: { allDefinitionTokens: allDefTokens, meanReturnedDefinitionsTokens: Math.round(meanResponseTokens), searchToolDefTokens: tokens(SEARCH_TOOL_DEF), savings: Number(savings.toFixed(4)), formula: "1 - (search tool def + mean returned definitions per response) / (one eager definition payload of the full catalog); load() schema cost excluded" } },
     worstFailures: { engine: "blend", querySet: "full", items: worst },
+    realistic: realisticReport
+      ? {
+          note: "HEADLINE product numbers (hand-written realistic fixture, intake FX13-R2); contract gates below remain on the generated corpus",
+          count: realisticReport.count, mix: realisticReport.mix, engines: realisticReport.engines,
+          gates: {
+            recallAt5: { target: GATES.recallAt5.paraphrase, actual: realisticReport.engines.blend.recallAt5, pass: realisticReport.engines.blend.recallAt5 >= GATES.recallAt5.paraphrase },
+            recallAt10: { target: GATES.recallAt10.paraphrase, actual: realisticReport.engines.blend.recallAt10, pass: realisticReport.engines.blend.recallAt10 >= GATES.recallAt10.paraphrase },
+            mrrAt10: { target: GATES.mrrAt10.paraphrase, actual: realisticReport.engines.blend.mrrAt10, pass: realisticReport.engines.blend.mrrAt10 >= GATES.mrrAt10.paraphrase },
+            noMatchFpRate: { target: GATES.noMatchFpRate, actual: realisticReport.engines.blend.noMatch.fpRate, pass: realisticReport.engines.blend.noMatch.fpRate !== null && realisticReport.engines.blend.noMatch.fpRate <= GATES.noMatchFpRate },
+            informational: true,
+          },
+        }
+      : null,
   };
 
-  // summary.ok reflects EVERY required gate (reviewer-2 blocker 2); the run
-  // exits nonzero when any gate fails, even though the report is complete.
+  // summary.ok reflects EVERY required gate (reviewer-2 blocker 2); the
+  // harness contract turns it into the exit code and the last stdout line.
   summary.ok = Object.values(gateChecks).every((c) => c.pass);
-  const outPath = join(RESULTS_DIR, "eval-retrieval.json");
-  writeFileSync(outPath, JSON.stringify(summary, null, 2));
-  process.exitCode = summary.ok ? 0 : 1;
+  return summary;
   // Human-readable tail (stdout), then the machine-readable JSON as the LAST line.
   console.log(`# mode=${mode} tools=${summary.corpus.tools} skills=${summary.corpus.skills} queries=${queries.length} (${excluded} excluded)`);
   for (const [name, r] of Object.entries(results)) {
@@ -889,16 +867,14 @@ function countBy(arr, keyFn) {
   return counts;
 }
 
-// Failure envelope: isolation setup AND main both run inside it, so ANY
-// failure (including a refusal thrown during isolation setup) emits the final
-// JSON summary on stdout and exits nonzero.
-(async () => {
-  try {
-    setupIsolation();
-    await main();
-  } catch (cause) {
-    console.error(cause);
-    console.log(JSON.stringify({ script: "eval-retrieval", ok: false, error: String(cause?.message ?? cause) }));
-    process.exitCode = 1;
-  }
-})();
+// Shared-harness failure envelope (PR 64): isolation, summary contract and
+// exit code all come from stress/lib/harness.mjs. setupIsolation, the local
+// withTimeout-guarded runner and the local write/exit logic are gone.
+harnessMain(async () => {
+  // Isolate THIS process first: every checklist env var is replaced under one
+  // fresh run root before any hub construction.
+  const sandbox = createSandbox({ prefix: "action-hub-eval-" });
+  Object.assign(process.env, sandbox.env);
+  assertIsolated(process.env, sandbox.root);
+  return runEval();
+}, { resultsPath: join(RESULTS_DIR, "eval-retrieval.json") });

@@ -540,20 +540,12 @@
     "difficulty": "hard"
   },
   {
-    "query": "find every tool that can get an invoice in the acme corp stack",
+    "query": "find every tool that can get an invoice",
     "expected": null,
     "expectedAll": [
       "acme-corp-analytics:get_invoice",
       "acme-corp-legal:get_invoice",
-      "acme-corp-payments:get_invoice"
-    ],
-    "subtype": "multi",
-    "difficulty": "hard"
-  },
-  {
-    "query": "which tools can get an invoice in the globex or initech workspaces",
-    "expected": null,
-    "expectedAll": [
+      "acme-corp-payments:get_invoice",
       "globex-cloud-infra:get_invoice",
       "globex-search:get_invoice",
       "initech-billing:get_invoice"
