@@ -107,7 +107,7 @@ function defaultConfigPath(): string {
   return join(homedir(), ".config", "action-hub", "servers.json");
 }
 
-const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
+export const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
   "claude-code": {
     label: "Claude Code",
     configPath: (home: string) => join(home, ".claude.json"),
@@ -116,16 +116,25 @@ const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
   },
   "claude-desktop": {
     label: "Claude Desktop",
-    configPath: (home: string) =>
-      process.platform === "darwin"
-        ? join(
-            home,
-            "Library",
-            "Application Support",
-            "Claude",
-            "claude_desktop_config.json",
-          )
-        : join(home, ".config", "Claude", "claude_desktop_config.json"),
+    configPath: (home: string) => {
+      if (process.platform === "darwin") {
+        return join(
+          home,
+          "Library",
+          "Application Support",
+          "Claude",
+          "claude_desktop_config.json",
+        );
+      }
+      if (process.platform === "win32") {
+        return join(
+          process.env.APPDATA ?? join(home, "AppData", "Roaming"),
+          "Claude",
+          "claude_desktop_config.json",
+        );
+      }
+      return join(home, ".config", "Claude", "claude_desktop_config.json");
+    },
     format: "json",
     serversKey: "mcpServers",
   },
@@ -154,10 +163,29 @@ const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
   },
   vscode: {
     label: "VS Code",
-    configPath: (home: string) =>
-      process.platform === "darwin"
-        ? join(home, "Library", "Application Support", "Code", "User", "mcp.json")
-        : join(home, ".config", "Code", "User", "mcp.json"),
+    configPath: (home: string) => {
+      // User-profile mcp.json; the default profile lives in the VS Code user
+      // folder (https://code.visualstudio.com/docs/copilot/customize/mcp-servers).
+      if (process.platform === "darwin") {
+        return join(
+          home,
+          "Library",
+          "Application Support",
+          "Code",
+          "User",
+          "mcp.json",
+        );
+      }
+      if (process.platform === "win32") {
+        return join(
+          process.env.APPDATA ?? join(home, "AppData", "Roaming"),
+          "Code",
+          "User",
+          "mcp.json",
+        );
+      }
+      return join(home, ".config", "Code", "User", "mcp.json");
+    },
     format: "json",
     serversKey: "servers",
   },
@@ -368,23 +396,25 @@ export async function harnessCommand(
     return 0;
   }
 
-  // export mode
+  // export mode — print ONLY the Action Hub fragment for this target.
+  // The existing target config is deliberately never read here: it may
+  // contain unrelated secrets that must not be echoed to the terminal.
+  // (install mode reads and merges; export must not.)
+  if (options.json && def.format === "toml") {
+    return fail("--json is only supported for JSON-format targets (codex emits TOML)");
+  }
   if (def.format === "toml") {
-    const doc = await readTomlDoc(def.configPath(homedir()));
-    const updated = upsertTomlEntry(doc, serverEntry);
     console.log(
       `# ${def.label} — add to ${def.configPath(homedir())} (install with --write; existing comments are not preserved by the rewrite, the .bak keeps them)`,
     );
     console.log(tomlStringify({ mcp_servers: { "action-hub": serverEntry } }));
   } else {
-    const filePath = def.configPath(homedir());
-    const doc = await readJsonFile(filePath);
-    const merged = upsertJsonEntry(
-      doc,
+    const fragment = upsertJsonEntry(
+      {},
       def.serversKey,
       jsonEntryFor(def.serversKey, serverEntry),
     );
-    console.log(JSON.stringify(merged, null, 2));
+    console.log(JSON.stringify(fragment, null, 2));
   }
   if (!options.json) {
     console.log(
@@ -412,7 +442,8 @@ Options:
   --write         Required for install mode; confirms in-place writes.
   --config <path> Point the harness at a specific Action Hub config file
                   (exported as ACTION_HUB_CONFIG in the snippet).
-  --json          (export) Print only the JSON document, no commentary.
+  --json          (export, JSON targets only) Print only the JSON document,
+                  no commentary. Rejected for TOML targets (codex).
 
 Examples:
   action-hub harness cursor                 # print Cursor's mcp.json snippet
