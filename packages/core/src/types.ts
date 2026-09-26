@@ -41,7 +41,10 @@ export interface ServerConfig {
   allowTools?: string[];
   /** Optional deny-list applied after `allowTools`. */
   denyTools?: string[];
-  /** Optional timeout in milliseconds for tool executions on this server. */
+  /** Optional deadline in milliseconds for this server's operations: the
+ * activation phase (spawn + initialize) AND each tool execution/indexing
+ * call. A server that never answers initialize is abandoned after this
+ * deadline and marked unreachable instead of gating startup (F27). */
   timeoutMs?: number;
   /** Per-server circuit breaker. Overrides hub defaults when set. */
   circuitBreaker?: CircuitBreakerConfig;
@@ -281,8 +284,17 @@ export interface McpClient {
   close(): Promise<void>;
 }
 
-/** Factory used by the connection manager to create clients lazily. */
-export type McpClientFactory = (config: ServerConfig) => Promise<McpClient>;
+/** Factory used by the connection manager to create clients lazily.
+ *
+ * The optional second argument carries an activation AbortSignal: when the
+ * activation deadline (spawn + initialize) expires, the manager aborts the
+ * signal and the adapter must stop connecting and release the spawned child
+ * (bounded, non-blocking). Implementations that ignore the signal still fail
+ * the activation — the manager times it out independently. */
+export type McpClientFactory = (
+  config: ServerConfig,
+  options?: { signal?: AbortSignal },
+) => Promise<McpClient>;
 
 export type ServerStatus =
   | "inactive"

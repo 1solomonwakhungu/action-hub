@@ -49,6 +49,10 @@ export interface ConnectionManagerOptions extends CircuitBreakerOptions, Connect
   heartbeat?: HeartbeatConfig;
   restartBackoff?: RestartBackoffConfig;
   maxOldSpaceSizeMb?: number;
+  /** Per-server deadline for activation (spawn + initialize), covering the
+   * phase before the index/execute timeout can start. Defaults to 10s.
+   * A server's own config.timeoutMs takes precedence. (F27) */
+  activationTimeoutMs?: number;
 }
 
 export interface HealthCheckResult {
@@ -65,6 +69,9 @@ interface Entry {
   client?: McpClient;
   /** In-flight activation, shared so concurrent callers don't double-connect. */
   pending?: Promise<McpClient>;
+  /** Abort controller for the in-flight activation (F27): shutdown paths
+   * abort it so a never-initializing connect releases its child. */
+  activationAbort?: AbortController;
   error?: string;
   toolCount: number;
   lastActivatedAt?: string;
@@ -83,9 +90,21 @@ interface Entry {
   lastHeartbeatAt?: number;
 }
 
+/**
+ * Abort reason used by manual shutdown/replacement paths (deactivate,
+ * reconnect, closeAll). Distinguishes a deliberate abort from a deadline
+ * expiry so the activation catch never records failures or overwrites
+ * disabled/inactive status for a manual shutdown (F27 rework 3).
+ */
+const SHUTDOWN_ABORT_REASON = new Error("Activation cancelled by shutdown");
+function isShutdownAbort(signal: AbortSignal): boolean {
+  return signal.reason === SHUTDOWN_ABORT_REASON;
+}
+
 const DEFAULT_FAILURE_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 10_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+const DEFAULT_ACTIVATION_TIMEOUT_MS = 10_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
 
 /**
@@ -127,6 +146,7 @@ export class ConnectionManager {
   readonly #heartbeat: HeartbeatConfig;
   readonly #restartBackoff: RestartBackoffConfig;
   readonly #maxOldSpaceSizeMb?: number;
+  readonly #activationTimeoutMs: number;
   readonly #now: () => number;
   readonly #random: () => number;
   readonly #setTimeout: (handler: () => void, ms: number) => TimerHandle;
@@ -144,6 +164,7 @@ export class ConnectionManager {
     this.#heartbeat = options.heartbeat ?? {};
     this.#restartBackoff = options.restartBackoff ?? {};
     this.#maxOldSpaceSizeMb = options.maxOldSpaceSizeMb;
+    this.#activationTimeoutMs = options.activationTimeoutMs ?? DEFAULT_ACTIVATION_TIMEOUT_MS;
     this.#now = options.now ?? Date.now;
     this.#random = options.random ?? Math.random;
     this.#setTimeout =
@@ -355,8 +376,49 @@ export class ConnectionManager {
     const generation = ++entry.generation;
     const config = this.#factoryConfig(entry);
 
-    const pending = this.#factory(config)
-      .then(async (client) => {
+    // F27: activation (spawn + initialize) has a deadline — the index/execute
+    // timeout only starts after activate() returns, so without this a server
+    // that never answers initialize hangs startup forever. The deadline is
+    // the server's config.timeoutMs if set, else the activation default.
+    const deadlineMs = entry.config.timeoutMs ?? this.#activationTimeoutMs;
+    const controller = new AbortController();
+    entry.activationAbort = controller;
+    let deadlineTimer: TimerHandle | undefined = undefined;
+    const clearDeadline = (): void => {
+      if (deadlineTimer !== undefined) this.#clearTimeout(deadlineTimer);
+      deadlineTimer = undefined;
+    };
+    const timedOut = new Promise<never>((_, reject) => {
+      deadlineTimer = this.#setTimeout(() => {
+        controller.abort();
+        reject(
+          new Error(
+            `Activation of server "${serverId}" timed out after ${deadlineMs}ms (spawn + initialize deadline)`,
+          ),
+        );
+      }, deadlineMs);
+    });
+
+    let pendingRef: Promise<McpClient> | undefined;
+    // Deadline bookkeeping must happen EXACTLY once regardless of which
+    // rejection arrives first: a cooperative factory rejects on the abort
+    // (inner catch) before the timer race rejects (outer catch).
+    let deadlineBookkept = false;
+    const bookkeepDeadline = (message: string): void => {
+      if (deadlineBookkept) return;
+      deadlineBookkept = true;
+      entry.generation += 1;
+      if (entry.pending === pendingRef) entry.pending = undefined;
+      this.recordFailure(serverId, message);
+      entry.status = "unreachable";
+      // Schedule AFTER the pending handle is cleared: scheduleRestart
+      // refuses while a pending activation exists.
+      this.#scheduleRestart(entry);
+    };
+    const pending = (async (): Promise<McpClient> => {
+      try {
+        const client = await this.#factory(config, { signal: controller.signal });
+        clearDeadline();
         if (this.#closed || entry.generation !== generation || entry.manualShutdown || entry.config.enabled === false) {
           try {
             await client.close();
@@ -365,6 +427,7 @@ export class ConnectionManager {
           }
           throw new Error(`Server "${serverId}" was shut down during connect`);
         }
+        entry.activationAbort = undefined;
         entry.client = tagTransportFailures(client);
         entry.status = "ready";
         entry.lastActivatedAt = new Date(this.#now()).toISOString();
@@ -378,17 +441,45 @@ export class ConnectionManager {
         entry.error = undefined;
         this.#startHeartbeat(entry);
         return entry.client;
-      })
-      .catch((cause: unknown) => {
-        if (entry.pending === pending) entry.pending = undefined;
+      } catch (cause) {
+        clearDeadline();
+        if (entry.pending === pendingRef) entry.pending = undefined;
+        // Deadline bookkeeping is centralized (bookkeepDeadline is
+        // exactly-once) and takes precedence: a cooperative factory's abort
+        // rejection arrives HERE before the timer race rejects. Manual
+        // shutdown aborts are skipped entirely (no failure recorded, no
+        // status overwrite).
+        if (controller.signal.aborted && !isShutdownAbort(controller.signal)) {
+          bookkeepDeadline(cause instanceof Error ? cause.message : String(cause));
+          throw cause;
+        }
         if (entry.generation !== generation) throw cause;
         this.recordFailure(serverId, cause instanceof Error ? cause.message : String(cause));
         this.#scheduleRestart(entry);
         throw cause;
-      });
+      }
+    })();
 
+    pendingRef = pending;
     entry.pending = pending;
-    return pending;
+    try {
+      return await Promise.race([pending, timedOut]);
+    } catch (cause) {
+      const deadlineExpired = controller.signal.aborted && !isShutdownAbort(controller.signal);
+      if (deadlineExpired) {
+        // The factory may have rejected on the abort BEFORE this timer race
+        // did (inner catch) — bookkeepDeadline is exactly-once either way.
+        bookkeepDeadline(cause instanceof Error ? cause.message : String(cause));
+      }
+      if (controller.signal.aborted) {
+        // Deadline or manual shutdown: drop the pending handle so a later
+        // activate can retry, and make sure a factory that ignores the
+        // AbortSignal cannot turn its late rejection into an unhandled one.
+        if (entry.pending === pendingRef) entry.pending = undefined;
+        void pendingRef?.catch(() => {});
+      }
+      throw cause;
+    }
   }
 
   /** Reconnects a server by deactivating and activating again. */
@@ -405,6 +496,12 @@ export class ConnectionManager {
     entry.autoRestart = true;
     this.#clearRestartTimer(entry);
     this.#stopHeartbeat(entry);
+    // Abort the in-flight activation (releases its child) and settle it
+    // bounded before starting the replacement — otherwise the old connect
+    // keeps initializing until its own deadline with a lost controller.
+    entry.activationAbort?.abort(SHUTDOWN_ABORT_REASON);
+    entry.activationAbort = undefined;
+    await this.#settlePendingBounded(entry);
     entry.generation += 1;
     entry.pending = undefined;
     await this.#dropClient(entry);
@@ -458,11 +555,31 @@ export class ConnectionManager {
     entry.autoRestart = false;
     this.#clearRestartTimer(entry);
     this.#stopHeartbeat(entry);
+    // Abort an in-flight activation so its spawned child is released, then
+    // wait bounded for the connect to settle — shutdown must not leave a
+    // hung child behind and must not wait on a wedged connect either.
+    entry.activationAbort?.abort(SHUTDOWN_ABORT_REASON);
+    entry.activationAbort = undefined;
+    await this.#settlePendingBounded(entry);
     entry.generation += 1;
     entry.pending = undefined;
     await this.#dropClient(entry);
     if (entry.status !== "disabled") entry.status = "inactive";
     entry.nextRestartAt = undefined;
+  }
+
+  /** Waits at most ~2.5s (real time — teardown is not simulated) for an
+   * in-flight activation to settle after its abort. */
+  async #settlePendingBounded(entry: Entry): Promise<void> {
+    const pending = entry.pending;
+    if (!pending) return;
+    await Promise.race([
+      pending.catch(() => {}),
+      new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 2_500);
+        t.unref?.();
+      }),
+    ]);
   }
 
   async closeAll(): Promise<void> {
