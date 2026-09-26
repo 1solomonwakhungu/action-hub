@@ -25,6 +25,40 @@ export async function writeConfigAtomic(
 }
 
 /**
+ * Validates the shape of an existing raw config's `servers` array.
+ *
+ * The write path merges into this array by id, so it must actually be a
+ * well-formed list: an array of objects with non-empty string ids and no
+ * duplicates. Anything else fails closed — the caller must exit without
+ * touching the original bytes rather than coercing or replacing them.
+ */
+export function validateRawServersShape(
+  raw: Record<string, unknown>,
+  path: string,
+): void {
+  const value = raw["servers"];
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    throw new Error(`Malformed config at ${path}: "servers" must be an array, refusing to overwrite`);
+  }
+  const seen = new Set<string>();
+  for (const [index, entry] of value.entries()) {
+    const label = `"servers"[${index}]`;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      throw new Error(`Malformed config at ${path}: ${label} must be an object, refusing to overwrite`);
+    }
+    const id = entry["id"];
+    if (typeof id !== "string" || id.length === 0) {
+      throw new Error(`Malformed config at ${path}: ${label}.id must be a non-empty string, refusing to overwrite`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`Malformed config at ${path}: duplicate server id "${id}", refusing to overwrite`);
+    }
+    seen.add(id);
+  }
+}
+
+/**
  * Returns the existing raw config document as the merge base for a write.
  *
  * Malformed existing configs (valid JSON but not an object) are rejected so a

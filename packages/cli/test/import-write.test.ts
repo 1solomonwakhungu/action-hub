@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { importCommand } from "../dist/commands/import.js";
@@ -76,3 +76,61 @@ test("import --write preserves skills and custom keys; writes with mode 600", as
     await rm(tempHome, { recursive: true, force: true });
   }
 });
+
+/**
+ * Regression for the reviewer-2 HIGH finding: a malformed config must fail
+ * closed — exit code 1 (the command rejects) and byte-for-byte unchanged.
+ * Covers the zero-discovery early-return path too: validation runs before it.
+ */
+for (const scenario of [
+  {
+    name: "import --write fails closed on invalid JSON",
+    content: "{servers: [broken",
+    withDiscoveryFixture: false,
+  },
+  {
+    name: "import --write fails closed on malformed servers (zero discovery)",
+    content: JSON.stringify({ servers: ["KEEP_SENTINEL"], skills: [], custom: "keep" }),
+    withDiscoveryFixture: false,
+  },
+  {
+    name: "import --write fails closed on duplicate server ids with a discovery fixture",
+    content: JSON.stringify({
+      servers: [{ id: "dup" }, { id: "dup" }],
+      skills: [{ id: "my-skill" }],
+      custom: "keep",
+    }),
+    withDiscoveryFixture: true,
+  },
+] as const) {
+  test(scenario.name, async () => {
+    const tempHome = await mkdtemp(resolve(tmpdir(), "action-hub-import-bad-"));
+    const originalHome = process.env["HOME"];
+    process.env["HOME"] = tempHome;
+    const configPath = join(tempHome, "config", "servers.json");
+    try {
+      await mkdir(join(tempHome, "config"), { recursive: true });
+      const originalBytes = scenario.content;
+      await writeFile(configPath, originalBytes);
+
+      if (scenario.withDiscoveryFixture) {
+        const claudeDir = join(tempHome, "Library", "Application Support", "Claude");
+        await mkdir(claudeDir, { recursive: true });
+        await writeFile(
+          join(claudeDir, "claude_desktop_config.json"),
+          JSON.stringify({ mcpServers: { "fixture-weather": { command: "npx" } } }),
+        );
+      }
+
+      await assert.rejects(
+        () => importCommand({ configPath, write: true }),
+        /Malformed config|Failed to parse config/,
+      );
+      assert.equal(await readFile(configPath, "utf8"), originalBytes, "config bytes changed");
+    } finally {
+      if (originalHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = originalHome;
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+}

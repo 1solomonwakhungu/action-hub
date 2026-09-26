@@ -1,6 +1,6 @@
 import { discoverMcpServers, redactServerConfig, type ServerConfig } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
-import { rawConfigDocument, writeConfigAtomic } from "../config-writer.js";
+import { rawConfigDocument, validateRawServersShape, writeConfigAtomic } from "../config-writer.js";
 
 /** Harness source filters accepted by the import command. */
 export const IMPORT_SOURCE_FILTERS = [
@@ -28,7 +28,13 @@ export async function importCommand(options: ImportOptions = {}): Promise<number
   // With --write, load (and validate) the config before any early return so a
   // malformed existing config fails with exit 1 and is never overwritten.
   const writeConfig = options.write ? await loadCliConfig(options.configPath) : undefined;
-  if (writeConfig) rawConfigDocument(writeConfig);
+  if (writeConfig) {
+    // Fail closed before any early return: a malformed config (invalid JSON,
+    // non-object document, or malformed servers array) must exit 1 with the
+    // original bytes untouched, never be coerced or overwritten.
+    const raw = rawConfigDocument(writeConfig);
+    validateRawServersShape(raw, writeConfig.path);
+  }
 
   const discovered = await discoverMcpServers();
   const filter = options.source && options.source !== "all" ? options.source : undefined;
@@ -61,6 +67,7 @@ export async function importCommand(options: ImportOptions = {}): Promise<number
     // all survive a write. Existing server entries always win — import only
     // adds what is missing.
     const raw = rawConfigDocument(currentConfig);
+    validateRawServersShape(raw, currentConfig.path);
     const existingRawServers: Record<string, unknown>[] = Array.isArray(raw["servers"])
       ? raw["servers"].filter(
           (s): s is Record<string, unknown> => typeof s === "object" && s !== null,
