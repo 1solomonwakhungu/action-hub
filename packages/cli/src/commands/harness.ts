@@ -1,7 +1,9 @@
-import { copyFile, mkdir, readFile, statSync, writeFile } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readFile, realpathSync, writeFile, copyFile } from "node:fs";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
+import { createRequire } from "node:module";
+import { parse as tomlParse, stringify as tomlStringify } from "smol-toml";
 
 const copyFileP = promisify(copyFile);
 const mkdirP = promisify(mkdir);
@@ -10,7 +12,7 @@ const writeFileP = promisify(writeFile);
 
 /**
  * `action-hub harness` — connect any AI harness (Claude Code, Claude Desktop,
- * Cursor, Codex, OpenCode, pi, VS Code) to Action Hub with one command.
+ * Cursor, Codex, OpenCode, VS Code) to Action Hub with one command.
  *
  * Grammar:
  *   action-hub harness <target>             # print the config snippet (export)
@@ -19,12 +21,19 @@ const writeFileP = promisify(writeFile);
  *                                           # (requires --write)
  *
  * Install mode:
- *   - writes a timestamped `.bak` of the config before touching it
- *   - fails (exit 1) if the existing config is malformed JSON/TOML — it never
- *     overwrites bytes it cannot parse
+ *   - writes a timestamped `.bak` of the config before touching it (a backup
+ *     failure aborts before the config is modified)
+ *   - fails (exit 1) if the existing config is malformed JSON/TOML or cannot
+ *     be read — it never overwrites bytes it cannot parse
  *   - updates an existing `action-hub` entry in place; all other entries are
- *     preserved
+ *     preserved (Codex config.toml comments are not preserved; the .bak keeps
+ *     the original)
  *   - `--config <path>` is exported as ACTION_HUB_CONFIG in the snippet
+ *
+ * The emitted server command runs this CLI itself (`action-hub start`), so it
+ * works both from a repo checkout (node <realpath of CLI entry>, start) and a
+ * standalone binary (process.execPath, start when running as a single
+ * executable application).
  */
 
 export type HarnessName =
@@ -33,7 +42,6 @@ export type HarnessName =
   | "cursor"
   | "codex"
   | "opencode"
-  | "pi"
   | "vscode";
 
 export const SUPPORTED_HARNESSES: readonly HarnessName[] = [
@@ -42,7 +50,6 @@ export const SUPPORTED_HARNESSES: readonly HarnessName[] = [
   "cursor",
   "codex",
   "opencode",
-  "pi",
   "vscode",
 ];
 
@@ -51,7 +58,6 @@ export type HarnessMode = "export" | "install";
 export interface HarnessOptions {
   write?: boolean;
   json?: boolean;
-  command?: string;
   configPath?: string;
   mode?: HarnessMode;
 }
@@ -72,23 +78,34 @@ interface HarnessDef {
   configPath: (home: string) => string;
   format: "json" | "toml";
   /** Top-level key under which MCP server entries live (JSON harnesses). */
-  serversKey?: string;
-  /** TOML table header for the server entry (codex). */
-  tomlSection?: (name: string) => string;
-  /** Build the entry object this harness expects. */
-  entryFor: (server: { command: string; script: string; configPath: string }) => JsonEntry;
+  serversKey: string;
 }
 
-function serverEntry(server: {
-  command: string;
-  script: string;
-  configPath: string;
-}): ServerEntry {
-  const entry: ServerEntry = { command: server.command, args: [server.script] };
-  if (server.configPath) {
-    entry.env = { ACTION_HUB_CONFIG: server.configPath };
+/** Build the command that runs this CLI's `start` subcommand. */
+function cliServerEntry(configPath?: string): ServerEntry {
+  // Node entrypoint: node <realpath of this CLI>, start.
+  // Standalone (SEA) binary: process.execPath, start.
+  let args: string[];
+  if (checkSea()) {
+    args = ["start"];
+  } else {
+    args = [realpathSync(process.argv[1] ?? "action-hub"), "start"];
+  }
+  const entry: ServerEntry = { command: process.execPath, args };
+  if (configPath) {
+    entry.env = { ACTION_HUB_CONFIG: configPath };
   }
   return entry;
+}
+
+const nodeRequire = createRequire(import.meta.url);
+
+function checkSea(): boolean {
+  try {
+    return nodeRequire("node:sea").isSea === true;
+  } catch {
+    return false;
+  }
 }
 
 function defaultConfigPath(): string {
@@ -97,30 +114,12 @@ function defaultConfigPath(): string {
   return join(homedir(), ".config", "action-hub", "servers.json");
 }
 
-/** Locate the built MCP server script shipped in this repo. */
-function findServerScript(startDir: string): string | null {
-  const candidates = [
-    resolve(startDir, "../../copilot-plugin/server/dist/index.js"),
-    resolve(startDir, "../copilot-plugin/server/dist/index.js"),
-    resolve(startDir, "packages/copilot-plugin/server/dist/index.js"),
-  ];
-  for (const candidate of candidates) {
-    try {
-      if (statSync(candidate).isFile()) return candidate;
-    } catch {
-      /* keep looking */
-    }
-  }
-  return null;
-}
-
 const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
   "claude-code": {
     label: "Claude Code",
     configPath: (home: string) => join(home, ".claude.json"),
     format: "json",
     serversKey: "mcpServers",
-    entryFor: (server) => serverEntry(server) as unknown as JsonEntry,
   },
   "claude-desktop": {
     label: "Claude Desktop",
@@ -136,21 +135,18 @@ const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
         : join(home, ".config", "Claude", "claude_desktop_config.json"),
     format: "json",
     serversKey: "mcpServers",
-    entryFor: (server) => serverEntry(server) as unknown as JsonEntry,
   },
   cursor: {
     label: "Cursor",
     configPath: (home: string) => join(home, ".cursor", "mcp.json"),
     format: "json",
     serversKey: "mcpServers",
-    entryFor: (server) => serverEntry(server) as unknown as JsonEntry,
   },
   codex: {
     label: "Codex CLI",
     configPath: (home: string) => join(home, ".codex", "config.toml"),
     format: "toml",
-    tomlSection: (name: string) => `mcp_servers.${name}`,
-    entryFor: (server) => serverEntry(server) as unknown as JsonEntry,
+    serversKey: "mcp_servers",
   },
   opencode: {
     // Schema per https://opencode.ai/docs/mcp-servers/ : each local MCP
@@ -162,23 +158,6 @@ const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
       join(home, ".config", "opencode", "opencode.json"),
     format: "json",
     serversKey: "mcp",
-    entryFor: (server) => {
-      const entry: JsonEntry = {
-        type: "local",
-        command: [server.command, server.script],
-      };
-      if (server.configPath) {
-        entry.environment = { ACTION_HUB_CONFIG: server.configPath };
-      }
-      return entry;
-    },
-  },
-  pi: {
-    label: "pi",
-    configPath: (home: string) => join(home, ".pi", "mcp.json"),
-    format: "json",
-    serversKey: "mcpServers",
-    entryFor: (server) => serverEntry(server) as unknown as JsonEntry,
   },
   vscode: {
     label: "VS Code",
@@ -188,7 +167,6 @@ const HARNESS_DEFS: Record<HarnessName, HarnessDef> = {
         : join(home, ".config", "Code", "User", "mcp.json"),
     format: "json",
     serversKey: "servers",
-    entryFor: (server) => serverEntry(server) as unknown as JsonEntry,
   },
 };
 
@@ -202,9 +180,11 @@ async function readJsonFile(
   let raw: string;
   try {
     raw = await readFileP(filePath, "utf8");
-  } catch {
-    // Missing file = empty document (first install).
-    return {};
+  } catch (err) {
+    // Only a missing file means "first install"; any other read error
+    // (permissions, is-a-directory, I/O) must abort before we mutate config.
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+    throw err;
   }
   if (raw.trim() === "") return {};
   let parsed: unknown;
@@ -240,85 +220,63 @@ function upsertJsonEntry(
   return { ...doc, [serversKey]: servers };
 }
 
+/** The JSON entry shape a harness expects for its servers key. */
+function jsonEntryFor(
+  serversKey: string,
+  serverEntry: ServerEntry,
+): JsonEntry {
+  if (serversKey === "mcp") {
+    // OpenCode local-server schema (opencode.ai/docs/mcp-servers/).
+    const entry: JsonEntry = {
+      type: "local",
+      command: [serverEntry.command, ...serverEntry.args],
+    };
+    if (serverEntry.env) entry.environment = serverEntry.env;
+    return entry;
+  }
+  return serverEntry as unknown as JsonEntry;
+}
+
 // ---------------------------------------------------------------------------
-// TOML handling (codex config.toml)
+// TOML handling (codex config.toml) — via smol-toml, no hand-rolled parsing
 // ---------------------------------------------------------------------------
 
-const TOML_LINE =
-  /^\s*(\[\[?[A-Za-z0-9_.\-"']+\]?\]|([A-Za-z0-9_\-."']+)\s*=\s*\S.*)?$/;
-
-/**
- * Lightweight structural validation: every non-empty, non-comment line must
- * be a table header or a `key = value` pair. Catches truncated/corrupted
- * TOML without pulling in a parser dependency.
- */
-function validateToml(raw: string, filePath: string): void {
-  const lines = raw.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] ?? "";
-    const trimmed = line.trim();
-    if (trimmed === "" || trimmed.startsWith("#")) continue;
-    if (!TOML_LINE.test(line)) {
-      throw new Error(
-        `Failed to parse existing config at ${filePath}: malformed TOML at line ${
-          i + 1
-        }. Refusing to modify a config we cannot parse.`,
-      );
+async function readTomlDoc(filePath: string): Promise<Record<string, unknown>> {
+  let raw = "";
+  try {
+    raw = await readFileP(filePath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return {};
+    throw err;
+  }
+  if (raw.trim() === "") return {};
+  try {
+    const parsed = tomlParse(raw) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("config root is not a TOML table");
     }
+    return parsed as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(
+      `Failed to parse existing config at ${filePath}: ${
+        err instanceof Error ? err.message : String(err)
+      }. Refusing to modify a config we cannot parse.`,
+    );
   }
 }
 
-/** Serialize a ServerEntry as TOML key/value lines. */
-function tomlLines(entry: ServerEntry): string[] {
-  return [
-    `command = ${JSON.stringify(entry.command)}`,
-    `args = ${JSON.stringify(entry.args)}`,
-    ...(entry.env ? [`env = ${JSON.stringify(entry.env)}`] : []),
-  ];
-}
-
-/** Replace an existing `[mcp_servers.action-hub]` table, or append a new one. */
+/** Replace an existing `[mcp_servers.action-hub]` table, or add a new one. */
 function upsertTomlEntry(
-  raw: string,
-  section: string,
+  doc: Record<string, unknown>,
   entry: ServerEntry,
-): string {
-  const lines = raw.split("\n");
-  const header = `[${section}]`;
-  const start = lines.findIndex((l) => l.trim() === header);
-  if (start === -1) {
-    const body = [
-      "",
-      `# Action Hub MCP server (managed by \`action-hub harness codex install\`)`,
-      header,
-      ...tomlLines(entry),
-    ];
-    const sep = raw.endsWith("\n") || raw === "" ? "" : "\n";
-    return raw + sep + body.join("\n") + "\n";
-  }
-  // Find the end of the existing table (next table header or EOF).
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
-    const line = lines[i] ?? "";
-    if (/^\s*\[\[?\s*[A-Za-z0-9_.\-"']+\s*\]?\]/.test(line)) {
-      end = i;
-      break;
-    }
-  }
-  const updated = [...lines.slice(0, start), header, ...tomlLines(entry), ...lines.slice(end)];
-  return updated.join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Snippet rendering (export mode)
-// ---------------------------------------------------------------------------
-
-function renderTomlSnippet(entry: ServerEntry, section: string): string {
-  return [
-    `# Add to your Codex config (~/.codex/config.toml)`,
-    `[${section}]`,
-    ...tomlLines(entry),
-  ].join("\n");
+): Record<string, unknown> {
+  const existing = doc["mcp_servers"];
+  const servers =
+    existing && typeof existing === "object" && !Array.isArray(existing)
+      ? { ...(existing as Record<string, unknown>) }
+      : {};
+  servers["action-hub"] = entry;
+  return { ...doc, mcp_servers: servers };
 }
 
 // ---------------------------------------------------------------------------
@@ -329,11 +287,14 @@ function renderTomlSnippet(entry: ServerEntry, section: string): string {
 async function backupFile(filePath: string): Promise<void> {
   try {
     await readFileP(filePath, "utf8");
-  } catch {
-    return; // No original file (first install) — nothing to back up.
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return; // No original file (first install) — nothing to back up.
+    }
+    throw err; // Unreadable original: abort rather than modify without a backup.
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  await copyFileP(filePath, `${filePath}.bak-${stamp}`);
+  await copyFileP(filePath, `${filePath}.bak-${stamp}`); // failures propagate
 }
 
 async function installJson(
@@ -342,7 +303,7 @@ async function installJson(
   entry: JsonEntry,
 ): Promise<string> {
   const doc = await readJsonFile(filePath);
-  const updated = upsertJsonEntry(doc, def.serversKey ?? "mcpServers", entry);
+  const updated = upsertJsonEntry(doc, def.serversKey, entry);
 
   await backupFile(filePath);
   await mkdirP(dirname(filePath), { recursive: true });
@@ -351,25 +312,16 @@ async function installJson(
 }
 
 async function installToml(
-  def: HarnessDef,
   filePath: string,
   entry: ServerEntry,
 ): Promise<string> {
-  let raw = "";
-  try {
-    raw = await readFileP(filePath, "utf8");
-  } catch {
-    raw = "";
-  }
-  if (raw.trim() !== "") {
-    validateToml(raw, filePath);
-  }
-  const section = def.tomlSection?.("action-hub") ?? "mcp_servers.action-hub";
-  const updated = upsertTomlEntry(raw, section, entry);
+  const doc = await readTomlDoc(filePath);
+  const updated = upsertTomlEntry(doc, entry);
 
   await backupFile(filePath);
   await mkdirP(dirname(filePath), { recursive: true });
-  await writeFileP(filePath, updated, "utf8");
+  // NOTE: smol-toml stringify drops comments — the .bak keeps the original.
+  await writeFileP(filePath, tomlStringify(updated) + "\n", "utf8");
   return filePath;
 }
 
@@ -377,10 +329,10 @@ async function installToml(
 // Command
 // ---------------------------------------------------------------------------
 
-function fail(message: string): never {
+function fail(message: string): number {
   console.error(`error: ${message}`);
   console.error(`supported harnesses: ${SUPPORTED_HARNESSES.join(", ")}`);
-  process.exit(1);
+  return 1;
 }
 
 export async function harnessCommand(
@@ -394,54 +346,51 @@ export async function harnessCommand(
 
   const def = HARNESS_DEFS[target as HarnessName];
   if (!def) {
-    fail(`unknown harness "${target}"`);
+    return fail(`unknown harness "${target}"`);
   }
 
   const mode: HarnessMode = options.mode ?? (options.write ? "install" : "export");
   if (mode === "install" && options.write !== true) {
-    fail(`install mode requires --write (refusing to modify ${def.configPath(homedir())} without it)`);
+    return fail(
+      `install mode requires --write (refusing to modify ${def.configPath(homedir())} without it)`,
+    );
   }
 
-  const script = findServerScript(process.cwd());
-  const command = options.command ?? (process.execPath || "node");
-  const configPath = options.configPath ?? defaultConfigPath();
-  const server = {
-    command,
-    script: script ?? "<action-hub>/packages/copilot-plugin/server/dist/index.js",
-    configPath,
-  };
-  const entry = def.entryFor(server);
+  const serverEntry = cliServerEntry(options.configPath);
 
   if (mode === "install") {
-    if (!script) {
-      fail(
-        "cannot locate the Action Hub MCP server build (packages/copilot-plugin/server/dist/index.js). Run `npm run build` first.",
-      );
-    }
     const filePath = def.configPath(homedir());
-    if (def.format === "toml") {
-      const written = await installToml(
-        def,
-        filePath,
-        serverEntry(server),
+    try {
+      if (def.format === "toml") {
+        await installToml(filePath, serverEntry);
+      } else {
+        await installJson(def, filePath, jsonEntryFor(def.serversKey, serverEntry));
+      }
+    } catch (err) {
+      return fail(
+        `${err instanceof Error ? err.message : String(err)} (config left untouched)`,
       );
-      console.log(`Wrote Action Hub MCP server to ${written} for ${def.label}.`);
-    } else {
-      const written = await installJson(def, filePath, entry);
-      console.log(`Wrote Action Hub MCP server to ${written} for ${def.label}.`);
     }
+    console.log(`Wrote Action Hub MCP server to ${filePath} for ${def.label}.`);
     return 0;
   }
 
   // export mode
   if (def.format === "toml") {
-    const section = def.tomlSection?.("action-hub") ?? "mcp_servers.action-hub";
-    console.log(`# ${def.label} — add to ${def.configPath(homedir())}`);
-    console.log(renderTomlSnippet(serverEntry(server), section));
+    const doc = await readTomlDoc(def.configPath(homedir()));
+    const updated = upsertTomlEntry(doc, serverEntry);
+    console.log(
+      `# ${def.label} — add to ${def.configPath(homedir())} (install with --write; existing comments are not preserved by the rewrite, the .bak keeps them)`,
+    );
+    console.log(tomlStringify({ mcp_servers: { "action-hub": serverEntry } }));
   } else {
     const filePath = def.configPath(homedir());
     const doc = await readJsonFile(filePath);
-    const merged = upsertJsonEntry(doc, def.serversKey ?? "mcpServers", entry);
+    const merged = upsertJsonEntry(
+      doc,
+      def.serversKey,
+      jsonEntryFor(def.serversKey, serverEntry),
+    );
     console.log(JSON.stringify(merged, null, 2));
   }
   if (!options.json) {

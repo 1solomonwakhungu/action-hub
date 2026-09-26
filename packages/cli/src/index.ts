@@ -236,7 +236,6 @@ async function main(): Promise<void> {
           mode: modeArg,
           write: Boolean(parsedArgs["write"]),
           json: Boolean(parsedArgs["json"]),
-          command: typeof parsedArgs["command"] === "string" ? parsedArgs["command"] : undefined,
           configPath,
         });
         break;
