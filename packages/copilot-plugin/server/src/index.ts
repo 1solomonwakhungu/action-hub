@@ -37,12 +37,12 @@ function hardenedBundlePayload(loaded: {
   return {
     ok: true,
     bundle_id: loaded.id,
-    display_name: loaded.displayName,
+    display_name: hardenText(loaded.displayName, SEARCH_SUMMARY_MAX_BYTES),
     description: hardenText(loaded.description ?? "", LOAD_DESCRIPTION_MAX_BYTES),
     actions_count: loaded.actions.length,
     actions: loaded.actions.map((act) => ({
       action_id: act.id,
-      name: act.name,
+      name: hardenText(act.name, SEARCH_SUMMARY_MAX_BYTES),
       server: act.serverId,
       trust: act.trust,
       summary: hardenText(act.summary, SEARCH_SUMMARY_MAX_BYTES),
@@ -302,7 +302,7 @@ async function dispatch(
         count: hits.length,
         results: hits.map((hit) => ({
           action_id: hit.id,
-          name: hit.name,
+          name: hardenText(hit.name, SEARCH_SUMMARY_MAX_BYTES),
           server: hit.serverId,
           kind: hit.kind,
           summary: hardenText(hit.summary, SEARCH_SUMMARY_MAX_BYTES),
@@ -312,8 +312,8 @@ async function dispatch(
           ? {
               bundles: matchingBundles.map((b) => ({
                 bundle_id: b.id,
-                display_name: b.displayName,
-                description: b.description,
+                display_name: hardenText(b.displayName, SEARCH_SUMMARY_MAX_BYTES),
+                description: hardenText(b.description ?? "", SEARCH_SUMMARY_MAX_BYTES),
               })),
             }
           : {}),
@@ -332,8 +332,8 @@ async function dispatch(
         count: bundles.length,
         bundles: bundles.map((b) => ({
           bundle_id: b.id,
-          display_name: b.displayName,
-          description: b.description,
+          display_name: hardenText(b.displayName, SEARCH_SUMMARY_MAX_BYTES),
+          description: hardenText(b.description ?? "", SEARCH_SUMMARY_MAX_BYTES),
           server_ids: b.serverIds,
           action_ids: b.actionIds,
         })),
@@ -358,7 +358,7 @@ async function dispatch(
       return {
         ok: true,
         action_id: action.id,
-        name: action.name,
+        name: hardenText(action.name, SEARCH_SUMMARY_MAX_BYTES),
         server: action.serverId,
         kind: action.kind,
         trust: action.trust,

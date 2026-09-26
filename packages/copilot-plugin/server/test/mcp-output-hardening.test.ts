@@ -137,6 +137,23 @@ test("load caps descriptions, redacts schemas, and covers skills end-to-end", as
   assertNoSecret(skill);
 });
 
+test("bundle discovery routes (search, search_bundles) harden descriptions end-to-end", async () => {
+  const runtime = await buildRuntime();
+  for (const args of [
+    { operation: "search", query: "hostile bundle" },
+    { operation: "search_bundles", query: "hostile bundle" },
+  ]) {
+    const out = await callOperation(runtime, args);
+    const rows = out.bundles ?? [];
+    assert.ok(rows.length >= 1, `expected bundle discovery hits for ${args.operation}`);
+    for (const b of rows) {
+      assert.ok(bytes(b.description) <= SEARCH_SUMMARY_MAX_BYTES, "bundle description exceeds cap incl. marker");
+      assert.match(b.description, /\[truncated by action_hub: dropped \d+ bytes\]/);
+      assert.ok(!JSON.stringify(b).includes(SECRET), "known-prefix secret leaked in bundle discovery");
+    }
+  }
+});
+
 test("both bundle-load routes return hardened output end-to-end", async () => {
   const runtime = await buildRuntime();
   for (const args of [
