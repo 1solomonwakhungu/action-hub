@@ -16,6 +16,14 @@ export class SearchEngine {
   #semanticScorer?: SemanticScorer;
   #semanticWeight = DEFAULT_SEMANTIC_WEIGHT;
 
+  // Memoized corpus work, keyed by the catalog generation. The dominant F18
+  // cost was re-tokenizing the entire corpus on every query; this cache makes
+  // tokenization O(1) per record after the first pass and lets a full-corpus
+  // query (the server's default path) reuse whole stats wholesale.
+  #tokensCache = new Map<string, { generation: number; tokens: string[] }>();
+  #fullStats?: { generation: number; stats: CorpusStats };
+  #tokensGeneration = -1;
+
   constructor(catalog: Catalog) {
     this.#catalog = catalog;
   }
@@ -62,7 +70,7 @@ export class SearchEngine {
         .map((record) => toHit(record, 0, options.includeSchema ?? false));
     }
 
-    const stats = buildStats(candidates);
+    const stats = this.#statsFor(candidates);
     const lexical = candidates.map((record) => ({
       record,
       score: bm25(record, terms, stats),
@@ -82,6 +90,71 @@ export class SearchEngine {
       .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id))
       .slice(0, limit)
       .map((entry) => toHit(entry.record, entry.score, options.includeSchema ?? false));
+  }
+
+  /**
+   * Corpus stats for a candidate set, memoized across queries.
+   *
+   * Bit-identical to the uncached path: `buildStats` still runs over the same
+   * records in the same order — the cache only removes repeated tokenization
+   * and repeated whole-corpus accumulation when the catalog has not changed.
+   */
+  #statsFor(candidates: readonly ActionRecord[]): CorpusStats {
+    const generation = this.#catalog.generation;
+    if (generation !== this.#tokensGeneration) {
+      // Catalog changed: drop stale per-record tokens (and deleted ids) wholesale.
+      this.#tokensCache.clear();
+      this.#tokensGeneration = generation;
+    }
+    // Fast path: the candidate set IS the whole catalog (the server's default
+    // search path passes no filters). Reuse the stats wholesale.
+    const full =
+      candidates.length === this.#catalog.size && this.#catalog.size > 0;
+    if (full) {
+      if (this.#fullStats?.generation === generation) return this.#fullStats.stats;
+      const stats = this.#buildStats(candidates, generation);
+      this.#fullStats = { generation, stats };
+      return stats;
+    }
+    return this.#buildStats(candidates, generation);
+  }
+
+  #buildStats(records: readonly ActionRecord[], generation: number): CorpusStats {
+    const docFreq = new Map<string, number>();
+    const termFreq = new Map<string, Map<string, number>>();
+    const lengths = new Map<string, number>();
+    let totalLength = 0;
+
+    for (const record of records) {
+      const tokens = this.#documentTokens(record, generation);
+      const freq = new Map<string, number>();
+      for (const token of tokens) {
+        freq.set(token, (freq.get(token) ?? 0) + 1);
+      }
+      termFreq.set(record.id, freq);
+      lengths.set(record.id, tokens.length);
+      totalLength += tokens.length;
+      for (const token of freq.keys()) {
+        docFreq.set(token, (docFreq.get(token) ?? 0) + 1);
+      }
+    }
+
+    return {
+      docFreq,
+      docCount: records.length,
+      avgLength: records.length > 0 ? totalLength / records.length : 0,
+      termFreq,
+      lengths,
+    };
+  }
+
+  /** Tokenizes a record's document text once per catalog generation. */
+  #documentTokens(record: ActionRecord, generation: number): string[] {
+    const cached = this.#tokensCache.get(record.id);
+    if (cached && cached.generation === generation) return cached.tokens;
+    const tokens = documentTokens(record);
+    this.#tokensCache.set(record.id, { generation, tokens });
+    return tokens;
   }
 
   /**
@@ -159,35 +232,6 @@ interface CorpusStats {
   /** Term frequencies per action id. */
   termFreq: Map<string, Map<string, number>>;
   lengths: Map<string, number>;
-}
-
-function buildStats(records: readonly ActionRecord[]): CorpusStats {
-  const docFreq = new Map<string, number>();
-  const termFreq = new Map<string, Map<string, number>>();
-  const lengths = new Map<string, number>();
-  let totalLength = 0;
-
-  for (const record of records) {
-    const tokens = documentTokens(record);
-    const freq = new Map<string, number>();
-    for (const token of tokens) {
-      freq.set(token, (freq.get(token) ?? 0) + 1);
-    }
-    termFreq.set(record.id, freq);
-    lengths.set(record.id, tokens.length);
-    totalLength += tokens.length;
-    for (const token of freq.keys()) {
-      docFreq.set(token, (docFreq.get(token) ?? 0) + 1);
-    }
-  }
-
-  return {
-    docFreq,
-    docCount: records.length,
-    avgLength: records.length > 0 ? totalLength / records.length : 0,
-    termFreq,
-    lengths,
-  };
 }
 
 const K1 = 1.2;
