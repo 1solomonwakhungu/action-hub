@@ -1,0 +1,800 @@
+[
+  {
+    "query": "please move the api key to the new vault",
+    "expected": "acme-corp-billing:move_api_key",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "can you archive that old customer record",
+    "expected": "acme-corp-billing:archive_customer",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "compare the two dispute cases side by side",
+    "expected": "acme-corp-billing:compare_dispute",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "lock the budget so nobody edits it",
+    "expected": "acme-corp-cloud-infra:lock_budget",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "put that thread away in the archive",
+    "expected": "acme-corp-cloud-infra:archive_thread",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "make that permission null and void",
+    "expected": "acme-corp-cloud-infra:void_permission",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "the orphaned backup needs refreshing",
+    "expected": "acme-corp-cloud-infra:update_backup_orphaned",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "shift the meeting to next week",
+    "expected": "acme-corp-crm:amend_meeting",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "unlock that lead so sales can work it",
+    "expected": "acme-corp-crm:unlock_lead",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "put the credit note on hold for now",
+    "expected": "acme-corp-crm:pause_credit_note_running",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "show me what changed between the two log versions",
+    "expected": "acme-corp-data-warehouse:diff_log",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "get the warehouse issue sorted out",
+    "expected": "acme-corp-email:resolve_warehouse",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "delete the whole team",
+    "expected": "acme-corp-email:delete_team",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "replay that node from the start",
+    "expected": "acme-corp-email:replay_node",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "set up a new funnel for the campaign",
+    "expected": "acme-corp-email:create_funnel",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "let the issue thaw",
+    "expected": "acme-corp-git-hosting:unfreeze_issue",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "hand the issue to someone else",
+    "expected": "acme-corp-git-hosting:assign_issue",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "keep the backup reconciled",
+    "expected": "acme-corp-git-hosting:sync_backup",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "share the csat score with the team",
+    "expected": "acme-corp-git-hosting:share_csat",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "look for the golden signal that fired",
+    "expected": "acme-corp-git-hosting:search_golden_signal",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "hold the project until we hear back",
+    "expected": "acme-corp-hr:pause_project",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "tidy up the batch",
+    "expected": "acme-corp-hr:prune_batch",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "bring the secret out of the deep freeze",
+    "expected": "acme-corp-hr:unfreeze_secret",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "turn the user account off",
+    "expected": "acme-corp-iam:disable_user",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "pass that branch to the reviewers",
+    "expected": "acme-corp-iam:share_branch",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "look inside the bucket",
+    "expected": "acme-corp-iam:search_bucket",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "take a snapshot of the release",
+    "expected": "acme-corp-inventory:snapshot_release",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "pull that artifact off the build",
+    "expected": "acme-corp-inventory:detach_artifact",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "give the cohort a fresh rotation",
+    "expected": "acme-corp-inventory:rotate_cohort",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "carve the dock into two zones",
+    "expected": "acme-corp-inventory:split_dock",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "get the container reconciled with the registry",
+    "expected": "acme-corp-legal:sync_container",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "open the audience back up",
+    "expected": "acme-corp-legal:unlock_audience",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "hide the table's sensitive columns",
+    "expected": "acme-corp-legal:redact_table",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "pass that document to the counsel desk",
+    "expected": "acme-corp-legal:share_document",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "ship the import over",
+    "expected": "acme-corp-legal:send_import",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "turn down the review",
+    "expected": "acme-corp-marketing:reject_review",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "fold the two warehouses into one",
+    "expected": "acme-corp-marketing:merge_warehouse",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "tie the user to the account",
+    "expected": "acme-corp-marketing:link_user",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "flip the golden signal on",
+    "expected": "acme-corp-marketing:enable_golden_signal",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "bring the burn rate tracker back",
+    "expected": "acme-corp-observability:restore_burn_rate_running",
+    "subtype": "paraphrase",
+    "difficulty": "paraphrase"
+  },
+  {
+    "query": "restart the flaky checkout deployment",
+    "expected": "acme-corp-analytics:retry_channel_projected",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "stop charging my card every month",
+    "expected": "acme-corp-analytics:void_contract",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "give the customer their money back",
+    "expected": "acme-corp-shipping:unlock_refund",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "I need those two accounts combined",
+    "expected": "globex-data-warehouse:merge_customer",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "reserve the big room for thursday",
+    "expected": "acme-corp-calendar:promote_meeting_favorite",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "tally the money movements from last quarter",
+    "expected": "acme-corp-payments:count_transfer",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "tell me who is on call this weekend",
+    "expected": "initech-billing:summarize_oncall",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "our stock counts look wrong, recheck them",
+    "expected": "globex-data-warehouse:get_sku",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "blast the announcement to everyone",
+    "expected": "globex-crm:send_email",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "wipe the stale backlog entries",
+    "expected": "acme-corp-ticketing:purge_task_external",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "can I get a peek at the draft before it goes out",
+    "expected": "acme-corp-crm:preview_export_external",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "why did the card charge bounce",
+    "expected": "acme-corp-billing:compare_dispute",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "get this box to the oak street depot",
+    "expected": "acme-corp-analytics:send_shipment",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "pull up the slow request trail",
+    "expected": "acme-corp-git-hosting:share_trace",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "the tls document is expiring soon, save a copy",
+    "expected": "globex-git-hosting:snapshot_certificate",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "give the contractor access",
+    "expected": "acme-corp-chat:invite_user",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "the board is stale, tidy it up",
+    "expected": "acme-corp-billing:prune_dashboard_summary",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "wrap up the yearly plan extension",
+    "expected": "acme-corp-search:close_renewal_pending",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "call off the maintenance window",
+    "expected": "globex-calendar:cancel_zone_partial",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "who has been poking around the credentials store",
+    "expected": "acme-corp-iam:search_bucket",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "combine the twin people records",
+    "expected": "acme-corp-billing:move_contact_legacy",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "pull last month's figures out to a sheet",
+    "expected": "acme-corp-observability:export_segment",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "the pipeline went red, kick it off once more",
+    "expected": "acme-corp-billing:retry_object",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "turn off the ex-employee's access",
+    "expected": "globex-data-warehouse:revoke_role_compact",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "dig up the boss's messages from last week",
+    "expected": "acme-corp-search:search_customer",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "bring the payment gateway back up",
+    "expected": "acme-corp-cloud-infra:resume_payout_overdue",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "line up the newsletter blast for tuesday",
+    "expected": "acme-corp-calendar:send_segment_paused",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "save a copy of the catalog before the cutover",
+    "expected": "globex-docs:snapshot_index_full",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "the projected numbers look off, redo the math",
+    "expected": "globex-calendar:recalculate_forecast",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "move the team onto the bigger tier",
+    "expected": "acme-corp-analytics:promote_payment",
+    "subtype": "goal-only",
+    "difficulty": "hard"
+  },
+  {
+    "query": "backfill the missing roles in the crm system",
+    "expected": "initech-crm:backfill_role",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "approve the project in the data warehouse",
+    "expected": "acme-corp-data-warehouse:approve_project",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "summarize what changed in the zone config, hr side",
+    "expected": "acme-corp-hr:summarize_zone",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "give me the on-call summary for ticketing",
+    "expected": "initech-ticketing:summarize_oncall",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "freeze the spammy channel in chat",
+    "expected": "acme-corp-chat:freeze_channel",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "delete that awful marketing issue",
+    "expected": "acme-corp-marketing:delete_issue",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "cancel the segment export in analytics",
+    "expected": "acme-corp-analytics:cancel_segment",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "double-check the supplier in billing",
+    "expected": "initech-billing:verify_supplier",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "set up a warehouse in the billing workspace",
+    "expected": "acme-corp-billing:create_warehouse",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "attach the zone to the iam record",
+    "expected": "globex-iam:attach_zone",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "approve the onboarding in crm",
+    "expected": "initech-crm:approve_onboarding",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "list the creatives in crm",
+    "expected": "initech-crm:list_creative",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "snapshot the audience for ticketing",
+    "expected": "initech-ticketing:snapshot_audience",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "close the creative in iam",
+    "expected": "acme-corp-iam:close_creative",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "create the payout in chat",
+    "expected": "acme-corp-chat:create_payout",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "approve that alert in git hosting",
+    "expected": "acme-corp-git-hosting:approve_alert",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "unlock the stuck stock item in billing",
+    "expected": "globex-billing:unlock_stock",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "roll back the login session in billing",
+    "expected": "initech-billing:rollback_session",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "lock the renewal in payments",
+    "expected": "acme-corp-payments:lock_renewal",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "restore the agent in cloud infra",
+    "expected": "globex-cloud-infra:restore_agent",
+    "subtype": "near-duplicate",
+    "difficulty": "hard"
+  },
+  {
+    "query": "find every tool that can get an invoice",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:get_invoice",
+      "acme-corp-legal:get_invoice",
+      "acme-corp-payments:get_invoice",
+      "globex-cloud-infra:get_invoice",
+      "globex-search:get_invoice",
+      "initech-billing:get_invoice"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "list all the invoice listing tools we have",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:list_invoices",
+      "acme-corp-legal:list_invoices",
+      "globex-search:list_invoices",
+      "initech-billing:list_invoices"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "what can create an event",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:create_event",
+      "acme-corp-legal:create_event",
+      "globex-search:create_event",
+      "initech-billing:create_event"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "which tools summarize the on-call rotation",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:summarize_oncall",
+      "initech-billing:summarize_oncall",
+      "initech-ticketing:summarize_oncall"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "everything that can unlock a stuck stock item",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:unlock_stock",
+      "acme-corp-crm:unlock_stock",
+      "globex-billing:unlock_stock"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "all the tools that approve an alert",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:approve_alert",
+      "acme-corp-billing:approve_alert",
+      "acme-corp-git-hosting:approve_alert"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "ways to close a secret",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:close_secret",
+      "globex-inventory:close_secret",
+      "initech-ticketing:close_secret"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "which tools sync a team",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:sync_team",
+      "acme-corp-shipping:sync_team",
+      "globex-docs:sync_team"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "all tools that can lock a renewal",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:lock_renewal",
+      "acme-corp-iam:lock_renewal",
+      "acme-corp-payments:lock_renewal"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "what can invite to a queue",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:invite_queue",
+      "globex-crm:invite_queue",
+      "globex-iam:invite_queue"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "which tools restore an agent",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:restore_agent",
+      "globex-cloud-infra:restore_agent",
+      "globex-crm:restore_agent"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "everything that can prune a key",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:prune_key",
+      "acme-corp-email:prune_key",
+      "acme-corp-payments:prune_key"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "which tools search an opportunity",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:search_opportunity",
+      "globex-hr:search_opportunity",
+      "globex-legal:search_opportunity"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "all the tools that can approve a renewal",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:approve_renewal",
+      "globex-iam:approve_renewal"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "which tools can verify an object",
+    "expected": null,
+    "expectedAll": [
+      "acme-corp-analytics:verify_object",
+      "acme-corp-docs:verify_object"
+    ],
+    "subtype": "multi",
+    "difficulty": "hard"
+  },
+  {
+    "query": "book a wedding photographer for my cousin",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "fix the squeaky hinge on the garden gate",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "plan a surprise birthday party for my roommate",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "find a recipe for gluten free banana bread",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "water the office plants while I am away",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "reschedule my dentist appointment to friday",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "translate this paragraph into japanese",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "recommend a good mystery novel",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "calculate the tip for a dinner bill",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "debug the crash in my hobby game project",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "what is the fastest route to the airport",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "help me choose a laptop backpack",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "convert these measurements to metric",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "write a limerick about a sleepy cat",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  },
+  {
+    "query": "remind me to stretch every hour",
+    "expected": null,
+    "subtype": "no-match",
+    "difficulty": "hard"
+  }
+]
