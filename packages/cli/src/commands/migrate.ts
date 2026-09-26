@@ -1,5 +1,3 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import {
   discoverAll,
   executeMigration,
@@ -9,6 +7,7 @@ import {
   type DiscoveredSkill,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
+import { rawConfigDocument, validateRawCapabilityArrays, writeConfigAtomic } from "../config-writer.js";
 
 /** Harness source filters accepted by the migrate command (servers, skills, and plugins). */
 export const MIGRATE_SOURCE_FILTERS = [
@@ -174,9 +173,10 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
   if (options.write) {
     // Preserve existing raw config to retain top-level settings like approvalTtlSeconds,
     // autoDiscover, and unexpanded environment variable references in servers.
-    const raw: Record<string, unknown> = currentConfig.raw
-      ? { ...currentConfig.raw }
-      : {};
+    const raw = rawConfigDocument(currentConfig);
+    // Fail closed: malformed servers, skills, or bundles arrays are never
+    // filtered or coerced — this throws and the original bytes are untouched.
+    validateRawCapabilityArrays(raw, currentConfig.path);
 
     const existingRawServers: Record<string, unknown>[] = Array.isArray(raw["servers"])
       ? (raw["servers"].filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null))
@@ -201,15 +201,18 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
       }
     }
 
-    raw["servers"] = serverEntries;
-    raw["skills"] = mergedSkills;
-    raw["bundles"] = mergedBundles;
+    // Only rewrite the arrays for the capability types actually being
+    // migrated: a narrow --type must not add or rewrite the sibling arrays.
+    if (migrationTypes.includes("mcps")) raw["servers"] = serverEntries;
+    if (migrationTypes.includes("skills")) raw["skills"] = mergedSkills;
+    if (migrationTypes.includes("plugins")) raw["bundles"] = mergedBundles;
     if (raw["autoApproveAtOrAbove"] === undefined) {
       raw["autoApproveAtOrAbove"] = currentConfig.autoApproveAtOrAbove;
     }
 
-    await mkdir(dirname(currentConfig.path), { recursive: true });
-    await writeFile(currentConfig.path, JSON.stringify(raw, null, 2) + "\n", "utf8");
+    // Atomic owner-only write: configs can contain credentials, and a
+    // concurrent reader must never observe a half-written file.
+    await writeConfigAtomic(currentConfig.path, raw);
 
     if (!isJson) {
       console.log(
