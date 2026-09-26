@@ -9,15 +9,18 @@
 //   2. circuit breakers open and recover
 //   3. hung calls fail in bounded time (defaultTimeoutMs)
 //   4. memory stays bounded (5 MB responses)
-//   5. `doctor` completes in bounded time with 44 servers and exits 1
+//   5. `doctor` completes in bounded time with 44 servers (under live
+//      chaos the exit is racy: 0 = all servers bootable at check time,
+//      1 = a crash-looping/flapping server was failing at check time;
+//      both are recorded, neither is a pass/fail gate)
 //   6. no configured secret appears in any captured output
 //
-// The fake server is PR 46's stress/fake-mcp-server.mjs, copied into this
-// worktree UNCOMMITTED (it belongs to the fake-servers PR; this PR adds only
-// chaos.mjs). It is spawned with the same --chaos contract used elsewhere:
-// crash-after (delivery-based, counts initialize), hang-rate, slow-start-ms,
-// huge-bytes, stderr-secret. All probabilistic draws are seeded by the
-// server itself (chaos seed), so this harness fixes seed=7 for replay.
+// The fake server is stress/fake-mcp-server.mjs, COMMITTED on main (PR 46,
+// merged as 55dc286). It is spawned with the --chaos contract documented
+// there: crash-after counts tools/call requests ONLY (initialize never
+// counts; per-connection id scoping; each accepted call settles finished
+// or aborted), hang-rate, slow-start-ms, huge-bytes, stderr-secret. All
+// probabilistic draws are seeded (this harness fixes seed=7 for replay).
 //
 // Isolation per stress/CONTRACT.md: temp HOME, XDG_CACHE_HOME,
 // XDG_CONFIG_HOME, ACTION_HUB_SKILLS_DIR, PI_CODING_AGENT_DIR;
@@ -178,7 +181,7 @@ async function main() {
     process.exit(2);
   }
   if (!existsSync(FAKE_SERVER)) {
-    console.error(`[chaos] missing ${FAKE_SERVER} (copy PR 46's fake-mcp-server.mjs in, uncommitted)`);
+    console.error(`[chaos] missing ${FAKE_SERVER} (committed by PR 46; run from a checkout of main 55dc286 or later)`);
     process.exit(2);
   }
 
@@ -187,6 +190,10 @@ async function main() {
 
   installSecretScan();
   const specs = buildFixtures();
+  // Documented fault-injection hook (CHAOS_FAULT=mid-run): throws after
+  // indexing to exercise the failure path — used to prove the finally
+  // block closes the hub and kills all child transports. Not part of a
+  // normal run.
   process.env.ACTION_HUB_CONFIG = CONFIG_PATH; // real config now exists
   const startedAt = Date.now();
   const rssStartMB = Math.round(process.memoryUsage().rss / 1048576);
@@ -236,6 +243,8 @@ async function main() {
     verdict: {},
   };
 
+  let hubClosed = false;
+  try {
   // 1. Index the fleet; slow-start servers (10 s) may dominate the wall time.
   const indexStart = Date.now();
   const indexResults = await hub.indexAll();
@@ -249,6 +258,9 @@ async function main() {
   };
   if (!summary.index.bounded) {
     finding("P1", `indexAll took ${indexMs}ms for ${SERVER_COUNT} servers (unbounded fleet startup)`, "stress/chaos.mjs scenario run; see index.durationMs");
+  }
+  if (process.env.CHAOS_FAULT === "mid-run") {
+    throw new Error("injected mid-run fault (CHAOS_FAULT=mid-run) to exercise the failure path");
   }
 
   // 2. Hung calls: hang-rate=1.0 servers must fail within timeoutMs.
@@ -265,6 +277,11 @@ async function main() {
     ]);
     const ms = Date.now() - t0;
     hang.samples.push({ id, durationMs: ms, outcome: res.outcome, error: (res.error ?? res.result?.error ?? "").slice(0, 120) });
+    const timeoutShaped =
+      res.outcome === "failed" &&
+      ms >= CALL_TIMEOUT_MS - 1_000 &&
+      ms <= CALL_TIMEOUT_MS + 2_000 &&
+      /timed out/i.test(res.error ?? res.result?.error ?? "");
     if (res.outcome === "unexpected-success") {
       hang.bounded = false;
       finding("P1", `call to hang-rate=1.0 server ${id} SUCCEEDED in ${ms}ms — the hang injector is broken; timeout path untested`, `hub.execute("${id}:tool_0") returned ok against a server configured to never respond`);
@@ -275,9 +292,12 @@ async function main() {
       finding("P1", `call to ${id} hung unbounded (>${ms}ms) despite timeoutMs=${CALL_TIMEOUT_MS}`, `hub.execute("${id}:tool_0") against hang-rate=1.0 server`);
       break;
     }
-    if (ms > CALL_TIMEOUT_MS + 2_000) {
+    if (!timeoutShaped) {
+      // A prompt failure (disconnect, fixture error, ...) is NOT proof the
+      // timeout path was exercised — fail honestly instead.
       hang.bounded = false;
-      finding("P1", `hung call on ${id} took ${ms}ms, exceeding timeoutMs=${CALL_TIMEOUT_MS} by margin`, `timeoutMs=${CALL_TIMEOUT_MS} configured; observed ${ms}ms`);
+      finding("P1", `hang call on ${id} failed in ${ms}ms but NOT with the expected timeout (error: ${(res.error ?? "").slice(0, 120)})`, `expected duration ~${CALL_TIMEOUT_MS}ms with a timeout-shaped error against hang-rate=1.0`);
+      break;
     }
   }
 
@@ -336,10 +356,26 @@ async function main() {
   for (let i = 0; i < 6; i++) await hub.execute("flapper:tool_0", { x: i }, { noCache: true }).catch(() => {});
   const flapperOpen = await waitForState("flapper", ["open"], 30_000);
   circuit.perId.flapper = { opened: flapperOpen.state === "open" && !flapperOpen.timedOut, state: flapperOpen.state, openedMs: flapperOpen.ms };
+  // Gate: EVERY expected crash id must open; every finite id must open,
+  // recover, AND pass its post-recovery execute; the flapper must open.
+  // Partial success is a finding, never a true verdict.
   circuit.opened = crashIds.filter((id) => circuit.perId[id]?.opened);
-  circuit.recovered = finiteIds.filter((id) => circuit.perId[id]?.recovered);
-  if (circuit.opened.length === 0) {
-    finding("P1", `no circuit breaker opened for any crash-after server (checked: ${crashIds.join(",")})`, "stress/chaos.mjs circuit scenario; see circuit.perId");
+  circuit.recovered = finiteIds.filter((id) => circuit.perId[id]?.recovered && circuit.perId[id]?.postRecoveryOk);
+  for (const id of crashIds) {
+    if (!circuit.perId[id]?.opened) {
+      finding("P1", `circuit did not OPEN for ${id} (expected: every crash-after server opens)`, "stress/chaos.mjs circuit scenario; see circuit.perId");
+    }
+  }
+  for (const id of finiteIds) {
+    const rec = circuit.perId[id] ?? {};
+    if (!rec.recovered) {
+      finding("P1", `circuit for ${id} never RECOVERED after cooldown`, "stress/chaos.mjs circuit scenario; see circuit.perId");
+    } else if (!rec.postRecoveryOk) {
+      finding("P1", `post-recovery execute against ${id} did not succeed`, "stress/chaos.mjs circuit scenario; see circuit.perId");
+    }
+  }
+  if (!circuit.perId.flapper?.opened) {
+    finding("P1", "flapper circuit did not OPEN (expected: the permanently-failing server must open)", "stress/chaos.mjs circuit scenario; see circuit.perId.flapper");
   }
 
   // 4. Search p95 while chaos runs (flapper restarts, hung servers active).
@@ -428,10 +464,6 @@ async function main() {
     ? "index failures present; exit 1 expected"
     : "exit 0 or 1 both consistent with live chaos (racy server health at check time)";
 
-  await hub.close().catch(() => {});
-
-  summary.elapsedMs = Date.now() - startedAt;
-  summary.secretScan = { sentinelLength: SECRET.length, prefixChecked: true, leaked };
   const memoryBounded = summary.memory.rssPeakMB <= 1_536;
   summary.verdict = {
     indexComplete: indexFailures.length === 0,
@@ -450,13 +482,28 @@ async function main() {
   if (indexFailures.length > 0) {
     finding("P1", `${indexFailures.length} server(s) failed to index: ${indexFailures.map((r) => r.serverId).join(",")}`, "stress/chaos.mjs index phase; see index.failures");
   }
+  } finally {
+    // The hub is closed on EVERY path: happy path, findings, and uncaught
+    // errors — closing the hub tears down all 44 child transports, so no
+    // fake-server process survives a failed run.
+    hubClosed = true;
+    await hub.close().catch(() => {});
+  }
 
+  summary.elapsedMs = Date.now() - startedAt;
+  summary.hubClosedOnAllPaths = hubClosed;
+  summary.secretScan = { sentinelLength: SECRET.length, prefixChecked: true, leaked };
+
+
+  const scrub = (t) => t.split(SECRET).join("[redacted]").split(SECRET_PREFIX).join("[redacted]");
   let text = JSON.stringify(summary, null, 2);
   if (text.includes(SECRET) || text.includes(SECRET_PREFIX)) {
     findings.push({ severity: "P1", summary: "secret reached the harness's own summary (scrubbed in this copy)", repro: "captured output fragment in the leak finding" });
-    text = text.split(SECRET).join("[redacted]").split(SECRET_PREFIX).join("[redacted]");
+    text = scrub(text);
   }
-  console.log(text);
+  // CONTRACT.md hard rule: machine-readable JSON is the LAST stdout line —
+  // one compact line; the results file keeps the pretty form.
+  console.log(scrub(JSON.stringify(summary)));
   mkdirSync(RESULTS_DIR, { recursive: true });
   writeFileSync(RESULTS_FILE, text + "\n");
   process.exit(0);
