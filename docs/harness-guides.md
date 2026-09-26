@@ -15,6 +15,51 @@ config entries — copy the snippet for your harness, substitute the absolute
 path, and restart. The supported harnesses: Claude Code, Claude Desktop,
 Cursor, VS Code, Codex, OpenCode, Zed, and Windsurf.
 
+## Automatic setup
+
+As of the `harness` command, most harnesses can be configured for you. The
+exact grammar (from `action-hub harness --help`):
+
+```
+action-hub harness <target> [export|install]
+
+Targets:
+  claude-code      Claude Code
+  claude-desktop   Claude Desktop
+  cursor           Cursor
+  codex            Codex CLI
+  opencode         OpenCode
+  vscode           VS Code
+
+Modes:
+  export          Print the config snippet (default).
+  install         Write the snippet into the harness config file.
+                  Requires --write as a safety guard.
+
+Options:
+  --write         Required for install mode; confirms in-place writes.
+  --config <path> Point the harness at a specific Action Hub config file
+                  (exported as ACTION_HUB_CONFIG in the snippet).
+  --json          (export) Print only the JSON document, no commentary.
+```
+
+`export` prints the snippet for you to paste; `install` writes it into the
+harness config file and requires `--write`. Before touching a config,
+`install` writes a timestamped `.bak` copy of the file (e.g.
+`mcp.json.bak-20260926T090000Z`), so the original is always recoverable.
+
+```bash
+action-hub harness claude-code                 # print the Claude Code snippet
+action-hub harness claude-code install --write
+action-hub harness codex install --write --config ~/.config/action-hub/servers.json
+```
+
+The supported targets are `claude-code`, `claude-desktop`, `cursor`, `codex`,
+`opencode`, and `vscode`. Pi is not supported by the harness command; Zed and
+Windsurf are covered by the manual snippets below, which remain the fallback
+for every harness. If the CLI is not on your `PATH`, run the same commands via
+`node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js harness ...`.
+
 Replace `<ABSOLUTE_PATH_TO_ACTION_HUB>` with the absolute path to your checkout
 (for example `/Users/me/Projects/action-hub`), and make sure the build exists:
 
@@ -237,6 +282,10 @@ if the CLI is not on your `PATH`.) The migration engine discovers MCP servers,
 skills, and plugins from your local agent configurations and merges them into
 the Action Hub config, preserving entries that are already there.
 
-For a servers-only look, `action-hub import` previews MCP servers discovered
-from your local agent configurations. It does not bring in skills, so use
-`migrate --type all --write` when you want servers *and* skills written.
+For a servers-only pass, `action-hub import` previews MCP servers discovered
+from your local agent configurations, and `action-hub import --write` writes
+them. Since the raw-config fix, `--write` preserves everything already in the
+config (existing entries win, unknown top-level settings survive, and the
+write is atomic with `0600` permissions; it fails closed on a malformed
+config). It does not bring in skills, so use `migrate --type all --write`
+when you want servers *and* skills written.
