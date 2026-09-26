@@ -31,7 +31,7 @@
 // stress/.generated/results/chaos.json. Requires `npm run build` first.
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir, userInfo as osUserInfo } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,7 +55,17 @@ const RESULTS_FILE = join(RESULTS_DIR, "chaos.json");
 // final object; exit nonzero whenever ok is false. stdout is flushed (with
 // a fallback timer) before exiting — the process.exit-before-flush failure
 // class is not acceptable here either.
+let summaryEmitted = false;
+class FatalSummary extends Error {
+  constructor(summary, code) {
+    super(summary.reason ?? "fatal");
+    this.summary = summary;
+    this.code = code;
+  }
+}
 function emitSummary(summary, code) {
+  if (summaryEmitted) return; // EXACTLY ONE final summary per run
+  summaryEmitted = true;
   const compact = JSON.stringify(summary);
   const pretty = JSON.stringify(summary, null, 2);
   try {
@@ -69,7 +79,10 @@ function emitSummary(summary, code) {
   setTimeout(() => process.exit(code), 1_000).unref();
 }
 function failureSummary(reason, extra = {}, code = 2) {
-  emitSummary({ script: "chaos", ok: false, reason, findings, elapsedMs: 0, ...extra }, code);
+  // Terminate control flow SYNCHRONOUSLY: throw a typed fatal that the
+  // single top-level catch serializes once. No caller continues past a
+  // refusal (proven: preflight failure no longer runs later phases).
+  throw new FatalSummary({ script: "chaos", ok: false, reason, findings, elapsedMs: 0, ...extra }, code);
 }
 
 // CONTRACT.md hard rule 2 + intake ISOLATION.md checklist (revised
@@ -114,30 +127,52 @@ const realHome = resolve(osUserInfo().homedir);
 // checklist): macOS Library caches + Application Support, Windows
 // AppData/LocalAppData action-hub dirs, dot-configured harness dirs, and
 // every real-home child matching .claude*.
-function ownerStateDirs() {
+function ownerStateDirs(home = realHome) {
   const dirs = [
-    join(realHome, ".cache", "action-hub"),
-    join(realHome, ".config", "action-hub"),
-    join(realHome, ".action-hub"),
-    join(realHome, "Library", "Caches", "action-hub"),
-    join(realHome, "Library", "Application Support", "action-hub"),
-    join(realHome, "AppData", "Roaming", "action-hub"),
-    join(realHome, "AppData", "Local", "action-hub"),
-    join(realHome, ".cursor"),
-    join(realHome, ".copilot"),
-    join(realHome, ".pi"),
-    join(realHome, ".codex"),
-    join(realHome, ".claude"),
-    join(realHome, ".claude.json"),
+    join(home, ".cache", "action-hub"),
+    join(home, ".config", "action-hub"),
+    join(home, ".action-hub"),
+    join(home, "Library", "Caches", "action-hub"),
+    join(home, "Library", "Application Support", "action-hub"),
+    join(home, "AppData", "Roaming", "action-hub"),
+    join(home, "AppData", "Local", "action-hub"),
+    join(home, ".cursor"),
+    join(home, ".copilot"),
+    join(home, ".pi"),
+    join(home, ".codex"),
+    join(home, ".claude"),
+    join(home, ".claude.json"),
   ];
+  let entries = [];
   try {
-    for (const entry of readdirSync(realHome)) {
-      if (entry.startsWith(".claude") || entry.startsWith(".codex")) {
-        dirs.push(join(realHome, entry));
-      }
+    entries = readdirSync(home);
+  } catch (err) {
+    throw new Error(`sentinel: cannot enumerate real-home children for wildcard coverage: ${err?.message ?? err}`);
+  }
+  for (const entry of entries) {
+    if (entry.startsWith(".claude") || entry.startsWith(".codex")) {
+      dirs.push(join(home, entry));
     }
-  } catch {}
+  }
   return dirs;
+}
+
+// Sentinel regression (CHAOS_SENTINEL_SELFTEST=1): builds a fake home with
+// .claude and .codex-plus children and asserts the wildcard entries are
+// present in ownerStateDirs' output — the coverage the readdir must never
+// silently lose.
+if (process.env.CHAOS_SENTINEL_SELFTEST === "1") {
+  const fakeHome = join(tmpdir(), `chaos-sentinel-selftest-${process.pid}`);
+  mkdirSync(join(fakeHome, ".claude"), { recursive: true });
+  mkdirSync(join(fakeHome, ".codex-history"), { recursive: true });
+  const dirs = ownerStateDirs(fakeHome);
+  const ok =
+    dirs.includes(join(fakeHome, ".claude")) &&
+    dirs.includes(join(fakeHome, ".codex-history")) &&
+    dirs.includes(join(fakeHome, ".cache", "action-hub"));
+  rmSync(fakeHome, { recursive: true, force: true });
+  console.log(JSON.stringify({ script: "chaos-sentinel-selftest", ok }));
+  process.exit(ok ? 0 : 1);
 }
 
 // Separator-safe containment: child is inside parent when its relative
@@ -150,7 +185,9 @@ const isInside = (child, parent) => {
 function validateIsolation() {
   for (const k of Object.keys(isolationPaths)) {
     const v = process.env[k]; // FINAL env value, not the table
-    if (!v) continue;
+    if (!v) {
+      failureSummary(`isolation violation: ${k} is missing from the final process.env`, { phase: "preflight" });
+    }
     if (!isInside(v, tmpRoot)) {
       failureSummary(`isolation violation: ${k}=${v} is outside the run root ${tmpRoot}`, { phase: "preflight" });
     }
@@ -554,7 +591,15 @@ async function main() {
     let child;
     let stdout = "", stderr = "", timedOut = false, escalated = false, settled = false;
     let killTimer = null;
-    const finish = (info) => { if (!settled) { settled = true; resolveRun(info); } };
+    const finish = (info) => {
+      if (settled) return;
+      settled = true;
+      if (killTimer) { clearTimeout(killTimer); killTimer = null; } // every settled path
+      resolveRun(info);
+    };
+    // after escalation begins, only the escalation chain's final finish
+    // resolves — a TERM-close must not resolve while grandchildren may
+    // still be pending the KILL.
     child = spawn("node", [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"], {
       env: isolationEnv(), // isolated process.env, captured after repointing
       cwd: tmpRoot, // cross-cwd proof: not the repo root
@@ -565,13 +610,10 @@ async function main() {
     child.stderr.on("data", (c) => { stderr += String(c); });
     child.on("error", (e) => finish({ pid: child.pid, code: null, signal: null, timedOut, escalated, stdout, stderr, error: String(e) }));
     child.on("close", (code, signal) => {
-      const base = { pid: child.pid, code, signal, timedOut, escalated, stdout, stderr };
-      if (escalated) {
-        // give the OS a beat to reap the KILLed grandchildren group
-        setTimeout(() => finish(base), 1_000);
-      } else {
-        finish(base);
+      if (!escalated) {
+        finish({ pid: child.pid, code, signal, timedOut, escalated, stdout, stderr });
       }
+      // escalated closes are ignored: the escalation chain finishes.
     });
     killTimer = setTimeout(() => {
       timedOut = true;
@@ -588,9 +630,12 @@ async function main() {
   try {
     doctorInfo = await runDoctor();
   } finally {
-    // belt-and-braces: kill the whole group again whatever happened
-    try { killTree(doctorInfo?.pid ?? 0, "SIGKILL"); } catch {}
-  }  const doctor = await runDoctor();
+    // belt-and-braces: kill the SAME group again whatever happened; the
+    // pid is passed explicitly (no closure over the runner's child).
+    if (doctorInfo?.pid) {
+      try { killTree(doctorInfo.pid, "SIGKILL"); } catch {}
+    }
+  }
   const doctorMs = Date.now() - doctorStart;
   const doctorOut = `${doctorInfo.stdout ?? ""}\n${doctorInfo.stderr ?? ""}`;
   scanForSecret(doctorOut);
@@ -674,7 +719,14 @@ async function main() {
   emitSummary(summary, summary.ok ? 0 : 1);
 }
 
+// Single top-level catch: serializes exactly one final summary (via the
+// summaryEmitted guard) for both typed refusals and uncaught errors.
 main().catch((err) => {
+  if (err instanceof FatalSummary) {
+    console.error(`[chaos] refused: ${err.message}`);
+    emitSummary(err.summary, err.code);
+    return;
+  }
   console.error(`[chaos] fatal: ${err?.stack ?? err}`);
-  failureSummary(`fatal: ${String(err?.message ?? err).slice(0, 200)}`, { phase: "run" }, 1);
+  emitSummary({ script: "chaos", ok: false, reason: `fatal: ${String(err?.message ?? err).slice(0, 200)}`, findings, phase: "run" }, 1);
 });
