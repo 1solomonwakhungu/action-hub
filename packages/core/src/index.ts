@@ -91,11 +91,13 @@ export {
   summarizeTokens,
 } from "./auth/index.js";
 export {
+  collectServerSecrets,
   redactArg,
   redactArgs,
   redactRecord,
   redactServerConfig,
   redactUrl,
+  sanitizeErrorForServer,
 } from "./redact.js";
 export type {
   AuthenticatedFetchOptions,

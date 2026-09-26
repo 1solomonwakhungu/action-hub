@@ -50,6 +50,16 @@ function checkHelp(bin) {
   process.stderr.write(`  ok  --help\n`);
 }
 
+function checkDoctor(bin) {
+  const dir = mkdtempSync(join(tmpdir(), "ah-smoke-doctor-"));
+  const cfg = join(dir, "servers.json");
+  writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
+  const { status, stdout } = runBinary(bin, ["doctor", "--config", cfg]);
+  if (status !== 0) fail(`\`doctor\` exited ${status}: ${stdout ?? ""}`);
+  if (!(stdout ?? "").includes("System Diagnostics")) fail(`\`doctor\` output missing diagnostics header`);
+  process.stderr.write(`  ok  doctor (empty config, bundled binary)\n`);
+}
+
 function checkLightweightCommand(bin) {
   const dir = mkdtempSync(join(tmpdir(), "ah-smoke-"));
   const cfg = join(dir, "servers.json");
@@ -173,6 +183,7 @@ async function main() {
   checkHelp(bin);
   checkLightweightCommand(bin);
   checkHarnessExport(bin);
+  checkDoctor(bin);
   checkDaemonLifecycle(bin);
   await checkMcpHandshake(bin);
   process.stderr.write("SMOKE PASS\n");

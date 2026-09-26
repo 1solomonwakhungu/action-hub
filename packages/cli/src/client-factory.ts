@@ -3,11 +3,13 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { context, propagation } from "@opentelemetry/api";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { StringDecoder } from "node:string_decoder";
 import { HUB_HTTP_TOKEN_ENV_VAR } from "@action-hub/copilot-mcp";
 import {
   applyNodeMemoryLimit,
   createHttpAuthBinding,
   isAuthorizationRequired,
+  sanitizeErrorForServer,
   type CallToolOptions,
   type JsonSchema,
   type McpClient,
@@ -48,6 +50,11 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     const client = new Client(CLIENT_INFO, { capabilities: {} });
     const transport = buildTransport(config, options, () => activeHeaders.getStore());
 
+    if (config.transport.type === "stdio") {
+      const stdioTransport = transport as StdioClientTransport;
+      attachSanitizedStderr(stdioTransport, config, options);
+    }
+
     try {
       await client.connect(transport);
     } catch (cause) {
@@ -84,6 +91,90 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
   };
 };
 
+/**
+ * Buffer cap for a child stderr line without newlines. Beyond this the
+ * partial line is sanitized and flushed as-is rather than buffering
+ * unboundedly (fail closed: an over-long line is more likely to carry
+ * secrets than to be meaningful output).
+ */
+const MAX_PENDING_STDERR_BYTES = 8 * 1024;
+
+/**
+ * Pipe a stdio server's stderr and re-emit it sanitized.
+ *
+ * Sanitization is line-buffered, not per-chunk: a secret the child writes in
+ * pieces (or that Node splits across chunk boundaries) must be assembled
+ * before exact-value replacement runs. UTF-8 sequences split across chunks
+ * are decoded correctly via StringDecoder; a final partial line is flushed
+ * when the stream ends or closes. The listener stays attached for the
+ * transport's lifetime so the SDK's PassThrough is always drained.
+ */
+function attachSanitizedStderr(
+  transport: StdioClientTransport,
+  config: ServerConfig,
+  options: SdkClientFactoryOptions,
+): void {
+  const stream = transport.stderr;
+  if (!stream) return;
+
+  const emit = (safe: string): void => {
+    if (options.onWarning) options.onWarning(`${config.id}: ${safe.trimEnd()}`);
+    else process.stderr.write(safe);
+  };
+
+  const decoder = new StringDecoder("utf8");
+  let pending = "";
+  let flushed = false;
+  /** True while we are discarding an over-long line (fail closed). */
+  let discarding = false;
+
+  const flush = (): void => {
+    if (flushed) return;
+    flushed = true;
+    const tail = discarding ? "" : pending + decoder.end();
+    pending = "";
+    if (tail.length > 0) emit(sanitizeErrorForServer(config, tail));
+  };
+
+  stream.on("data", (chunk: Buffer | string) => {
+    pending += decoder.write(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+
+    if (discarding) {
+      // An over-long line is being discarded wholesale: a configured secret
+      // crossing the cap boundary must never be emitted in fragments.
+      const resume = pending.indexOf("\n");
+      if (resume >= 0) {
+        pending = pending.slice(resume + 1);
+        discarding = false;
+      } else {
+        pending = "";
+        return;
+      }
+    }
+
+    let newlineIndex: number;
+    while ((newlineIndex = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, newlineIndex);
+      pending = pending.slice(newlineIndex + 1);
+      emit(`${sanitizeErrorForServer(config, line)}\n`);
+    }
+
+    // Cap is measured in bytes, not JS characters. Exceeding it fails
+    // closed: the buffered logical line is NOT emitted (an unsanitized
+    // prefix could carry most of a configured secret); only a fixed marker
+    // is emitted and the remainder of the line is discarded through the
+    // next newline.
+    if (Buffer.byteLength(pending, "utf8") > MAX_PENDING_STDERR_BYTES) {
+      emit(`[stderr line truncated: ${Buffer.byteLength(pending, "utf8")} bytes discarded]\n`);
+      pending = "";
+      discarding = true;
+    }
+  });
+  stream.on("end", flush);
+  stream.on("close", flush);
+  stream.on("error", flush);
+}
+
 function buildTransport(
   config: ServerConfig,
   options: SdkClientFactoryOptions,
@@ -104,6 +195,10 @@ function buildTransport(
       args: limited.args,
       env: limited.env,
       cwd,
+      // Child stderr must never reach the parent's stderr verbatim: servers
+      // echo their own configuration (tokens, URLs) in crash output. Piped
+      // stderr is sanitized per-server before it is re-emitted.
+      stderr: "pipe",
     });
   }
 

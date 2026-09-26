@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { redactArg, redactArgs, redactRecord, redactServerConfig, redactUrl } from "../dist/redact.js";
+import { redactArg, redactArgs, redactRecord, redactServerConfig, redactUrl, sanitizeErrorForServer } from "../dist/redact.js";
 
 test("redact helpers cover credential-bearing flag, header, URL and record forms", () => {
   const cases: Array<{ label: string; run: () => unknown; expect: unknown | RegExp }> = [
@@ -42,6 +42,38 @@ test("redact helpers cover credential-bearing flag, header, URL and record forms
       assert.deepEqual(result, expect, label);
     }
   }
+});
+
+test("sanitizeErrorForServer uses a low floor and collects header credential parts", () => {
+  // 7-char sensitive flag/env value: collected and replaced despite the floor.
+  const shortServer = {
+    id: "s",
+    transport: {
+      type: "stdio",
+      command: "node",
+      args: ["server.js", "--token", "tkn7xyz"],
+      env: { API_TOKEN: "tkn7xyz" },
+    },
+  } as never;
+  assert.equal(
+    sanitizeErrorForServer(shortServer, "health failed token=tkn7xyz"),
+    "health failed token=[redacted]",
+  );
+
+  // 14-char Bearer token passed via a header form: the credential component
+  // is collected, not just the whole header value.
+  const headerServer = {
+    id: "h",
+    transport: {
+      type: "http",
+      url: "https://example.com/mcp",
+      headers: { Authorization: "Bearer short14token" },
+    },
+  } as never;
+  assert.equal(
+    sanitizeErrorForServer(headerServer, "echo Bearer short14token"),
+    "echo [redacted]",
+  );
 });
 
 test("redactServerConfig redacts stdio and http transports", () => {

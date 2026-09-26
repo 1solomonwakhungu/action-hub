@@ -152,6 +152,87 @@ export function redactUrl(url: string): string {
 }
 
 /**
+ * Collect every secret value present in a server config, for value-based
+ * redaction of strings that may echo configuration (error messages, logs).
+ */
+export function collectServerSecrets(server: ServerConfig): string[] {
+  const secrets: string[] = [];
+  const push = (value: unknown): void => {
+    if (typeof value === "string" && value.length > 0) secrets.push(value);
+  };
+  /** Push a header-style value whole, plus its credential components. */
+  const pushWithParts = (value: string): void => {
+    push(value);
+    const bearer = /\b(Bearer|Basic)\s+(\S+)/i.exec(value);
+    if (bearer && bearer[2] !== undefined) push(bearer[2]);
+    const colon = value.indexOf(":");
+    if (colon >= 0) {
+      const rest = value.slice(colon + 1).trim();
+      if (rest.length > 0) push(rest);
+    }
+  };
+  const transport = server.transport;
+  if (transport.type === "stdio") {
+    for (const value of Object.values(transport.env ?? {})) push(value);
+    let redactNext = false;
+    for (const arg of transport.args ?? []) {
+      if (redactNext) {
+        pushWithParts(arg);
+        redactNext = false;
+        continue;
+      }
+      const flag = /^(--?[^=\s]+)(?:=(.*))?$/s.exec(arg);
+      if (flag && flag[1] !== undefined && (SENSITIVE_NAME_RE.test(flag[1]) || HEADER_FLAG_RE.test(flag[1]))) {
+        if (flag[2] !== undefined) pushWithParts(flag[2]);
+        else redactNext = true;
+        continue;
+      }
+      const bearer = /^(?:[A-Za-z0-9-]+:\s*)?(?:Bearer|Basic)\s+(\S+)$/i.exec(arg);
+      if (bearer && bearer[1] !== undefined) {
+        pushWithParts(arg);
+        continue;
+      }
+      const eq = arg.indexOf("=");
+      if (eq > 0 && SENSITIVE_NAME_RE.test(arg.slice(0, eq))) push(arg.slice(eq + 1));
+    }
+  } else {
+    // The whole URL is a secret carrier: an error echoing it verbatim would
+    // leak userinfo/query values even after per-part redaction.
+    push(transport.url);
+    try {
+      const parsed = new URL(transport.url);
+      push(parsed.username);
+      push(parsed.password);
+      for (const value of parsed.searchParams.values()) push(value);
+    } catch {
+      // Unparseable URL was already collected whole.
+    }
+    for (const value of Object.values(transport.headers ?? {})) pushWithParts(value);
+    if (transport.auth?.clientSecret) push(transport.auth.clientSecret);
+  }
+  return secrets;
+}
+
+/**
+ * Sanitize a string that may echo a server's configuration (error messages,
+ * diagnostics). Uses a dedicated exact-value replacement with a low floor of
+ * 4 characters — config-derived credentials are known values, not
+ * provider-response guesses, so the provider-response 8-character floor does
+ * not apply. Secrets are replaced longest-first so that a value contained in
+ * a longer collected secret is not partially replaced.
+ */
+export function sanitizeErrorForServer(server: ServerConfig, text: string): string {
+  const secrets = collectServerSecrets(server)
+    .filter((value) => value.length >= 4)
+    .sort((a, b) => b.length - a.length);
+  let out = text;
+  for (const secret of secrets) {
+    out = out.split(secret).join(REDACTED);
+  }
+  return redactRawSecrets(out);
+}
+
+/**
  * Produce a display-safe copy of a resolved ServerConfig: env values, stdio
  * args, header values, URL userinfo/query values, and the OAuth auth block
  * are redacted.
