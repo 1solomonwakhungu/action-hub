@@ -237,7 +237,6 @@ if the CLI is not on your `PATH`.) The migration engine discovers MCP servers,
 skills, and plugins from your local agent configurations and merges them into
 the Action Hub config, preserving entries that are already there.
 
-For servers only, `action-hub import` (preview) and `action-hub import
---write` do a servers-only pass. Note that `import --write` does not bring in
-skills, so prefer `migrate --type all --write` when you want servers *and*
-skills.
+For a servers-only look, `action-hub import` previews MCP servers discovered
+from your local agent configurations. It does not bring in skills, so use
+`migrate --type all --write` when you want servers *and* skills written.
