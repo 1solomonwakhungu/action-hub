@@ -13,6 +13,9 @@ test("doctor output contains no secret sentinels from server config", async () =
     "DOCTOR_ARG_TOKEN_35",
     "DOCTOR_ENV_VALUE_35",
     "SPLIT_SECRET_12345",
+    // All-but-one-character prefix: an over-long cap-crossing line must not
+    // leak a substantial fragment of the configured secret either.
+    "SPLIT_SECRET_1234",
   ];
   const tempDir = resolve(tmpdir(), `action-hub-doctor-test-${Date.now()}`);
   await mkdir(tempDir, { recursive: true });
@@ -44,12 +47,13 @@ test("doctor output contains no secret sentinels from server config", async () =
           transport: {
             type: "stdio",
             command: "node",
-            // Writes 8193 spaces plus the first half of the secret (crossing
-            // the 8KB cap boundary), pauses, then the rest + newline. The
-            // over-long line must be truncated fail-closed at the cap.
+            // Writes 8193 spaces plus all but the last character of the
+            // secret (crossing the 8KB cap boundary), pauses, then the last
+            // character + newline. Nothing of the over-long line may be
+            // emitted: only a fixed truncation marker.
             args: [
               "-e",
-              "process.stderr.write(' '.repeat(8193)+process.env.API_TOKEN.slice(0,6));setTimeout(()=>{process.stderr.write(process.env.API_TOKEN.slice(6)+'\\n');process.stderr.write('SAFE_LINE_OK\\n');process.exit(0);},50);",
+              "process.stderr.write(' '.repeat(8193)+process.env.API_TOKEN.slice(0,-1));setTimeout(()=>{process.stderr.write(process.env.API_TOKEN.slice(-1)+'\\n');process.stderr.write('SAFE_LINE_OK\\n');process.exit(0);},50);",
             ],
             env: { API_TOKEN: "SPLIT_SECRET_12345" },
           },

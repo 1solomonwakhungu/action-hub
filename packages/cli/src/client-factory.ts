@@ -160,12 +160,12 @@ function attachSanitizedStderr(
     }
 
     // Cap is measured in bytes, not JS characters. Exceeding it fails
-    // closed: the sanitized first part is emitted followed by a truncation
-    // marker, and the rest of that logical line is discarded up to the next
-    // newline — a configured secret straddling the boundary can never be
-    // revealed as a fragment pair.
+    // closed: the buffered logical line is NOT emitted (an unsanitized
+    // prefix could carry most of a configured secret); only a fixed marker
+    // is emitted and the remainder of the line is discarded through the
+    // next newline.
     if (Buffer.byteLength(pending, "utf8") > MAX_PENDING_STDERR_BYTES) {
-      emit(`${sanitizeErrorForServer(config, pending)} [stderr line truncated]\n`);
+      emit(`[stderr line truncated: ${Buffer.byteLength(pending, "utf8")} bytes discarded]\n`);
       pending = "";
       discarding = true;
     }
