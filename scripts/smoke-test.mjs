@@ -60,6 +60,24 @@ function checkLightweightCommand(bin) {
   process.stderr.write(`  ok  list (empty catalog)\n`);
 }
 
+// The SEA binary must emit a snippet whose command is the binary itself with
+// args ["start"] — never a node invocation of a nonexistent CLI path.
+function checkHarnessExport(bin) {
+  const { status, stdout, stderr } = runBinary(bin, ["harness", "cursor", "--json"]);
+  if (status !== 0) fail(`\`harness cursor --json\` exited ${status}: ${stderr ?? ""}`);
+  let doc;
+  try {
+    doc = JSON.parse(stdout ?? "");
+  } catch {
+    fail(`\`harness cursor --json\` did not print valid JSON`);
+  }
+  const entry = doc?.mcpServers?.["action-hub"];
+  if (!entry) fail(`harness snippet missing mcpServers["action-hub"]`);
+  if (entry.command !== bin) fail(`harness command should be the binary (${bin}), got ${entry.command}`);
+  if (JSON.stringify(entry.args) !== JSON.stringify(["start"])) fail(`harness args should be ["start"], got ${JSON.stringify(entry.args)}`);
+  process.stderr.write(`  ok  harness cursor --json (binary + ["start"])\n`);
+}
+
 function checkDaemonLifecycle(bin) {
   const dir = mkdtempSync(join(tmpdir(), "ah-smoke-daemon-"));
   const cfg = join(dir, "servers.json");
@@ -154,6 +172,7 @@ async function main() {
   checkVersion(bin, version);
   checkHelp(bin);
   checkLightweightCommand(bin);
+  checkHarnessExport(bin);
   checkDaemonLifecycle(bin);
   await checkMcpHandshake(bin);
   process.stderr.write("SMOKE PASS\n");
