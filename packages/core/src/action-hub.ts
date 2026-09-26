@@ -274,6 +274,17 @@ export class ActionHub {
     this.rebuildSemanticIndex();
   }
 
+  /**
+   * Replaces the entire skill set: existing skill records are dropped first
+   * (including ones restored from a warm catalog cache), then the given
+   * records are registered. This keeps skills always-live with the current
+   * config + skills directory, including removals.
+   */
+  replaceSkills(records: readonly Omit<ActionRecord, "kind">[]): void {
+    this.#catalog.removeKind("skill");
+    this.registerSkills(records);
+  }
+
   /** Cheap, schema-free retrieval. */
   async search(query: string, options?: SearchOptions): Promise<SearchHit[]> {
     return this.#telemetry.withActiveSpan(

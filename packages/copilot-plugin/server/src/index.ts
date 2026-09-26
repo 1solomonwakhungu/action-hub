@@ -3,8 +3,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { pathToFileURL } from "node:url";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { z } from "zod";
-import { ActionHub, ActionHubError, CatalogCache, bootstrapCatalog } from "@action-hub/core";
+import {
+  ActionHub,
+  ActionHubError,
+  CatalogCache,
+  bootstrapCatalog,
+  discoverSkillsFromDirectory,
+} from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { startControlServer, type ControlServer } from "./control.js";
 import { createSdkClientFactory } from "./sdk-client.js";
@@ -78,9 +86,34 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
     approvals: { ttlMs: config.approvalTtlMs },
   });
 
-  if (config.skills && config.skills.length > 0) {
-    hub.registerSkills(
-      config.skills.map((s) => ({
+  // Skills are local and cheap, so they are treated as always-live: after the
+  // catalog is restored from the warm cache (which may contain stale skill
+  // records), the entire skill set is replaced with the current config +
+  // skills-directory set — including removals.
+  const skillsDir = process.env["ACTION_HUB_SKILLS_DIR"] ?? resolve(homedir(), ".action-hub", "skills");
+  const dirSkills = await discoverSkillsFromDirectory(skillsDir);
+  const configSkillIds = new Set((config.skills ?? []).map((s) => s.id));
+  const skillRecords = [
+    ...(config.skills ?? []).map((s) => ({
+      id: s.id,
+      name: s.name,
+      serverId: s.sourceClient ?? "skills",
+      summary: s.summary,
+      description: s.description,
+      tags: s.tags,
+      trust: s.trust ?? "trusted",
+    })),
+    ...dirSkills
+      .filter((s) => {
+        if (configSkillIds.has(s.id)) {
+          warn(
+            `skill "${s.id}" is defined in both ${configPath} and ${skillsDir}; the config entry wins`,
+          );
+          return false;
+        }
+        return true;
+      })
+      .map((s) => ({
         id: s.id,
         name: s.name,
         serverId: s.sourceClient ?? "skills",
@@ -89,8 +122,7 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
         tags: s.tags,
         trust: s.trust ?? "trusted",
       })),
-    );
-  }
+  ];
 
   const cache = new CatalogCache({ onWarning: warn });
 
@@ -101,6 +133,8 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
     cache,
     onWarning: warn,
   });
+
+  hub.replaceSkills(skillRecords);
 
   bootstrap.refreshed.then(
     (results) => {

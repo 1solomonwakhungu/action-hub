@@ -575,7 +575,7 @@ export function parseSkillContent(
  */
 export async function discoverSkills(options: DiscoveryOptions = {}): Promise<DiscoveredSkill[]> {
   const discovered: DiscoveredSkill[] = [];
-  const seenIds = new Set<string>();
+  const seenIds = new Map<string, string>();
 
   // Check direct .cursorrules in cwd
   if (!options.skipDefaults) {
@@ -587,7 +587,7 @@ export async function discoverSkills(options: DiscoveryOptions = {}): Promise<Di
       skill.id = "skill:cursorrules";
       skill.name = "Cursor Rules";
       discovered.push(skill);
-      seenIds.add(skill.id);
+      seenIds.set(skill.id, cursorRulesPath);
     } catch {
       // Missing .cursorrules is normal
     }
@@ -603,47 +603,108 @@ export async function discoverSkills(options: DiscoveryOptions = {}): Promise<Di
           const content = await readFile(dir, "utf8");
           const skill = parseSkillContent(content, dir, client);
           if (!seenIds.has(skill.id)) {
-            seenIds.add(skill.id);
+            seenIds.set(skill.id, dir);
             discovered.push(skill);
           }
         }
         continue;
       }
 
-      const entries = await readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          // Look for SKILL.md inside skill subdirectory
-          const skillMdPath = join(fullPath, "SKILL.md");
-          try {
-            const content = await readFile(skillMdPath, "utf8");
-            const skill = parseSkillContent(content, skillMdPath, client);
-            if (!seenIds.has(skill.id)) {
-              seenIds.add(skill.id);
-              discovered.push(skill);
-            }
-          } catch {
-            // No SKILL.md in this directory
-          }
-        } else if (entry.isFile()) {
-          const ext = extname(entry.name);
-          if (ext === ".md" || ext === ".mdc") {
-            const content = await readFile(fullPath, "utf8");
-            const skill = parseSkillContent(content, fullPath, client);
-            if (!seenIds.has(skill.id)) {
-              seenIds.add(skill.id);
-              discovered.push(skill);
-            }
-          }
-        }
-      }
+  await scanSkillDirectory(dir, client, seenIds, discovered);
     } catch {
       // Directory missing or unreadable
     }
   }
 
   return discovered;
+}
+
+/**
+ * Scans a single directory for skills: a `SKILL.md` inside each
+ * subdirectory, plus top-level `.md`/`.mdc` files. Uses the canonical
+ * `parseSkillContent` parser. A missing or unreadable directory simply
+ * yields no skills.
+ */
+export async function discoverSkillsFromDirectory(
+  dirPath: string,
+  sourceClient: DiscoveredSkill["sourceClient"] = "custom",
+  onWarning: (message: string) => void = (message) =>
+    process.stderr.write(`action-hub: ${message}\n`),
+): Promise<DiscoveredSkill[]> {
+  const discovered: DiscoveredSkill[] = [];
+  try {
+    const entries = await readdir(dirPath, { withFileTypes: true });
+    if (entries.length === 0) return discovered;
+  } catch {
+    // Directory missing or unreadable: no skills.
+    return discovered;
+  }
+  await scanSkillDirectory(dirPath, sourceClient, new Map(), discovered, onWarning);
+  return discovered;
+}
+
+function describeFailure(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
+/** Shared directory scanner used by `discoverSkills` and `discoverSkillsFromDirectory`. */
+async function scanSkillDirectory(
+  dir: string,
+  client: DiscoveredSkill["sourceClient"],
+  seenIds: Map<string, string>,
+  discovered: DiscoveredSkill[],
+  onWarning?: (message: string) => void,
+): Promise<void> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  // Deterministic winner for duplicate ids: first entry by name wins.
+  const sorted = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of sorted) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      // Look for SKILL.md inside skill subdirectory
+      const skillMdPath = join(fullPath, "SKILL.md");
+      let content: string;
+      try {
+        content = await readFile(skillMdPath, "utf8");
+      } catch (cause) {
+        // A single unreadable skill must never abort discovery.
+        onWarning?.(
+          `skipping unreadable skill "${skillMdPath}": ${describeFailure(cause)}`,
+        );
+        continue;
+      }
+      const skill = parseSkillContent(content, skillMdPath, client);
+      const previous = seenIds.get(skill.id);
+      if (previous) {
+        onWarning?.(
+          `duplicate skill id "${skill.id}": "${previous}" wins over "${skillMdPath}"`,
+        );
+        continue;
+      }
+      seenIds.set(skill.id, skillMdPath);
+      discovered.push(skill);
+    } else if (entry.isFile()) {
+      const ext = extname(entry.name);
+      if (ext === ".md" || ext === ".mdc") {
+        let content: string;
+        try {
+          content = await readFile(fullPath, "utf8");
+        } catch (cause) {
+          // A single unreadable skill must never abort discovery.
+          onWarning?.(`skipping unreadable skill "${fullPath}": ${describeFailure(cause)}`);
+          continue;
+        }
+        const skill = parseSkillContent(content, fullPath, client);
+        const previous = seenIds.get(skill.id);
+        if (previous) {
+          onWarning?.(`duplicate skill id "${skill.id}": "${previous}" wins over "${fullPath}"`);
+          continue;
+        }
+        seenIds.set(skill.id, fullPath);
+        discovered.push(skill);
+      }
+    }
+  }
 }
 
 /**
