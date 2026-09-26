@@ -934,7 +934,13 @@ async function main() {
       daemonChild = spawn("node", [cli, "daemon", "start"], { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
       daemonChild.stdout.on("data", () => {}); // drain
       daemonChild.stderr.on("data", () => {}); // drain
-      for (let i = 0; i < 300; i++) {
+      // F35: with --fault, HARNESS_E2E_READINESS_MS may shorten the readiness
+      // wait so the fault proof runs in seconds; honoured ONLY under --fault —
+      // the production budget (150 s) is unchanged.
+      const readinessMs = FAULT !== "none" && process.env["HARNESS_E2E_READINESS_MS"]
+        ? Math.max(1000, Number(process.env["HARNESS_E2E_READINESS_MS"]) || 150000)
+        : 150000;
+      for (let i = 0; i < Math.ceil(readinessMs / 500); i++) {
         await new Promise((r) => setTimeout(r, 500));
         if (existsSync(join(env["ACTION_HUB_DAEMON_DIR"], "daemon.json"))) break;
       }
@@ -1043,6 +1049,7 @@ async function main() {
   } catch (cause) {
     summary.errors.push(`fatal: ${cause?.stack ?? String(cause)}`);
   } finally {
+    summary.wallMs = Date.now() - started; // always present, even on failure
     // Orphan safety (S6-R3 #6/#7): stop the daemon by CLI (result checked),
     // then by the recorded pid group, then verify it is gone. Root removal
     // happens only AFTER teardown so daemon.json stays readable on failure.
