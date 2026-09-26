@@ -2,7 +2,6 @@ import { mkdir, readFile, realpathSync, writeFile, copyFile } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
-import { createRequire } from "node:module";
 import { parse as tomlParse, stringify as tomlStringify } from "smol-toml";
 
 const copyFileP = promisify(copyFile);
@@ -82,30 +81,24 @@ interface HarnessDef {
 }
 
 /** Build the command that runs this CLI's `start` subcommand. */
-function cliServerEntry(configPath?: string): ServerEntry {
-  // Node entrypoint: node <realpath of this CLI>, start.
+async function cliServerEntry(configPath?: string): Promise<ServerEntry> {
   // Standalone (SEA) binary: process.execPath, start.
-  let args: string[];
-  if (checkSea()) {
-    args = ["start"];
-  } else {
-    args = [realpathSync(process.argv[1] ?? "action-hub"), "start"];
+  // Node entrypoint: node <realpath of this CLI>, start.
+  let sea: { isSea?: () => boolean } | undefined;
+  try {
+    sea = (await import("node:sea")) as { isSea?: () => boolean };
+  } catch {
+    /* Node without node:sea */
   }
+  const inSea = typeof sea?.isSea === "function" && sea.isSea();
+  const args = inSea
+    ? ["start"]
+    : [realpathSync(process.argv[1] ?? "action-hub"), "start"];
   const entry: ServerEntry = { command: process.execPath, args };
   if (configPath) {
     entry.env = { ACTION_HUB_CONFIG: configPath };
   }
   return entry;
-}
-
-const nodeRequire = createRequire(import.meta.url);
-
-function checkSea(): boolean {
-  try {
-    return nodeRequire("node:sea").isSea === true;
-  } catch {
-    return false;
-  }
 }
 
 function defaultConfigPath(): string {
@@ -356,7 +349,7 @@ export async function harnessCommand(
     );
   }
 
-  const serverEntry = cliServerEntry(options.configPath);
+  const serverEntry = await cliServerEntry(options.configPath);
 
   if (mode === "install") {
     const filePath = def.configPath(homedir());
