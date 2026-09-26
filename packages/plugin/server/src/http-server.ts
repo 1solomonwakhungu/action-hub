@@ -200,9 +200,14 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
         await requestTransport.handleRequest(req, res, parsedBody);
         // F23 rework: stateless HTTP clients may skip the initialize
         // handshake, so the deferred refresh is also triggered after the
-        // first fully handled request. Memoised in the runtime — repeated
+        // first request — but only AFTER the response has flushed and off
+        // this callback's turn (setImmediate), so the authoritative re-index
+        // can never extend the client-observed response latency even if its
+        // work is synchronous. Memoised in the runtime, so repeated
         // stateless requests cannot duplicate it.
-        runtime.startRefresh();
+        const trigger = () => setImmediate(() => runtime.startRefresh());
+        if (res.writableFinished) trigger();
+        else res.once("finish", trigger);
       } finally {
         await requestTransport.close().catch(() => undefined);
       }

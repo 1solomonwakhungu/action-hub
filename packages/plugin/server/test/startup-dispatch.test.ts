@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
+import { spawn } from "node:child_process";
 import { test } from "node:test";
 import { ActionHub, CatalogCache } from "@action-hub/core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -270,3 +272,109 @@ test("F23 rework: HTTP stateless requests start the refresh once, after the firs
     else process.env["ACTION_HUB_CONFIG"] = prevConfig;
   }
 });
+test("F23 rework: the initialize response arrives before the deferred refresh starts", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "hub-order-"));
+  const configPath = join(tmp, "config.json");
+  await writeFile(configPath, JSON.stringify({ autoDiscover: false }), "utf8");
+  const prevConfig = process.env["ACTION_HUB_CONFIG"];
+  process.env["ACTION_HUB_CONFIG"] = configPath;
+  try {
+    const runtime = await createHubRuntime();
+    const order: string[] = [];
+    // Deliberately blocking refresh: if the trigger ever fires before the
+    // initialize response, awaiting it would stall the handshake.
+    runtime.startRefresh = () => {
+      order.push("refresh-start");
+      return new Promise(() => {}); // never resolves
+    };
+    const server = createMcpServer(runtime);
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    // Intercept SERVER->client sends (the client overwrites its own inbound
+    // handler on connect, so the response must be recorded server-side).
+    const realSend = serverTransport.send.bind(serverTransport);
+    (serverTransport as unknown as { send: (msg: unknown) => Promise<void> }).send = async (msg: unknown) => {
+      const m = msg as { id?: unknown; result?: unknown };
+      if (m.id !== undefined && m.result !== undefined) order.push("initialize-response");
+      await realSend(msg as Parameters<typeof realSend>[0]);
+    };
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    assert.ok(order.includes("initialize-response"), "initialize response sent");
+    assert.ok(order.includes("refresh-start"), "refresh trigger fired");
+    assert.equal(
+      order.indexOf("initialize-response") < order.indexOf("refresh-start"),
+      true,
+      `initialize response must precede the refresh trigger: ${order.join(",")}`,
+    );
+    await client.close();
+    await server.close();
+    await runtime.close();
+  } finally {
+    if (prevConfig === undefined) delete process.env["ACTION_HUB_CONFIG"];
+    else process.env["ACTION_HUB_CONFIG"] = prevConfig;
+  }
+});
+
+test("F23 rework 2: synchronous refresh work cannot extend client-observed initialize latency (HTTP)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "hub-http-lat-"));
+  const configPath = join(tmp, "config.json");
+  await writeFile(configPath, JSON.stringify({ autoDiscover: false }), "utf8");
+  const prevConfig = process.env["ACTION_HUB_CONFIG"];
+  process.env["ACTION_HUB_CONFIG"] = configPath;
+  try {
+    const { startHttpServer } = await import("../dist/http-server.js");
+    // Seed run (cold) so the test runtime is warm.
+    const seed = await startHttpServer({ port: 0, token: "tok" });
+    await seed.close();
+    const handle = await startHttpServer({ port: 0, token: "tok" });
+    const SYNC_COST_MS = 300;
+    let refreshRan = 0;
+    handle.runtime.startRefresh = () => {
+      // Deliberately synchronous index-shaped work: if this ran on the
+      // response-critical path, an independent client would observe the full
+      // cost added to its initialize latency.
+      const start = Date.now();
+      while (Date.now() - start < SYNC_COST_MS) { /* busy */ }
+      refreshRan += 1;
+      return Promise.resolve([]);
+    };
+    // The measuring client runs in a CHILD PROCESS so its event loop is
+    // independent of this process (an in-process fetch would be delayed by
+    // the busy loop regardless of server-side ordering).
+    const child = spawn(process.execPath, [
+      "-e",
+      `const { performance } = require("node:perf_hooks");
+       const t = performance.now();
+       fetch("http://127.0.0.1:${handle.port}/mcp", {
+         method: "POST",
+         headers: { authorization: "Bearer tok", "content-type": "application/json" },
+         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } })
+       }).then(async (r) => { await r.arrayBuffer(); console.log(JSON.stringify({ ms: Math.round(performance.now() - t) })); })
+        .catch((e) => console.log(JSON.stringify({ ms: -1, error: String(e) })));`,
+    ]);
+    let stdout = "";
+    child.stdout.on("data", (c: Buffer) => { stdout += String(c); });
+    const latency = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("child client timed out")), 15000);
+      child.on("exit", () => {
+        clearTimeout(timer);
+        try { resolve(JSON.parse(stdout.trim().split("\n").pop() ?? "{}").ms as number); }
+        catch (cause) { reject(cause as Error); }
+      });
+    });
+    assert.ok(latency > 0, `child client failed: ${stdout.slice(0, 200)}`);
+    assert.ok(
+      latency < SYNC_COST_MS,
+      `client-observed initialize latency (${latency}ms) must stay below the synchronous refresh cost (${SYNC_COST_MS}ms)`,
+    );
+    // The refresh still ran (after the flushed response, off-turn).
+    await new Promise((resolve) => setTimeout(resolve, SYNC_COST_MS + 100));
+    assert.equal(refreshRan, 1, "refresh triggered exactly once, after the response");
+    await handle.close();
+  } finally {
+    if (prevConfig === undefined) delete process.env["ACTION_HUB_CONFIG"];
+    else process.env["ACTION_HUB_CONFIG"] = prevConfig;
+  }
+});
+
