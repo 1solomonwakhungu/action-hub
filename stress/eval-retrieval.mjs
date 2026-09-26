@@ -24,68 +24,97 @@
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import * as os from "node:os";
+import { join, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActionHub, createLocalSemanticScorer, parseSkillContent } from "../packages/core/dist/index.js";
 
-// ---- isolation (contract + ISOLATION.md checklist) ---------------------------
-// One fresh temp root; EVERY path-bearing env var is REPLACED (never forwarded
-// from the caller). The real owner home is derived independently of $HOME and
-// the run refuses to start if any resolved path lies inside it.
-import { homedir, userInfo } from "node:os";
-const realOwnerHome = userInfo().homedir ?? homedir();
-const isoRoot = mkdtempSync(join(tmpdir(), "action-hub-eval-"));
-for (const d of ["cache", "config", "state", "data", join("cache", "action-hub"), join("config", "action-hub"), "daemon", "credentials", "skills", "pi"]) {
-  mkdirSync(join(isoRoot, d), { recursive: true });
-}
-const ISO_ENV = {
-  HOME: isoRoot,
-  USERPROFILE: isoRoot,
-  APPDATA: join(isoRoot, "config"),
-  LOCALAPPDATA: join(isoRoot, "cache"),
-  XDG_CACHE_HOME: join(isoRoot, "cache"),
-  XDG_CONFIG_HOME: join(isoRoot, "config"),
-  XDG_STATE_HOME: join(isoRoot, "state"),
-  XDG_DATA_HOME: join(isoRoot, "data"),
-  ACTION_HUB_CONFIG: join(isoRoot, "config", "servers.json"),
-  ACTION_HUB_CACHE: join(isoRoot, "cache", "action-hub"),
-  ACTION_HUB_SKILLS_DIR: join(isoRoot, "skills"),
-  ACTION_HUB_DAEMON_DIR: join(isoRoot, "daemon"),
-  ACTION_HUB_CREDENTIALS: join(isoRoot, "credentials"),
-  PI_CODING_AGENT_DIR: join(isoRoot, "pi"),
-};
-for (const [key, value] of Object.entries(ISO_ENV)) process.env[key] = value;
-// Sentinel self-check (ISOLATION.md rev 21:27Z): validate FINAL env values
-// after every assignment. All path-bearing vars must resolve inside the run
-// root; refuse only paths inside the owner's REAL app-state/harness dirs —
-// NOT anything under home (os.tmpdir() itself sits under USERPROFILE on
-// Windows, so whole-home refusal would break Windows). Containment uses
-// separator-safe path.relative, never startsWith.
-import { relative, isAbsolute } from "node:path";
-const isInside = (child, parent) => {
-  const rel = relative(parent, child);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-};
-const forbiddenOwnerDirs = [
-  join(realOwnerHome, ".cache", "action-hub"),
-  join(realOwnerHome, ".config", "action-hub"),
-  join(realOwnerHome, ".action-hub"),
-  join(realOwnerHome, ".claude"),
-  join(realOwnerHome, ".codex"),
-  join(realOwnerHome, ".gemini"),
-  join(realOwnerHome, ".agents"),
-].filter((p) => !isInside(p, isoRoot));
-for (const [key, value] of Object.entries(ISO_ENV)) {
-  const resolved = resolve(value);
-  if (!isInside(resolved, isoRoot)) {
-    throw new Error(`isolation sentinel failed: ${key}=${resolved} escapes run root`);
-  }
+// ---- isolation (ISOLATION.md checklist, rev 21:27Z + reviewer-2 rework) ------
+// The ENTIRE setup runs inside the failure envelope (see the bottom-of-file
+// runner): any throw here produces the final JSON summary on stdout and a
+// nonzero exit. All path-bearing env vars are REPLACED under ONE fresh temp
+// root; the real owner home is derived independently of $HOME.
+function setupIsolation() {
+  const { homedir, userInfo, tmpdir } = os;
+  const realOwnerHome = userInfo().homedir ?? homedir();
+  const isInside = (child, parent) => {
+    const rel = relative(parent, child);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  };
+
+  // Owner app-state / harness dirs we must never touch. macOS + Windows Action
+  // Hub locations, plus cursor/copilot/pi harness dirs. Whole-home refusal is
+  // deliberately NOT applied: os.tmpdir() itself sits under USERPROFILE on
+  // Windows.
+  const forbiddenOwnerDirs = [
+    join(realOwnerHome, ".cache", "action-hub"),
+    join(realOwnerHome, ".config", "action-hub"),
+    join(realOwnerHome, ".action-hub"),
+    join(realOwnerHome, "Library", "Application Support", "action-hub"),
+    join(realOwnerHome, "Library", "Caches", "action-hub"),
+    join(realOwnerHome, "AppData", "Roaming", "action-hub"),
+    join(realOwnerHome, "AppData", "Local", "action-hub"),
+    join(realOwnerHome, ".claude"),
+    join(realOwnerHome, "Library", "Application Support", "Claude"),
+    join(realOwnerHome, ".codex"),
+    join(realOwnerHome, ".cursor"),
+    join(realOwnerHome, ".copilot"),
+    join(realOwnerHome, ".pi"),
+    join(realOwnerHome, ".gemini"),
+    join(realOwnerHome, ".agents"),
+  ];
+
+  // Validate the system temp dir BEFORE creating anything in it.
+  const sysTmp = resolve(tmpdir());
   for (const forbidden of forbiddenOwnerDirs) {
-    if (isInside(resolved, forbidden)) {
-      throw new Error(`isolation refused: ${key}=${resolved} is inside the owner's real state dir ${forbidden}`);
+    if (isInside(sysTmp, forbidden)) {
+      throw new Error(`isolation refused: system tmpdir ${sysTmp} is inside owner state ${forbidden}`);
     }
   }
+
+  const isoRoot = mkdtempSync(join(sysTmp, "action-hub-eval-"));
+  for (const d of ["cache", "config", "state", "data", join("cache", "action-hub"), join("config", "action-hub"), "daemon", "credentials", "skills", "pi", "codex", "claude", "tmp"]) {
+    mkdirSync(join(isoRoot, d), { recursive: true });
+  }
+
+  // File-shaped vars get FILE paths; dir-shaped vars get DIR paths.
+  const ISO_ENV = {
+    HOME: isoRoot,
+    USERPROFILE: isoRoot,
+    APPDATA: join(isoRoot, "config"),
+    LOCALAPPDATA: join(isoRoot, "cache"),
+    TMPDIR: join(isoRoot, "tmp"),
+    TMP: join(isoRoot, "tmp"),
+    TEMP: join(isoRoot, "tmp"),
+    XDG_CACHE_HOME: join(isoRoot, "cache"),
+    XDG_CONFIG_HOME: join(isoRoot, "config"),
+    XDG_STATE_HOME: join(isoRoot, "state"),
+    XDG_DATA_HOME: join(isoRoot, "data"),
+    ACTION_HUB_CONFIG: join(isoRoot, "config", "servers.json"),
+    ACTION_HUB_CACHE: join(isoRoot, "cache", "action-hub", "catalog.json"),
+    ACTION_HUB_SKILLS_DIR: join(isoRoot, "skills"),
+    ACTION_HUB_DAEMON_DIR: join(isoRoot, "daemon"),
+    ACTION_HUB_CREDENTIALS: join(isoRoot, "credentials", "credentials.json"),
+    ACTION_HUB_CONTROL: join(isoRoot, "cache", "action-hub", "control.json"),
+    PI_CODING_AGENT_DIR: join(isoRoot, "pi"),
+    CODEX_HOME: join(isoRoot, "codex"),
+    CLAUDE_CONFIG_DIR: join(isoRoot, "claude"),
+  };
+
+  // Validate FINAL env values after assignment (sentinel self-check).
+  for (const [key, value] of Object.entries(ISO_ENV)) {
+    process.env[key] = value;
+    const resolved = resolve(value);
+    if (!isInside(resolved, isoRoot)) {
+      throw new Error(`isolation sentinel failed: ${key}=${resolved} escapes run root`);
+    }
+    for (const forbidden of forbiddenOwnerDirs) {
+      if (isInside(resolved, forbidden)) {
+        throw new Error(`isolation refused: ${key}=${resolved} is inside the owner's real state dir ${forbidden}`);
+      }
+    }
+  }
+  return isoRoot;
 }
 
 const STRESS_DIR = resolve(fileURLToPath(import.meta.url), "..");
@@ -93,7 +122,6 @@ const GENERATED = join(STRESS_DIR, ".generated");
 const RESULTS_DIR = join(GENERATED, "results");
 const ARGV = new Set(process.argv.slice(2));
 const QUICK = ARGV.has("--quick");
-const SWEEP_ONLY = ARGV.has("--sweep-only");
 const SEED = 0x5eed;
 const PREFIXES = [100, 1000, 5000, 10000, 15000];
 const GATES = {
@@ -441,10 +469,13 @@ const ENGINE_DESC = {
 };
 
 async function warmAndTime(hub, queries) {
-  const withTimeout = (promise, ms, label) => Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout: ${label} exceeded ${ms}ms`)), ms)),
-  ]);
+  const withTimeout = (promise, ms, label) => {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timeout: ${label} exceeded ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  };
   for (const q of queries) await withTimeout(hub.search(q.query, { limit: 20 }), 30_000, `warmup "${q.query.slice(0, 40)}"`);
   const rows = [];
   const latencies = [];
@@ -622,23 +653,46 @@ function goldsOf(q) {
   return q.expected == null ? [] : [q.expected];
 }
 
+/**
+ * Fail-closed corpus validation (reviewer-2 blocker 5): a partial or
+ * malformed fixture set must never silently pass as "full-generated".
+ */
+function validateGeneratedCorpus({ manifests, skills, queries, idMismatches }) {
+  const errors = [];
+  const toolCount = manifests.reduce((s, m) => s + m.tools.length, 0);
+  if (manifests.length !== 44) errors.push(`expected 44 server manifests, got ${manifests.length}`);
+  if (toolCount !== 10000) errors.push(`expected 10,000 tools, got ${toolCount}`);
+  if (skills.length !== 5000) errors.push(`expected 5,000 skills, got ${skills.length}`);
+  if (queries.length !== 1500) errors.push(`expected 1,500 queries, got ${queries.length}`);
+  if ((idMismatches ?? 0) !== 0) errors.push(`${idMismatches} skill id mismatches vs parseSkillContent`);
+  for (const q of queries) {
+    if (typeof q.query !== "string" || q.query.trim() === "") { errors.push(`invalid query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
+    const hasExpected = typeof q.expected === "string" || q.expected === null;
+    const hasExpectedAll = Array.isArray(q.expectedAll);
+    if (!hasExpected && !hasExpectedAll) { errors.push(`query without expected/expectedAll: ${String(q.query).slice(0, 60)}`); break; }
+    if (hasExpectedAll && (q.expectedAll.length < 2 || q.expectedAll.length > 4 || q.expectedAll.some((g) => typeof g !== "string"))) {
+      errors.push(`invalid expectedAll on: ${String(q.query).slice(0, 60)}`); break;
+    }
+  }
+  const uniqueQueries = new Set(queries.map((q) => q.query));
+  if (uniqueQueries.size !== queries.length) errors.push(`duplicate query strings: ${queries.length - uniqueQueries.size}`);
+  if (errors.length > 0) throw new Error(`generated corpus failed fail-closed validation:\n- ${errors.join("\n- ")}`);
+}
+
 async function main() {
   mkdirSync(RESULTS_DIR, { recursive: true });
 
   // --- corpus ------------------------------------------------------------------
-  let manifests, skills, queries, idMismatches = 0, mode = "self-fixtures";
+  let manifests, skills, queries, mode = "self-fixtures";
   const generated = loadGenerated();
+  const idMismatches = generated?.idMismatches ?? 0;
   if (generated) {
     manifests = generated.manifests;
     skills = generated.skills;
     queries = generated.queries;
     mode = "full-generated";
-    console.error(`[eval-retrieval] using generated corpus: ${manifests.length} servers, ${skills.length} skills, ${queries.length} queries`);
-  } else if (generated) {
-    manifests = generated.manifests;
-    skills = generated.skills;
-    queries = generated.queries;
-    mode = "full-generated";
+    // Fail closed on malformed/partial full fixtures (reviewer-2 blocker 5).
+    validateGeneratedCorpus({ manifests, skills, queries, idMismatches: generated.idMismatches ?? 0 });
     console.error(`[eval-retrieval] using generated corpus: ${manifests.length} servers, ${skills.length} skills, ${queries.length} queries`);
   } else {
     ({ tools } = syntheticCatalog(QUICK ? 2 : DOMAINS.length));
@@ -660,48 +714,69 @@ async function main() {
   const totalQueries = queries.length;
   queries = queries.filter((q) => goldsOf(q).every((g) => catalogIds.has(g)));
   const excluded = totalQueries - queries.length;
-  if (excluded > 0) console.error(`[eval-retrieval] excluded ${excluded} queries whose gold ids are not in the catalog`);
+  if (excluded > 0) {
+    // Fail closed: a full corpus with missing gold ids is malformed, not
+    // merely smaller (reviewer-2 blocker 5).
+    if (mode === "full-generated") {
+      throw new Error(`fail-closed: ${excluded}/${totalQueries} queries reference gold ids absent from the corpus`);
+    }
+    console.error(`[eval-retrieval] excluded ${excluded} queries whose gold ids are not in the catalog`);
+  }
 
-  // The scorer engine re-embeds on demand and is the slowest path; the
-  // contract's full-scale numbers come from keyword + blend on ALL queries,
-  // while scorer runs on a deterministic 300-query subset (noted in output).
-  const engineQuerySets = {
-    keyword: queries,
-    blend: queries,
-    scorer: (() => { const r = mulberry32(SEED ^ 0xa11ce); return sampleN(queries, Math.min(300, queries.length), r); })(),
-  };
+  // Engine comparison runs ALL THREE engines on ONE fixed, identical query
+  // sample (reviewer-2 blocker: no side-by-side recall on different samples).
+  // Gates are then computed from keyword+blend on the FULL query set.
+  const fixedEvalSample = (() => { const r = mulberry32(SEED ^ 0xe11a); return sampleN(queries, Math.min(300, queries.length), r); })();
   const results = {};
-  const engineRows = {};
   for (const name of ENGINE_NAMES) {
-    const engineQueries = engineQuerySets[name];
     const t0 = performance.now();
     const { hub, buildMs } = await buildEngine(name, manifests, skills);
     const engineBuildMs = Number((performance.now() - t0).toFixed(0));
-    const { rows, latencies } = await warmAndTime(hub, engineQueries);
+    const { rows, latencies } = await warmAndTime(hub, fixedEvalSample);
     const scored = scoreEngine(rows, latencies);
     results[name] = {
       description: ENGINE_DESC[name], buildMs, engineBuildMs, ...scored,
-      totalResponseTokens: rows.reduce((s, r) => s + r.responseTokens, 0),
+      querySample: { size: fixedEvalSample.length, note: "identical fixed sample for all engines" },
     };
-    engineRows[name] = rows;
-    console.error(`[eval-retrieval] ${name}: recall@5=${scored.recallAt5?.toFixed?.(3)} mrr@10=${scored.mrrAt10?.toFixed?.(3)} p95=${scored.latency.warmP95Ms}ms`);
+    console.error(`[eval-retrieval] ${name} (n=${fixedEvalSample.length}): recall@5=${scored.recallAt5?.toFixed?.(3)} mrr@10=${scored.mrrAt10?.toFixed?.(3)} p95=${scored.latency.warmP95Ms}ms`);
+    await hub.close?.();
+  }
+
+  // Full-query-set runs for the GATE numbers (keyword + blend only; the
+  // scorer engine is not needed at full scale and is excluded from gates).
+  const gateRows = {};
+  for (const name of SWEEP_ENGINES) {
+    const { hub, buildMs } = await buildEngine(name, manifests, skills);
+    const { rows, latencies } = await warmAndTime(hub, queries);
+    gateRows[name] = { scored: scoreEngine(rows, latencies), rows, buildMs };
+    console.error(`[eval-retrieval] gates ${name} (n=${queries.length}): recall@5=${gateRows[name].scored.recallAt5?.toFixed?.(3)} p95=${gateRows[name].scored.latency.warmP95Ms}ms`);
     await hub.close?.();
   }
 
   // --- prefix sweep ---------------------------------------------------------------
   const sweep = [];
+  // ONE fixed latency sample for every prefix (reviewer-2 blocker 3). Recall
+  // uses only the golds-present subset of this same fixed sample; both counts
+  // are reported per row.
+  const fixedLatencySample = (() => { const r = mulberry32(SEED ^ 0x7a7); return sampleN(queries, Math.min(100, queries.length), r); })();
   for (const size of PREFIXES) {
-    const toolTake = Math.round(size * 0.9);
-    const skillTake = Math.max(0, size - toolTake);
-    const prefixTools = manifests.flatMap((m) => m.tools).slice(0, Math.min(toolTake, manifests.reduce((s, m) => s + m.tools.length, 0)));
+    const totalTools = manifests.reduce((s, m) => s + m.tools.length, 0);
+    const toolTake = Math.min(totalTools, size);
+    const skillTake = Math.max(0, Math.min(skills.length, size - toolTake));
+    // Preserve serverId when flattening (blocker 3): bare manifest tools do
+    // not carry it, which previously collapsed every prefix under "undefined".
+    const prefixTools = manifests
+      .flatMap((m) => m.tools.map((t) => ({ ...t, serverId: m.serverId })))
+      .slice(0, toolTake);
     const prefixManifests = groupTools(prefixTools);
     const prefixSkills = skills.slice(0, skillTake);
     const ids = new Set([
       ...prefixManifests.flatMap((m) => m.tools.map((t) => `${m.serverId}:${t.name}`)),
       ...prefixSkills.map((s) => s.id),
     ]);
-    const usable = queries.filter((q) => goldsOf(q).every((g) => ids.has(g)));
-    const row = { prefixSize: size, toolCount: prefixManifests.reduce((s, m) => s + m.tools.length, 0), skillCount: prefixSkills.length, queriesUsed: usable.length, queriesExcluded: queries.length - usable.length, engines: {} };
+    const usable = fixedLatencySample.filter((q) => goldsOf(q).every((g) => ids.has(g)));
+    const actualSize = toolTake + skillTake;
+    const row = { requestedSize: size, prefixSize: actualSize, toolCount: prefixManifests.reduce((s, m) => s + m.tools.length, 0), skillCount: prefixSkills.length, queriesUsed: usable.length, queriesExcluded: fixedLatencySample.length - usable.length, engines: {} };
     for (const name of SWEEP_ENGINES) {
       const { hub, buildMs } = await buildEngine(name, prefixManifests, prefixSkills);
       const { rows, latencies } = await warmAndTime(hub, usable);
@@ -718,33 +793,44 @@ async function main() {
       await hub.close?.();
     }
     sweep.push(row);
-    console.error(`[eval-retrieval] sweep ${size}: ` + SWEEP_ENGINES.map((n) => `${n} r@5=${row.engines[n].recallAt5.toFixed(3)} p95=${row.engines[n].warmP95Ms.toFixed(0)}ms build=${row.engines[n].indexBuildMs}ms`).join(" | "));
+    console.error(`[eval-retrieval] sweep ${row.prefixSize}: ` + SWEEP_ENGINES.map((n) => `${n} r@5=${row.engines[n].recallAt5.toFixed(3)} p95=${row.engines[n].warmP95Ms.toFixed(0)}ms build=${row.engines[n].indexBuildMs}ms`).join(" | "));
   }
 
   // --- gates (evaluated on the full-corpus blend + keyword engines) ---------------
-  const blend = results.blend;
   const gateChecks = {};
   for (const difficulty of ["exact", "paraphrase", "hard"]) {
-    const d = blend.byDifficulty[difficulty];
+    const d = gateRows.blend?.scored.byDifficulty[difficulty];
     gateChecks[`recallAt5_${difficulty}`] = { target: GATES.recallAt5[difficulty], actual: d?.recallAt5 ?? null, pass: (d?.recallAt5 ?? 0) >= GATES.recallAt5[difficulty] };
     gateChecks[`recallAt10_${difficulty}`] = { target: GATES.recallAt10[difficulty], actual: d?.recallAt10 ?? null, pass: (d?.recallAt10 ?? 0) >= GATES.recallAt10[difficulty] };
     gateChecks[`mrrAt10_${difficulty}`] = { target: GATES.mrrAt10[difficulty], actual: d?.mrrAt10 ?? null, pass: (d?.mrrAt10 ?? 0) >= GATES.mrrAt10[difficulty] };
   }
-  const lastSweep = sweep[sweep.length - 1];
+  // Gate numbers come from the full-query-set gate runs, not the engine
+  // comparison sample (reviewer-2 blockers 3+5): warmP95 uses the TRUE
+  // full-corpus blend run on all 1,500 queries at the full 15K corpus.
+  const blend = gateRows.blend?.scored ?? results.blend;
   gateChecks.sufficiencyAt10 = { target: GATES.sufficiencyAt10, actual: blend.sufficiencyAt10, pass: (blend.sufficiencyAt10 ?? 0) >= GATES.sufficiencyAt10 };
   gateChecks.noMatchFpRate = { target: GATES.noMatchFpRate, actual: blend.noMatch.fpRate, pass: blend.noMatch.fpRate !== null && blend.noMatch.fpRate <= GATES.noMatchFpRate };
-  gateChecks.warmP95MsAt15K = { target: GATES.warmP95MsAt15K, actual: lastSweep?.engines.blend.warmP95Ms ?? null, pass: (lastSweep?.engines.blend.warmP95Ms ?? Infinity) <= GATES.warmP95MsAt15K };
+  const fullBlendP95 = gateRows.blend?.scored.latency.warmP95Ms ?? null;
+  gateChecks.warmP95MsAt15K = { target: GATES.warmP95MsAt15K, actual: fullBlendP95, pass: (fullBlendP95 ?? Infinity) <= GATES.warmP95MsAt15K };
 
   // --- definition-token savings -----------------------------------------------------
   const allDefTokens =
     manifests.reduce((s, m) => s + m.tools.reduce((acc, t) => acc + tokens(`${t.name} ${t.description} ${JSON.stringify(t.inputSchema ?? {})}`), 0), 0) +
     skills.reduce((acc, s) => acc + tokens(`${s.name} ${s.summary ?? s.description ?? ""}`), 0);
-  const hubTokens = tokens(SEARCH_TOOL_DEF) + (results.blend?.totalResponseTokens ?? 0);
-  const savings = safeDiv(allDefTokens - hubTokens, allDefTokens);
+  // Per-response context cost (reviewer-2 blocker 4): one search response
+  // (search-tool definition + mean returned definitions) against ONE eager
+  // definition payload of the whole catalog. Load cost (the follow-up
+  // load() call that returns a full input schema) is NOT included in the
+  // numerator; responseTokens cover name/id/summary/score per hit only.
+  const meanResponseTokens = gateRows.blend?.rows.length
+    ? mean(gateRows.blend.rows.map((r) => r.responseTokens))
+    : (results.blend?.responseTokensMean ?? 0);
+  const hubPerResponseTokens = tokens(SEARCH_TOOL_DEF) + meanResponseTokens;
+  const savings = safeDiv(allDefTokens - hubPerResponseTokens, allDefTokens);
   gateChecks.tokenSavings = { target: GATES.tokenSavings, actual: Number(savings.toFixed(4)), pass: savings >= GATES.tokenSavings };
 
-  // worst 20 failures from the blend engine
-  const blendRows = engineRows.blend ?? [];
+  // worst 20 failures from the full-set blend engine rows
+  const blendRows = gateRows.blend?.rows ?? [];
   const worst = blendRows
     .filter((r) => r.expected !== null || (r.expectedAll?.length ?? 0) > 0)
     .sort((a, b) => (b.firstGoldRank === Infinity ? 1 : 0) - (a.firstGoldRank === Infinity ? 1 : 0) || (b.firstGoldRank === a.firstGoldRank ? 0 : (a.firstGoldRank === Infinity ? -1 : b.firstGoldRank - a.firstGoldRank)))
@@ -766,12 +852,16 @@ async function main() {
     },
     engines: results,
     sweep,
-    gates: { definitions: GATES, checks: gateChecks, tokenSavings: { allDefinitionTokens: allDefTokens, hubPathTokens: hubTokens, savings: Number(savings.toFixed(4)), formula: "1 - tokens(search tool def + returned definitions) / tokens(all definitions)" } },
-    worstFailures: { engine: "blend", items: worst },
+    gates: { definitions: GATES, checks: gateChecks, tokenSavings: { allDefinitionTokens: allDefTokens, meanReturnedDefinitionsTokens: Math.round(meanResponseTokens), searchToolDefTokens: tokens(SEARCH_TOOL_DEF), savings: Number(savings.toFixed(4)), formula: "1 - (search tool def + mean returned definitions per response) / (one eager definition payload of the full catalog); load() schema cost excluded" } },
+    worstFailures: { engine: "blend", querySet: "full", items: worst },
   };
 
+  // summary.ok reflects EVERY required gate (reviewer-2 blocker 2); the run
+  // exits nonzero when any gate fails, even though the report is complete.
+  summary.ok = Object.values(gateChecks).every((c) => c.pass);
   const outPath = join(RESULTS_DIR, "eval-retrieval.json");
   writeFileSync(outPath, JSON.stringify(summary, null, 2));
+  process.exitCode = summary.ok ? 0 : 1;
   // Human-readable tail (stdout), then the machine-readable JSON as the LAST line.
   console.log(`# mode=${mode} tools=${summary.corpus.tools} skills=${summary.corpus.skills} queries=${queries.length} (${excluded} excluded)`);
   for (const [name, r] of Object.entries(results)) {
@@ -783,7 +873,7 @@ async function main() {
   for (const [check, res] of Object.entries(gateChecks)) {
     console.log(`# gate ${check}: ${res.pass ? "PASS" : "FAIL"} (actual=${fmt(res.actual)} target=${res.target})`);
   }
-  console.log(`# token savings: ${(savings * 100).toFixed(1)}% (all-def=${allDefTokens} hub-path=${hubTokens})`);
+  console.log(`# token savings: ${(savings * 100).toFixed(1)}% (all-def=${allDefTokens} per-response=${hubPerResponseTokens})`);
   console.log(JSON.stringify(summary));
 }
 
@@ -799,8 +889,16 @@ function countBy(arr, keyFn) {
   return counts;
 }
 
-main().catch((cause) => {
-  console.error(cause);
-  console.log(JSON.stringify({ script: "eval-retrieval", ok: false, error: String(cause?.message ?? cause) }));
-  process.exitCode = 1;
-});
+// Failure envelope: isolation setup AND main both run inside it, so ANY
+// failure (including a refusal thrown during isolation setup) emits the final
+// JSON summary on stdout and exits nonzero.
+(async () => {
+  try {
+    setupIsolation();
+    await main();
+  } catch (cause) {
+    console.error(cause);
+    console.log(JSON.stringify({ script: "eval-retrieval", ok: false, error: String(cause?.message ?? cause) }));
+    process.exitCode = 1;
+  }
+})();
