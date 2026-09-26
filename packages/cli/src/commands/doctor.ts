@@ -1,11 +1,10 @@
 import { stat } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   ActionHub,
   defaultCatalogCachePath,
   redactArgs,
   redactUrl,
+  sanitizeErrorForServer,
   type ServerConfig,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
@@ -14,19 +13,6 @@ import { createSdkClientFactory } from "../client-factory.js";
 export interface DoctorOptions {
   configPath?: string;
   checkConnectivity?: boolean;
-}
-
-/**
- * Resolve a repo-relative build-artifact path independent of the caller's
- * cwd: anchors on this module's compiled location (packages/cli/dist or
- * packages/cli/src) instead of process.cwd(), so `doctor` run from anywhere
- * reports build status accurately.
- */
-function packageRoot(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  return here.endsWith("dist/commands") || here.endsWith("src/commands")
-    ? resolve(here, "..", "..")
-    : here;
 }
 
 function describeTransport(transport: ServerConfig["transport"]): string {
@@ -53,26 +39,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
     criticalFailures++;
   }
 
-  // 2. Build Status (anchored on this module's location, not cwd)
-  const root = packageRoot();
-  const coreDist = resolve(root, "..", "core", "dist");
-  const copilotDist = resolve(root, "..", "copilot-plugin", "server", "dist");
-  let buildOk = true;
-  try {
-    const st1 = await stat(coreDist);
-    if (!st1.isDirectory()) buildOk = false;
-    const st2 = await stat(copilotDist);
-    if (!st2.isDirectory()) buildOk = false;
-  } catch {
-    buildOk = false;
-  }
-  if (buildOk) {
-    console.log("✔ Workspace builds: Core and Plugin build artifacts verified");
-  } else {
-    console.log("⚠ Workspace builds: One or more build artifacts missing (run `npm run build`)");
-  }
-
-  // 3. Configuration Discovery & Syntax
+  // 2. Configuration Discovery & Syntax
   const config = await loadCliConfig(options.configPath);
   console.log(`\nConfiguration:`);
   console.log(`  File location: ${config.path}`);
@@ -81,7 +48,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
   console.log(`  Configured bundles: ${config.bundles.length}`);
   console.log(`  Auto-approve at or above: ${config.autoApproveAtOrAbove}`);
 
-  // 4. Cache Health
+  // 3. Cache Health
   const cachePath = defaultCatalogCachePath();
   try {
     const st = await stat(cachePath);
@@ -95,7 +62,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
     return criticalFailures > 0 ? 1 : 0;
   }
 
-  // 5. Downstream Server Connectivity & Indexing Status
+  // 4. Downstream Server Connectivity & Indexing Status
   const factory = createSdkClientFactory();
   const hub = new ActionHub({
     servers: config.servers,
@@ -116,21 +83,32 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
       if (res.error) {
         criticalFailures++;
         console.log(`  ✖ [${res.serverId}] (${transportType}) ${transportDesc}`);
-        console.log(`    Error: ${res.error}`);
+        // Error text may echo the server's own configuration (URLs, args,
+        // env); every secret value is redacted before printing.
+        console.log(`    Error: ${srv ? sanitizeErrorForServer(srv, res.error) : res.error}`);
       } else {
         console.log(`  ✔ [${res.serverId}] (${transportType}) ${res.indexed} tools indexed`);
       }
     }
 
-    // 6. Latency & Health Probing
+    // 5. Latency & Health Probing
     if (options.checkConnectivity !== false && indexResults.some((r) => !r.error)) {
       console.log("\nProbing Server Latency & Health:");
       const healthResults = await hub.checkAllHealth();
       for (const h of healthResults) {
+        const srv = config.servers.find((s) => s.id === h.serverId);
+        if (srv?.enabled === false || h.status === "disabled") {
+          console.log(`  ℹ [${h.serverId}] intentionally disabled; health probe skipped`);
+          continue;
+        }
         if (h.status === "ready") {
           console.log(`  ✔ [${h.serverId}] Status: ${h.status} (${h.latencyMs ?? 0}ms latency)`);
         } else {
-          console.log(`  ✖ [${h.serverId}] Status: ${h.status} ${h.error ? `(${h.error})` : ""}`);
+          criticalFailures++;
+          const detail = h.error
+            ? (srv ? sanitizeErrorForServer(srv, h.error) : h.error)
+            : "";
+          console.log(`  ✖ [${h.serverId}] Status: ${h.status} ${detail ? `(${detail})` : ""}`);
         }
       }
     }

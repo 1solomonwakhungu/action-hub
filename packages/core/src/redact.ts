@@ -1,4 +1,4 @@
-import { REDACTED, redactOAuthConfig } from "./auth/index.js";
+import { REDACTED, redactOAuthConfig, redactSecrets } from "./auth/index.js";
 import type { OAuthClientConfig } from "./auth/types.js";
 import type { HttpTransport, ServerConfig } from "./types.js";
 
@@ -149,6 +149,66 @@ export function redactUrl(url: string): string {
     parsed.searchParams.set(key, REDACTED);
   }
   return parsed.toString();
+}
+
+/**
+ * Collect every secret value present in a server config, for value-based
+ * redaction of strings that may echo configuration (error messages, logs).
+ */
+export function collectServerSecrets(server: ServerConfig): string[] {
+  const secrets: string[] = [];
+  const push = (value: unknown): void => {
+    if (typeof value === "string" && value.length >= 8) secrets.push(value);
+  };
+  const transport = server.transport;
+  if (transport.type === "stdio") {
+    for (const value of Object.values(transport.env ?? {})) push(value);
+    let redactNext = false;
+    for (const arg of transport.args ?? []) {
+      if (redactNext) {
+        push(arg);
+        redactNext = false;
+        continue;
+      }
+      const flag = /^(--?[^=\s]+)(?:=(.*))?$/s.exec(arg);
+      if (flag && flag[1] !== undefined && (SENSITIVE_NAME_RE.test(flag[1]) || HEADER_FLAG_RE.test(flag[1]))) {
+        if (flag[2] !== undefined) push(flag[2]);
+        else redactNext = true;
+        continue;
+      }
+      const bearer = /^(?:[A-Za-z0-9-]+:\s*)?(?:Bearer|Basic)\s+(\S+)$/i.exec(arg);
+      if (bearer && bearer[1] !== undefined) {
+        push(bearer[1]);
+        continue;
+      }
+      const eq = arg.indexOf("=");
+      if (eq > 0 && SENSITIVE_NAME_RE.test(arg.slice(0, eq))) push(arg.slice(eq + 1));
+    }
+  } else {
+    // The whole URL is a secret carrier: an error echoing it verbatim would
+    // leak userinfo/query values even after per-part redaction.
+    push(transport.url);
+    try {
+      const parsed = new URL(transport.url);
+      push(parsed.username);
+      push(parsed.password);
+      for (const value of parsed.searchParams.values()) push(value);
+    } catch {
+      // Unparseable URL was already collected whole.
+    }
+    for (const value of Object.values(transport.headers ?? {})) push(value);
+    if (transport.auth?.clientSecret) push(transport.auth.clientSecret);
+  }
+  return secrets;
+}
+
+/**
+ * Sanitize a string that may echo a server's configuration (error messages,
+ * diagnostics): value-based replacement of every collected secret, then the
+ * raw-secret pattern backstop. Safe to call on any external text.
+ */
+export function sanitizeErrorForServer(server: ServerConfig, text: string): string {
+  return redactRawSecrets(redactSecrets(text, collectServerSecrets(server)));
 }
 
 /**
