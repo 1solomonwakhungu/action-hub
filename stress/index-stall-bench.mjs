@@ -18,6 +18,14 @@ import { LocalSemanticIndex } from "../packages/core/dist/index.js";
 
 const N = Number(process.argv[2] ?? 15_000);
 const CHUNK = Number(process.argv[3] ?? 500);
+if (!Number.isInteger(N) || N < 1) {
+  console.error(`FAIL: corpus size N must be a positive integer, got "${process.argv[2] ?? N}"`);
+  process.exit(1);
+}
+if (!Number.isInteger(CHUNK) || CHUNK < 1) {
+  console.error(`FAIL: chunk must be a positive integer, got "${process.argv[3] ?? CHUNK}"`);
+  process.exit(1);
+}
 const WORDS = [
   "deploy", "pipeline", "rollback", "notify", "provision", "database", "shard",
   "backup", "monitor", "cache", "queue", "scheduler", "webhook",
@@ -35,11 +43,14 @@ const records = Array.from({ length: N }, (_, i) => ({
 
 const t0 = performance.now();
 let firstYield = null;
+let yieldCount = 0;
 let lastYield = t0;
 let maxYieldGap = 0;
 let hbLast = t0;
 let hbMaxGap = 0;
+let hbTicks = 0;
 const heartbeat = setInterval(() => {
+  hbTicks += 1;
   const now = performance.now();
   hbMaxGap = Math.max(hbMaxGap, now - hbLast);
   hbLast = now;
@@ -49,6 +60,7 @@ await new LocalSemanticIndex().indexCooperative(records, {
   chunkSize: CHUNK,
   yieldFn: () => {
     const now = performance.now();
+    yieldCount += 1;
     if (firstYield === null) firstYield = now - t0;
     maxYieldGap = Math.max(maxYieldGap, now - lastYield);
     lastYield = now;
@@ -57,17 +69,34 @@ await new LocalSemanticIndex().indexCooperative(records, {
 });
 clearInterval(heartbeat);
 
+// Account for the completion gap: the final chunk may run without a
+// trailing yield, so measure one last event-loop turn after indexing and
+// fold it into both gap histograms — an unchunked regression cannot hide
+// behind "the run finished".
+await new Promise((done) => setImmediate(done));
+const completion = performance.now();
+maxYieldGap = Math.max(maxYieldGap, completion - lastYield);
+hbMaxGap = Math.max(hbMaxGap, completion - hbLast);
+
 const result = {
   corpus: N,
   chunk: CHUNK,
-  timeToFirstYieldMs: Number(firstYield?.toFixed(1)),
+  timeToFirstYieldMs: firstYield === null ? null : Number(firstYield.toFixed(1)),
+  yieldCount,
+  hbTicks,
   maxYieldGapMs: Number(maxYieldGap.toFixed(1)),
   maxHeartbeatGapMs: Number(hbMaxGap.toFixed(1)),
   totalMs: Number((lastYield - t0).toFixed(0)),
   bounds: { timeToFirstYieldMs: 500, maxStallMs: 500 },
 };
 console.log(JSON.stringify(result));
+// Hard evidence requirements — a fully synchronous (no-yield) rebuild MUST
+// fail here, not pass vacuously on empty gap histograms.
 const fail =
+  result.timeToFirstYieldMs === null ||
+  !Number.isFinite(result.timeToFirstYieldMs) ||
+  yieldCount < 1 ||
+  hbTicks < 1 ||
   result.timeToFirstYieldMs > result.bounds.timeToFirstYieldMs ||
   Math.max(result.maxYieldGapMs, result.maxHeartbeatGapMs) > result.bounds.maxStallMs;
 if (fail) {

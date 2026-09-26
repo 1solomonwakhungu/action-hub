@@ -151,18 +151,22 @@ test("a search during a paused rebuild stays bounded and the event loop stays li
     lexical.map((hit) => hit.id),
     "paused-rebuild search ranking diverged from pure BM25 — lazy embedding ran during the rebuild",
   );
-  // Score-level proof: the hub's engine emits normalized blended scores
-  // (lexical*(1-w) + semantic*w, w=0.2) while the reference emits raw BM25.
-  // With the semantic channel contributing exactly zero, paused/reference is
-  // ONE constant ratio across every hit; any lazy embedding would give
-  // per-document semantic scores and break the constancy.
-  const ratios = paused.map((hit, i) => hit.score / lexical[i].score);
-  const k = ratios[0];
-  assert.ok(Number.isFinite(k) && k > 0, "paused/reference score ratio must be finite and positive");
-  ratios.forEach((r, i) => {
+  // Score-level proof (per-hit, exact): the engine emits
+  // (1-w)*(lex/(1+lex)) + w*sem with w=0.2 (lex is the raw BM25 score the
+  // reference emits; lex/(1+lex) is the engine's lexical normalization).
+  // With the semantic channel contributing exactly zero, each paused score
+  // must equal 0.8*(lex/(1+lex)) for THAT hit's raw BM25 score. Any lazy
+  // embedding gives w*sem > 0 and moves the hit off its expected value.
+  // (The earlier constant-ratio version was accidental: paused/raw varies
+  // with s, and only passed because the top five lexical scores happened to
+  // be equal.)
+  const weight = 0.2;
+  paused.forEach((hit, i) => {
+    const lex = lexical[i].score;
+    const expected = (1 - weight) * (lex / (1 + lex));
     assert.ok(
-      Math.abs(r - k) < 1e-9,
-      `score ratio varies at rank ${i} (${r} vs ${k}) — lazy embedding ran during the rebuild`,
+      Math.abs(hit.score - expected) < 1e-6,
+      `paused score ${hit.score} != zero-semantic blend ${expected.toFixed(9)} of raw ${lex} at rank ${i} — lazy embedding ran during the rebuild`,
     );
   });
 
