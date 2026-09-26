@@ -154,6 +154,7 @@ export function renderPage(controlToken) {
     <button class="tab-btn" data-tab="explorer">📦 Actions & Bundles</button>
     <button class="tab-btn" data-tab="analytics">📊 Token Analytics</button>
     <button class="tab-btn" data-tab="presets">⚡ Presets & Import</button>
+    <button class="tab-btn" data-tab="harnesses">🧩 Harnesses & Skills</button>
     <button class="tab-btn" data-tab="history">📜 Invocations</button>
   </div>
 
@@ -305,6 +306,65 @@ export function renderPage(controlToken) {
     </div>
   </div>
 
+  <!-- TAB: HARNESSES & SKILLS -->
+  <div id="tab-harnesses" class="tab-content">
+    <h2>Connect Your AI Harness</h2>
+    <p style="font-size:13px; color:var(--muted); margin-top:0;">
+      Copy the configuration snippet below and replace &lt;ABSOLUTE_PATH_TO_ACTION_HUB&gt; with the absolute path to your action-hub repository directory. The path is shown escaped in the page but copies as the literal placeholder, ready for search-and-replace.
+    </p>
+    <div class="presets-grid" id="harness-snippets">
+      <div class="preset-card" style="cursor:default;">
+        <b>🤖 Claude Desktop</b> <code style="color:var(--muted);">claude_desktop_config.json</code>
+        <pre class="schema-view" style="white-space:pre-wrap; margin:8px 0;"><code id="snippet-claude-desktop">{
+  "mcpServers": {
+    "action-hub": {
+      "command": "node",
+      "args": ["&lt;ABSOLUTE_PATH_TO_ACTION_HUB&gt;/packages/copilot-plugin/server/dist/index.js"]
+    }
+  }
+}</code></pre>
+        <button data-copy-snippet="snippet-claude-desktop">📋 Copy</button>
+      </div>
+      <div class="preset-card" style="cursor:default;">
+        <b>🖱️ Cursor</b> <code style="color:var(--muted);">.cursor/mcp.json</code>
+        <pre class="schema-view" style="white-space:pre-wrap; margin:8px 0;"><code id="snippet-cursor">{
+  "mcpServers": {
+    "action-hub": {
+      "command": "node",
+      "args": ["&lt;ABSOLUTE_PATH_TO_ACTION_HUB&gt;/packages/copilot-plugin/server/dist/index.js"]
+    }
+  }
+}</code></pre>
+        <button data-copy-snippet="snippet-cursor">📋 Copy</button>
+      </div>
+      <div class="preset-card" style="cursor:default;">
+        <b>🐚 Codex</b> <code style="color:var(--muted);">config.toml</code>
+        <pre class="schema-view" style="white-space:pre-wrap; margin:8px 0;"><code id="snippet-codex">[mcp_servers.action-hub]
+command = "node"
+args = ["&lt;ABSOLUTE_PATH_TO_ACTION_HUB&gt;/packages/copilot-plugin/server/dist/index.js"]</code></pre>
+        <button data-copy-snippet="snippet-codex">📋 Copy</button>
+      </div>
+      <div class="preset-card" style="cursor:default;">
+        <b>💻 VS Code</b> <code style="color:var(--muted);">.vscode/mcp.json</code>
+        <pre class="schema-view" style="white-space:pre-wrap; margin:8px 0;"><code id="snippet-vscode">{
+  "servers": {
+    "action-hub": {
+      "command": "node",
+      "args": ["&lt;ABSOLUTE_PATH_TO_ACTION_HUB&gt;/packages/copilot-plugin/server/dist/index.js"]
+    }
+  }
+}</code></pre>
+        <button data-copy-snippet="snippet-vscode">📋 Copy</button>
+      </div>
+    </div>
+
+    <h2>Indexed Skills</h2>
+    <p style="font-size:13px; color:var(--muted); margin-top:0;">
+      Skills indexed by the hub, shown with their summaries and tags as the agent receives them.
+    </p>
+    <div id="skills-list"><p class="empty">Loading skills…</p></div>
+  </div>
+
   <!-- TAB: INVOCATIONS HISTORY -->
   <div id="tab-history" class="tab-content">
     <h2>Recent Action Invocations</h2>
@@ -333,6 +393,7 @@ const $ = (id) => document.getElementById(id);
 let live = false;
 let busy = false;
 let currentState = null;
+let lastSyncedTab = null;
 
 const PRESETS = {
   github: {
@@ -575,6 +636,23 @@ function searchResults(result) {
   return html;
 }
 
+function skillsRows(actionsList) {
+  const skills = (actionsList || []).filter((a) => a.kind === "skill");
+  if (skills.length === 0) {
+    return '<p class="empty">No skills indexed yet. Use Auto-Migrate to discover skills from installed harnesses.</p>';
+  }
+  return '<table><thead><tr><th>Skill</th><th>Summary</th><th>Tags</th><th>Source</th></tr></thead><tbody>' +
+    skills.map((s) =>
+      '<tr>' +
+        '<td><b>' + esc(s.name) + '</b><br><code>' + esc(s.id) + '</code></td>' +
+        '<td>' + esc(s.summary) + '</td>' +
+        '<td>' + (Array.isArray(s.tags) && s.tags.length
+          ? s.tags.map((t) => '<span class="badge ready">' + esc(t) + '</span> ').join("")
+          : '<span style="color:var(--muted);">—</span>') + '</td>' +
+        '<td><code>' + esc(s.serverId || '') + '</code></td>' +
+      '</tr>').join("") + '</tbody></table>';
+}
+
 function report(node, result, success) {
   if (!result) { node.innerHTML = ""; return; }
   node.innerHTML = result.ok
@@ -592,6 +670,16 @@ async function paint() {
 
   currentState = state;
   live = state.hubAvailable === true;
+
+  // Follow tab changes made through the show_tab action (e.g. the agent
+  // opening the canvas with tab: "harnesses"). Only a change in state.tab
+  // triggers a switch: tab clicks here are client-local and never written
+  // back, so syncing on every poll would snap the view back every 4 seconds.
+  if (state.tab && state.tab !== lastSyncedTab) {
+    const btn = document.querySelector('.tab-btn[data-tab="' + state.tab + '"]');
+    if (btn) btn.click();
+  }
+  lastSyncedTab = state.tab ?? null;
 
   $("path").textContent = state.configPath ?? "";
   $("notice").innerHTML = live
@@ -616,6 +704,7 @@ async function paint() {
   const filter = ($("explorer-filter").value || "").toLowerCase().trim();
   $("bundles-list").innerHTML = bundlesRows(state.bundles, filter);
   $("actions-list").innerHTML = actionsRows(state.actionsList, filter);
+  $("skills-list").innerHTML = skillsRows(state.actionsList);
 
   for (const node of document.querySelectorAll("#add-fields input, #add-fields select, #add-run, #q, #q-run, #btn-check-health, #btn-import, #btn-migrate, #migrate-overwrite")) {
     node.disabled = !live;
@@ -751,6 +840,31 @@ document.querySelectorAll(".preset-card").forEach(card => {
     document.querySelector('.tab-btn[data-tab="servers"]').click();
     $("add-run").scrollIntoView({ behavior: "smooth" });
   });
+});
+
+// SNIPPET COPY & SKILLS
+$("harness-snippets").addEventListener("click", async (event) => {
+  const btn = event.target.closest("[data-copy-snippet]");
+  if (!btn) return;
+  const code = $(btn.dataset.copySnippet);
+  if (!code) return;
+  const text = code.textContent;
+  let ok = false;
+  try {
+    await navigator.clipboard.writeText(text);
+    ok = true;
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    ok = document.execCommand("copy");
+    selection.removeAllRanges();
+  }
+  const original = btn.textContent;
+  btn.textContent = ok ? "✓ Copied" : "✗ Copy failed";
+  setTimeout(() => { btn.textContent = original; }, 1500);
 });
 
 // AUTO-MIGRATE CAPABILITIES

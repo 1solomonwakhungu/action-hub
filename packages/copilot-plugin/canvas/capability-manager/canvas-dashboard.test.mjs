@@ -17,6 +17,21 @@ test("renderPage produces complete HTML with dashboard tabs, health indicators, 
   assert.ok(html.includes("data-tab=\"analytics\""));
   assert.ok(html.includes("data-tab=\"presets\""));
   assert.ok(html.includes("data-tab=\"history\""));
+  // Harnesses & Skills tab
+  assert.ok(html.includes("data-tab=\"harnesses\""));
+  assert.ok(html.includes("id=\"tab-harnesses\""));
+  assert.ok(html.includes("claude_desktop_config.json"));
+  assert.ok(html.includes(".cursor/mcp.json"));
+  assert.ok(html.includes("config.toml"));
+  assert.ok(html.includes("mcp.json"));
+  // The placeholder is entity-escaped in the HTML source (&lt;…&gt;) so the
+  // browser does not parse it as an unknown tag; textContent/clipboard get the
+  // literal <ABSOLUTE_PATH_TO_ACTION_HUB> form.
+  assert.ok(html.includes('&lt;ABSOLUTE_PATH_TO_ACTION_HUB&gt;/packages/copilot-plugin/server/dist/index.js'));
+  assert.ok(!html.includes('"packages/copilot-plugin/server/dist/index.js"'));
+  assert.ok(!html.includes('@action-hub/cli'));
+  assert.ok(html.includes("id=\"skills-list\""));
+  assert.ok(html.includes("data-copy-snippet"));
   // Server Health & Reconnect
   assert.ok(html.includes("btn-check-health"));
   assert.ok(html.includes("data-reconnect"));

@@ -647,6 +647,7 @@ function liveState(hub: ActionHub, configPath: string): unknown {
     summary: r.summary,
     description: r.description ?? r.summary,
     inputSchema: r.inputSchema,
+    tags: r.tags,
   }));
 
   const bundles = hub.bundles.list().map((b) => ({
