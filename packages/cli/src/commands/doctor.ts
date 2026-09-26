@@ -5,6 +5,7 @@ import {
   redactArgs,
   redactUrl,
   sanitizeErrorForServer,
+  type McpClient,
   type ServerConfig,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
@@ -13,12 +14,166 @@ import { createSdkClientFactory } from "../client-factory.js";
 export interface DoctorOptions {
   configPath?: string;
   checkConnectivity?: boolean;
+  /** Total budget for all servers and attempts (ms). Default 120000. */
+  deadlineMs?: number;
 }
 
 /** Settle delay before a retry attempt (deterministic, bounded). */
 const RETRY_SETTLE_MS = 250;
+/**
+ * Extra time on top of the server's own timeoutMs that a connect attempt gets
+ * before the doctor gives up on it. The core's execution timeout only starts
+ * AFTER activation returns, and the SDK client.connect() has no deadline of
+ * its own (F27, core-side), so without this bound a permanently hanging
+ * initialize would hang the doctor forever. The doctor-side factory bounds
+ * every connect AND closes the transport of a timed-out attempt so no child
+ * survives.
+ */
+const ACTIVATION_SLACK_MS = 2_000;
+/** Timeout used when a server config does not define one. */
+const DEFAULT_SERVER_TIMEOUT_MS = 5_000;
+/**
+ * Total doctor budget (activation + listTools + health, all servers, both
+ * attempts). Without it, worst case scales 44 servers x 2 attempts x per-
+ * server timeout. Overridable via ACTION_HUB_DOCTOR_DEADLINE_MS.
+ */
+const DEFAULT_DOCTOR_BUDGET_MS = 120_000;
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Supervisor for doctor-spawned stdio servers (run via `node -e`).
+ *
+ * The SDK transport spawns the downstream server itself, and when a server
+ * hangs during initialize (the F27 gap — activation has no deadline in core),
+ * nothing ever closes the transport, so the child process would leak. This
+ * supervisor sits between the transport and the real server and guarantees
+ * the child dies when either:
+ *  - the parent closes stdin (normal transport close / hub shutdown), or
+ *  - the activation deadline passes without a single stdout byte (the child
+ *    never answered initialize — kill it, which unblocks the pending connect
+ *    with a closed-pipe error instead of an infinitely pending one).
+ * A server that has answered initialize is never deadline-killed, so
+ * long-lived health-probe connections are unaffected.
+ */
+const SUPERVISOR_SCRIPT = `
+const { spawn } = require("node:child_process");
+// With: node -e <script> a b c  ->  process.argv is [node, a, b, c].
+const deadlineMs = Number(process.argv[1] || 0);
+const command = process.argv[2];
+const args = process.argv.slice(3);
+if (!command) process.exit(2);
+const child = spawn(command, args, {
+  stdio: ["pipe", "pipe", "pipe"],
+  env: process.env,
+  cwd: process.cwd(),
+});
+let sawStdout = false;
+let killed = false;
+const killChild = (signal) => {
+  if (killed) return;
+  killed = true;
+  try { child.kill(signal); } catch {}
+  setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 1000).unref?.();
+};
+if (deadlineMs > 0) {
+  const t = setTimeout(() => { if (!sawStdout) { killChild("SIGKILL"); } }, deadlineMs);
+  t.unref?.();
+}
+process.stdin.on("data", (chunk) => child.stdin.write(chunk));
+process.stdin.on("end", () => { killChild("SIGTERM"); });
+process.stdin.on("error", () => { killChild("SIGKILL"); });
+child.stdout.on("data", (chunk) => { sawStdout = true; process.stdout.write(chunk); });
+child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+child.on("error", () => process.exit(1));
+child.on("exit", (code) => process.exit(code ?? 1));
+process.on("exit", () => { if (!killed) killChild("SIGTERM"); });
+`;
+
+function serverTimeoutMs(srv: ServerConfig | undefined): number {
+  return typeof srv?.timeoutMs === "number" && srv.timeoutMs > 0 ? srv.timeoutMs : DEFAULT_SERVER_TIMEOUT_MS;
+}
+
+/**
+ * Routes stdio servers through the supervisor (see SUPERVISOR_SCRIPT) so a
+ * child that hangs during initialize is killed at the activation deadline
+ * instead of leaking forever. HTTP servers are unaffected. The original
+ * transport description is preserved for display.
+ */
+function supervisedServers(servers: readonly ServerConfig[]): ServerConfig[] {
+  return servers.map((srv) => {
+    if (srv.transport.type !== "stdio") return srv;
+    const transport = srv.transport;
+    return {
+      ...srv,
+      transport: {
+        type: "stdio",
+        command: process.execPath,
+        args: ["-e", SUPERVISOR_SCRIPT, String(Math.max(1_000, serverTimeoutMs(srv))), transport.command, ...(transport.args ?? [])],
+        ...(transport.env ? { env: transport.env } : {}),
+        ...(transport.cwd ? { cwd: transport.cwd } : {}),
+      },
+    } as ServerConfig;
+  });
+}
+
+function attemptBudgetMs(srv: ServerConfig | undefined): number {
+  return serverTimeoutMs(srv) + ACTIVATION_SLACK_MS;
+}
+
+function doctorBudgetMs(explicit?: number): number {
+  if (explicit !== undefined && Number.isFinite(explicit) && explicit > 0) return explicit;
+  const envRaw = process.env["ACTION_HUB_DOCTOR_DEADLINE_MS"];
+  if (envRaw) {
+    const parsed = Number(envRaw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_DOCTOR_BUDGET_MS;
+}
+
+/** Races `op` against a deadline; on timeout, rejects with a labeled error. */
+function withDeadline<T>(label: string, op: () => Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([op(), timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * Wraps the SDK client factory with an activation deadline. The core starts
+ * its own timeout only after activation returns, so a server whose initialize
+ * never completes would otherwise hang the doctor forever. On timeout the
+ * eventual client (if it ever connects) is closed so no transport or child
+ * process survives the attempt.
+ */
+function boundedClientFactory(inner: (config: ServerConfig) => Promise<McpClient>): (config: ServerConfig) => Promise<McpClient> {
+  return async (config: ServerConfig): Promise<McpClient> => {
+    const deadline = attemptBudgetMs(config);
+    const clientPromise = (async () => inner(config))();
+    // Swallow a late rejection so the loser of the race cannot surface as an
+    // unhandled rejection after the race has already decided.
+    clientPromise.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        // Close the transport of a timed-out attempt: no child survives.
+        void clientPromise
+          .then((client) => client.close())
+          .catch(() => undefined);
+        reject(new Error(`connect timed out after ${deadline}ms`));
+      }, deadline);
+    });
+    try {
+      return (await Promise.race([clientPromise, timeout])) as McpClient;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 }
 
 function describeTransport(transport: ServerConfig["transport"]): string {
@@ -69,12 +224,22 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
   }
 
   // 4. Downstream Server Connectivity & Indexing Status
-  const factory = createSdkClientFactory();
   const hub = new ActionHub({
-    servers: config.servers,
+    servers: supervisedServers(config.servers),
     bundles: config.bundles,
-    clientFactory: factory,
+    // Bounded activation: the core's execution timeout starts only AFTER the
+    // client connects, and client.connect() has no deadline of its own, so a
+    // permanently hanging initialize would otherwise hang the doctor. The
+    // wrapped factory bounds every connect attempt and closes the transport
+    // of a timed-out attempt (no child survives).
+    clientFactory: boundedClientFactory(createSdkClientFactory()),
   });
+
+  // Total budget across all servers and both attempts, so worst case cannot
+  // multiply servers x attempts x per-server timeout.
+  const budgetStart = Date.now();
+  const budget = doctorBudgetMs(options.deadlineMs);
+  const budgetLeft = (): number => Math.max(0, budget - (Date.now() - budgetStart));
 
   try {
     console.log("\nServer Connectivity & Indexing Status:");
@@ -84,15 +249,42 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
     // a bounded number of attempts (one retry after a settle delay) and the
     // probes run serially, so the exit code is explainable: 1 iff any enabled
     // server is still down at check time after the retry.
-    const indexResults: { serverId: string; indexed: number; error?: string; attempts: number }[] = [];
-    for (const res of await hub.indexAll()) {
-      if (res.error && config.servers.find((s) => s.id === res.serverId)?.enabled !== false) {
+    const enabledServers = config.servers.filter((s) => s.enabled !== false);
+    type IndexRow = { serverId: string; indexed: number; error?: string; attempts: number; skipped?: boolean };
+    const indexResults: IndexRow[] = [];
+    for (const srv of enabledServers) {
+      if (budgetLeft() <= 0) {
+        indexResults.push({ serverId: srv.id, indexed: 0, error: "global doctor deadline exceeded before this server was checked", attempts: 0, skipped: true });
+        continue;
+      }
+      const first = await withDeadline(
+        `indexing "${srv.id}"`,
+        () => hub.indexServer(srv.id),
+        Math.min(attemptBudgetMs(srv), budgetLeft()),
+      ).catch((cause: unknown) => ({
+        serverId: srv.id,
+        indexed: 0,
+        error: cause instanceof Error ? cause.message : String(cause),
+      }));
+      if (first.error && srv.enabled !== false) {
+        if (budgetLeft() <= RETRY_SETTLE_MS + 1) {
+          indexResults.push({ ...first, attempts: 1 });
+          continue;
+        }
         await delay(RETRY_SETTLE_MS);
-        const retry = await hub.indexServer(res.serverId);
+        const retry = await withDeadline(
+          `indexing "${srv.id}" (retry)`,
+          () => hub.indexServer(srv.id),
+          Math.min(attemptBudgetMs(srv), budgetLeft()),
+        ).catch((cause: unknown) => ({
+          serverId: srv.id,
+          indexed: 0,
+          error: cause instanceof Error ? cause.message : String(cause),
+        }));
         indexResults.push({ ...retry, attempts: 2 });
         continue;
       }
-      indexResults.push({ ...res, attempts: 1 });
+      indexResults.push({ ...first, attempts: 1 });
     }
 
     for (const res of indexResults) {
@@ -122,15 +314,40 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
       console.log("\nProbing Server Latency & Health:");
       // Serial, bounded, one retry: probe each enabled server once; on a
       // failure, settle briefly and probe once more. The final attempt decides.
-      const healthResults = [];
-      for (const srv of config.servers) {
-        const first = await hub.checkHealth(srv.id);
+      type HealthRow = { serverId: string; status: string; latencyMs?: number; error?: string; attempts: number };
+      const healthResults: HealthRow[] = [];
+      for (const srv of enabledServers) {
+        if (budgetLeft() <= 0) {
+          healthResults.push({ serverId: srv.id, status: "skipped", attempts: 0, error: "global doctor deadline exceeded" });
+          continue;
+        }
+        const first = await withDeadline(
+          `health check "${srv.id}"`,
+          () => hub.checkHealth(srv.id),
+          Math.min(attemptBudgetMs(srv), budgetLeft()),
+        ).catch((cause: unknown) => ({
+          serverId: srv.id,
+          status: "error",
+          error: cause instanceof Error ? cause.message : String(cause),
+        }));
         if (first.status === "ready" || first.status === "disabled") {
           healthResults.push({ ...first, attempts: 1 });
           continue;
         }
+        if (budgetLeft() <= RETRY_SETTLE_MS + 1) {
+          healthResults.push({ ...first, attempts: 1 });
+          continue;
+        }
         await delay(RETRY_SETTLE_MS);
-        const second = await hub.checkHealth(srv.id);
+        const second = await withDeadline(
+          `health check "${srv.id}" (retry)`,
+          () => hub.checkHealth(srv.id),
+          Math.min(attemptBudgetMs(srv), budgetLeft()),
+        ).catch((cause: unknown) => ({
+          serverId: srv.id,
+          status: "error",
+          error: cause instanceof Error ? cause.message : String(cause),
+        }));
         healthResults.push({ ...second, attempts: 2 });
       }
       for (const h of healthResults) {
@@ -140,7 +357,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
           continue;
         }
         const attemptNote =
-          h.attempts > 1 ? (h.status === "ready" ? " (recovered on retry)" : ` (${h.attempts} attempts)`) : "";
+          h.attempts > 1 ? (h.status === "ready" ? " (recovered on retry)" : ` (${h.attempts} attempts)`) : h.status === "skipped" ? " (global deadline)" : "";
         if (h.status === "ready") {
           console.log(`  ✔ [${h.serverId}] Status: ${h.status} (${h.latencyMs ?? 0}ms latency)${attemptNote}`);
         } else {
