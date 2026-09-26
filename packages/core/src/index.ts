@@ -89,6 +89,13 @@ export {
   resolveOAuthConfigSecrets,
   summarizeTokens,
 } from "./auth/index.js";
+export {
+  redactArg,
+  redactArgs,
+  redactRecord,
+  redactServerConfig,
+  redactUrl,
+} from "./redact.js";
 export type {
   AuthenticatedFetchOptions,
   AuthorizationRequest,

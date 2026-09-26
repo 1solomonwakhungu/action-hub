@@ -50,6 +50,50 @@ test("import command executes without errors", async () => {
   assert.equal(code, 0);
 });
 
+test("import command redacts secret values from discovery output", async (t) => {
+  const SENTINEL = "sk-test-SENTINEL-a1b2c3d4";
+  const tempHome = resolve(tmpdir(), `action-hub-import-redact-${Date.now()}`);
+  const cursorDir = join(tempHome, ".cursor");
+  await mkdir(cursorDir, { recursive: true });
+  await writeFile(
+    join(cursorDir, "mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        "leaky-server": {
+          command: "node",
+          args: ["server.js", "--token", SENTINEL],
+          env: { API_TOKEN: SENTINEL },
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  const originalHome = process.env["HOME"];
+  process.env["HOME"] = tempHome;
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  };
+
+  try {
+    const code = await importCommand({ write: false });
+    assert.equal(code, 0);
+    const output = logs.join("\n");
+    assert.match(output, /leaky-server/);
+    assert.ok(
+      !output.includes(SENTINEL),
+      "sentinel token must never appear in import output",
+    );
+  } finally {
+    console.log = originalLog;
+    if (originalHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = originalHome;
+    await rm(tempHome, { recursive: true, force: true });
+  }
+});
+
 test("migrate command plans and executes capability migration", async () => {
   const tempDir = resolve(tmpdir(), `action-hub-cli-migrate-${Date.now()}`);
   await mkdir(tempDir, { recursive: true });
