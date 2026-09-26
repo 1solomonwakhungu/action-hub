@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { parse as tomlParse } from "smol-toml";
 import { harnessCommand, HARNESS_DEFS } from "../dist/commands/harness.js";
 
@@ -347,7 +348,9 @@ test("pi default config path is ~/.pi/agent/mcp.json when env is unset", async (
 });
 
 test("valueless or empty --node exits 1 with a usage error before any mutation", async () => {
-  const bin = resolve("dist/index.js");
+  // Resolve relative to THIS test file: resolve("dist/index.js") is
+  // cwd-relative and fails when tests run from the repo root (F33).
+  const bin = fileURLToPath(new URL("../dist/index.js", import.meta.url));
   const env = { ...process.env, HOME: join(tmpdir(), `action-hub-node-flag-${Date.now()}`) };
   try {
     for (const argv of [["harness", "cursor", "--node", "--json"], ["harness", "cursor", "--node", ""]]) {
