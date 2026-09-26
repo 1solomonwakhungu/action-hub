@@ -84,6 +84,13 @@ export class BundleRegistry {
     return [...result.values()];
   }
 
+  /** Serializes a bundle to pretty-printed JSON. */
+  exportBundle(id: string): string {
+    const bundle = this.#bundles.get(id);
+    if (!bundle) throw new Error(`Unknown bundle "${id}"`);
+    return JSON.stringify(bundle, null, 2);
+  }
+
   /** Simple search across bundle names, descriptions, and tags. */
   search(query: string): Bundle[] {
     const terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
@@ -94,4 +101,23 @@ export class BundleRegistry {
       return terms.every((term) => text.includes(term));
     });
   }
+}
+
+export function createPresetBundles(): Bundle[] {
+  return [
+    {
+      id: "git",
+      displayName: "Git & Version Control",
+      description: "Tools for PRs, commits, branches, and repo workflows",
+      serverIds: ["github", "gitlab"],
+      tags: ["git", "code", "vcs"],
+    },
+    {
+      id: "triage",
+      displayName: "Issue Triage",
+      description: "Tools for searching and updating issues",
+      serverIds: ["linear", "jira", "github"],
+      tags: ["triage", "issues", "tickets"],
+    },
+  ];
 }
