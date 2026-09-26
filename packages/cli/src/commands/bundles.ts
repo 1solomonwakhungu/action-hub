@@ -4,6 +4,7 @@ import { loadCliConfig } from "../config-loader.js";
 export interface BundleOptions {
   configPath?: string;
   load?: string;
+  exportId?: string;
 }
 
 export async function bundlesCommand(options: BundleOptions = {}): Promise<number> {
@@ -15,6 +16,16 @@ export async function bundlesCommand(options: BundleOptions = {}): Promise<numbe
       throw new Error("Client execution not needed for bundle inspection");
     },
   });
+
+  if (options.exportId !== undefined) {
+    const bundle = hub.bundles.get(options.exportId);
+    if (!bundle) {
+      console.error(`Bundle not found: ${options.exportId}`);
+      return 1;
+    }
+    console.log(hub.bundles.exportBundle(options.exportId));
+    return 0;
+  }
 
   if (options.load) {
     try {
