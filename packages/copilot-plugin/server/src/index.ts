@@ -26,6 +26,33 @@ import {
   hardenText,
 } from "./output-hardening.js";
 
+/** One hardened formatter for every bundle-load response path. */
+function hardenedBundlePayload(loaded: {
+  id: string;
+  displayName: string;
+  description?: string;
+  actions: Array<{ id: string; name: string; serverId: string; trust: string; summary: string; inputSchema?: unknown }>;
+  tokensSaved: number;
+}) {
+  return {
+    ok: true,
+    bundle_id: loaded.id,
+    display_name: loaded.displayName,
+    description: hardenText(loaded.description ?? "", LOAD_DESCRIPTION_MAX_BYTES),
+    actions_count: loaded.actions.length,
+    actions: loaded.actions.map((act) => ({
+      action_id: act.id,
+      name: act.name,
+      server: act.serverId,
+      trust: act.trust,
+      summary: hardenText(act.summary, SEARCH_SUMMARY_MAX_BYTES),
+      input_schema: hardenSchema(act.inputSchema, LOAD_SCHEMA_MAX_BYTES),
+    })),
+    tokens_saved: loaded.tokensSaved,
+    next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
+  };
+}
+
 const TOOL_DESCRIPTION = `Search, load, and run capabilities from every connected MCP server and installed skill.
 
 Use this whenever a task needs an integration that is not already among your visible tools, or when you are unsure whether a capability exists.
@@ -317,46 +344,12 @@ async function dispatch(
     case "load_bundle": {
       const bundleId = input.bundle_id ?? input.action_id;
       if (!bundleId) throw new Error(`"bundle_id" is required for operation "load_bundle".`);
-      const loaded = hub.loadBundle(bundleId);
-      return {
-        ok: true,
-        bundle_id: loaded.id,
-        display_name: loaded.displayName,
-        description: loaded.description,
-        actions_count: loaded.actions.length,
-        actions: loaded.actions.map((act) => ({
-          action_id: act.id,
-          name: act.name,
-          server: act.serverId,
-          trust: act.trust,
-          summary: act.summary,
-          input_schema: act.inputSchema,
-        })),
-        tokens_saved: loaded.tokensSaved,
-        next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
-      };
+      return hardenedBundlePayload(hub.loadBundle(bundleId));
     }
 
     case "load": {
       if (input.bundle_id) {
-        const loaded = hub.loadBundle(input.bundle_id);
-        return {
-          ok: true,
-          bundle_id: loaded.id,
-          display_name: loaded.displayName,
-          description: loaded.description,
-          actions_count: loaded.actions.length,
-          actions: loaded.actions.map((act) => ({
-            action_id: act.id,
-            name: act.name,
-            server: act.serverId,
-            trust: act.trust,
-            summary: act.summary,
-            input_schema: act.inputSchema,
-          })),
-          tokens_saved: loaded.tokensSaved,
-          next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
-        };
+        return hardenedBundlePayload(hub.loadBundle(input.bundle_id));
       }
       const actionId = requireActionId(input, "load");
       const action = hub.load(actionId);

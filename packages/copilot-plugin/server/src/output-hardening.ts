@@ -4,8 +4,8 @@ import { redactKnownSecretPrefixes } from "@action-hub/core";
  * Output hardening for the action_hub tool (stress findings F1/F2).
  *
  * All limits live here so the response formatting layer stays declarative.
- * These caps apply ONLY to what the action_hub tool returns — nothing about
- * what gets indexed changes.
+ * These caps apply ONLY to what the action_hub tool returns — per intake
+ * decision, indexing is unchanged.
  */
 
 /** Maximum bytes of any search-result summary returned to the model. */
@@ -17,7 +17,9 @@ export const LOAD_SCHEMA_MAX_BYTES = 32 * 1024;
 /** Maximum bytes of skill instructions returned by load. */
 export const SKILL_INSTRUCTIONS_MAX_BYTES = 32 * 1024;
 
-const TRUNCATION_MARKER = "…[truncated by action_hub: dropped %d bytes]";
+function truncationMarker(droppedBytes: number): string {
+  return `…[truncated by action_hub: dropped ${droppedBytes} bytes]`;
+}
 
 /**
  * Truncate a string to at most `maxBytes` UTF-8 bytes without splitting a
@@ -40,26 +42,58 @@ export function truncateBytes(
 }
 
 /**
- * Redact known secret-shaped prefixes and cap the text at `maxBytes` bytes,
- * appending an explicit marker that says how many bytes were dropped.
+ * Redact known secret-shaped prefixes and cap the text at `maxBytes` bytes.
+ * The FINAL returned value — truncation marker included — is at most
+ * `maxBytes` bytes; the marker itself states how many bytes were dropped.
  */
 export function hardenText(text: string, maxBytes: number): string {
   const redacted = redactKnownSecretPrefixes(text);
-  const { text: capped, droppedBytes } = truncateBytes(redacted, maxBytes);
-  if (droppedBytes === 0) return capped;
-  return `${capped}${TRUNCATION_MARKER.replace("%d", String(droppedBytes))}`;
+  const originalBytes = Buffer.byteLength(redacted, "utf8");
+  if (originalBytes <= maxBytes) return redacted;
+
+  // Reserve room for the marker so the returned value never exceeds the cap.
+  let keep = maxBytes;
+  let dropped = originalBytes - keep;
+  for (let i = 0; i < 8; i++) {
+    const markerBytes = Buffer.byteLength(truncationMarker(dropped), "utf8");
+    if (keep + markerBytes <= maxBytes) break;
+    keep = Math.max(0, maxBytes - markerBytes);
+    dropped = originalBytes - keep;
+  }
+  const { text: capped, droppedBytes } = truncateBytes(redacted, keep);
+  return `${capped}${truncationMarker(droppedBytes)}`;
 }
 
 /**
- * Return the schema object when it serializes within `maxBytes`; otherwise
- * return the truncated JSON string with an explicit dropped-bytes marker.
+ * Redact every string value inside a JSON structure (descriptions, defaults,
+ * examples, enum members, ...) using the known-prefix rules, leaving ordinary
+ * hashes and ids intact. Keys are structural and are left untouched.
  */
-export function hardenSchema(
-  schema: unknown,
-  maxBytes: number,
-): unknown {
-  const serialized = JSON.stringify(schema ?? {});
-  const { text: capped, droppedBytes } = truncateBytes(serialized, maxBytes);
-  if (droppedBytes === 0) return schema;
-  return `${capped}${TRUNCATION_MARKER.replace("%d", String(droppedBytes))}`;
+function redactSchemaStrings(value: unknown): unknown {
+  if (typeof value === "string") return redactKnownSecretPrefixes(value);
+  if (Array.isArray(value)) return value.map((item) => redactSchemaStrings(item));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, redactSchemaStrings(item)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Return the schema object (with string values redacted) when it serializes
+ * within `maxBytes`; otherwise return a structured truncation object with
+ * truthful guidance. The returned value is ALWAYS a valid JSON value — never
+ * a partial-JSON string advertised as a schema.
+ */
+export function hardenSchema(schema: unknown, maxBytes: number): unknown {
+  const redacted = redactSchemaStrings(schema);
+  const serialized = JSON.stringify(redacted ?? {});
+  const { droppedBytes } = truncateBytes(serialized, maxBytes);
+  if (droppedBytes === 0) return redacted;
+  return {
+    truncated: true,
+    original_bytes: Buffer.byteLength(serialized, "utf8"),
+    note: `This input schema exceeded the ${maxBytes}-byte response cap (${droppedBytes} bytes dropped) and is not included. Pass arguments from the upstream tool's own documentation, or ask the server owner for a slimmer schema.`,
+  };
 }
