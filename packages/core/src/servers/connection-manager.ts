@@ -90,6 +90,17 @@ interface Entry {
   lastHeartbeatAt?: number;
 }
 
+/**
+ * Abort reason used by manual shutdown/replacement paths (deactivate,
+ * reconnect, closeAll). Distinguishes a deliberate abort from a deadline
+ * expiry so the activation catch never records failures or overwrites
+ * disabled/inactive status for a manual shutdown (F27 rework 3).
+ */
+const SHUTDOWN_ABORT_REASON = new Error("Activation cancelled by shutdown");
+function isShutdownAbort(signal: AbortSignal): boolean {
+  return signal.reason === SHUTDOWN_ABORT_REASON;
+}
+
 const DEFAULT_FAILURE_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 10_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
@@ -422,8 +433,11 @@ export class ConnectionManager {
         this.recordFailure(serverId, cause instanceof Error ? cause.message : String(cause));
         // A deadline miss must never gate startup again: until a deliberate
         // retry succeeds, the server is unreachable (same surface state as a
-        // tripped breaker). Circuit accumulation still applies.
-        if (controller.signal.aborted) entry.status = "unreachable";
+        // tripped breaker). Circuit accumulation still applies. Manual
+        // shutdown aborts must not overwrite disabled/inactive state.
+        if (controller.signal.aborted && !isShutdownAbort(controller.signal)) {
+          entry.status = "unreachable";
+        }
         this.#scheduleRestart(entry);
         throw cause;
       }
@@ -434,22 +448,26 @@ export class ConnectionManager {
     try {
       return await Promise.race([pending, timedOut]);
     } catch (cause) {
-      if (controller.signal.aborted) {
-        // The deadline expired. The inner catch is skipped by the generation
-        // bump below, so THIS catch owns the bookkeeping exactly once: a
-        // failure recorded through the same circuit/restart state machine as
-        // any other activation failure (F27 rework — repeated timeouts must
-        // trip the breaker, not just flip a status field).
+      const deadlineExpired = controller.signal.aborted && !isShutdownAbort(controller.signal);
+      if (deadlineExpired) {
+        // The inner catch is skipped by the generation bump below, so THIS
+        // catch owns the deadline bookkeeping exactly once: a failure
+        // recorded through the same circuit/restart state machine as any
+        // other activation failure (F27 — repeated timeouts must trip the
+        // breaker, not just flip a status field).
         entry.generation += 1;
-        if (entry.pending === pending) entry.pending = undefined;
-        this.recordFailure(
-          serverId,
-          cause instanceof Error ? cause.message : String(cause),
-        );
+        if (entry.pending === pendingRef) entry.pending = undefined;
+        this.recordFailure(serverId, cause instanceof Error ? cause.message : String(cause));
         entry.status = "unreachable";
+        // Schedule AFTER the pending handle is cleared: scheduleRestart
+        // refuses while a pending activation exists.
         this.#scheduleRestart(entry);
-        // A factory that ignores the AbortSignal may leave the connect
-        // hanging forever; its late rejection must not become unhandled.
+      }
+      if (controller.signal.aborted) {
+        // Deadline or manual shutdown: drop the pending handle so a later
+        // activate can retry, and make sure a factory that ignores the
+        // AbortSignal cannot turn its late rejection into an unhandled one.
+        if (entry.pending === pendingRef) entry.pending = undefined;
         void pendingRef?.catch(() => {});
       }
       throw cause;
@@ -470,6 +488,12 @@ export class ConnectionManager {
     entry.autoRestart = true;
     this.#clearRestartTimer(entry);
     this.#stopHeartbeat(entry);
+    // Abort the in-flight activation (releases its child) and settle it
+    // bounded before starting the replacement — otherwise the old connect
+    // keeps initializing until its own deadline with a lost controller.
+    entry.activationAbort?.abort(SHUTDOWN_ABORT_REASON);
+    entry.activationAbort = undefined;
+    await this.#settlePendingBounded(entry);
     entry.generation += 1;
     entry.pending = undefined;
     await this.#dropClient(entry);
@@ -526,7 +550,7 @@ export class ConnectionManager {
     // Abort an in-flight activation so its spawned child is released, then
     // wait bounded for the connect to settle — shutdown must not leave a
     // hung child behind and must not wait on a wedged connect either.
-    entry.activationAbort?.abort();
+    entry.activationAbort?.abort(SHUTDOWN_ABORT_REASON);
     entry.activationAbort = undefined;
     await this.#settlePendingBounded(entry);
     entry.generation += 1;

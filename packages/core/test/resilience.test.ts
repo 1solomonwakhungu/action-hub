@@ -892,3 +892,55 @@ test("deactivate aborts an in-flight activation and settles bounded", async () =
   activating.catch(() => {});
   assert.equal(manager.states()[0]!.status, "inactive");
 });
+
+test("reconnect aborts and settles an in-flight activation before replacing it", async () => {
+  const clock = new FakeClock();
+  const abortsSeen: AbortSignal[] = [];
+  const factory = (_config: ServerConfig, options?: { signal?: AbortSignal }): Promise<McpClient> => {
+    const signal = options?.signal;
+    if (signal) {
+      abortsSeen.push(signal);
+      return new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("activation aborted")), { once: true });
+      });
+    }
+    return Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }]));
+  };
+  const manager = new ConnectionManager(factory, [{ ...server("flappy"), timeoutMs: 60_000 }], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  // First activation in flight (never initializes, cooperative abort).
+  void manager.activate("flappy").catch(() => {});
+  await clock.drain();
+  assert.equal(abortsSeen.length, 1);
+  // Reconnect must abort the old activation, not leave it initializing.
+  // Its replacement activation never initializes (fake factory), so race
+  // the call instead of awaiting the 60s fake deadline.
+  const reconnecting = manager.reconnect("flappy").catch(() => "rejected");
+  await Promise.race([reconnecting, new Promise((r) => setTimeout(r, 200))]);
+  assert.equal(abortsSeen[0]!.aborted, true, "reconnect aborts the in-flight activation");
+  assert.equal(abortsSeen.length, 2, "replacement activation started");
+  reconnecting.catch(() => {});
+  await manager.closeAll();
+});
+
+test("setEnabled(false) during an in-flight activation leaves status disabled with no failure recorded", async () => {
+  const clock = new FakeClock();
+  const factory = (_config: ServerConfig, options?: { signal?: AbortSignal }): Promise<McpClient> =>
+    new Promise((_, reject) => {
+      options?.signal?.addEventListener("abort", () => reject(new Error("activation aborted")), { once: true });
+    });
+  const manager = new ConnectionManager(factory, [{ ...server("gated"), timeoutMs: 60_000 }], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  void manager.activate("gated").catch(() => {});
+  await clock.drain();
+  manager.setEnabled("gated", false);
+  await manager.deactivate("gated"); // completes the shutdown path
+  const st = manager.states()[0]!;
+  assert.equal(st.status, "disabled", "manual shutdown must not be overwritten with unreachable");
+  assert.equal(st.consecutiveFailures, 0, "manual shutdown records no failure");
+  assert.equal(st.circuitState, "closed");
+});
