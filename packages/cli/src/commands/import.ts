@@ -3,9 +3,23 @@ import { dirname } from "node:path";
 import { discoverMcpServers, redactServerConfig, type ServerConfig } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
 
+/** Harness source filters accepted by the import command. */
+export const IMPORT_SOURCE_FILTERS = [
+  "claude-desktop",
+  "cursor",
+  "vscode",
+  "copilot",
+  "codex",
+  "windsurf",
+  "cline",
+  "roo-code",
+] as const;
+
+export type ImportSourceFilter = (typeof IMPORT_SOURCE_FILTERS)[number];
+
 export interface ImportOptions {
   configPath?: string;
-  source?: "claude-desktop" | "cursor" | "vscode" | "copilot" | "all";
+  source?: ImportSourceFilter | "all";
   write?: boolean;
 }
 

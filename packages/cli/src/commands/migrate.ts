@@ -10,10 +10,25 @@ import {
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
 
+/** Harness source filters accepted by the migrate command (servers, skills, and plugins). */
+export const MIGRATE_SOURCE_FILTERS = [
+  "claude-desktop",
+  "cursor",
+  "vscode",
+  "copilot",
+  "agents",
+  "codex",
+  "windsurf",
+  "cline",
+  "roo-code",
+] as const;
+
+export type MigrateSourceFilter = (typeof MIGRATE_SOURCE_FILTERS)[number];
+
 export interface MigrateOptions {
   configPath?: string;
   type?: "all" | "mcps" | "skills" | "plugins";
-  source?: "claude-desktop" | "cursor" | "vscode" | "copilot" | "agents" | "all";
+  source?: MigrateSourceFilter | "all";
   customPaths?: string[];
   write?: boolean;
   overwrite?: boolean;
