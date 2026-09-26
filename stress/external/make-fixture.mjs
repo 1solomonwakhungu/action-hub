@@ -13,13 +13,15 @@
  *
  * Usage: node stress/external/make-fixture.mjs [--servers N] [--tools-per N]
  */
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
-const outDir = resolve(here, "..", ".generated", "external");
+const outBase = resolve(here, "..", ".generated", "external");
+const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
+const outDir = join(outBase, `run-${runStamp}`); // fresh per run — no stale reuse
 const resultsDir = resolve(here, "..", ".generated", "results");
 
 function argNum(name, fallback) {
@@ -110,17 +112,34 @@ export PI_CODING_AGENT_DIR="${outDir}/pi"
     join(outDir, "actions.json"),
     JSON.stringify(firstTools.slice(0, 20).map((t) => `${first}:${t.name}`), null, 2) + "\n",
   );
-  const queries = [
-    ...new Set(firstTools.slice(0, 20).map((t) => t.description.split(/[:.]/)[0].toLowerCase())),
-  ];
-  await writeFile(join(outDir, "queries.json"), JSON.stringify(queries, null, 2) + "\n");
+  // Distinct query per tool: the goal clause after the first colon (which
+  // contains the varying verb + domain + index), prefixed with the tool name.
+  const queries = firstTools.slice(0, 20).map((t) => {
+    const clause = t.description.split(":").slice(1).join(":").replace(/\.\s*$/, "").trim();
+    return `${t.name}: ${clause}`;
+  });
+  const unique = new Set(queries);
+  if (unique.size < 4) {
+    throw new Error(`query pool not distinct enough (${unique.size}/${queries.length})`);
+  }
+  await writeFile(join(outDir, "queries.json"), JSON.stringify([...unique], null, 2) + "\n");
+
+  // Stable pointer for tools that default to ../.generated/external/*.json.
+  for (const name of ["actions.json", "queries.json", "servers.json"]) {
+    const link = join(outBase, name);
+    try { await unlink(link); } catch { /* first run */ }
+    await symlink(join(outDir, name), link);
+  }
 
   const summary = {
     script: "make-fixture.mjs",
+    ok: true,
+    runStamp,
     servers: serverCount,
     toolsPerServer: toolsPer,
     totalTools: serverCount * toolsPer,
     outDir,
+    queryPoolSize: unique.size,
     at: new Date().toISOString(),
   };
   await mkdir(resultsDir, { recursive: true });

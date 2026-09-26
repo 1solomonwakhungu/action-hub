@@ -37,7 +37,7 @@ function flag(name) {
 }
 const hasFlag = (name) => process.argv.includes(name);
 
-const configPath = resolve(flag("--config") ?? join(genDir, "servers.json"));
+let configPath = resolve(flag("--config") ?? join(genDir, "servers.json"));
 const token = "stress-external-token-0f1e2d3c";
 
 // Full isolation per contract hard rules.
@@ -72,10 +72,31 @@ async function main() {
 
   const runs = [];
 
-  // 1. Small fixture unless an external config is provided.
+  // 1. Small fixture unless an external config is provided. The generator's
+  // own summary is validated like every other step: unparsable output or a
+  // non-ok summary fails the run (stale fixtures cannot mask a broken
+  // generator, because it writes a fresh run-<stamp> dir per invocation).
   if (!flag("--config")) {
     const gen = spawnSync("node", [join(here, "make-fixture.mjs")], { encoding: "utf8", timeout: 60_000 });
-    runs.push({ label: "make-fixture", exitCode: gen.status, stdout: gen.stdout?.trim() });
+    let genSummary = null;
+    try {
+      genSummary = JSON.parse(gen.stdout?.trim().split("\n").pop() ?? "");
+    } catch {
+      /* unparsable -> failure below */
+    }
+    runs.push({
+      label: "make-fixture",
+      requiresSummary: true,
+      exitCode: gen.status,
+      summary: genSummary,
+      stdout: gen.stdout?.trim(),
+      stderr: gen.stderr?.slice(0, 2000),
+    });
+    if (genSummary?.outDir) {
+      // Keep serving the fresh fixture dir for the rest of the orchestrator.
+      configPath = resolve(genSummary.outDir, "servers.json");
+      isolatedEnv["ACTION_HUB_CONFIG"] = configPath;
+    }
   }
 
   // 2. Start serve + RSS sampler.
