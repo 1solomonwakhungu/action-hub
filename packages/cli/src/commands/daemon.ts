@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile } from "node:fs/promises";import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
@@ -55,6 +55,8 @@ export interface DaemonOptions {
   entryPath?: string;
   /** Overall startup cap in ms (default 120000, env/flag overridable). */
   startTimeoutMs?: number;
+  /** Called with the detached child's PID as soon as it is spawned. */
+  onSpawn?: (pid: number) => void;
 }
 
 /** Isolated readiness predicate: a single place to change the readiness signal. */
@@ -156,6 +158,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   child.once("error", (cause) => {
     spawnError = cause;
   });
+  if (child.pid) options.onSpawn?.(child.pid);
   child.unref();
   closeSync(logFd);
 
@@ -180,6 +183,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
+      await killAndReapSpawned(child);
       console.error(`Could not start Action Hub daemon: ${spawnError.message}`);
       return 1;
     }
@@ -191,6 +195,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
+      await killAndReapSpawned(child);
       console.error(
         `Action Hub daemon exited during startup (code ${childExitCode ?? "signal"}). See ${paths.log}`,
       );
@@ -232,7 +237,36 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
 
   console.error(`Action Hub daemon did not become ready. See ${paths.log}`);
   if (await waitForAnotherDaemon(paths)) return 0;
+  await killAndReapSpawned(child);
   return 1;
+}
+
+/**
+ * Terminates and reaps the detached child (and its whole process group) this
+ * start spawned. Called on EVERY failure path before returning: a daemon that
+ * never became ready must not survive its own failed start as an orphan.
+ */
+async function killAndReapSpawned(child: ChildProcess): Promise<void> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    if (platform() !== "win32") process.kill(-child.pid, "SIGKILL");
+    child.kill("SIGKILL");
+  } catch {
+    // Already gone.
+  }
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    let alive = false;
+    try {
+      process.kill(child.pid, 0);
+      alive = true;
+    } catch {
+      alive = false;
+    }
+    if (!alive || Date.now() >= deadline) return;
+    await delay(50);
+  }
 }
 
 /**

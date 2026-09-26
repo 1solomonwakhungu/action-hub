@@ -129,6 +129,10 @@ test("daemon start fails on a silent daemon after the no-progress window", async
   const savedNoProgress = process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"];
   process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"] = "2000";
   const env = stubEnv({ SILENT: "1" });
+  // The silent daemon never writes daemon.json, so the ONLY evidence of the
+  // detached child is the PID captured at spawn. The failed start must have
+  // terminated and reaped it before returning (no orphans).
+  const spawnedPids: number[] = [];
   try {
     const captured = captureConsole();
     try {
@@ -138,11 +142,23 @@ test("daemon start fails on a silent daemon after the no-progress window", async
         entryPath: stub,
         startTimeoutMs: 60_000,
         configPath: join(root, "servers.json"),
+        onSpawn: (pid) => void spawnedPids.push(pid),
       });
       const wall = Date.now() - startedAt;
       assert.equal(code, 1);
       assert.ok(wall >= 2_000 && wall < 15_000, `failed after ${wall}ms; expected ~2s (no-progress window)`);
       assert.match(captured.errors.join("\n"), /did not become ready/);
+      assert.equal(spawnedPids.length, 1, "the detached stub must have been spawned exactly once");
+      const isAlive = (): boolean => {
+        try {
+          process.kill(spawnedPids[0]!, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      assert.equal(isAlive(), false, `spawned silent daemon pid ${spawnedPids[0]} survived the failed start`);
+      await assert.rejects(readFile(join(daemonDir, "daemon.json"), "utf8"), { code: "ENOENT" });
     } finally {
       captured.restore();
       env.restore();
