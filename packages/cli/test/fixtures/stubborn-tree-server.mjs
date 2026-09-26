@@ -68,6 +68,11 @@ if (process.argv[2] !== "child") {
           },
         ],
       });
+      // Reviewer-1 round 4 mode: exit voluntarily right after a valid
+      // response. The supervisor must still clean up the process group.
+      if (process.env["EXIT_AFTER_LIST"] === "1") {
+        process.exit(0);
+      }
       return;
     }
     if (message.method === "tools/call") {

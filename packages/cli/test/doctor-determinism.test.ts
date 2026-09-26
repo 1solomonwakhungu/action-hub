@@ -255,3 +255,54 @@ test("doctor kills the whole downstream process tree, including TERM-ignoring gr
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// Reviewer-1 round 4: a server that exits VOLUNTARILY after a valid response
+// must still have its process group cleaned up — a same-group TERM-ignoring
+// grandchild may outlive the direct child if the supervisor exits eagerly.
+test("doctor cleans up the process group when the server exits on its own", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-doctor-selfexit-"));
+  try {
+    const servers = [
+      {
+        id: "self-exit",
+        transport: {
+          type: "stdio",
+          command: process.execPath,
+          args: [stubbornTreeFixture],
+          env: { EXIT_AFTER_LIST: "1" },
+        },
+        timeoutMs: 5000,
+      },
+    ];
+    const cfgPath = await makeFleet(tempDir, servers);
+    const { code } = await withIsolatedEnv(tempDir, () => runDoctor(cfgPath));
+    // The server dies mid-session, so the doctor may legitimately report a
+    // failure — the CONTRACT under test is that no downstream process
+    // survives, whatever the exit code.
+    assert.ok(code === 0 || code === 1, `unexpected doctor exit code ${code}`);
+
+    const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
+      .split("\n")
+      .map((l) => Number.parseInt(l.trim(), 10))
+      .filter((n) => Number.isSafeInteger(n) && n > 0);
+    assert.equal(recordedPids.length, 2, `expected server + grandchild PIDs recorded, got ${recordedPids.join(", ")}`);
+
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const pollDeadline = Date.now() + 8_000;
+    let survivors = recordedPids.filter(isAlive);
+    while (survivors.length > 0 && Date.now() < pollDeadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      survivors = recordedPids.filter(isAlive);
+    }
+    assert.deepEqual(survivors, [], `downstream tree survived self-exit: ${survivors.join(", ")}`);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

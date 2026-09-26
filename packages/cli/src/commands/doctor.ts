@@ -151,10 +151,17 @@ child.stderr.on("error", () => {});
 child.on("error", () => process.exit(1));
 child.on("exit", (code) => {
   childExitCode = code;
-  // Do NOT exit here when a kill sequence is in flight — wait for it.
-  maybeFinish();
+  if (killed) {
+    // A kill sequence is already in flight — keep waiting for it.
+    maybeFinish();
+  } else {
+    // The downstream server exited on its own, but its process group may
+    // still hold a TERM-ignoring grandchild. Start (and await) the full
+    // group cleanup instead of exiting immediately: process.on("exit")
+    // hooks cannot keep the process alive for async escalation.
+    killTree("SIGTERM");
+  }
 });
-process.on("exit", () => { if (!killed) killTree("SIGTERM"); });
 `;
 
 function serverTimeoutMs(srv: ServerConfig | undefined): number {
