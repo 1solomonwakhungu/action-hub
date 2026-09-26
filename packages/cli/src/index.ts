@@ -71,12 +71,13 @@ DAEMON:
 MIGRATE OPTIONS:
   --type <type>       Capability types to migrate: all, mcps, skills, plugins (default: all)
   --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, agents, codex, windsurf, cline, roo-code, all
-
-IMPORT OPTIONS:
-  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, codex, windsurf, cline, roo-code, all
   --write             Commit migrated capabilities to config (default is dry-run)
   --overwrite         Overwrite existing servers or skills on ID conflict
   --json              Output plan and results in JSON format
+
+IMPORT OPTIONS:
+  --source <source>   Filter by source: claude-desktop, cursor, vscode, copilot, codex, windsurf, cline, roo-code, all
+  --write             Save discovered servers to the Action Hub config
 
 AUTH OPTIONS:
   --no-browser        Print the authorization URL instead of opening a browser
