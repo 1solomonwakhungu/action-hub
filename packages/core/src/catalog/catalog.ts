@@ -10,6 +10,13 @@ import type { ActionRecord, ActionKind, TrustTier } from "../types.js";
 export class Catalog {
   readonly #byId = new Map<string, ActionRecord>();
   readonly #byServer = new Map<string, Set<string>>();
+  /** Bumped on every mutation so derived indexes (search stats) can invalidate. */
+  #generation = 0;
+
+  /** Monotonic counter bumped whenever the catalog's contents change. */
+  get generation(): number {
+    return this.#generation;
+  }
 
   static actionId(serverId: string, name: string): string {
     return `${serverId}:${name}`;
@@ -23,6 +30,7 @@ export class Catalog {
       this.#byServer.set(record.serverId, ids);
     }
     ids.add(record.id);
+    this.#generation += 1;
   }
 
   addAll(records: readonly ActionRecord[]): void {
@@ -43,6 +51,7 @@ export class Catalog {
     if (!ids) return 0;
     for (const id of ids) this.#byId.delete(id);
     this.#byServer.delete(serverId);
+    if (ids.size > 0) this.#generation += 1;
     return ids.size;
   }
 
@@ -57,6 +66,7 @@ export class Catalog {
       this.#byId.delete(id);
       this.#byServer.get(record.serverId)?.delete(id);
     }
+    if (ids.length > 0) this.#generation += 1;
     return ids.length;
   }
 
