@@ -41,7 +41,10 @@ export interface ServerConfig {
   allowTools?: string[];
   /** Optional deny-list applied after `allowTools`. */
   denyTools?: string[];
-  /** Optional timeout in milliseconds for tool executions on this server. */
+  /** Optional deadline in milliseconds for this server's operations: the
+ * activation phase (spawn + initialize) AND each tool execution/indexing
+ * call. A server that never answers initialize is abandoned after this
+ * deadline and marked unreachable instead of gating startup (F27). */
   timeoutMs?: number;
   /** Per-server circuit breaker. Overrides hub defaults when set. */
   circuitBreaker?: CircuitBreakerConfig;

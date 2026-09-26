@@ -69,6 +69,9 @@ interface Entry {
   client?: McpClient;
   /** In-flight activation, shared so concurrent callers don't double-connect. */
   pending?: Promise<McpClient>;
+  /** Abort controller for the in-flight activation (F27): shutdown paths
+   * abort it so a never-initializing connect releases its child. */
+  activationAbort?: AbortController;
   error?: string;
   toolCount: number;
   lastActivatedAt?: string;
@@ -368,6 +371,7 @@ export class ConnectionManager {
     // the server's config.timeoutMs if set, else the activation default.
     const deadlineMs = entry.config.timeoutMs ?? this.#activationTimeoutMs;
     const controller = new AbortController();
+    entry.activationAbort = controller;
     let deadlineTimer: TimerHandle | undefined = undefined;
     const clearDeadline = (): void => {
       if (deadlineTimer !== undefined) this.#clearTimeout(deadlineTimer);
@@ -397,6 +401,7 @@ export class ConnectionManager {
           }
           throw new Error(`Server "${serverId}" was shut down during connect`);
         }
+        entry.activationAbort = undefined;
         entry.client = tagTransportFailures(client);
         entry.status = "ready";
         entry.lastActivatedAt = new Date(this.#now()).toISOString();
@@ -430,13 +435,22 @@ export class ConnectionManager {
       return await Promise.race([pending, timedOut]);
     } catch (cause) {
       if (controller.signal.aborted) {
-        // The deadline expired. A factory that ignores the AbortSignal may
-        // leave the connect hanging: drop the pending handle so a later
-        // activate can retry, and invalidate the generation so any late
-        // client is discarded instead of cached.
-        if (entry.pending === pending) entry.pending = undefined;
+        // The deadline expired. The inner catch is skipped by the generation
+        // bump below, so THIS catch owns the bookkeeping exactly once: a
+        // failure recorded through the same circuit/restart state machine as
+        // any other activation failure (F27 rework — repeated timeouts must
+        // trip the breaker, not just flip a status field).
         entry.generation += 1;
+        if (entry.pending === pending) entry.pending = undefined;
+        this.recordFailure(
+          serverId,
+          cause instanceof Error ? cause.message : String(cause),
+        );
         entry.status = "unreachable";
+        this.#scheduleRestart(entry);
+        // A factory that ignores the AbortSignal may leave the connect
+        // hanging forever; its late rejection must not become unhandled.
+        void pendingRef?.catch(() => {});
       }
       throw cause;
     }
@@ -509,11 +523,31 @@ export class ConnectionManager {
     entry.autoRestart = false;
     this.#clearRestartTimer(entry);
     this.#stopHeartbeat(entry);
+    // Abort an in-flight activation so its spawned child is released, then
+    // wait bounded for the connect to settle — shutdown must not leave a
+    // hung child behind and must not wait on a wedged connect either.
+    entry.activationAbort?.abort();
+    entry.activationAbort = undefined;
+    await this.#settlePendingBounded(entry);
     entry.generation += 1;
     entry.pending = undefined;
     await this.#dropClient(entry);
     if (entry.status !== "disabled") entry.status = "inactive";
     entry.nextRestartAt = undefined;
+  }
+
+  /** Waits at most ~2.5s (real time — teardown is not simulated) for an
+   * in-flight activation to settle after its abort. */
+  async #settlePendingBounded(entry: Entry): Promise<void> {
+    const pending = entry.pending;
+    if (!pending) return;
+    await Promise.race([
+      pending.catch(() => {}),
+      new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 2_500);
+        t.unref?.();
+      }),
+    ]);
   }
 
   async closeAll(): Promise<void> {

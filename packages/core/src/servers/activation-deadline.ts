@@ -12,7 +12,7 @@ export async function connectWithDeadline(
     connect(transport: unknown): Promise<void>;
     close(): Promise<void>;
   },
-  transport: unknown,
+  transport: { close?: () => Promise<void> } | unknown,
   signal: AbortSignal | undefined,
   describeCause?: (cause: unknown) => unknown,
 ): Promise<void> {

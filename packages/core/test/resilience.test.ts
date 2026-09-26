@@ -826,3 +826,69 @@ test("a slow-but-within-deadline server still activates", async () => {
   assert.equal(results[0]!.error, undefined);
   hub.close();
 });
+
+test("repeated activation timeouts flow through the failure/restart state machine", async () => {
+  const clock = new FakeClock();
+  let alive = false; // server never initializes until it "comes back"
+  let activations = 0;
+  const factory = (config: ServerConfig, options?: { signal?: AbortSignal }): Promise<McpClient> => {
+    activations += 1;
+    void options;
+    if (!alive) return new Promise(() => void config); // never settles (ignores signal)
+    return Promise.resolve(new FakeClient([{ name: "ping", description: "d", inputSchema: { type: "object" } }]));
+  };
+  const manager = new ConnectionManager(factory, [{ ...server("dead"), timeoutMs: 100 }], {
+    failureThreshold: 3,
+    cooldownMs: 3_000,
+    heartbeat: { enabled: false },
+    restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+    now: clock.now,
+    random: clock.random,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+  const deadlineMs = 100;
+  for (let i = 0; i < 3; i++) {
+    const attempt = manager.activate("dead").catch((e: Error) => e.message);
+    await clock.advance(deadlineMs + 10);
+    const message = await attempt;
+    assert.match(message, /timed out/);
+    const st = manager.states()[0]!;
+    assert.equal(st.status, "unreachable");
+    assert.equal(st.consecutiveFailures, i + 1, `timeout ${i + 1} must be recorded`);
+    if (i < 2) assert.equal(st.circuitState, "closed");
+  }
+  const open = manager.states()[0]!;
+  assert.equal(open.circuitState, "open", "3 consecutive activation timeouts open the circuit");
+  assert.ok(open.nextRestartAt !== undefined, "restart scheduled from the state machine");
+  // Server comes back: the scheduled restart recovers through the normal path.
+  alive = true;
+  await clock.advance(5_000);
+  await clock.drain();
+  const recovered = manager.states()[0]!;
+  assert.equal(recovered.circuitState, "closed");
+  assert.equal(recovered.consecutiveFailures, 0);
+});
+
+test("deactivate aborts an in-flight activation and settles bounded", async () => {
+  const clock = new FakeClock();
+  // Cooperative factory like the real adapters: rejects when aborted.
+  const factory = (_config: ServerConfig, options?: { signal?: AbortSignal }): Promise<McpClient> =>
+    new Promise((_, reject) => {
+      options?.signal?.addEventListener("abort", () => reject(new Error("activation aborted")), { once: true });
+    });
+  const manager = new ConnectionManager(factory, [{ ...server("stuck"), timeoutMs: 60_000 }], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  const t0 = Date.now();
+  // The fake factory never settles and ignores the signal; activate() can
+  // only reject at its (60s fake) deadline. Race it against the real clock.
+  const activating = manager.activate("stuck").catch(() => "rejected");
+  await Promise.race([activating, new Promise((r) => setTimeout(r, 100))]);
+  await manager.deactivate("stuck"); // must not wait for the 60s deadline
+  assert.ok(Date.now() - t0 < 4_000, "deactivate settles bounded, not on the activation deadline");
+  // Swallow the still-hanging activation so the test process can exit.
+  activating.catch(() => {});
+  assert.equal(manager.states()[0]!.status, "inactive");
+});
