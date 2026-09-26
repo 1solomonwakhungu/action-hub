@@ -23,37 +23,43 @@ export async function testSearchCommand(query: string, options: TestSearchOption
     clientFactory: factory,
   });
 
-  console.log(`Searching catalog for: "${query}"...\n`);
-  await hub.indexAll();
+  try {
+    console.log(`Searching catalog for: "${query}"...\n`);
+    await hub.indexAll();
 
-  const hits = await hub.search(query, {
-    limit: options.limit ?? 10,
-    serverIds: options.server ? [options.server] : undefined,
-  });
+    const hits = await hub.search(query, {
+      limit: options.limit ?? 10,
+      serverIds: options.server ? [options.server] : undefined,
+    });
 
-  if (hits.length === 0) {
-    console.log("No matching tools or skills found.");
-    return 0;
-  }
-
-  console.log(`Found ${hits.length} result(s):\n`);
-  for (let i = 0; i < hits.length; i++) {
-    const hit = hits[i]!;
-    const scorePct = hit.score ? (hit.score * 100).toFixed(1) + "%" : "N/A";
-    console.log(`${i + 1}. [${hit.id}]  (Score: ${scorePct}, Kind: ${hit.kind})`);
-    console.log(`   Summary: ${hit.summary}`);
-    console.log("");
-  }
-
-  // Also check if any bundle matches the query
-  const bundleHits = hub.searchBundles(query);
-  if (bundleHits.length > 0) {
-    console.log(`Matching Action Bundles (${bundleHits.length}):`);
-    for (const b of bundleHits) {
-      console.log(`  • [bundle:${b.id}] "${b.displayName}": ${b.description ?? ""}`);
-      console.log(`    Action IDs: ${(b.actionIds ?? []).join(", ")}`);
+    if (hits.length === 0) {
+      console.log("No matching tools or skills found.");
+      return 0;
     }
-  }
 
-  return 0;
+    console.log(`Found ${hits.length} result(s):\n`);
+    for (let i = 0; i < hits.length; i++) {
+      const hit = hits[i]!;
+      const scorePct = hit.score ? (hit.score * 100).toFixed(1) + "%" : "N/A";
+      console.log(`${i + 1}. [${hit.id}]  (Score: ${scorePct}, Kind: ${hit.kind})`);
+      console.log(`   Summary: ${hit.summary}`);
+      console.log("");
+    }
+
+    // Also check if any bundle matches the query
+    const bundleHits = hub.searchBundles(query);
+    if (bundleHits.length > 0) {
+      console.log(`Matching Action Bundles (${bundleHits.length}):`);
+      for (const b of bundleHits) {
+        console.log(`  • [bundle:${b.id}] "${b.displayName}": ${b.description ?? ""}`);
+        console.log(`    Action IDs: ${(b.actionIds ?? []).join(", ")}`);
+      }
+    }
+
+    return 0;
+  } finally {
+    // Close MCP client connections so no dangling handle keeps the process
+    // alive after the command completes.
+    await hub.close();
+  }
 }

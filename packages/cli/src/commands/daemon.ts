@@ -169,6 +169,11 @@ export async function connectCommand(options: DaemonOptions = {}): Promise<numbe
     const finish = (code: number): void => {
       if (settled) return;
       settled = true;
+      // Drop the pipe handles so the event loop can wind down after the socket
+      // closes; without this the flowing stdin pipe keeps the process alive.
+      process.stdin.unpipe(socket);
+      socket.destroy();
+      if (process.stdin.readable) process.stdin.destroy();
       done(code);
     };
     socket.once("close", () => finish(0));

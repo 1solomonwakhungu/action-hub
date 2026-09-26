@@ -117,12 +117,14 @@ async function main(): Promise<void> {
 
   if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     printHelp();
-    process.exit(0);
+    process.exitCode = 0;
+    return;
   }
 
   if (args.includes("--version") || args.includes("-v")) {
     console.log(`action-hub ${VERSION}`);
-    process.exit(0);
+    process.exitCode = 0;
+    return;
   }
 
   const command = args[0];
@@ -352,10 +354,15 @@ async function main(): Promise<void> {
       }
     }
 
-    process.exit(exitCode);
+    // Set the exit code and return instead of calling process.exit() here:
+    // process.exit() truncates pending stdout writes beyond ~64 KiB when stdout
+    // is a pipe (the pipe buffer plus Node's internal buffer get discarded).
+    // Commands that must force-close (serve's signal shutdown, the MCP server
+    // runtime) do their own flush-then-exit internally.
+    process.exitCode = exitCode;
   } catch (err) {
     console.error(`Fatal error: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
