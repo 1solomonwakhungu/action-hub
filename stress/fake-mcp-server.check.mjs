@@ -90,17 +90,14 @@ function parseCrashLog(stderrText) {
   return m ? { completed: Number(m[1]), aborted: Number(m[2]) } : null;
 }
 
-async function runSingleClient({ http, port }) {
+async function runSingleClient({ http, port, existingChild = null, existingStderr = null }) {
   const label = http ? "http" : "stdio";
-  let child = null;
-  let stderrText = "";
+  let child = existingChild;
+  let stderrText = existingStderr;
   let transport;
   if (http) {
-    child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", String(port), "--chaos", "crash-after=3"], { stdio: ["ignore", "ignore", "pipe"] });
-    const collect = await collectStderr(child.stderr);
     await withTimeout(waitForTcp(port, `http boot :${port}`), "http server boot");
     transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
-    stderrText = collect;
   } else {
     transport = new StdioClientTransport({
       command: "node",
@@ -147,9 +144,7 @@ async function runSingleClient({ http, port }) {
   }
 }
 
-async function runTwoClientCollision({ port }) {
-  const child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", String(port), "--chaos", "crash-after=2"], { stdio: ["ignore", "ignore", "pipe"] });
-  const getStderr = await collectStderr(child.stderr);
+async function runTwoClientCollision({ port, getStderr, child }) {
   await withTimeout(waitForTcp(port, `two-client boot :${port}`), "two-client server boot");
   try {
     const transports = [0, 1].map(() => new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
@@ -171,20 +166,16 @@ async function runTwoClientCollision({ port }) {
     const log = parseCrashLog(getStderr());
     check("two-client: log completed=2 aborted=0 (exact)", log?.completed === 2 && log?.aborted === 0, JSON.stringify(log));
 
-    // Server must have exited.
-    await withTimeout(new Promise((r) => setTimeout(r, 500)), "exit wait");
-    const exited = ["close", "exit"].some((ev) => child.listeners(ev).length > 0) ? null : undefined;
-    const alive = child.exitCode === null && child.signalCode === null && !exited;
-    let reallyAlive = alive;
-    if (alive) {
-      reallyAlive = await withTimeout(
-        Promise.race([
-          new Promise((res) => { child.once("exit", () => res(false)); setTimeout(() => res(true), 100); }),
-        ]),
-        "exit probe",
-      );
-    }
-    check("two-client: server exited after both settled", !reallyAlive);
+    // Server must have exited once both calls settled.
+    const exited = await withTimeout(
+      new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
+        child.once("exit", () => resolve(true));
+        setTimeout(() => resolve(false), 5_000);
+      }),
+      "two-client exit wait",
+    );
+    check("two-client: server exited after both settled", exited === true);
   } catch (e) {
     check("two-client: scenario completed", false, String(e).slice(0, 120));
   } finally {
@@ -192,28 +183,101 @@ async function runTwoClientCollision({ port }) {
   }
 }
 
-// Ephemeral ports: ask the server to listen on 0 and read the real port
-// from its "listening on" log line.
-async function freePort() {
-  const child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", "0"], { stdio: ["ignore", "ignore", "pipe"] });
-  const getStderr = await collectStderr(child.stderr);
-  let port = null;
-  for (let i = 0; i < 50 && port === null; i++) {
-    const m = getStderr().match(/listening on http:\/\/127\.0\.0\.1:(\d+)\/mcp/);
-    if (m) port = Number(m[1]);
-    else await new Promise((r) => setTimeout(r, 100));
+// Early-abort: a raw HTTP client that destroys the request as soon as the
+// response HEADERS arrive (before the delayed 5 MB body). The accepted call
+// must settle as aborted (completed=0 aborted=1) and the process must exit.
+async function runEarlyAbort({ port, getStderr, child }) {
+  await withTimeout(waitForTcp(port, `early-abort boot :${port}`), "early-abort server boot");
+  try {
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: {} } });
+    const ac = new AbortController();
+    const t0 = Date.now();
+    let sawHeaders = false;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body,
+        signal: ac.signal,
+      });
+      sawHeaders = true;
+      ac.abort(); // destroy as soon as headers arrive, before the 5 MB body
+      await res.text().catch(() => {});
+    } catch {
+      // abort may surface as a fetch rejection — fine
+    }
+    check("early-abort: response headers arrived before destroy", sawHeaders);
+
+    await withTimeout(
+      new Promise((resolve, reject) => {
+        const poll = setInterval(() => {
+          const log = parseCrashLog(getStderr());
+          if (log) { clearInterval(poll); resolve(log); }
+        }, 100);
+        setTimeout(() => { clearInterval(poll); reject(new Error("no settled crash log within deadline")); }, STEP_TIMEOUT_MS);
+      }),
+      "early-abort settle wait",
+    ).then(
+      (log) => check("early-abort: log completed=0 aborted=1", log?.completed === 0 && log?.aborted === 1, JSON.stringify(log)),
+      (e) => check("early-abort: log completed=0 aborted=1", false, String(e).slice(0, 80)),
+    );
+
+    const exited = await withTimeout(
+      new Promise((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolve(true);
+        child.once("exit", () => resolve(true));
+        setTimeout(() => resolve(false), STEP_TIMEOUT_MS);
+      }),
+      "early-abort exit wait",
+    );
+    check("early-abort: server process exited", exited === true);
+    process.stdout.write(`early-abort: settled after ${Date.now() - t0}ms\n`);
+  } catch (e) {
+    check("early-abort: scenario completed", false, String(e).slice(0, 120));
   }
-  child.kill("SIGKILL");
-  if (port === null) throw new Error("could not obtain an ephemeral port");
-  return port;
 }
 
-const httpPort = await freePort();
-check("ephemeral port obtained", Number.isInteger(httpPort) && httpPort > 0, `port ${httpPort}`);
+// Each live test server owns its own port-0 allocation: spawn with
+// --port 0, then read the ACTUAL port from that same child's log line.
+async function spawnEphemeralServer(chaos) {
+  const child = spawn("node", [SERVER, "--manifest", manifestPath, "--transport", "http", "--port", "0", "--chaos", chaos], { stdio: ["ignore", "ignore", "pipe"] });
+  const getStderr = await collectStderr(child.stderr);
+  let port = null;
+  await withTimeout((async () => {
+    while (port === null) {
+      const m = getStderr().match(/listening on http:\/\/127\.0\.0\.1:(\d+)\/mcp/);
+      if (m) port = Number(m[1]);
+      else await new Promise((r) => setTimeout(r, 100));
+    }
+  })(), "ephemeral port discovery");
+  return { child, getStderr, port };
+}
 
 await runSingleClient({ http: false });
-await runSingleClient({ http: true, port: httpPort });
-await runTwoClientCollision({ port: httpPort + 1 });
+{
+  const { child, getStderr, port } = await spawnEphemeralServer("crash-after=3");
+  try {
+    await runSingleClient({ http: true, port, existingChild: child, existingStderr: getStderr });
+  } finally {
+    child.kill("SIGKILL");
+  }
+}
+{
+  const { child, getStderr, port } = await spawnEphemeralServer("crash-after=2");
+  try {
+    await runTwoClientCollision({ port, getStderr, child });
+  } finally {
+    child.kill("SIGKILL");
+  }
+}
+{
+  const { child, getStderr, port } = await spawnEphemeralServer("crash-after=1");
+  try {
+    await runEarlyAbort({ port, getStderr, child });
+  } finally {
+    child.kill("SIGKILL");
+  }
+}
 
 process.stdout.write(failures === 0 ? "ALL CHECKS PASSED\n" : `${failures} CHECK(S) FAILED\n`);
 process.exit(failures === 0 ? 0 : 1);

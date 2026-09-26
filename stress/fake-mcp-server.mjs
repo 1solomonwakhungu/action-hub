@@ -155,42 +155,16 @@ function refusalResult() {
  * never a global flag. Every SDK-assigned handler passes through.
  */
 function withCrashCounting(inner, conn, { http = false } = {}) {
-  let currentRes = null;
   return new Proxy(inner, {
     get(target, prop, recv) {
       if (prop === "send") {
         return async (msg) => {
           const result = await target.send(msg);
-          if (
-            crashAfter !== undefined &&
-            msg && typeof msg === "object" && !("method" in msg) &&
-            conn.acceptedIds.has(msg.id)
-          ) {
-            conn.acceptedIds.delete(msg.id);
-            if (http && currentRes) {
-              // SSE/HTTP responses drain asynchronously (res.write may be
-              // backpressured well past send() resolving), so completion is
-              // that response's own ServerResponse 'finish'. An abort is
-              // settled truthfully as aborted, never as completed.
-              const res = currentRes;
-              let settled = false;
-              const settle = (kind, reason) => {
-                if (settled) return;
-                settled = true;
-                if (kind === "finished") finishedCalls += 1;
-                else abortedCalls += 1;
-                if (finishedCalls + abortedCalls >= crashAfter) crashLog(reason);
-              };
-              if (res.writableFinished) settle("finished", "finish");
-              else {
-                res.once("finish", () => settle("finished", "finish"));
-                res.once("close", () => {
-                  if (!res.writableFinished) settle("aborted", "client-abort");
-                });
-              }
-            } else {
-              // stdio: the write callback means the chunk is in the pipe
-              // buffer, which survives process exit.
+          if (!http && crashAfter !== undefined && msg && typeof msg === "object" && !("method" in msg)) {
+            // stdio: the write callback means the chunk is in the pipe
+            // buffer, which survives process exit — settlement signal.
+            if (conn.acceptedIds.has(msg.id)) {
+              conn.acceptedIds.delete(msg.id);
               finishedCalls += 1;
               if (finishedCalls + abortedCalls >= crashAfter) crashLog("write-drained");
             }
@@ -199,9 +173,33 @@ function withCrashCounting(inner, conn, { http = false } = {}) {
         };
       }
       if (prop === "handleRequest" && http) {
+        // Stateless HTTP: this res serves at most one request. finish/close
+        // listeners are armed BEFORE the handler runs, so a client that
+        // aborts mid-latency or mid-body is always settled (an accepted
+        // call aborts; a refused/unrelated request settles nothing). A
+        // handleRequest rejection settles as aborted too. settled-once
+        // guards prevent double counting.
         return async (req, res, ...rest) => {
-          currentRes = res;
-          return target.handleRequest(req, res, ...rest);
+          let settled = false;
+          const settle = (kind, reason) => {
+            if (settled) return;
+            settled = true;
+            if (conn.acceptedIds.size === 0) return; // nothing accepted on this res
+            for (const id of conn.acceptedIds) conn.acceptedIds.delete(id);
+            if (kind === "finished") finishedCalls += 1;
+            else abortedCalls += 1;
+            if (finishedCalls + abortedCalls >= crashAfter) crashLog(reason);
+          };
+          res.once("finish", () => settle("finished", "finish"));
+          res.once("close", () => {
+            if (!res.writableFinished) settle("aborted", "client-abort");
+          });
+          try {
+            return await target.handleRequest(req, res, ...rest);
+          } catch (cause) {
+            settle("aborted", "send-rejected");
+            throw cause;
+          }
         };
       }
       const value = Reflect.get(target, prop, target);
