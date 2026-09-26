@@ -46,7 +46,7 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
             name: tool.name,
             description: tool.description,
             inputSchema: tool.inputSchema as JsonSchema | undefined,
-            annotations: (tool as { annotations?: { readOnlyHint?: boolean } }).annotations,
+            annotations: tool.annotations,
           }));
         });
       },

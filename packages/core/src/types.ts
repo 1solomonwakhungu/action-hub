@@ -249,12 +249,34 @@ export interface CallToolOptions {
 }
 
 /**
+ * Standard MCP tool annotations. All fields are hints from the downstream
+ * server; clients must not treat them as guarantees.
+ */
+export interface ToolAnnotations {
+  /** Human-readable title for display. */
+  title?: string;
+  /** If true, the tool does not modify its environment — safe to cache and retry. */
+  readOnlyHint?: boolean;
+  /** If true, the tool may destructively modify its environment. */
+  destructiveHint?: boolean;
+  /** If true, calling the tool repeatedly with the same args has no additional effect. */
+  idempotentHint?: boolean;
+  /** If true, the tool may interact with an "open world" of external entities. */
+  openWorldHint?: boolean;
+}
+
+/**
  * Minimal contract Action Hub needs from a downstream MCP server. Keeping
  * this narrow means the transport implementation can be swapped (real MCP
  * client, in-memory fake, recorded fixture) without touching the router.
  */
 export interface McpClient {
-  listTools(options?: CallToolOptions): Promise<Array<{ name: string; description?: string; inputSchema?: JsonSchema }>>;
+  listTools(options?: CallToolOptions): Promise<Array<{
+    name: string;
+    description?: string;
+    inputSchema?: JsonSchema;
+    annotations?: ToolAnnotations;
+  }>>;
   callTool(name: string, args: Record<string, unknown>, options?: CallToolOptions): Promise<unknown>;
   close(): Promise<void>;
 }
