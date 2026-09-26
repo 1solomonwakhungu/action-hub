@@ -490,105 +490,162 @@ test("Node memory limit injection skips non-Node commands and existing flags", (
 // F16: execute-time connection errors trip the circuit breaker
 // ---------------------------------------------------------------------------
 
-test("isConnectionFailure classifies transport errors, not tool errors", async () => {
-  const { isConnectionFailure } = await import("../dist/servers/connection-manager.js");
-  const connection = [
-    "Not connected",
-    "Stdio transport closed unexpectedly",
-    "Connection closed",
-    "write EPIPE",
-    "Child process exited with code 1",
-    "connect ECONNREFUSED 127.0.0.1:3000",
-    "getaddrinfo ENOTFOUND localhost",
-  ];
-  const toolLevel = [
-    "Tool \"linear:create_issue\" returned an error: invalid project id",
-    "Tool \"x\" timed out after 5000ms",
-    "Circuit breaker open for server \"a\": too many consecutive failures. Cooling down.",
-    "Invalid arguments: missing title",
-    "JSON-RPC error -32602: unknown tool",
-  ];
-  for (const message of connection) assert.equal(isConnectionFailure(message), true, message);
-  for (const message of toolLevel) assert.equal(isConnectionFailure(message), false, message);
+// Helper: calls through the manager's wrapped client and returns the thrown cause.
+async function clientWrapperCall(manager: ConnectionManager, id: string, tool: string): Promise<unknown> {
+  const client = await manager.activate(id);
+  try {
+    await client.callTool(tool, {});
+    throw new Error("expected callTool to reject");
+  } catch (cause) {
+    if (cause instanceof Error && cause.message === "expected callTool to reject") throw cause;
+    return cause;
+  }
+}
+
+test("transport failures are tagged at the client boundary; JSON-RPC coded errors are not", async () => {
+  const { isTransportFailure } = await import("../dist/servers/connection-manager.js");
+  const clock = new FakeClock();
+  const client = new FakeClient([
+    { name: "t1", description: "dies at transport layer", inputSchema: { type: "object" } },
+    { name: "t2", description: "returns a JSON-RPC error", inputSchema: { type: "object" } },
+  ]);
+  let mode: "transport" | "jsonrpc" = "transport";
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async (...args: unknown[]) => {
+    if (mode === "transport") throw new Error("Stdio transport closed unexpectedly");
+    const e: Error & { code?: number } = new Error("Not connected to Slack workspace. Authenticate this integration first.");
+    e.code = -32000;
+    throw e;
+  };
+  const manager = new ConnectionManager((async () => client) as unknown as Parameters<typeof ConnectionManager["prototype"]["activate"]> extends never ? never : never, [server("t")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  await manager.activate("t");
+  mode = "transport";
+  const transportCause = await clientWrapperCall(manager, "t", "t1").catch((c) => c);
+  assert.equal(transportCause instanceof Error, true);
+  assert.equal(isTransportFailure(transportCause), true, "plain transport error must be tagged");
+  mode = "jsonrpc";
+  const jsonrCause = await clientWrapperCall(manager, "t", "t2").catch((c) => c);
+  assert.equal(isTransportFailure(jsonrCause), false, "coded JSON-RPC error must NOT be tagged");
 });
 
-test("reportExecuteFailure: connection failures open the circuit, drop the client, and restart after cooldown", async () => {
+test("reportExecuteFailure: consecutive transport failures open the circuit, release the client, and restart after cooldown", async () => {
   const clock = new FakeClock();
   let alive = true; // the child dies mid-flight after a healthy start
-  let calls = 0;
+  const underlying = new FakeClient([{ name: "ping", description: "pings", inputSchema: { type: "object" } }], () => {
+    if (!alive) throw new Error("Not connected"); // dead child: transport-level
+    return "ok:ping";
+  });
   const factory = async (): Promise<McpClient> => {
     if (!alive) throw new Error("spawn failed: child process exited with code 1");
-    calls += 1;
-    return new FakeClient([
-      { name: "ping", description: "pings", inputSchema: { type: "object" } },
-    ]);
+    return underlying;
   };
   const manager = new ConnectionManager(factory, [server("dead")], {
-    failureThreshold: 3,
-    cooldownMs: 3_000,
-    heartbeat: { enabled: false },
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
     restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
-    now: clock.now,
-    random: clock.random,
-    setTimeout: clock.setTimeout,
-    clearTimeout: clock.clearTimeout,
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
   });
-
-  // Server starts healthy, then the child dies mid-flight.
-  const client = await manager.activate("dead");
+  await manager.activate("dead");
   assert.equal(manager.states()[0]!.circuitState, "closed");
   alive = false;
-
-  // Three execute-time connection failures: breaker opens, stale client dropped.
+  let lastCause: unknown;
   for (let i = 0; i < 3; i++) {
-    await manager.reportExecuteFailure("dead", "Not connected");
+    lastCause = await clientWrapperCall(manager, "dead", "ping");
+    await manager.reportExecuteFailure("dead", lastCause, (lastCause as Error).message);
   }
   const open = manager.states()[0]!;
   assert.equal(open.circuitState, "open");
   assert.equal(open.consecutiveFailures, 3);
-  assert.equal(client.closed, true, "stale client must be dropped");
+  assert.equal(underlying.closed, true, "stale client must be released once the breaker opens");
   assert.ok(open.nextRestartAt !== undefined, "a restart must be scheduled");
-
-  // Reconnecting during cooldown still fails and keeps the circuit open.
-  await clock.advance(3_000);
+  await clock.advance(3_000); // restart fires while the server is still dead
   assert.equal(manager.states()[0]!.circuitState, "open");
-
-  // Server comes back: the scheduled restart reconnects and the breaker closes.
-  // The failed attempt above re-armed the cooldown, so clear it fully.
   alive = true;
-  await clock.advance(4_000);
+  await clock.advance(4_000); // failed attempt re-armed the cooldown; clear it fully
   await clock.drain();
   const recovered = manager.states()[0]!;
   assert.equal(recovered.circuitState, "closed");
   assert.equal(recovered.consecutiveFailures, 0);
-  assert.equal(calls >= 1, true, "factory must have produced a new client");
 });
 
-test("reportExecuteFailure ignores tool-level errors", async () => {
+test("a successful execute resets the failure streak (alternating failures must not open the circuit)", async () => {
   const clock = new FakeClock();
-  const client = new FakeClient([
-    { name: "boom", description: "always fails", inputSchema: { type: "object" } },
-  ], () => {
-    throw new Error("Tool \"boom\" returned an error: invalid arguments");
+  let fail = true;
+  const client = new FakeClient([{ name: "flaky_pipe", description: "alternates", inputSchema: { type: "object" } }]);
+  const rawCall = client.callTool.bind(client);
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async (...args: unknown[]) => {
+    if (fail) { fail = false; throw new Error("write EPIPE"); }
+    fail = true;
+    return rawCall(args[0] as string, args[1] as Record<string, unknown>, args[2]);
+  };
+  const manager = new ConnectionManager(async () => client, [server("alt")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
   });
-  const { factory } = makeFactory({ boom: client });
-  const manager = new ConnectionManager(factory, [server("boom")], {
-    failureThreshold: 3,
-    cooldownMs: 3_000,
-    heartbeat: { enabled: false },
-    now: clock.now,
-    random: clock.random,
-    setTimeout: clock.setTimeout,
-    clearTimeout: clock.clearTimeout,
-  });
-  await manager.activate("boom");
-  for (let i = 0; i < 5; i++) {
-    await manager.reportExecuteFailure("boom", "Tool \"boom\" returned an error: invalid arguments");
+  await manager.activate("alt");
+  for (let i = 0; i < 3; i++) {
+    const cause = await clientWrapperCall(manager, "alt", "flaky_pipe");
+    await manager.reportExecuteFailure("alt", cause, (cause as Error).message);
+    // successful call in between resets the streak
+    const wrapped = await manager.activate("alt");
+    await wrapped.callTool("flaky_pipe", {});
+    manager.recordSuccess("alt", 1);
   }
-  const state = manager.states()[0]!;
-  assert.equal(state.circuitState, "closed");
-  assert.equal(state.consecutiveFailures, 0);
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "closed", "alternating failures are not consecutive");
+  assert.equal(st.consecutiveFailures, 0);
+  assert.equal(client.closed, false);
+});
+
+test("free-form tool error text can never open the circuit (JSON-RPC coded errors are tool-level)", async () => {
+  const clock = new FakeClock();
+  const client = new FakeClient([{ name: "send_message", description: "slack-like", inputSchema: { type: "object" } }]);
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async () => {
+    const e: Error & { code?: number } = new Error("Not connected to Slack workspace. Authenticate this integration first.");
+    e.code = -32000; // live server JSON-RPC error response
+    throw e;
+  };
+  const manager = new ConnectionManager(async () => client, [server("live")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    now: clock.now, random: clock.random, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+  });
+  await manager.activate("live");
+  for (let i = 0; i < 5; i++) {
+    const cause = await clientWrapperCall(manager, "live", "send_message");
+    await manager.reportExecuteFailure("live", cause, (cause as Error).message);
+  }
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "closed", "tool-level error text must not trip the breaker");
+  assert.equal(st.consecutiveFailures, 0);
   assert.equal(client.closed, false, "a live server's client must be retained");
+});
+
+test("a threshold execute failure returns promptly even when close() never settles", async () => {
+  const clock = new FakeClock();
+  const client = new FakeClient([{ name: "t", description: "d", inputSchema: { type: "object" } }]);
+  (client as unknown as { callTool: (...a: unknown[]) => Promise<unknown> }).callTool = async () => {
+    throw new Error("Stdio transport closed unexpectedly");
+  };
+  (client as unknown as { close: () => Promise<void> }).close = () => new Promise<void>(() => {}); // never settles
+  // Real timers: the bounded background close must not need a clock advance.
+  const manager = new ConnectionManager(async () => client, [server("stuck")], {
+    failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false },
+    restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+    now: clock.now, random: clock.random,
+  });
+  await manager.activate("stuck");
+  const cause = await clientWrapperCall(manager, "stuck", "t");
+  const t0 = Date.now();
+  await manager.reportExecuteFailure("stuck", cause, "Stdio transport closed unexpectedly");
+  await manager.reportExecuteFailure("stuck", cause, "Stdio transport closed unexpectedly");
+  // Third failure opens the circuit and must not hang on the never-settling close.
+  await manager.reportExecuteFailure("stuck", cause, "Stdio transport closed unexpectedly");
+  assert.ok(Date.now() - t0 < 250, "threshold failure must return without awaiting close");
+  const st = manager.states()[0]!;
+  assert.equal(st.circuitState, "open");
+  assert.ok(st.nextRestartAt !== undefined, "restart scheduled despite unbounded close");
+  assert.equal(client.closed, false, "close is left to the bounded background task");
 });
 
 test("execute-time connection errors trip the breaker without waiting for the heartbeat", async () => {
@@ -631,9 +688,6 @@ test("execute-time connection errors trip the breaker without waiting for the he
   const [broken] = hub.serverStates();
   assert.equal(broken!.circuitState, "open");
   assert.ok(broken!.nextRestartAt !== undefined, "restart scheduled from execute failures");
-
-  // Before this fix, circuitState stayed closed here because only the
-  // heartbeat recorded failures. No heartbeat is configured in this test.
 
   // A tool-level isError result from a live server must NOT trip the breaker.
   const erroringClient = new FakeClient([
