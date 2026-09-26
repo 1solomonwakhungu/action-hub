@@ -29,16 +29,64 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ActionHub, createLocalSemanticScorer, parseSkillContent } from "../packages/core/dist/index.js";
 
-// ---- isolation (contract hard rules) ----------------------------------------
+// ---- isolation (contract + ISOLATION.md checklist) ---------------------------
+// One fresh temp root; EVERY path-bearing env var is REPLACED (never forwarded
+// from the caller). The real owner home is derived independently of $HOME and
+// the run refuses to start if any resolved path lies inside it.
+import { homedir, userInfo } from "node:os";
+const realOwnerHome = userInfo().homedir ?? homedir();
 const isoRoot = mkdtempSync(join(tmpdir(), "action-hub-eval-"));
-for (const d of ["cache", "config", join("cache", "action-hub"), join("config", "action-hub"), "pi"]) {
+for (const d of ["cache", "config", "state", "data", join("cache", "action-hub"), join("config", "action-hub"), "daemon", "credentials", "skills", "pi"]) {
   mkdirSync(join(isoRoot, d), { recursive: true });
 }
-process.env.HOME = isoRoot;
-process.env.XDG_CACHE_HOME = join(isoRoot, "cache");
-process.env.XDG_CONFIG_HOME = join(isoRoot, "config");
-process.env.ACTION_HUB_CONFIG = join(isoRoot, "config", "servers.json");
-process.env.PI_CODING_AGENT_DIR = join(isoRoot, "pi");
+const ISO_ENV = {
+  HOME: isoRoot,
+  USERPROFILE: isoRoot,
+  APPDATA: join(isoRoot, "config"),
+  LOCALAPPDATA: join(isoRoot, "cache"),
+  XDG_CACHE_HOME: join(isoRoot, "cache"),
+  XDG_CONFIG_HOME: join(isoRoot, "config"),
+  XDG_STATE_HOME: join(isoRoot, "state"),
+  XDG_DATA_HOME: join(isoRoot, "data"),
+  ACTION_HUB_CONFIG: join(isoRoot, "config", "servers.json"),
+  ACTION_HUB_CACHE: join(isoRoot, "cache", "action-hub"),
+  ACTION_HUB_SKILLS_DIR: join(isoRoot, "skills"),
+  ACTION_HUB_DAEMON_DIR: join(isoRoot, "daemon"),
+  ACTION_HUB_CREDENTIALS: join(isoRoot, "credentials"),
+  PI_CODING_AGENT_DIR: join(isoRoot, "pi"),
+};
+for (const [key, value] of Object.entries(ISO_ENV)) process.env[key] = value;
+// Sentinel self-check (ISOLATION.md rev 21:27Z): validate FINAL env values
+// after every assignment. All path-bearing vars must resolve inside the run
+// root; refuse only paths inside the owner's REAL app-state/harness dirs —
+// NOT anything under home (os.tmpdir() itself sits under USERPROFILE on
+// Windows, so whole-home refusal would break Windows). Containment uses
+// separator-safe path.relative, never startsWith.
+import { relative, isAbsolute } from "node:path";
+const isInside = (child, parent) => {
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+};
+const forbiddenOwnerDirs = [
+  join(realOwnerHome, ".cache", "action-hub"),
+  join(realOwnerHome, ".config", "action-hub"),
+  join(realOwnerHome, ".action-hub"),
+  join(realOwnerHome, ".claude"),
+  join(realOwnerHome, ".codex"),
+  join(realOwnerHome, ".gemini"),
+  join(realOwnerHome, ".agents"),
+].filter((p) => !isInside(p, isoRoot));
+for (const [key, value] of Object.entries(ISO_ENV)) {
+  const resolved = resolve(value);
+  if (!isInside(resolved, isoRoot)) {
+    throw new Error(`isolation sentinel failed: ${key}=${resolved} escapes run root`);
+  }
+  for (const forbidden of forbiddenOwnerDirs) {
+    if (isInside(resolved, forbidden)) {
+      throw new Error(`isolation refused: ${key}=${resolved} is inside the owner's real state dir ${forbidden}`);
+    }
+  }
+}
 
 const STRESS_DIR = resolve(fileURLToPath(import.meta.url), "..");
 const GENERATED = join(STRESS_DIR, ".generated");
@@ -393,12 +441,16 @@ const ENGINE_DESC = {
 };
 
 async function warmAndTime(hub, queries) {
-  for (const q of queries) await hub.search(q.query, { limit: 20 }); // warmup, untimed
+  const withTimeout = (promise, ms, label) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`timeout: ${label} exceeded ${ms}ms`)), ms)),
+  ]);
+  for (const q of queries) await withTimeout(hub.search(q.query, { limit: 20 }), 30_000, `warmup "${q.query.slice(0, 40)}"`);
   const rows = [];
   const latencies = [];
   for (const q of queries) {
     const t0 = performance.now();
-    const hits = await hub.search(q.query, { limit: 20 });
+    const hits = await withTimeout(hub.search(q.query, { limit: 20 }), 30_000, `search "${q.query.slice(0, 40)}"`);
     latencies.push(performance.now() - t0);
     const golds = goldsOf(q);
     const ids = hits.map((h) => h.id);
@@ -749,5 +801,6 @@ function countBy(arr, keyFn) {
 
 main().catch((cause) => {
   console.error(cause);
+  console.log(JSON.stringify({ script: "eval-retrieval", ok: false, error: String(cause?.message ?? cause) }));
   process.exitCode = 1;
 });
