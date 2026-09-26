@@ -238,28 +238,38 @@ export class LocalSemanticIndex {
    * Rebuilds every document embedding. Called once per catalog change so that
    * query time stays proportional to the query, not to the catalog.
    */
+  /**
+   * Synchronous rebuild. It takes a generation from the same counter as the
+   * cooperative path and publishes through the same latest-wins gate, so a
+   * sync rebuild started while a cooperative rebuild is parked wins, and the
+   * older build's late publish is discarded instead of regressing the index.
+   * (Being await-free, the build itself is atomic by construction.)
+   */
   index(records: readonly ActionRecord[]): void {
+    const myGeneration = ++this.#nextGeneration;
     const documents = records.map((record) => describe(record));
-    this.#documentCount = documents.length;
-    this.#documents = new Map();
-    this.#idf = new Map();
+    const nextDocuments = new Map<string, CachedVector>();
+    const nextIdf = new Map<string, number>();
 
-    if (documents.length === 0) return;
-
-    const docFreq = new Map<string, number>();
-    for (const document of documents) {
-      for (const term of document.terms.keys()) {
-        docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+    if (documents.length !== 0) {
+      const docFreq = new Map<string, number>();
+      for (const document of documents) {
+        for (const term of document.terms.keys()) {
+          docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+        }
+      }
+      for (const [term, df] of docFreq) {
+        nextIdf.set(term, Math.log(1 + documents.length / (df + 0.5)));
+      }
+      for (const document of documents) {
+        const vector = this.#embed(document.terms, nextIdf, documents.length);
+        if (vector) {
+          nextDocuments.set(document.id, { fingerprint: document.fingerprint, vector });
+        }
       }
     }
-    for (const [term, df] of docFreq) {
-      this.#idf.set(term, Math.log(1 + documents.length / (df + 0.5)));
-    }
 
-    for (const document of documents) {
-      const vector = this.#embed(document.terms, this.#idf, this.#documentCount);
-      if (vector) this.#documents.set(document.id, { fingerprint: document.fingerprint, vector });
-    }
+    this.#publish(myGeneration, nextDocuments, nextIdf, documents.length);
   }
 
   /**
@@ -281,40 +291,54 @@ export class LocalSemanticIndex {
     const myGeneration = ++this.#nextGeneration;
     this.#inFlight += 1;
     try {
-      const documents = records.map((record) => describe(record));
       const nextDocuments = new Map<string, CachedVector>();
       const nextIdf = new Map<string, number>();
+      const total = records.length;
 
-      if (documents.length === 0) {
+      if (total === 0) {
         this.#publish(myGeneration, nextDocuments, nextIdf, 0);
         return;
       }
 
+      // Every phase (describe + doc-freq, idf, embed) is chunked with the
+      // same yield discipline, so time-to-first-yield — and therefore the
+      // maximum single event-loop stall — is bounded by one chunk of work,
+      // not by the size of the corpus.
+      const described: IndexedDocument[] = [];
       const docFreq = new Map<string, number>();
-      for (const document of documents) {
-        for (const term of document.terms.keys()) {
-          docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+      for (let start = 0; start < total; start += chunkSize) {
+        if (start > 0) await yieldFn();
+        for (const record of records.slice(start, start + chunkSize)) {
+          const document = describe(record);
+          described.push(document);
+          for (const term of document.terms.keys()) {
+            docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+          }
         }
       }
+
+      let idfEntries = 0;
       for (const [term, df] of docFreq) {
-        nextIdf.set(term, Math.log(1 + documents.length / (df + 0.5)));
+        if (idfEntries > 0 && idfEntries % chunkSize === 0) await yieldFn();
+        nextIdf.set(term, Math.log(1 + total / (df + 0.5)));
+        idfEntries += 1;
       }
 
-      for (let start = 0; start < documents.length; start += chunkSize) {
+      for (let start = 0; start < total; start += chunkSize) {
         if (start > 0) await yieldFn();
-        for (const document of documents.slice(start, start + chunkSize)) {
-          // Embed against THIS generation's idf: the live idf still belongs to
-          // the previous generation, and weighting by it would make vectors
-          // depend on rebuild interleaving. The sync path (index()) does the
-          // same by setting #idf before its embed loop.
-          const vector = this.#embed(document.terms, nextIdf, documents.length);
+        for (const document of described.slice(start, start + chunkSize)) {
+          // Embed against THIS generation's idf: the live idf still belongs
+          // to the previous generation, and weighting by it would make
+          // vectors depend on rebuild interleaving. The sync path (index())
+          // does the same by building nextIdf before its embed loop.
+          const vector = this.#embed(document.terms, nextIdf, total);
           if (vector) {
             nextDocuments.set(document.id, { fingerprint: document.fingerprint, vector });
           }
         }
       }
 
-      this.#publish(myGeneration, nextDocuments, nextIdf, documents.length);
+      this.#publish(myGeneration, nextDocuments, nextIdf, total);
     } finally {
       this.#inFlight -= 1;
     }

@@ -79,8 +79,16 @@ test("indexAll embeds cooperatively: yields between chunks and serves the event 
     },
   });
 
+  const t0 = performance.now();
   let ticks = 0;
-  const heartbeat = setInterval(() => (ticks += 1), 1);
+  let lastTick = t0;
+  let maxStallMs = 0;
+  const heartbeat = setInterval(() => {
+    ticks += 1;
+    const now = performance.now();
+    maxStallMs = Math.max(maxStallMs, now - lastTick);
+    lastTick = now;
+  }, 1);
   try {
     const results = await hub.indexAll();
     assert.equal(results.every((result) => !result.error), true);
@@ -92,6 +100,14 @@ test("indexAll embeds cooperatively: yields between chunks and serves the event 
   // 8000 documents at chunk size 250 => at least 31 chunk boundaries.
   assert.ok(yields.length >= 31, `expected >= 31 yields, got ${yields.length}`);
   assert.ok(ticks > 0, "event loop heartbeat never fired during indexAll");
+  // Bounded stall (FX/D1-R3): preprocessing is chunked too, so time to the
+  // first yield — and every max event-loop stall between heartbeats — is
+  // bounded by roughly one chunk of work plus scheduler noise, not by the
+  // corpus size. 250ms leaves >50x headroom over the measured chunk cost
+  // (a chunk of 250 wordy records describes/embeds in ~2-4ms).
+  const timeToFirstYield = yields[0] - t0;
+  assert.ok(timeToFirstYield < 250, `first yield took ${timeToFirstYield.toFixed(1)}ms — preprocessing is not chunked`);
+  assert.ok(maxStallMs < 250, `max event-loop stall was ${maxStallMs.toFixed(1)}ms during indexAll`);
 });
 
 test("a search during a paused rebuild stays bounded and the event loop stays live", async () => {
@@ -176,6 +192,43 @@ test("overlapping cooperative rebuilds publish atomically: latest generation win
   gateB.auto();
   await buildB;
   assert.equal(index.stats().documents, 2, "latest-started generation (B) must win, no interleave");
+});
+
+test("a synchronous rebuild wins over an older parked cooperative rebuild", async () => {
+  const record = (id: string, text: string): ActionRecord => ({
+    id,
+    kind: "tool",
+    name: text,
+    serverId: "test",
+    summary: text,
+    description: text,
+    tags: [],
+    trust: "trusted",
+  });
+
+  const index = new LocalSemanticIndex();
+  const gate = gatedYield();
+  // Cooperative build (3 records) parks at its chunk boundary...
+  const building = index.indexCooperative(
+    [
+      record("a:one", "alpha one deploy"),
+      record("a:two", "alpha two rollback"),
+      record("a:three", "alpha three notify"),
+    ],
+    { chunkSize: 2, yieldFn: gate.fn },
+  );
+  while (gate.paused() === 0) await new Promise((done) => setImmediate(done));
+
+  // ...then a synchronous rebuild runs (registerSkills/replaceSkills path).
+  // It must take the newest generation and publish immediately.
+  index.index([record("b:one", "beta one backup")]);
+  assert.equal(index.stats().documents, 1, "sync rebuild must publish immediately");
+
+  // The older cooperative build resumes: its stale generation is discarded.
+  gate.releaseAll();
+  gate.auto();
+  await building;
+  assert.equal(index.stats().documents, 1, "older cooperative build must not regress the newer sync generation");
 });
 
 test("non-integer and NaN chunk sizes fall back to the default instead of indexing nothing", async () => {
