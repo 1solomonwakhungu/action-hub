@@ -45,9 +45,107 @@ test("CLI config loader handles empty and populated configs", async () => {
   }
 });
 
-test("import command executes without errors", async () => {
-  const code = await importCommand({ write: false });
-  assert.equal(code, 0);
+test("import command executes without errors", async (t) => {
+  // Isolated empty HOME: the discovery path must never read real owner configs.
+  const tempHome = resolve(tmpdir(), `action-hub-cli-import-${Date.now()}`);
+  await mkdir(tempHome, { recursive: true });
+  const originalHome = process.env["HOME"];
+  process.env["HOME"] = tempHome;
+  try {
+    const code = await importCommand({ write: false });
+    assert.equal(code, 0);
+  } finally {
+    if (originalHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = originalHome;
+    await rm(tempHome, { recursive: true, force: true });
+  }
+});
+
+test("import and migrate redact every secret sentinel from discovery output", async (t) => {
+  const sentinels = {
+    BASIC: "SENTINEL_BASIC_35",
+    ENV: "SENTINEL_ENV_35",
+    FLAG: "SENTINEL_FLAG_35",
+    HEADER: "SENTINEL_HEADER_35",
+    USERINFO: "SENTINEL_USERINFO_35",
+    INVALID_URL: "SENTINEL_INVALID_URL_35",
+    PWD: "SENTINEL_PWD_35",
+    ATTACHED_HEADER: "SENTINEL_SHORT_HEADER_35",
+    RAW_SECRET: "rawsecret12345678901234567890abcd",
+  };
+  const tempHome = resolve(tmpdir(), `action-hub-import-redact-${Date.now()}`);
+  const cursorDir = join(tempHome, ".cursor");
+  await mkdir(cursorDir, { recursive: true });
+  await writeFile(
+    join(cursorDir, "mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        basic: {
+          command: "node",
+          args: ["server.js", "--token", sentinels.BASIC],
+          env: { API_TOKEN: sentinels.ENV },
+        },
+        "custom-token-flag": {
+          command: "node",
+          args: ["server.js", "--github-token", sentinels.FLAG],
+        },
+        "inline-header": {
+          command: "node",
+          args: ["server.js", `--header=X-API-Key: ${sentinels.HEADER}`],
+        },
+        "url-userinfo": {
+          url: `https://user:${sentinels.USERINFO}@example.com/mcp`,
+        },
+        "invalid-url": {
+          url: `not-a-valid-url?token=${sentinels.INVALID_URL}`,
+        },
+        "pwd-flag": {
+          command: "node",
+          args: ["server.js", "--pwd", sentinels.PWD],
+        },
+        "attached-header": {
+          command: "node",
+          args: ["server.js", `-HX-API-Key:${sentinels.ATTACHED_HEADER}`],
+        },
+        "raw-secret": {
+          command: "node",
+          args: ["server.js", "--serve-data", sentinels.RAW_SECRET],
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  const originalHome = process.env["HOME"];
+  process.env["HOME"] = tempHome;
+  const logs: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  };
+
+  try {
+    const importCode = await importCommand({ write: false });
+    assert.equal(importCode, 0);
+    const importOutput = logs.join("\n");
+    assert.match(importOutput, /basic/);
+
+    const migrateCode = await migrateCommand({ write: false, type: "mcps" });
+    assert.equal(migrateCode, 0);
+    const output = logs.join("\n");
+
+    for (const [name, sentinel] of Object.entries(sentinels)) {
+      assert.ok(
+        !output.includes(sentinel),
+        `${name} sentinel must never appear in import/migrate output`,
+      );
+    }
+  } finally {
+    console.log = originalLog;
+    if (originalHome === undefined) delete process.env["HOME"];
+    else process.env["HOME"] = originalHome;
+    await rm(tempHome, { recursive: true, force: true });
+  }
 });
 
 test("migrate command plans and executes capability migration", async () => {
