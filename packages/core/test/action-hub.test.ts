@@ -142,6 +142,42 @@ test("readOnlyHint annotation makes non-prefixed tools cacheable and cache hits 
   assert.equal(lastEntry?.ok, true);
 });
 
+test("a typed annotations object from a client marks the action readOnly", async () => {
+  // Tool objects flowing through the shared McpClient.listTools type (not an
+  // untyped inline client) carry annotations, so the hub must honor
+  // readOnlyHint without any local casts.
+  let downstreamCalls = 0;
+  const hub = new ActionHub({
+    clientFactory: makeFactory({
+      rep: new FakeClient(
+        [
+          {
+            name: "create_report",
+            description: "Generates a report",
+            annotations: { readOnlyHint: true },
+          },
+        ],
+        () => {
+          downstreamCalls += 1;
+          return "ok:create_report";
+        },
+      ),
+    }).factory,
+    servers: [{ id: "rep", transport: { type: "stdio", command: "rep-mcp" }, trust: "trusted" }],
+  });
+  await hub.indexAll();
+
+  const first = await hub.execute("rep:create_report", {});
+  assert.equal(first.ok, true);
+  assert.notEqual(first.cached, true);
+  assert.equal(downstreamCalls, 1);
+
+  // Cached purely because the typed annotations marked the action readOnly.
+  const second = await hub.execute("rep:create_report", {});
+  assert.equal(second.cached, true);
+  assert.equal(downstreamCalls, 1);
+});
+
 test("gated servers are refused when approval is denied", async () => {
   const { hub, clients } = buildHub({ denyOnApprovalRequired: true });
   await hub.indexAll();

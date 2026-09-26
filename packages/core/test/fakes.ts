@@ -1,9 +1,10 @@
-import type { CallToolOptions, JsonSchema, McpClient, ServerConfig } from "../dist/types.js";
+import type { CallToolOptions, JsonSchema, McpClient, ServerConfig, ToolAnnotations } from "../dist/types.js";
 
 export interface FakeTool {
   name: string;
   description?: string;
   inputSchema?: JsonSchema;
+  annotations?: ToolAnnotations;
 }
 
 /** In-memory MCP client so the engine can be tested without spawning servers. */
