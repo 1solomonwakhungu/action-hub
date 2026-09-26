@@ -141,7 +141,7 @@ export const options = Object.assign(
   profile === "quick"
     ? {
         scenarios: {
-          quick: { executor: "constant-arrival-rate", rate: 20, timeUnit: "1s", duration: "15s", preAllocatedVUs: 20, maxVUs: 50 },
+          quick: { executor: "constant-arrival-rate", rate: 5, timeUnit: "1s", duration: "15s", preAllocatedVUs: 5, maxVUs: 10 },
         },
       }
     : profile === "steps"
