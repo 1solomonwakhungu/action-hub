@@ -15,6 +15,19 @@ import {
   DEFAULT_BACKOFF_JITTER,
   DEFAULT_BACKOFF_MAX_MS,
 } from "./restart-backoff.js";
+import {
+  errorHasTransportCode,
+  isTransportFailure,
+  markTransportFailure,
+  ToolError,
+} from "./transport-errors.js";
+
+export {
+  classifyDownstreamError,
+  isTransportFailure,
+  markTransportFailure,
+  ToolError,
+} from "./transport-errors.js";
 
 export interface CircuitBreakerOptions {
   failureThreshold?: number;
@@ -82,6 +95,30 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
  * authenticated until one of its actions is actually executed. This is what
  * makes a hundred configured integrations free until used.
  */
+/**
+ * Wraps a client so execute-time callTool rejections are classified at the
+ * boundary instead of by message text. Errors carrying a numeric `code` or an
+ * McpError-style type are JSON-RPC/tool-layer responses from a live server
+ * and are rethrown unmarked; everything else thrown by callTool is tagged as
+ * a transport failure (Not connected, EPIPE, closed stdio, ...).
+ */
+function tagTransportFailures(client: McpClient): McpClient {
+  return {
+    listTools: (options) => client.listTools(options),
+    callTool: async (name, args, options) => {
+      try {
+        return await client.callTool(name, args, options);
+      } catch (cause) {
+        if (errorHasTransportCode(cause, 0)) {
+          throw markTransportFailure(cause as Error);
+        }
+        throw cause;
+      }
+    },
+    close: () => client.close(),
+  };
+}
+
 export class ConnectionManager {
   readonly #entries = new Map<string, Entry>();
   readonly #factory: McpClientFactory;
@@ -231,6 +268,38 @@ export class ConnectionManager {
     }
   }
 
+  /**
+   * Reports a failure observed while executing a tool. Only transport-level
+   * callTool rejections (tagged by the client wrapper — see
+   * isTransportFailure) count against the circuit breaker; tool errors,
+   * JSON-RPC error responses, isError results, and tool timeouts never do.
+   *
+   * Once the breaker opens, the known-bad client reference is released
+   * synchronously and closed in the background with a bounded timeout — the
+   * failing execute's response never waits on a close that may never settle.
+   * A restart is scheduled after the cooldown (same recovery path as a failed
+   * health check). The cached client is deliberately kept while the breaker is
+   * closed: a stdio connect can succeed even with a dead child, so reconnecting
+   * per failure would reset the failure count on each connect and the circuit
+   * would never open.
+   */
+  async reportExecuteFailure(serverId: string, cause: unknown, message?: string): Promise<void> {
+    if (!isTransportFailure(cause)) return;
+    const entry = this.#entries.get(serverId);
+    if (!entry || entry.manualShutdown || entry.config.enabled === false) return;
+    this.recordFailure(serverId, message ?? (cause instanceof Error ? cause.message : String(cause)));
+    if (this.#circuitState(entry) === "open") {
+      this.#stopHeartbeat(entry);
+      const client = entry.client;
+      entry.client = undefined;
+      if (client) {
+        // Bounded background close: a dead transport's close may never settle.
+        void this.#withTimeout(client.close(), 2_000, "close timed out").catch(() => {});
+      }
+      this.#scheduleRestart(entry);
+    }
+  }
+
   resetCircuit(serverId: string): void {
     const entry = this.#entries.get(serverId);
     if (!entry) return;
@@ -296,7 +365,7 @@ export class ConnectionManager {
           }
           throw new Error(`Server "${serverId}" was shut down during connect`);
         }
-        entry.client = client;
+        entry.client = tagTransportFailures(client);
         entry.status = "ready";
         entry.lastActivatedAt = new Date(this.#now()).toISOString();
         entry.consecutiveFailures = 0;
@@ -308,7 +377,7 @@ export class ConnectionManager {
         entry.pending = undefined;
         entry.error = undefined;
         this.#startHeartbeat(entry);
-        return client;
+        return entry.client;
       })
       .catch((cause: unknown) => {
         if (entry.pending === pending) entry.pending = undefined;
