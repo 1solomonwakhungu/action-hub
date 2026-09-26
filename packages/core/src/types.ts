@@ -299,7 +299,16 @@ export interface SkillConfig {
 
 export interface DiscoveredServer extends ServerConfig {
   sourcePath: string;
-  sourceClient: "claude-desktop" | "cursor" | "vscode" | "copilot" | "custom";
+  sourceClient:
+    | "claude-desktop"
+    | "cursor"
+    | "vscode"
+    | "copilot"
+    | "codex"
+    | "windsurf"
+    | "cline"
+    | "roo-code"
+    | "custom";
 }
 
 export interface DiscoveredSkill extends SkillConfig {
