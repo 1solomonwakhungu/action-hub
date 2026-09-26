@@ -84,6 +84,13 @@ export interface CooperativeIndexOptions {
 /** Documents embedded per event-loop yield by default. */
 const DEFAULT_INDEX_CHUNK = 500;
 
+/** A finite positive integer chunk size, or the default. NaN is not >= 1. */
+function normalizeChunkSize(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_INDEX_CHUNK;
+  if (Number.isFinite(value) && value >= 1) return Math.floor(value);
+  return DEFAULT_INDEX_CHUNK;
+}
+
 function yieldToEventLoop(): Promise<void> {
   return new Promise((done) => setImmediate(done));
 }
@@ -197,6 +204,12 @@ export class LocalSemanticIndex {
   #documents = new Map<string, CachedVector>();
   #idf = new Map<string, number>();
   #documentCount = 0;
+  /** Generation of the currently published index; 0 until the first publish. */
+  #publishedGeneration = 0;
+  /** Monotonic counter; each cooperative rebuild takes its generation at start. */
+  #nextGeneration = 0;
+  /** Rebuilds started but not yet published (cooperative path, across awaits). */
+  #inFlight = 0;
 
   constructor(options: LocalSemanticOptions = {}) {
     this.#dimensions = Math.max(32, Math.floor(options.dimensions ?? DEFAULTS.dimensions));
@@ -244,7 +257,7 @@ export class LocalSemanticIndex {
     }
 
     for (const document of documents) {
-      const vector = this.#embed(document.terms);
+      const vector = this.#embed(document.terms, this.#idf, this.#documentCount);
       if (vector) this.#documents.set(document.id, { fingerprint: document.fingerprint, vector });
     }
   }
@@ -254,37 +267,75 @@ export class LocalSemanticIndex {
    * chunks of documents. Index-time embedding of large catalogs (10k+ actions)
    * otherwise congests the event loop for seconds and starves already-accepted
    * connections on long-running hosts such as the shared daemon.
+   *
+   * The replacement state is built privately and published atomically once
+   * complete: searches that run during the rebuild keep using the previous
+   * generation, and the latest-started rebuild wins if several overlap.
    */
   async indexCooperative(
     records: readonly ActionRecord[],
     options: CooperativeIndexOptions = {},
   ): Promise<void> {
-    const chunkSize = Math.max(1, options.chunkSize ?? DEFAULT_INDEX_CHUNK);
+    const chunkSize = normalizeChunkSize(options.chunkSize);
     const yieldFn = options.yieldFn ?? yieldToEventLoop;
-    const documents = records.map((record) => describe(record));
-    this.#documentCount = documents.length;
-    this.#documents = new Map();
-    this.#idf = new Map();
+    const myGeneration = ++this.#nextGeneration;
+    this.#inFlight += 1;
+    try {
+      const documents = records.map((record) => describe(record));
+      const nextDocuments = new Map<string, CachedVector>();
+      const nextIdf = new Map<string, number>();
 
-    if (documents.length === 0) return;
-
-    const docFreq = new Map<string, number>();
-    for (const document of documents) {
-      for (const term of document.terms.keys()) {
-        docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+      if (documents.length === 0) {
+        this.#publish(myGeneration, nextDocuments, nextIdf, 0);
+        return;
       }
-    }
-    for (const [term, df] of docFreq) {
-      this.#idf.set(term, Math.log(1 + documents.length / (df + 0.5)));
-    }
 
-    for (let start = 0; start < documents.length; start += chunkSize) {
-      if (start > 0) await yieldFn();
-      for (const document of documents.slice(start, start + chunkSize)) {
-        const vector = this.#embed(document.terms);
-        if (vector) this.#documents.set(document.id, { fingerprint: document.fingerprint, vector });
+      const docFreq = new Map<string, number>();
+      for (const document of documents) {
+        for (const term of document.terms.keys()) {
+          docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+        }
       }
+      for (const [term, df] of docFreq) {
+        nextIdf.set(term, Math.log(1 + documents.length / (df + 0.5)));
+      }
+
+      for (let start = 0; start < documents.length; start += chunkSize) {
+        if (start > 0) await yieldFn();
+        for (const document of documents.slice(start, start + chunkSize)) {
+          // Embed against THIS generation's idf: the live idf still belongs to
+          // the previous generation, and weighting by it would make vectors
+          // depend on rebuild interleaving. The sync path (index()) does the
+          // same by setting #idf before its embed loop.
+          const vector = this.#embed(document.terms, nextIdf, documents.length);
+          if (vector) {
+            nextDocuments.set(document.id, { fingerprint: document.fingerprint, vector });
+          }
+        }
+      }
+
+      this.#publish(myGeneration, nextDocuments, nextIdf, documents.length);
+    } finally {
+      this.#inFlight -= 1;
     }
+  }
+
+  /**
+   * Atomic swap. Single-threaded JavaScript makes one synchronous assignment
+   * block atomic; a stale rebuild finishing after a newer one has already
+   * published is discarded instead of regressing the index.
+   */
+  #publish(
+    generation: number,
+    documents: Map<string, CachedVector>,
+    idf: Map<string, number>,
+    documentCount: number,
+  ): void {
+    if (generation < this.#publishedGeneration) return;
+    this.#documents = documents;
+    this.#idf = idf;
+    this.#documentCount = documentCount;
+    this.#publishedGeneration = generation;
   }
 
   /**
@@ -298,7 +349,7 @@ export class LocalSemanticIndex {
 
     const weights = new Map<string, number>();
     for (const term of terms) weights.set(term, (weights.get(term) ?? 0) + 1);
-    const queryVector = this.#embed(weights);
+    const queryVector = this.#embed(weights, this.#idf, this.#documentCount);
     if (!queryVector) return zeros;
 
     let best = 0;
@@ -329,25 +380,37 @@ export class LocalSemanticIndex {
     const fingerprint = fingerprintOf(record);
     if (cached && cached.fingerprint === fingerprint) return cached.vector;
 
+    // A cooperative rebuild holds shared state across awaits. Never embed
+    // lazily inside that window: the previous generation is complete and
+    // serviceable, so an unchanged record scores from cache while a changed
+    // one simply scores zero. Lazily embedding here would walk the whole
+    // candidate set inside one synchronous pass — recreating the exact
+    // event-loop congestion the cooperative path exists to avoid.
+    if (this.#inFlight > 0) return undefined;
+
     const document = describe(record);
-    const vector = this.#embed(document.terms);
+    const vector = this.#embed(document.terms, this.#idf, this.#documentCount);
     if (vector) this.#documents.set(record.id, { fingerprint, vector });
     return vector;
   }
 
-  #embed(terms: ReadonlyMap<string, number>): Float32Array | undefined {
+  #embed(
+    terms: ReadonlyMap<string, number>,
+    idf: ReadonlyMap<string, number>,
+    documentCount: number,
+  ): Float32Array | undefined {
     const accumulator = new Float32Array(this.#dimensions);
     for (const [term, weight] of terms) {
-      addScaled(accumulator, this.#feature(term), weight * this.#idfOf(term));
+      addScaled(accumulator, this.#feature(term), weight * this.#idfOf(term, idf, documentCount));
     }
     return normalized(accumulator);
   }
 
   /** Unseen terms are treated as maximally specific rather than ignored. */
-  #idfOf(term: string): number {
-    const known = this.#idf.get(term);
+  #idfOf(term: string, idf: ReadonlyMap<string, number>, documentCount: number): number {
+    const known = idf.get(term);
     if (known !== undefined) return known;
-    return Math.log(1 + Math.max(1, this.#documentCount) / 0.5);
+    return Math.log(1 + Math.max(1, documentCount) / 0.5);
   }
 
   /**
