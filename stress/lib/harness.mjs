@@ -29,7 +29,8 @@ export class FatalError extends Error {}
 
 // Library mode: import the shared module without its preload side effects.
 process.env["ACTION_HUB_TEST_ISOLATION_LIBRARY"] = "1";
-const { ISOLATION_CHECKLIST } = await import("../../test-isolation.mjs");
+const isolationShared = await import("../../test-isolation.mjs");
+const { ISOLATION_CHECKLIST } = isolationShared;
 
 /** Vars whose value is a FILE path rather than a directory. */
 const FILE_SHAPED_VARS = new Set([
@@ -71,14 +72,28 @@ export function ownerHome() {
  */
 export function ownerStateDirs(baseEnv = process.env, homeOverride = undefined) {
   const home = homeOverride !== undefined ? resolve(homeOverride) : ownerHome();
+  // Platform/XDG app-state locations resolved from the INCOMING env first,
+  // defaults second — a redirected APPDATA/LOCALAPPDATA/XDG_* that the
+  // caller's shell pinned is exactly as owner-owned as the default one.
+  const appData = baseEnv.APPDATA ? resolve(baseEnv.APPDATA) : join(home, "AppData", "Roaming");
+  const localAppData = baseEnv.LOCALAPPDATA ? resolve(baseEnv.LOCALAPPDATA) : join(home, "AppData", "Local");
+  const xdgCache = baseEnv.XDG_CACHE_HOME ? resolve(baseEnv.XDG_CACHE_HOME) : join(home, ".cache");
+  const xdgConfig = baseEnv.XDG_CONFIG_HOME ? resolve(baseEnv.XDG_CONFIG_HOME) : join(home, ".config");
+  const xdgData = baseEnv.XDG_DATA_HOME ? resolve(baseEnv.XDG_DATA_HOME) : join(home, ".local", "share");
   const dirs = [
     join(home, ".cache", "action-hub"),
     join(home, ".config", "action-hub"),
     join(home, ".action-hub"),
     join(home, "Library", "Caches", "action-hub"),
     join(home, "Library", "Application Support", "action-hub"),
-    join(home, "AppData", "Roaming", "action-hub"),
-    join(home, "AppData", "Local", "action-hub"),
+    join(appData, "action-hub"),
+    join(localAppData, "action-hub"),
+    join(xdgCache, "action-hub"),
+    join(xdgConfig, "action-hub"),
+    // pi + OpenCode state, honoring the pi override; Codex/Claude keep theirs.
+    baseEnv.PI_CODING_AGENT_DIR ? resolve(baseEnv.PI_CODING_AGENT_DIR) : join(home, ".pi"),
+    join(home, ".opencode"),
+    join(xdgData, "opencode"),
     // Wildcard families: every real ~/.claude* and ~/.codex* entry.
     ...readdirOrEmpty(home).filter((e) => e.startsWith(".claude") || e.startsWith(".codex")).map((e) => join(home, e)),
     // Harness-specific config dirs, honoring explicit overrides.
@@ -86,7 +101,6 @@ export function ownerStateDirs(baseEnv = process.env, homeOverride = undefined) 
     baseEnv.CLAUDE_CONFIG_DIR ?? join(home, ".claude"),
     join(home, ".cursor"),
     join(home, ".copilot"),
-    join(home, ".pi"),
     join(home, ".vscode"),
   ];
   return [...new Set(dirs.map((d) => resolve(d)))];
@@ -106,10 +120,13 @@ function readdirOrEmpty(dir) {
 // Containment + run root
 // ---------------------------------------------------------------------------
 
-/** Separator-safe containment via path.relative (never string-prefix + "/"). */
+/**
+ * Separator-safe containment (never string-prefix + "/"). DELEGATED to the
+ * shared test-isolation.mjs `containedIn` export — argument order adapted
+ * (parent first) to keep this lib's API stable.
+ */
 export function pathContains(parent, child) {
-  const rel = relative(resolve(parent), resolve(child));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return isolationShared.containedIn(child, parent);
 }
 
 /** Refusal check usable without creating anything (self-testable). */
@@ -126,11 +143,17 @@ export function refusedInsideOwnerState(candidate, baseEnv = process.env) {
  */
 export function makeRunRoot(prefix = "stress-run-", baseEnv = process.env) {
   const osTmp = resolve(tmpdir());
+  // Path-escape check BEFORE creating anything: a prefix like "../x" must be
+  // refused, not partially materialized outside the temp root.
+  const intended = resolve(join(osTmp, prefix));
+  if (!pathContains(osTmp, intended)) {
+    throw new FatalError(`run-root prefix ${prefix} escapes the temp root ${osTmp}; refusing`);
+  }
   const ownerTmpConflict = refusedInsideOwnerState(osTmp, baseEnv);
   if (ownerTmpConflict) {
     throw new FatalError(`os.tmpdir() (${osTmp}) is inside owner state dir ${ownerTmpConflict}; refusing to run`);
   }
-  const root = resolve(mkdtempSync(join(osTmp, prefix)));
+  const root = resolve(mkdtempSync(intended));
   const conflict = refusedInsideOwnerState(root, baseEnv);
   if (conflict) {
     // mkdtemp succeeded but the location is owner-protected: remove and refuse.
@@ -150,32 +173,11 @@ export function makeRunRoot(prefix = "stress-run-", baseEnv = process.env) {
  * HOME and the Windows equivalents are all pinned under the run root.
  */
 export function buildIsolatedEnv(root, baseEnv = process.env) {
-  const home = join(root, "home");
-  const tmp = join(root, "tmp");
-  const under = (rel) => join(home, rel);
-  return {
-    ...baseEnv,
-    HOME: home,
-    USERPROFILE: home,
-    APPDATA: under(join("AppData", "Roaming")),
-    LOCALAPPDATA: under(join("AppData", "Local")),
-    TMPDIR: tmp,
-    TMP: tmp,
-    TEMP: tmp,
-    XDG_CACHE_HOME: under(".cache"),
-    XDG_CONFIG_HOME: under(".config"),
-    XDG_STATE_HOME: under(join(".local", "state")),
-    XDG_DATA_HOME: under(join(".local", "share")),
-    ACTION_HUB_CONFIG: under("servers.json"),
-    ACTION_HUB_CACHE: under(join(".cache", "action-hub", "catalog.json")),
-    ACTION_HUB_SKILLS_DIR: under("skills"),
-    ACTION_HUB_DAEMON_DIR: under("daemon"),
-    ACTION_HUB_CREDENTIALS: under("credentials.json"),
-    ACTION_HUB_CONTROL: under("control.sock"),
-    PI_CODING_AGENT_DIR: under("pi-agent"),
-    CODEX_HOME: under(".codex"),
-    CLAUDE_CONFIG_DIR: under(".claude"),
-  };
+  // DELEGATED to the shared test-isolation.mjs env builder — the run-root
+  // layout (and every checklist path) comes from the single source of truth.
+  // This wrapper keeps the lib's (root, baseEnv) signature and the
+  // replace-inherited-values contract.
+  return { ...baseEnv, ...isolationShared.buildIsolatedEnv(root) };
 }
 
 /**
@@ -217,7 +219,16 @@ export function createSandbox({ prefix = "stress-run-", baseEnv = process.env, m
   const root = makeRunRoot(prefix, baseEnv);
   const env = buildIsolatedEnv(root, baseEnv);
   assertIsolated(env, root, baseEnv);
-  for (const rel of ["home", "tmp", ...mkdir]) mkdirSync(join(root, rel), { recursive: true });
+  // Path-escape check BEFORE creating anything: mkdir entries like "../x"
+  // must be refused, not materialized outside the run root.
+  const toMake = ["tmp", ...mkdir];
+  for (const rel of toMake) {
+    const target = resolve(join(root, rel));
+    if (!pathContains(root, target)) {
+      throw new FatalError(`mkdir entry ${rel} escapes the run root ${root}; refusing`);
+    }
+  }
+  for (const rel of toMake) mkdirSync(join(root, rel), { recursive: true });
   return { root, env, home: join(root, "home") };
 }
 
@@ -226,26 +237,11 @@ export function createSandbox({ prefix = "stress-run-", baseEnv = process.env, m
 // ---------------------------------------------------------------------------
 
 const TERM_TO_KILL_MS = 5_000;
+const KILL_GRACE_MS = 5_000;
+const GROUP_POLL_MS = 50;
 
-function killProcessTree(pid) {
-  if (process.platform === "win32") {
-    // win32 has no process groups; taskkill /T walks the tree.
-    spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)]);
-    return;
-  }
-  try {
-    process.kill(-pid, "SIGTERM"); // negative pid = the whole group
-  } catch (err) {
-    if (err.code !== "ESRCH") throw err;
-  }
-  const killTimer = setTimeout(() => {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch (err) {
-      if (err.code !== "ESRCH") throw err;
-    }
-  }, TERM_TO_KILL_MS);
-  killTimer.unref();
+function sleep(ms) {
+  return new Promise((resolveP) => setTimeout(resolveP, ms));
 }
 
 function alive(pid) {
@@ -255,17 +251,82 @@ function alive(pid) {
   } catch (err) {
     if (err.code === "ESRCH") return false;
     if (err.code === "EPERM") return true; // exists but not ours
-    throw err;
+    return true; // any other probe failure: assume alive, never throw
+  }
+}
+
+/** True when nothing remains in the process group (kill(-pgid, 0) -> ESRCH). */
+function groupEmpty(pgid) {
+  try {
+    process.kill(-pgid, 0);
+    return false;
+  } catch (err) {
+    if (err.code === "ESRCH") return true;
+    return false; // EPERM or probe failure: assume members remain
+  }
+}
+
+/** Signal the group; never throws (errors are part of settling, not crashes). */
+function signalGroup(pgid, signal) {
+  try {
+    process.kill(-pgid, signal);
+  } catch {
+    // ESRCH = already gone; anything else still must not throw past main.
+  }
+}
+
+function killTreeWindows(pid) {
+  const result = spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)]);
+  if (result.error || (result.status !== 0 && result.status !== 128)) {
+    // 128 = process not found; anything else is logged, never thrown.
   }
 }
 
 /**
+ * TERM -> bounded wait -> KILL -> poll until the group is EMPTY. Runs on
+ * every completion path (timeout AND nominal success), so grandchildren that
+ * ignore TERM or were spawned+unref'd by a successful launcher cannot outlive
+ * the step — and the timeout path drives it INDEPENDENTLY of child exit/close
+ * (a group leader that ignores SIGTERM must still be SIGKILLed and the step
+ * must still settle). Never throws.
+ */
+async function reapGroup(pgid, { alreadyTermed = false } = {}) {
+  if (process.platform === "win32") {
+    // win32 has no process groups; taskkill /T walks the tree by pid.
+    return true; // caller already ran taskkill against the root pid
+  }
+  if (!alreadyTermed) signalGroup(pgid, "SIGTERM");
+  const termDeadline = Date.now() + TERM_TO_KILL_MS;
+  while (Date.now() < termDeadline && !groupEmpty(pgid)) {
+    await sleep(GROUP_POLL_MS);
+  }
+  if (!groupEmpty(pgid)) {
+    signalGroup(pgid, "SIGKILL");
+    const killDeadline = Date.now() + KILL_GRACE_MS;
+    while (Date.now() < killDeadline && !groupEmpty(pgid)) {
+      await sleep(GROUP_POLL_MS);
+    }
+  }
+  return groupEmpty(pgid);
+}
+
+/** Bounded wait for in-flight 'exit'/'close' events to flush stdio. */
+async function drainPipes(child, ms = 250) {
+  const deadline = Date.now() + ms;
+  while ((child.exitCode === null && child.signalCode === null) && Date.now() < deadline) {
+    await sleep(10);
+  }
+  await new Promise((r) => setTimeout(r, 25)); // one macrotask for data events
+}
+
+/**
  * Run one step as a detached process group with drained pipes and bounded
- * time. On timeout the group gets SIGTERM, a bounded wait, then SIGKILL; the
- * promise resolves only after the group is reaped (stdio closed AND exit
- * observed). win32 uses `taskkill /T /F`.
+ * time. On timeout the group gets TERM -> KILL. On EVERY completion path —
+ * timeout, error, or nominal success — the whole recorded group is signalled
+ * (TERM -> bounded wait -> KILL) and polled until it is empty before the
+ * promise resolves. win32 uses `taskkill /T /F` on the root pid.
  *
- * Resolves { code, signal, timedOut, killed, stdout, stderr, lastJson, error }.
+ * Resolves { pid, code, signal, timedOut, killed, groupEmpty, stdout, stderr, lastJson, error }.
  */
 export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
   return new Promise((resolveP) => {
@@ -273,9 +334,10 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
     try {
       child = spawn(cmd, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
     } catch (err) {
-      resolveP({ pid: null, code: null, signal: null, timedOut: false, killed: false, error: "spawn failed: " + err.message, stdout: "", stderr: "", lastJson: null });
+      resolveP({ pid: null, code: null, signal: null, timedOut: false, killed: false, groupEmpty: true, error: "spawn failed: " + err.message, stdout: "", stderr: "", lastJson: null });
       return;
     }
+    const pgid = child.pid; // detached + first member => the group leader
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -285,29 +347,75 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
     child.stdout.on("data", (d) => { stdout += d; });
     child.stderr.on("data", (d) => { stderr += d; });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      killed = true;
-      killProcessTree(child.pid);
-    }, timeoutMs);
-
+    let timer = null;
+    let settled = false;
     let exitInfo = null;
     let closed = false;
-    let settled = false;
-    const finish = () => {
+
+    const buildResult = (extraError) => ({
+      pid: pgid,
+      code: exitInfo ? exitInfo.code : null,
+      signal: exitInfo ? exitInfo.signal : null,
+      timedOut,
+      killed,
+      stdout,
+      stderr,
+      lastJson: lastJsonLine(stdout),
+      ...(extraError ? { error: extraError } : {}),
+    });
+
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolveP(result);
+    };
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      killed = true;
+      // The escalation must NOT depend on child exit/close: a group leader
+      // that ignores SIGTERM never exits, so 'finish' would never run and
+      // nothing would ever escalate to SIGKILL. Drive the ladder here.
+      (async () => {
+        if (process.platform === "win32") {
+          killTreeWindows(pgid);
+          await drainPipes(child);
+          settle({ ...buildResult(), groupEmpty: true, error: `timeout after ${timeoutMs}ms` });
+          return;
+        }
+        signalGroup(pgid, "SIGTERM");
+        const empty = await reapGroup(pgid, { alreadyTermed: true });
+        await drainPipes(child);
+        settle({
+          ...buildResult(),
+          groupEmpty: empty === true,
+          error: `timeout after ${timeoutMs}ms`,
+        });
+      })().catch(() => settle({ ...buildResult(), groupEmpty: false, error: `timeout after ${timeoutMs}ms; escalation error` }));
+    }, timeoutMs);
+
+    const finish = async () => {
       if (settled || exitInfo === null || !closed) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      // Reap the WHOLE group on every path: TERM -> bounded wait -> KILL ->
+      // poll until empty. A successful launcher that spawned+unref'd a
+      // grandchild leaves it in this group; it must not survive the step.
+      if (pgid) {
+        if (process.platform === "win32" && !timedOut) {
+          killTreeWindows(pgid);
+        }
+        const empty = await reapGroup(pgid, { alreadyTermed: timedOut });
+        resolveP({
+          ...buildResult(timedOut ? `timeout after ${timeoutMs}ms` : killed ? "terminated by runner" : undefined),
+          groupEmpty: empty === true,
+        });
+        return;
+      }
       resolveP({
-        pid: child.pid,
-        code: exitInfo.code,
-        signal: exitInfo.signal,
-        timedOut,
-        killed,
-        stdout,
-        stderr,
-        lastJson: lastJsonLine(stdout),
-        error: timedOut ? `timeout after ${timeoutMs}ms` : killed ? "terminated by runner" : undefined,
+        ...buildResult(timedOut ? `timeout after ${timeoutMs}ms` : undefined),
+        groupEmpty: true,
       });
     };
     child.on("exit", (code, signal) => { exitInfo = { code, signal }; finish(); });
@@ -315,8 +423,8 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      resolveP({ pid: child.pid, code: null, signal: null, timedOut, killed, error: "spawn error: " + err.message, stdout, stderr, lastJson: null });
+      if (timer) clearTimeout(timer);
+      resolveP({ pid: pgid, code: null, signal: null, timedOut, killed, groupEmpty: false, error: "spawn error: " + err.message, stdout, stderr, lastJson: null });
     });
   });
 }
@@ -351,29 +459,42 @@ export async function main(fn, { resultsPath } = {}) {
   if (!resultsPath) {
     throw new TypeError("main() requires { resultsPath } — the final summary must have a durable home");
   }
-  // Stale results from previous runs must not survive into this run.
-  rmSync(resultsPath, { force: true });
   const started = performance.now();
   let ok = true;
   let error = null;
   let result = null;
   try {
+    // Stale results from previous runs must not survive into this run.
+    // Inside the guarded region: a hostile resultsPath must produce a final
+    // ok:false summary, not a raw crash.
+    rmSync(resultsPath, { force: true });
     result = (await fn()) ?? {};
   } catch (err) {
     ok = false;
     error = err instanceof FatalError ? err.message : String((err && err.stack) || err);
     console.error("run failed: " + error);
   }
+  // `ok` and `error` are RESERVED: the task may override ok (that is the
+  // point of the contract), so the FINAL object decides the exit code.
   const final = {
     ok,
     ...(error ? { error } : {}),
     ...result,
     totalMs: Math.round(performance.now() - started),
   };
-  // Exactly one file write and exactly one last-line JSON print.
-  mkdirSync(dirname(resultsPath), { recursive: true });
-  writeFileSync(resultsPath, JSON.stringify(final, null, 2) + "\n");
+  // Durable write is also guarded: results-dir creation or file-write
+  // failures must still yield ONE final JSON line on stdout.
+  try {
+    mkdirSync(dirname(resultsPath), { recursive: true });
+    writeFileSync(resultsPath, JSON.stringify(final, null, 2) + "\n");
+  } catch (err) {
+    final.ok = false;
+    final.error = (final.error ? final.error + "; " : "") + `results write failed: ${String(err && err.message)}`;
+    console.error("results write failed: " + (err && err.message));
+  }
   console.log(JSON.stringify(final));
-  if (!ok) process.exitCode = 1;
+  // exitCode derives from the FINAL object (never a private ok from main's
+  // own bookkeeping, and never leaked from a nested failure).
+  process.exitCode = final.ok === false ? 1 : 0;
   return final;
 }
