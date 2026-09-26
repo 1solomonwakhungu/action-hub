@@ -4,7 +4,9 @@ import { ConnectionManager } from "../dist/servers/connection-manager.js";
 import { computeRestartBackoffMs } from "../dist/servers/restart-backoff.js";
 import { applyNodeMemoryLimit, isNodeStdioCommand } from "../dist/servers/node-memory.js";
 import type { ServerConfig } from "../dist/types.js";
-import { FakeClient } from "./fakes.ts";
+import { FakeClient, makeFactory } from "./fakes.ts";
+import { ActionHub } from "../dist/action-hub.js";
+import type { McpClient } from "../dist/types.js";
 
 class FakeClock {
   nowMs = 1_000_000;
@@ -482,4 +484,182 @@ test("Node memory limit injection skips non-Node commands and existing flags", (
   assert.equal(isNodeStdioCommand("node.exe"), true);
   assert.equal(isNodeStdioCommand("C:\\\\Program Files\\\\nodejs\\\\node.exe"), true);
   assert.equal(isNodeStdioCommand("python"), false);
+});
+
+// ---------------------------------------------------------------------------
+// F16: execute-time connection errors trip the circuit breaker
+// ---------------------------------------------------------------------------
+
+test("isConnectionFailure classifies transport errors, not tool errors", async () => {
+  const { isConnectionFailure } = await import("../dist/servers/connection-manager.js");
+  const connection = [
+    "Not connected",
+    "Stdio transport closed unexpectedly",
+    "Connection closed",
+    "write EPIPE",
+    "Child process exited with code 1",
+    "connect ECONNREFUSED 127.0.0.1:3000",
+    "getaddrinfo ENOTFOUND localhost",
+  ];
+  const toolLevel = [
+    "Tool \"linear:create_issue\" returned an error: invalid project id",
+    "Tool \"x\" timed out after 5000ms",
+    "Circuit breaker open for server \"a\": too many consecutive failures. Cooling down.",
+    "Invalid arguments: missing title",
+    "JSON-RPC error -32602: unknown tool",
+  ];
+  for (const message of connection) assert.equal(isConnectionFailure(message), true, message);
+  for (const message of toolLevel) assert.equal(isConnectionFailure(message), false, message);
+});
+
+test("reportExecuteFailure: connection failures open the circuit, drop the client, and restart after cooldown", async () => {
+  const clock = new FakeClock();
+  let alive = true; // the child dies mid-flight after a healthy start
+  let calls = 0;
+  const factory = async (): Promise<McpClient> => {
+    if (!alive) throw new Error("spawn failed: child process exited with code 1");
+    calls += 1;
+    return new FakeClient([
+      { name: "ping", description: "pings", inputSchema: { type: "object" } },
+    ]);
+  };
+  const manager = new ConnectionManager(factory, [server("dead")], {
+    failureThreshold: 3,
+    cooldownMs: 3_000,
+    heartbeat: { enabled: false },
+    restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+    now: clock.now,
+    random: clock.random,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+
+  // Server starts healthy, then the child dies mid-flight.
+  const client = await manager.activate("dead");
+  assert.equal(manager.states()[0]!.circuitState, "closed");
+  alive = false;
+
+  // Three execute-time connection failures: breaker opens, stale client dropped.
+  for (let i = 0; i < 3; i++) {
+    await manager.reportExecuteFailure("dead", "Not connected");
+  }
+  const open = manager.states()[0]!;
+  assert.equal(open.circuitState, "open");
+  assert.equal(open.consecutiveFailures, 3);
+  assert.equal(client.closed, true, "stale client must be dropped");
+  assert.ok(open.nextRestartAt !== undefined, "a restart must be scheduled");
+
+  // Reconnecting during cooldown still fails and keeps the circuit open.
+  await clock.advance(3_000);
+  assert.equal(manager.states()[0]!.circuitState, "open");
+
+  // Server comes back: the scheduled restart reconnects and the breaker closes.
+  // The failed attempt above re-armed the cooldown, so clear it fully.
+  alive = true;
+  await clock.advance(4_000);
+  await clock.drain();
+  const recovered = manager.states()[0]!;
+  assert.equal(recovered.circuitState, "closed");
+  assert.equal(recovered.consecutiveFailures, 0);
+  assert.equal(calls >= 1, true, "factory must have produced a new client");
+});
+
+test("reportExecuteFailure ignores tool-level errors", async () => {
+  const clock = new FakeClock();
+  const client = new FakeClient([
+    { name: "boom", description: "always fails", inputSchema: { type: "object" } },
+  ], () => {
+    throw new Error("Tool \"boom\" returned an error: invalid arguments");
+  });
+  const { factory } = makeFactory({ boom: client });
+  const manager = new ConnectionManager(factory, [server("boom")], {
+    failureThreshold: 3,
+    cooldownMs: 3_000,
+    heartbeat: { enabled: false },
+    now: clock.now,
+    random: clock.random,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+  await manager.activate("boom");
+  for (let i = 0; i < 5; i++) {
+    await manager.reportExecuteFailure("boom", "Tool \"boom\" returned an error: invalid arguments");
+  }
+  const state = manager.states()[0]!;
+  assert.equal(state.circuitState, "closed");
+  assert.equal(state.consecutiveFailures, 0);
+  assert.equal(client.closed, false, "a live server's client must be retained");
+});
+
+test("execute-time connection errors trip the breaker without waiting for the heartbeat", async () => {
+  const clock = new FakeClock();
+  let calls = 0;
+  const factory = async (): Promise<McpClient> => {
+    calls += 1;
+    return new FakeClient([
+      { name: "do_thing", description: "does a thing", inputSchema: { type: "object" } },
+    ], (name) => {
+      calls += 1;
+      if (calls <= 2) return `ok:${name}`;
+      throw new Error("Not connected");
+    });
+  };
+  const hub = new ActionHub({
+    servers: [server("dead")],
+    clientFactory: factory,
+    resilience: {
+      failureThreshold: 3,
+      cooldownMs: 3_000,
+      heartbeat: { enabled: false },
+      restartBackoff: { initialMs: 1_000, maxMs: 60_000, jitter: 0 },
+      now: clock.now,
+      random: clock.random,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+    defaultTimeoutMs: 5_000,
+  });
+  await hub.indexAll();
+
+  // Calls 1-2 succeed, then the child dies: every later call fails instantly.
+  const good = await hub.execute("dead:do_thing", {});
+  assert.equal(good.ok, true);
+  for (let i = 0; i < 3; i++) {
+    const result = await hub.execute("dead:do_thing", {});
+    assert.equal(result.ok, false);
+  }
+  const [broken] = hub.serverStates();
+  assert.equal(broken!.circuitState, "open");
+  assert.ok(broken!.nextRestartAt !== undefined, "restart scheduled from execute failures");
+
+  // Before this fix, circuitState stayed closed here because only the
+  // heartbeat recorded failures. No heartbeat is configured in this test.
+
+  // A tool-level isError result from a live server must NOT trip the breaker.
+  const erroringClient = new FakeClient([
+    { name: "flaky", description: "returns isError", inputSchema: { type: "object" } },
+  ], () => ({ isError: true, content: [{ type: "text", text: "nope" }] }));
+  const live = new ActionHub({
+    servers: [server("live")],
+    clientFactory: makeFactory({ live: erroringClient }).factory,
+    resilience: {
+      failureThreshold: 3,
+      cooldownMs: 3_000,
+      heartbeat: { enabled: false },
+      now: clock.now,
+      random: clock.random,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+    defaultTimeoutMs: 5_000,
+  });
+  await live.indexAll();
+  for (let i = 0; i < 5; i++) {
+    await live.execute("live:flaky", {});
+  }
+  const [liveState] = live.serverStates();
+  assert.equal(liveState!.circuitState, "closed", "tool isError must not trip the breaker");
+  assert.equal(erroringClient.closed, false);
+  hub.close();
+  live.close();
 });

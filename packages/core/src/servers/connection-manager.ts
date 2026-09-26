@@ -82,6 +82,33 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
  * authenticated until one of its actions is actually executed. This is what
  * makes a hundred configured integrations free until used.
  */
+/**
+ * Classifies an error message observed while executing a tool as a
+ * transport/connection failure rather than a tool-level failure. Connection
+ * failures are recorded against the server's circuit breaker; tool-level
+ * failures (isError results, JSON-RPC errors from a live server, tool
+ * timeouts) are not.
+ */
+export function isConnectionFailure(message: string): boolean {
+  const m = message.toLowerCase();
+  if (m.includes("circuit breaker open")) return false;
+  return (
+    m.includes("not connected") ||
+    m.includes("connection closed") ||
+    m.includes("closed transport") ||
+    m.includes("transport closed") ||
+    m.includes("connection disposed") ||
+    m.includes("epipe") ||
+    m.includes("broken pipe") ||
+    m.includes("econnrefused") ||
+    m.includes("econnreset") ||
+    m.includes("enotfound") ||
+    m.includes("child process exited") ||
+    m.includes("process exited") ||
+    m.includes("child exited")
+  );
+}
+
 export class ConnectionManager {
   readonly #entries = new Map<string, Entry>();
   readonly #factory: McpClientFactory;
@@ -228,6 +255,30 @@ export class ConnectionManager {
     } else {
       entry.circuitState = "closed";
       entry.status = "error";
+    }
+  }
+
+  /**
+   * Reports a failure observed while executing a tool. Transport/connection
+   * errors are recorded against the circuit breaker; once the breaker opens,
+   * the known-bad cached client is dropped and a restart is scheduled after
+   * the cooldown (same recovery path as a failed health check). Tool-level
+   * errors are ignored here, and a tool timeout is not a connection failure.
+   *
+   * The cached client is deliberately kept while the breaker is still closed:
+   * a stdio connect can succeed even when the child is already dead, so
+   * dropping and reconnecting per failure would let each connect-success reset
+   * the failure count and the circuit would never open.
+   */
+  async reportExecuteFailure(serverId: string, message: string): Promise<void> {
+    if (!isConnectionFailure(message)) return;
+    const entry = this.#entries.get(serverId);
+    if (!entry || entry.manualShutdown || entry.config.enabled === false) return;
+    this.recordFailure(serverId, message);
+    if (this.#circuitState(entry) === "open") {
+      this.#stopHeartbeat(entry);
+      await this.#dropClient(entry);
+      this.#scheduleRestart(entry);
     }
   }
 

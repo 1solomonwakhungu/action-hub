@@ -721,6 +721,16 @@ export class ActionHub {
           const isTimeout = message.includes("timed out after");
           const isCircuit = message.includes("Circuit breaker open");
 
+          // Feed transport/connection failures back into the circuit breaker.
+          // reportExecuteFailure classifies the message: connection failures
+          // are recorded (eventually opening the circuit) and the stale client
+          // is dropped so recovery does not have to wait for the heartbeat.
+          // Tool-level errors (isError results, JSON-RPC errors from a live
+          // server) are ignored by the manager.
+          if (!isTimeout && !isCircuit) {
+            await this.#connections.reportExecuteFailure(record.serverId, message);
+          }
+
           span.setAttribute(
             ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS,
             isTimeout ? "timed_out" : "failed",
