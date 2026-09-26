@@ -3,17 +3,56 @@
 How to connect Action Hub to the AI harnesses and editors it supports.
 
 Action Hub ships a Model Context Protocol (MCP) server. Every harness below
-speaks MCP over stdio, so wiring one up means pointing its MCP configuration at
-the bundled server script:
+speaks MCP over stdio, and two stdio entry forms are valid:
 
-```
-<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js
-```
+- the bundled server script
+  `<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/copilot-plugin/server/dist/index.js`, or
+- the CLI entrypoint `<ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js`
+  with the `start` argument (this is the form the `action-hub harness`
+  command emits).
 
-Auto-configuration commands are not shipped yet, so this guide uses manual
-config entries — copy the snippet for your harness, substitute the absolute
+The fastest path is automatic setup with the `action-hub harness` command
+(see the next section). If your harness is not covered by that command, or
+you prefer to manage the config yourself, use the manual snippets in the
+sections below — copy the snippet for your harness, substitute the absolute
 path, and restart. The supported harnesses: Claude Code, Claude Desktop,
 Cursor, VS Code, Codex, OpenCode, Zed, and Windsurf.
+
+## Automatic setup
+
+Most harnesses can be configured for you by the `action-hub harness` command.
+The shape:
+
+- `action-hub harness <target>` prints the target's config snippet
+  (`export` mode, the default).
+- `action-hub harness <target> install --write` writes the snippet into the
+  harness config file. `install` requires `--write` as a safety guard.
+- `--config <path>` points the harness at a specific Action Hub config file
+  (exported as `ACTION_HUB_CONFIG` in the snippet).
+- `--json` applies to JSON targets only — it prints just the JSON document.
+  For TOML targets such as `codex`, `--json` is rejected with a clear error.
+
+Targets: `claude-code`, `claude-desktop`, `cursor`, `codex`, `opencode`,
+`vscode`. (Run `action-hub harness --help` for the current exact grammar.)
+
+`export` prints the snippet for you to paste; `install` writes it into the
+harness config file and requires `--write`. When an existing config file is
+present, `install` first writes a timestamped backup of it, named
+`<file>.bak-<ISO timestamp>` (for example
+`mcp.json.bak-2026-09-26T08-24-51-422Z`), so the original is always
+recoverable. A first install has no original file, so no backup is created.
+
+```bash
+action-hub harness claude-code                 # print the Claude Code snippet
+action-hub harness claude-code install --write
+action-hub harness codex install --write --config ~/.config/action-hub/servers.json
+```
+
+The supported targets are `claude-code`, `claude-desktop`, `cursor`, `codex`,
+`opencode`, and `vscode`. Pi is not supported by the harness command; Zed and
+Windsurf are covered by the manual snippets below, which remain the fallback
+for every harness. If the CLI is not on your `PATH`, run the same commands via
+`node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/cli/dist/index.js harness ...`.
 
 Replace `<ABSOLUTE_PATH_TO_ACTION_HUB>` with the absolute path to your checkout
 (for example `/Users/me/Projects/action-hub`), and make sure the build exists:
@@ -237,6 +276,10 @@ if the CLI is not on your `PATH`.) The migration engine discovers MCP servers,
 skills, and plugins from your local agent configurations and merges them into
 the Action Hub config, preserving entries that are already there.
 
-For a servers-only look, `action-hub import` previews MCP servers discovered
-from your local agent configurations. It does not bring in skills, so use
-`migrate --type all --write` when you want servers *and* skills written.
+For a servers-only pass, `action-hub import` previews MCP servers discovered
+from your local agent configurations, and `action-hub import --write` writes
+them. Since the raw-config fix, `--write` preserves everything already in the
+config (existing entries win, unknown top-level settings survive, and the
+write is atomic with `0600` permissions; it fails closed on a malformed
+config). It does not bring in skills, so use `migrate --type all --write`
+when you want servers *and* skills written.
