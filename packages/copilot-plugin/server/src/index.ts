@@ -17,6 +17,41 @@ import { defaultConfigPath, loadConfig } from "./config.js";
 import { startControlServer, type ControlServer } from "./control.js";
 import { createSdkClientFactory } from "./sdk-client.js";
 import { warn, writeSnapshot } from "./snapshot.js";
+import {
+  LOAD_DESCRIPTION_MAX_BYTES,
+  LOAD_SCHEMA_MAX_BYTES,
+  SEARCH_SUMMARY_MAX_BYTES,
+  SKILL_INSTRUCTIONS_MAX_BYTES,
+  hardenSchema,
+  hardenText,
+} from "./output-hardening.js";
+
+/** One hardened formatter for every bundle-load response path. */
+function hardenedBundlePayload(loaded: {
+  id: string;
+  displayName: string;
+  description?: string;
+  actions: Array<{ id: string; name: string; serverId: string; trust: string; summary: string; inputSchema?: unknown }>;
+  tokensSaved: number;
+}) {
+  return {
+    ok: true,
+    bundle_id: loaded.id,
+    display_name: hardenText(loaded.displayName, SEARCH_SUMMARY_MAX_BYTES),
+    description: hardenText(loaded.description ?? "", LOAD_DESCRIPTION_MAX_BYTES),
+    actions_count: loaded.actions.length,
+    actions: loaded.actions.map((act) => ({
+      action_id: act.id,
+      name: hardenText(act.name, SEARCH_SUMMARY_MAX_BYTES),
+      server: act.serverId,
+      trust: act.trust,
+      summary: hardenText(act.summary, SEARCH_SUMMARY_MAX_BYTES),
+      input_schema: hardenSchema(act.inputSchema, LOAD_SCHEMA_MAX_BYTES),
+    })),
+    tokens_saved: loaded.tokensSaved,
+    next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
+  };
+}
 
 const TOOL_DESCRIPTION = `Search, load, and run capabilities from every connected MCP server and installed skill.
 
@@ -267,18 +302,18 @@ async function dispatch(
         count: hits.length,
         results: hits.map((hit) => ({
           action_id: hit.id,
-          name: hit.name,
+          name: hardenText(hit.name, SEARCH_SUMMARY_MAX_BYTES),
           server: hit.serverId,
           kind: hit.kind,
-          summary: hit.summary,
-          ...(hit.inputSchema ? { input_schema: hit.inputSchema } : {}),
+          summary: hardenText(hit.summary, SEARCH_SUMMARY_MAX_BYTES),
+          ...(hit.inputSchema ? { input_schema: hardenSchema(hit.inputSchema, LOAD_SCHEMA_MAX_BYTES) } : {}),
         })),
         ...(matchingBundles.length > 0
           ? {
               bundles: matchingBundles.map((b) => ({
                 bundle_id: b.id,
-                display_name: b.displayName,
-                description: b.description,
+                display_name: hardenText(b.displayName, SEARCH_SUMMARY_MAX_BYTES),
+                description: hardenText(b.description ?? "", SEARCH_SUMMARY_MAX_BYTES),
               })),
             }
           : {}),
@@ -297,8 +332,8 @@ async function dispatch(
         count: bundles.length,
         bundles: bundles.map((b) => ({
           bundle_id: b.id,
-          display_name: b.displayName,
-          description: b.description,
+          display_name: hardenText(b.displayName, SEARCH_SUMMARY_MAX_BYTES),
+          description: hardenText(b.description ?? "", SEARCH_SUMMARY_MAX_BYTES),
           server_ids: b.serverIds,
           action_ids: b.actionIds,
         })),
@@ -309,58 +344,26 @@ async function dispatch(
     case "load_bundle": {
       const bundleId = input.bundle_id ?? input.action_id;
       if (!bundleId) throw new Error(`"bundle_id" is required for operation "load_bundle".`);
-      const loaded = hub.loadBundle(bundleId);
-      return {
-        ok: true,
-        bundle_id: loaded.id,
-        display_name: loaded.displayName,
-        description: loaded.description,
-        actions_count: loaded.actions.length,
-        actions: loaded.actions.map((act) => ({
-          action_id: act.id,
-          name: act.name,
-          server: act.serverId,
-          trust: act.trust,
-          summary: act.summary,
-          input_schema: act.inputSchema,
-        })),
-        tokens_saved: loaded.tokensSaved,
-        next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
-      };
+      return hardenedBundlePayload(hub.loadBundle(bundleId));
     }
 
     case "load": {
       if (input.bundle_id) {
-        const loaded = hub.loadBundle(input.bundle_id);
-        return {
-          ok: true,
-          bundle_id: loaded.id,
-          display_name: loaded.displayName,
-          description: loaded.description,
-          actions_count: loaded.actions.length,
-          actions: loaded.actions.map((act) => ({
-            action_id: act.id,
-            name: act.name,
-            server: act.serverId,
-            trust: act.trust,
-            summary: act.summary,
-            input_schema: act.inputSchema,
-          })),
-          tokens_saved: loaded.tokensSaved,
-          next: "All actions in this bundle are loaded. Call execute with any action_id and matching arguments.",
-        };
+        return hardenedBundlePayload(hub.loadBundle(input.bundle_id));
       }
       const actionId = requireActionId(input, "load");
       const action = hub.load(actionId);
+      const descriptionLimit =
+        action.kind === "skill" ? SKILL_INSTRUCTIONS_MAX_BYTES : LOAD_DESCRIPTION_MAX_BYTES;
       return {
         ok: true,
         action_id: action.id,
-        name: action.name,
+        name: hardenText(action.name, SEARCH_SUMMARY_MAX_BYTES),
         server: action.serverId,
         kind: action.kind,
         trust: action.trust,
-        description: action.description ?? action.summary,
-        input_schema: action.inputSchema,
+        description: hardenText(action.description ?? action.summary, descriptionLimit),
+        input_schema: hardenSchema(action.inputSchema, LOAD_SCHEMA_MAX_BYTES),
         next:
           action.kind === "skill"
             ? "This is a skill. Follow its instructions; do not execute it."
@@ -387,7 +390,7 @@ async function dispatch(
           status: "approval_required",
           action_id: approval.actionId,
           server: approval.serverId,
-          name: approval.name,
+          name: hardenText(approval.name, SEARCH_SUMMARY_MAX_BYTES),
           trust: approval.trust,
           reason: approval.reason,
           arguments_summary: approval.argumentsSummary,

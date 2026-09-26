@@ -94,6 +94,7 @@ export {
   collectServerSecrets,
   redactArg,
   redactArgs,
+  redactKnownSecretPrefixes,
   redactRecord,
   redactServerConfig,
   redactUrl,

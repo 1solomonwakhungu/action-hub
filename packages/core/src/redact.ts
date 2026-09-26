@@ -46,6 +46,17 @@ function redactRawSecrets(text: string): string {
 }
 
 /**
+ * Redact only well-known secret-shaped prefixes (sk-, ghp_, gho_, github_pat_,
+ * xox, AKIA, glpat-). Unlike the fail-closed backstop above, this never
+ * touches long opaque runs, so ordinary hashes and ids in catalog text
+ * (descriptions, summaries, instructions) survive untouched. Intended for
+ * text that is returned to a model-facing consumer.
+ */
+export function redactKnownSecretPrefixes(text: string): string {
+  return text.replace(KNOWN_PREFIX_RE, REDACTED);
+}
+
+/**
  * Redact a header-style value while keeping the header name when one is
  * present (`X-API-Key: sk-...` -> `X-API-Key: [redacted]`).
  */
