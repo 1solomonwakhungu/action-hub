@@ -236,6 +236,16 @@ export { startHttpServer, HUB_HTTP_TOKEN_ENV_VAR, type HttpServerOptions, type H
 export function createMcpServer(runtime: HubRuntime): McpServer {
   const server = new McpServer({ name: "action-hub", version: "0.1.0" });
 
+  // F23 rework: the authoritative re-index starts only after the server has
+  // actually HANDLED an initialize handshake — `server.connect` merely
+  // attaches the transport and would start the refresh before the first
+  // response. The SDK fires `oninitialized` after the initialize exchange is
+  // processed, for both stdio and HTTP transports. Memoised in the runtime,
+  // so repeated connects or stateless HTTP requests start it at most once.
+  server.server.oninitialized = () => {
+    runtime.startRefresh();
+  };
+
   server.registerTool(
     "action_hub",
     {
@@ -262,10 +272,13 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
 export async function connectMcpClient(runtime: HubRuntime, transport: Transport): Promise<McpServer> {
   const server = createMcpServer(runtime);
   await server.connect(transport);
-  // The server can answer now; the authoritative re-index may contend for the
-  // event loop behind it. Memoised in the runtime, so repeated connects (HTTP,
-  // daemon) start it at most once.
-  runtime.startRefresh();
+  // The authoritative re-index is NOT started here: `server.connect` only
+  // attaches the transport. createMcpServer wires it to the initialize
+  // handshake (`server.server.oninitialized`), so the refresh begins after
+  // the server has actually handled a request, never before its first
+  // response (F23 rework). A client that never handshakes simply never
+  // triggers it; HTTP stateless requests additionally trigger it after the
+  // first handled request in http-server.ts.
   return server;
 }
 

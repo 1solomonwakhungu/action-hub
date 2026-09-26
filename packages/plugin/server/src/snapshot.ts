@@ -46,6 +46,7 @@ export class SnapshotDebouncer {
   #lastWriteAt = Date.now();
   #chain: Promise<void> = Promise.resolve();
   #disposed = false;
+  #drainRounds = 0;
 
   constructor(write: () => Promise<void>, minIntervalMs = 5000) {
     this.#write = write;
@@ -77,13 +78,26 @@ export class SnapshotDebouncer {
     await this.#chain;
   }
 
-  /** Flushes any pending snapshot and stops scheduling. Idempotent. */
+  /** Flushes any pending snapshot and stops scheduling. Idempotent.
+   *
+   *  Drains ALL accepted dirty state: a `markDirty` that lands while a flush
+   *  is still in flight is persisted by the next drain round, so shutdown can
+   *  never drop dirty state it has already accepted (F18 rework). Once
+   *  disposal completes, further marks are ignored.
+   */
   async dispose(): Promise<void> {
-    if (this.#timer) {
-      clearTimeout(this.#timer);
-      this.#timer = undefined;
+    if (this.#disposed) return;
+    for (;;) {
+      // Drain: a mark accepted during the in-flight write below must not be
+      // left to an unref'd timer nobody will wait for.
+      if (this.#timer) {
+        clearTimeout(this.#timer);
+        this.#timer = undefined;
+      }
+      await this.flush();
+      if (!this.#dirty) break;
+      if (this.#drainRounds++ > 1000) break; // pathological-writer guard
     }
-    await this.flush();
     this.#disposed = true;
   }
 }
