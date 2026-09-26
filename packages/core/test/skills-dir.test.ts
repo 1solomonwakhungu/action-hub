@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -81,4 +81,42 @@ test("skills discovered from a directory carry the body as instructions on load"
   );
   const loaded = hub.load(skills[0]!.id);
   assert.match(loaded.description ?? "", /Rotate via vault/);
+});
+
+test("duplicate ids in a skills dir are deterministic and warned, unreadable files are skipped", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "skills-dir-"));
+  for (const sub of ["a-dup", "b-dup"]) {
+    const skillDir = join(dir, sub);
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(
+      join(skillDir, "SKILL.md"),
+      ["---", "name: Same Skill", "---", "", `Body of ${sub}.`].join("\n"),
+      "utf8",
+    );
+  }
+  const locked = join(dir, "0-locked.md");
+  await writeFile(locked, "---\nname: Locked\n---\nsecret", "utf8");
+  let chmodOk = false;
+  try {
+    await chmod(locked, 0o000);
+    chmodOk = true;
+  } catch {
+    // e.g. running as root: the file stays readable, no EACCES to simulate.
+  }
+
+  const warnings: string[] = [];
+  const skills = await discoverSkillsFromDirectory(dir, "custom", (m) => warnings.push(m));
+
+  // Deterministic winner: "a-dup" sorts before "b-dup"; the loser is warned.
+  assert.equal(skills.filter((s) => s.id === "skill:same-skill").length, 1);
+  assert.match(skills.find((s) => s.id === "skill:same-skill")?.description ?? "", /Body of a-dup/);
+  assert.ok(
+    warnings.some((w) => w.includes('duplicate skill id "skill:same-skill"') && w.includes("a-dup") && w.includes("b-dup")),
+  );
+
+  // An unreadable file is skipped with a warning instead of aborting the scan.
+  if (chmodOk) {
+    assert.ok(warnings.some((w) => w.includes("0-locked.md")));
+  }
+  await chmod(locked, 0o644).catch(() => undefined);
 });
