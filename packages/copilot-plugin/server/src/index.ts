@@ -3,8 +3,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { pathToFileURL } from "node:url";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { z } from "zod";
-import { ActionHub, ActionHubError, CatalogCache, bootstrapCatalog } from "@action-hub/core";
+import {
+  ActionHub,
+  ActionHubError,
+  CatalogCache,
+  bootstrapCatalog,
+  discoverSkillsFromDirectory,
+} from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { startControlServer, type ControlServer } from "./control.js";
 import { createSdkClientFactory } from "./sdk-client.js";
@@ -90,6 +98,36 @@ export async function createHubRuntime(options: { control?: boolean } = {}): Pro
         trust: s.trust ?? "trusted",
       })),
     );
+  }
+
+  // Skills added after migration: scan the canonical Action Hub skills
+  // directory with the existing core discovery parser. Config entries win on
+  // id conflicts (warned, never silently dropped); the rest register like
+  // migrated skills, so search and load behave identically.
+  const skillsDir = process.env["ACTION_HUB_SKILLS_DIR"] ?? resolve(homedir(), ".action-hub", "skills");
+  const dirSkills = await discoverSkillsFromDirectory(skillsDir);
+  const configSkillIds = new Set((config.skills ?? []).map((s) => s.id));
+  const dirSkillRecords = dirSkills
+    .filter((s) => {
+      if (configSkillIds.has(s.id)) {
+        warn(
+          `skill "${s.id}" is defined in both ${configPath} and ${skillsDir}; the config entry wins`,
+        );
+        return false;
+      }
+      return true;
+    })
+    .map((s) => ({
+      id: s.id,
+      name: s.name,
+      serverId: s.sourceClient ?? "skills",
+      summary: s.summary,
+      description: s.description,
+      tags: s.tags,
+      trust: s.trust ?? "trusted",
+    }));
+  if (dirSkillRecords.length > 0) {
+    hub.registerSkills(dirSkillRecords);
   }
 
   const cache = new CatalogCache({ onWarning: warn });

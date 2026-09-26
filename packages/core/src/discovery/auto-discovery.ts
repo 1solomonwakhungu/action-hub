@@ -610,40 +610,72 @@ export async function discoverSkills(options: DiscoveryOptions = {}): Promise<Di
         continue;
       }
 
-      const entries = await readdir(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          // Look for SKILL.md inside skill subdirectory
-          const skillMdPath = join(fullPath, "SKILL.md");
-          try {
-            const content = await readFile(skillMdPath, "utf8");
-            const skill = parseSkillContent(content, skillMdPath, client);
-            if (!seenIds.has(skill.id)) {
-              seenIds.add(skill.id);
-              discovered.push(skill);
-            }
-          } catch {
-            // No SKILL.md in this directory
-          }
-        } else if (entry.isFile()) {
-          const ext = extname(entry.name);
-          if (ext === ".md" || ext === ".mdc") {
-            const content = await readFile(fullPath, "utf8");
-            const skill = parseSkillContent(content, fullPath, client);
-            if (!seenIds.has(skill.id)) {
-              seenIds.add(skill.id);
-              discovered.push(skill);
-            }
-          }
-        }
-      }
+      await scanSkillDirectory(dir, client, seenIds, discovered);
     } catch {
       // Directory missing or unreadable
     }
   }
 
   return discovered;
+}
+
+/**
+ * Scans a single directory for skills: a `SKILL.md` inside each
+ * subdirectory, plus top-level `.md`/`.mdc` files. Uses the canonical
+ * `parseSkillContent` parser. A missing or unreadable directory simply
+ * yields no skills.
+ */
+export async function discoverSkillsFromDirectory(
+  dirPath: string,
+  sourceClient: DiscoveredSkill["sourceClient"] = "custom",
+): Promise<DiscoveredSkill[]> {
+  const discovered: DiscoveredSkill[] = [];
+  try {
+    const entries = await readdir(dirPath, { withFileTypes: true });
+    if (entries.length === 0) return discovered;
+  } catch {
+    // Directory missing or unreadable: no skills.
+    return discovered;
+  }
+  await scanSkillDirectory(dirPath, sourceClient, new Set(), discovered);
+  return discovered;
+}
+
+/** Shared directory scanner used by `discoverSkills` and `discoverSkillsFromDirectory`. */
+async function scanSkillDirectory(
+  dir: string,
+  client: DiscoveredSkill["sourceClient"],
+  seenIds: Set<string>,
+  discovered: DiscoveredSkill[],
+): Promise<void> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      // Look for SKILL.md inside skill subdirectory
+      const skillMdPath = join(fullPath, "SKILL.md");
+      try {
+        const content = await readFile(skillMdPath, "utf8");
+        const skill = parseSkillContent(content, skillMdPath, client);
+        if (!seenIds.has(skill.id)) {
+          seenIds.add(skill.id);
+          discovered.push(skill);
+        }
+      } catch {
+        // No SKILL.md in this directory
+      }
+    } else if (entry.isFile()) {
+      const ext = extname(entry.name);
+      if (ext === ".md" || ext === ".mdc") {
+        const content = await readFile(fullPath, "utf8");
+        const skill = parseSkillContent(content, fullPath, client);
+        if (!seenIds.has(skill.id)) {
+          seenIds.add(skill.id);
+          discovered.push(skill);
+        }
+      }
+    }
+  }
 }
 
 /**
