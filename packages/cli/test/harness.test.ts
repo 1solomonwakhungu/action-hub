@@ -4,7 +4,7 @@ import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as tomlParse } from "smol-toml";
-import { harnessCommand } from "../dist/commands/harness.js";
+import { harnessCommand, HARNESS_DEFS } from "../dist/commands/harness.js";
 
 async function withTempHome(
   fn: (home: string, tempDir: string) => Promise<void>,
@@ -51,7 +51,7 @@ test("harness export prints valid JSON with an action-hub entry", async () => {
     const entry = doc.mcpServers?.["action-hub"];
     assert.ok(entry, "action-hub entry present");
     assert.equal(entry.args.at(-1), "start", "entry runs the CLI start subcommand");
-    assert.ok(doc.mcpServers?.["other"], "existing entry preserved");
+    assert.equal(doc.mcpServers?.["other"], undefined, "export emits only the action-hub fragment");
   });
 });
 
@@ -202,4 +202,54 @@ test("harness returns 1 for unknown targets and ungated installs (no process.exi
     assert.equal(await harnessCommand("cursor", { mode: "install" }), 1);
     assert.equal(await harnessCommand("help", {}), 0);
   });
+});
+
+test("harness export never echoes existing config secrets", async () => {
+  await withTempHome(async (home) => {
+    const cfg = join(home, ".cursor", "mcp.json");
+    await mkdir(join(home, ".cursor"), { recursive: true });
+    await writeFile(
+      cfg,
+      JSON.stringify({
+        mcpServers: { private: { command: "x" } },
+        SENTINEL_API_KEY: "sk-secret-do-not-print",
+      }),
+    );
+    for (const json of [true, false]) {
+      const out = await captureLogs(() =>
+        harnessCommand("cursor", { mode: "export", json }),
+      );
+      assert.ok(!out.includes("SENTINEL_API_KEY"), `--json=${json}: key not echoed`);
+      assert.ok(!out.includes("sk-secret-do-not-print"), `--json=${json}: value not echoed`);
+    }
+  });
+});
+
+test("harness --json is rejected for TOML targets", async () => {
+  await withTempHome(async () => {
+    assert.equal(await harnessCommand("codex", { mode: "export", json: true }), 1);
+  });
+});
+
+test("win32 targets resolve under APPDATA", async () => {
+  const home = "/home/fake";
+  const appData = "C:\\Users\\fake\\AppData\\Roaming";
+  const savedPlatform = process.platform;
+  const savedAppData = process.env.APPDATA;
+  Object.defineProperty(process, "platform", { value: "win32" });
+  process.env.APPDATA = appData;
+  try {
+    assert.equal(
+      HARNESS_DEFS["claude-desktop"].configPath(home),
+      join(appData, "Claude", "claude_desktop_config.json"),
+    );
+    assert.equal(
+      HARNESS_DEFS["vscode"].configPath(home),
+      join(appData, "Code", "User", "mcp.json"),
+    );
+  } finally {
+    Object.defineProperty(process, "platform", { value: savedPlatform });
+    if (savedAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = savedAppData;
+  }
 });
