@@ -65,31 +65,52 @@ const deadlineMs = Number(process.argv[1] || 0);
 const command = process.argv[2];
 const args = process.argv.slice(3);
 if (!command) process.exit(2);
+const isWindows = process.platform === "win32";
+// detached on POSIX makes the child a process-group leader, so the whole
+// downstream tree (grandchildren included) can be signalled at once.
 const child = spawn(command, args, {
   stdio: ["pipe", "pipe", "pipe"],
   env: process.env,
   cwd: process.cwd(),
+  detached: !isWindows,
 });
 let sawStdout = false;
 let killed = false;
-const killChild = (signal) => {
+const killTree = (signal) => {
   if (killed) return;
   killed = true;
-  try { child.kill(signal); } catch {}
-  setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 1000).unref?.();
+  const escalate = () => {
+    setTimeout(() => {
+      try {
+        if (isWindows) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+        else process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }, 1000).unref?.();
+  };
+  try {
+    if (isWindows) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+    else process.kill(-child.pid, signal);
+  } catch {}
+  escalate();
 };
 if (deadlineMs > 0) {
-  const t = setTimeout(() => { if (!sawStdout) { killChild("SIGKILL"); } }, deadlineMs);
+  const t = setTimeout(() => { if (!sawStdout) { killTree("SIGKILL"); } }, deadlineMs);
   t.unref?.();
 }
-process.stdin.on("data", (chunk) => child.stdin.write(chunk));
-process.stdin.on("end", () => { killChild("SIGTERM"); });
-process.stdin.on("error", () => { killChild("SIGKILL"); });
+process.stdin.on("data", (chunk) => {
+  try { child.stdin.write(chunk); } catch {}
+});
+// Downstream stdin closure must not surface as an unhandled EPIPE stack.
+process.stdin.on("end", () => { killTree("SIGTERM"); });
+process.stdin.on("error", () => { killTree("SIGKILL"); });
+child.stdin.on("error", () => {});
 child.stdout.on("data", (chunk) => { sawStdout = true; process.stdout.write(chunk); });
 child.stderr.on("data", (chunk) => process.stderr.write(chunk));
+child.stdout.on("error", () => {});
+child.stderr.on("error", () => {});
 child.on("error", () => process.exit(1));
 child.on("exit", (code) => process.exit(code ?? 1));
-process.on("exit", () => { if (!killed) killChild("SIGTERM"); });
+process.on("exit", () => { if (!killed) killTree("SIGTERM"); });
 `;
 
 function serverTimeoutMs(srv: ServerConfig | undefined): number {
@@ -151,29 +172,62 @@ function withDeadline<T>(label: string, op: () => Promise<T>, ms: number): Promi
  * eventual client (if it ever connects) is closed so no transport or child
  * process survives the attempt.
  */
-function boundedClientFactory(inner: (config: ServerConfig) => Promise<McpClient>): (config: ServerConfig) => Promise<McpClient> {
+function boundedClientFactory(inner: (config: ServerConfig) => Promise<McpClient>, spawnedPids: Set<number>): (config: ServerConfig) => Promise<McpClient> {
   return async (config: ServerConfig): Promise<McpClient> => {
     const deadline = attemptBudgetMs(config);
     const clientPromise = (async () => inner(config))();
     // Swallow a late rejection so the loser of the race cannot surface as an
     // unhandled rejection after the race has already decided.
     clientPromise.catch(() => undefined);
+    const recordPid = (client: McpClient | undefined): void => {
+      const transport = (client as unknown as { transport?: { pid?: number | null } } | undefined)?.transport;
+      if (transport && typeof transport.pid === "number") spawnedPids.add(transport.pid);
+    };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         // Close the transport of a timed-out attempt: no child survives.
         void clientPromise
-          .then((client) => client.close())
+          .then((client) => {
+            recordPid(client);
+            return client.close();
+          })
           .catch(() => undefined);
         reject(new Error(`connect timed out after ${deadline}ms`));
       }, deadline);
     });
     try {
-      return (await Promise.race([clientPromise, timeout])) as McpClient;
+      const client = (await Promise.race([clientPromise, timeout])) as McpClient;
+      recordPid(client);
+      return client;
     } finally {
       if (timer) clearTimeout(timer);
     }
   };
+}
+
+/**
+ * Resolves once every recorded supervisor process has exited (or the deadline
+ * passes). The supervisors are reaped by their owning transports; polling
+ * here guarantees the downstream process TREES they killed are gone before
+ * the doctor returns instead of dying asynchronously afterwards.
+ */
+async function waitForProcessesExit(pids: Iterable<number>, timeoutMs: number): Promise<void> {
+  const unique = [...new Set(pids)];
+  if (unique.length === 0) return;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const alive = unique.filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (alive.length === 0 || Date.now() >= deadline) return;
+    await delay(50);
+  }
 }
 
 function describeTransport(transport: ServerConfig["transport"]): string {
@@ -224,6 +278,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
   }
 
   // 4. Downstream Server Connectivity & Indexing Status
+  const supervisorPids = new Set<number>();
   const hub = new ActionHub({
     servers: supervisedServers(config.servers),
     bundles: config.bundles,
@@ -232,7 +287,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
     // permanently hanging initialize would otherwise hang the doctor. The
     // wrapped factory bounds every connect attempt and closes the transport
     // of a timed-out attempt (no child survives).
-    clientFactory: boundedClientFactory(createSdkClientFactory()),
+    clientFactory: boundedClientFactory(createSdkClientFactory(), supervisorPids),
   });
 
   // Total budget across all servers and both attempts, so worst case cannot
@@ -393,5 +448,10 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
     return criticalFailures > 0 ? 1 : 0;
   } finally {
     await hub.close();
+    // Every stdio server runs under a doctor supervisor that killed (and was
+    // killed with) its whole downstream process tree. Wait for the
+    // supervisors themselves to be reaped so no descendant outlives the
+    // doctor, then return.
+    await waitForProcessesExit(supervisorPids, 5_000);
   }
 }

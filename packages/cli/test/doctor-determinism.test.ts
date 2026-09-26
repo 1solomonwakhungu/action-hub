@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +9,8 @@ import { doctorCommand } from "../dist/commands/doctor.js";
 const testDir = dirname(fileURLToPath(import.meta.url));
 const failFirstFixture = resolve(testDir, "fixtures/fail-first-list-tools.mjs");
 const minimalFixture = resolve(testDir, "fixtures/minimal-mcp.mjs");
+const hangFixture = resolve(testDir, "fixtures/hang-server.mjs");
+const stubbornTreeFixture = resolve(testDir, "fixtures/stubborn-tree-server.mjs");
 
 function captureConsole(): { logs: string[]; errors: string[]; restore: () => void } {
   const logs: string[] = [];
@@ -37,12 +38,15 @@ async function withIsolatedEnv<T>(tempDir: string, fn: () => Promise<T>): Promis
     ACTION_HUB_SKILLS_DIR: process.env["ACTION_HUB_SKILLS_DIR"],
     ACTION_HUB_CACHE: process.env["ACTION_HUB_CACHE"],
     ACTION_HUB_DAEMON_DIR: process.env["ACTION_HUB_DAEMON_DIR"],
+    TREE_PIDS_FILE: process.env["TREE_PIDS_FILE"],
   };
   process.env["HOME"] = tempDir;
   process.env["XDG_CONFIG_HOME"] = join(tempDir, "xdg-config");
   process.env["XDG_CACHE_HOME"] = join(tempDir, "xdg-cache");
   process.env["ACTION_HUB_CACHE"] = join(tempDir, "ah-cache");
   process.env["ACTION_HUB_DAEMON_DIR"] = join(tempDir, "ah-daemon");
+  process.env["TREE_PIDS_FILE"] = join(tempDir, "recorded-pids.txt");
+  await writeFile(process.env["TREE_PIDS_FILE"], "");
   delete process.env["ACTION_HUB_CONFIG"];
   delete process.env["ACTION_HUB_SKILLS_DIR"];
   try {
@@ -171,8 +175,9 @@ test("44-server fleet with failures and hangs finishes within a wall-time ceilin
     servers.push(stdioServer("dead-1", ["-e", "process.exit(1)"], { timeoutMs: 500 }));
     servers.push(stdioServer("dead-2", ["-e", "process.exit(1)"], { timeoutMs: 500 }));
     // Permanent hangs: never answer; the per-attempt deadline must bound them.
-    servers.push(stdioServer("hang-1", ["-e", "process.stdin.resume()"], { timeoutMs: 500 }));
-    servers.push(stdioServer("hang-2", ["-e", "process.stdin.resume()"], { timeoutMs: 500 }));
+    // Each hang server records its own PID so survivor evidence is exact.
+    servers.push(stdioServer("hang-1", [hangFixture], { timeoutMs: 500 }));
+    servers.push(stdioServer("hang-2", [hangFixture], { timeoutMs: 500 }));
     const cfgPath = await makeFleet(tempDir, servers);
 
     const { code } = await withIsolatedEnv(tempDir, () => runDoctor(cfgPath));
@@ -182,19 +187,70 @@ test("44-server fleet with failures and hangs finishes within a wall-time ceilin
     // unbounded 44 x 2 x (30s index + 5s health) the old code allowed.
     assert.ok(wallMs < 45_000, `fleet run took ${wallMs}ms, expected < 45s`);
 
-    // No hung child survivors: every process still running our hang marker
-    // after the doctor returned would be a leaked transport. Late circuit
-    // restarts can legitimately be mid-shutdown, so poll until a deadline.
-    let survivors: string[] = [];
+    // No hung survivors, evidenced by the exact PIDs the fixtures recorded:
+    // every hang server wrote its own PID; each must be dead after the
+    // doctor returned. Poll until a bounded deadline to tolerate a supervisor
+    // still mid-teardown.
+    const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
+      .split("\n")
+      .map((l) => Number.parseInt(l.trim(), 10))
+      .filter((n) => Number.isSafeInteger(n) && n > 0);
+    assert.ok(recordedPids.length >= 4, `expected >=4 recorded hang PIDs, got ${recordedPids.length}`);
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
     const pollDeadline = Date.now() + 8_000;
-    do {
-      await new Promise((r) => setTimeout(r, 500));
-      const ps = spawnSync("ps", ["-eo", "pid,args"], { encoding: "utf8" });
-      survivors = (ps.stdout ?? "")
-        .split("\n")
-        .filter((l) => l.includes("process.stdin.resume()") && !l.includes("grep"));
-    } while (survivors.length > 0 && Date.now() < pollDeadline);
-    assert.equal(survivors.length, 0, `hung server processes survived: ${survivors.join(" | ")}`);
+    let survivors: number[] = recordedPids.filter(isAlive);
+    while (survivors.length > 0 && Date.now() < pollDeadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      survivors = recordedPids.filter(isAlive);
+    }
+    assert.deepEqual(survivors, [], `recorded hang processes survived: ${survivors.join(", ")}`);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// MUST-FIX regression (PR 61 rework): a server that spawns a TERM-ignoring
+// grandchild must have its ENTIRE process tree killed before the doctor
+// returns. Evidence is the exact PIDs the fixture recorded (server +
+// grandchild), not a ps output scan.
+test("doctor kills the whole downstream process tree, including TERM-ignoring grandchildren", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-doctor-tree-"));
+  try {
+    const servers = [stdioServer("stubborn", [stubbornTreeFixture], { timeoutMs: 5000 })];
+    const cfgPath = await makeFleet(tempDir, servers);
+    const { code } = await withIsolatedEnv(tempDir, () => runDoctor(cfgPath));
+    assert.equal(code, 0, "healthy stubborn-tree server must not fail the doctor");
+
+    const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
+      .split("\n")
+      .map((l) => Number.parseInt(l.trim(), 10))
+      .filter((n) => Number.isSafeInteger(n) && n > 0);
+    assert.equal(recordedPids.length, 2, `expected server + grandchild PIDs recorded, got ${recordedPids.join(", ")}`);
+
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    // The doctor waits for its supervisors to be reaped before returning;
+    // give the recorded processes a bounded grace period anyway.
+    const pollDeadline = Date.now() + 8_000;
+    let survivors = recordedPids.filter(isAlive);
+    while (survivors.length > 0 && Date.now() < pollDeadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      survivors = recordedPids.filter(isAlive);
+    }
+    assert.deepEqual(survivors, [], `downstream tree survived: ${survivors.join(", ")}`);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
