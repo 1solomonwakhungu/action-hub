@@ -18,14 +18,17 @@
  *                 "behavior": { "latencyMs": 5, "errorRate": 0, "responseBytes": 512 } }] }
  *
  * Chaos keys (comma-separated key=value after --chaos):
- *   crash-after=N     exit(1) after serving the Nth JSON-RPC request (any
- *                     handled method), preceded by a stderr note
+ *   crash-after=N     after the Nth JSON-RPC request is served (reply
+ *                     delivered), print a stderr note and exit(1)
  *   hang-rate=R       per tools/call draw: never respond to that call
+ *   seed=N            deterministic PRNG seed (mulberry32) for hang-rate and
+ *                     errorRate draws; also accepted as --seed or CHAOS_SEED;
+ *                     default 1. The seed is logged at startup.
  *   slow-start-ms=N   delay before the server serves its first request
  *   huge-bytes=N      pad every successful tools/call result to ~N bytes
  *   stderr-secret=V   print "chaos: secret=V" to stderr once at startup
  *
- * Deterministic given the manifest; no network beyond the local transport.
+ * Deterministic given (manifest, seed): all probabilistic chaos draws use a seeded PRNG.
  * Requires @modelcontextprotocol/sdk (resolved from the repo's node_modules).
  */
 
@@ -92,16 +95,40 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // --- chaos bookkeeping -------------------------------------------------------
 
 let requestsServed = 0;
+// Deterministic PRNG (mulberry32): seeded from --seed, CHAOS_SEED, or
+// chaos seed=N; every probabilistic draw (hang-rate, errorRate) uses it so
+// identical (manifest, seed) pairs replay the same behavior sequence.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const SEED = Number(chaos.get("seed") ?? args["seed"] ?? process.env.CHAOS_SEED ?? 1);
+const rand = mulberry32(Number.isFinite(SEED ? SEED : NaN) ? SEED : 1);
+const SEED_VALUE = Number.isFinite(SEED) ? SEED : 1;
+
 function serveRequest() {
   requestsServed += 1;
   if (crashAfter !== undefined && requestsServed >= crashAfter) {
-    process.stderr.write(`chaos: crash-after=${crashAfter} triggered\n`);
-    process.exit(1);
+    // Crash AFTER the response for this request is written: the Nth counted
+    // request completes (its reply is flushed to the client), then the
+    // process exits. setTimeout(0) runs after the reply write.
+    setTimeout(() => {
+      process.stderr.write(`chaos: crash-after=${crashAfter} triggered after ${crashAfter} served requests\n`);
+      process.exit(1);
+    }, 25);
   }
 }
 
 function toolBehavior(name) {
-  return manifest.tools.find((t) => t.name === name)?.behavior ?? {};
+  const tool = manifest.tools.find((t) => t.name === name);
+  return tool?.behavior ?? {};
 }
 
 function hangForever() {
@@ -125,16 +152,24 @@ function registerHandlers(server) {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     serveRequest();
-    const behavior = toolBehavior(request.params.name);
+    const tool = manifest.tools.find((t) => t.name === request.params.name);
+    // Unknown tool names are rejected with an isError result, consistent
+    // with real servers (a plain ok:true would hide router defects).
+    if (!tool) {
+      return {
+        content: [{ type: "text", text: `Unknown tool: ${String(request.params.name)}` }],
+        isError: true,
+      };
+    }
+    const behavior = tool.behavior ?? {};
     // Hang-rate draws only on tools/call, per contract: initialize and
-    // tools/list always proceed so clients can connect and index.
-    if (hangRate > 0 && Math.random() < hangRate) {
+    if (hangRate > 0 && rand() < hangRate) {
       return hangForever();
     }
-    const latencyMs = Number(behavior.latencyMs ?? 0);
+    const latencyMs = Number(behavior?.latencyMs ?? 0);
     if (latencyMs > 0) await sleep(latencyMs);
-    const errorRate = Number(behavior.errorRate ?? 0);
-    if (errorRate > 0 && Math.random() < errorRate) {
+    const errorRate = Number(behavior?.errorRate ?? 0);
+    if (errorRate > 0 && rand() < errorRate) {
       return {
         content: [{ type: "text", text: String(behavior.errorText ?? "injected failure") }],
         isError: true,
@@ -169,6 +204,14 @@ function runHttp() {
   // Stateless Streamable HTTP: a fresh transport + server per POST request
   // (SDK stateless pattern). GET/DELETE are rejected with 405.
   const httpServer = createServer(async (req, res) => {
+    // Endpoint discipline: only /mcp answers; anything else 404s visibly so
+    // misconfigured clients fail loudly instead of probing a lenient server.
+    const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    if (path !== "/mcp") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `unknown path ${req.url} (use /mcp)` }));
+      return;
+    }
     if (req.method !== "POST") {
       res.writeHead(405, { Allow: "POST" }).end();
       return;
@@ -183,6 +226,8 @@ function runHttp() {
       return;
     }
 
+    // Stateless Streamable HTTP: a fresh transport + server per POST request
+    // (SDK stateless pattern). GET/DELETE are rejected with 405.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       void transport.close().catch(() => {});
@@ -217,6 +262,9 @@ function runHttp() {
 if (stderrSecret !== undefined) {
   process.stderr.write(`chaos: secret=${stderrSecret}\n`);
 }
+// Determinism: the seed drives every probabilistic draw (hang-rate,
+// errorRate). Recorded here so a failing run can be replayed byte-for-byte.
+process.stderr.write(`chaos: seed=${SEED_VALUE}\n`);
 if (slowStartMs > 0) await sleep(slowStartMs);
 
 if (transportKind === "http") {
