@@ -148,7 +148,10 @@ export async function daemonStopCommand(options: DaemonOptions = {}): Promise<nu
 
 export async function connectCommand(options: DaemonOptions = {}): Promise<number> {
   const paths = daemonPaths(options.daemonDir);
-  let socket: Socket;
+  // Tracked so a handshake failure can destroy the socket before returning.
+  // Without this, a daemon that accepts but never responds leaves the socket
+  // open and the process hangs even after the timeout error is printed.
+  let socket: Socket | undefined;
   try {
     const { state, token } = await readCredentials(paths);
     socket = await openSocket(state);
@@ -157,6 +160,7 @@ export async function connectCommand(options: DaemonOptions = {}): Promise<numbe
     const parsed = JSON.parse(response) as Record<string, unknown>;
     if (!parsed["ok"]) throw new Error(String(parsed["error"] ?? "Daemon rejected the connection"));
   } catch (cause) {
+    socket?.destroy();
     process.stderr.write(`action-hub: could not connect to daemon: ${message(cause)}\n`);
     return 1;
   }
@@ -169,6 +173,11 @@ export async function connectCommand(options: DaemonOptions = {}): Promise<numbe
     const finish = (code: number): void => {
       if (settled) return;
       settled = true;
+      // Drop the pipe handles so the event loop can wind down after the socket
+      // closes; without this the flowing stdin pipe keeps the process alive.
+      process.stdin.unpipe(socket);
+      socket.destroy();
+      if (process.stdin.readable) process.stdin.destroy();
       done(code);
     };
     socket.once("close", () => finish(0));

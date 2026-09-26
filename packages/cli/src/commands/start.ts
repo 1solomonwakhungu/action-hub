@@ -25,5 +25,13 @@ export async function startCommand(options: StartOptions = {}): Promise<number> 
   }
 
   await runServer();
-  return 0;
+  // runServer resolves only after its runtime teardown (SIGINT/SIGTERM
+  // handlers close the hub and downstream connections). The imported
+  // entrypoint's own process.exit handler is NOT active inside the CLI, and
+  // main() deliberately sets process.exitCode instead of exiting, so the
+  // StdioServerTransport/stdin handles would keep the process alive forever.
+  // This is the verified forced-exit path for the long-running server
+  // command: teardown has completed by the time runServer resolves.
+  await new Promise<void>((flushed) => process.stderr.write("", () => flushed()));
+  process.exit(0);
 }
