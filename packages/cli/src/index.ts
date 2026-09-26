@@ -346,7 +346,11 @@ async function main(): Promise<void> {
 
       case "__daemon-run": {
         await runDaemonProcess();
-        exitCode = 0;
+        // Same lifecycle as `start`: the daemon resolves after its shutdown
+        // handlers run, but without a forced exit the process could linger on
+        // open handles (this child has no CLI caller to terminate it).
+        await new Promise<void>((flushed) => process.stderr.write("", () => flushed()));
+        process.exit(0);
         break;
       }
 

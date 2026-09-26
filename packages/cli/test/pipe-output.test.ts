@@ -375,3 +375,66 @@ test("list --kind skill --server missing exits 1", async () => {
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// start lifecycle (FX4-R3 MUST-FIX): after an MCP handshake, SIGTERM must
+// actually terminate the CLI. The imported runServer resolves after its own
+// teardown, but its entrypoint process.exit path is inactive inside the CLI;
+// startCommand must flush and force-exit or stdio handles linger.
+test("start terminates on SIGTERM after an MCP handshake", async () => {
+  const child_process_mod = await import("node:child_process");
+  void child_process_mod;
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-start-sigterm-"));
+  const cfgPath = join(tempDir, "servers.json");
+  await writeFile(cfgPath, JSON.stringify({ servers: [], autoDiscover: false }));
+
+  const transport = new StdioClientTransport({
+    command: "node",
+    args: [cliBin, "start", "--config", cfgPath],
+    env: { ...process.env, HOME: tempDir, ACTION_HUB_CONFIG: cfgPath },
+  });
+  const client = new Client({ name: "sigterm-test", version: "1.0.0" });
+  let serverPid: number | undefined;
+  try {
+    await client.connect(transport);
+    const tools = await client.listTools();
+    assert.ok(Array.isArray(tools.tools) && tools.tools.length > 0, "handshake complete");
+    serverPid = transport.pid;
+  } finally {
+    await client.close().catch(() => undefined);
+  }
+  assert.ok(serverPid, "transport must expose the spawned server pid");
+
+  // SIGTERM the server and require it to exit promptly: runServer resolves
+  // after teardown, startCommand must then flush and force-exit, otherwise
+  // the stdio handles keep the process alive (the FX4-R3 regression).
+  const signaledAt = Date.now();
+  try {
+    process.kill(serverPid, "SIGTERM");
+  } catch {
+    // already gone
+  }
+  let exited = false;
+  while (Date.now() - signaledAt < 3000) {
+    try {
+      process.kill(serverPid, 0); // liveness probe
+    } catch {
+      exited = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  try {
+    assert.equal(exited, true, "start must exit within 3s of SIGTERM");
+  } finally {
+    if (!exited) {
+      try {
+        process.kill(serverPid, "SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
