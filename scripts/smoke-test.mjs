@@ -3,10 +3,18 @@
 // `npm run smoke:binary`. Pass the binary path as the first argument, or let it
 // default to the host-target binary under dist-bin/.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, accessSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, accessSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
+
+// Owner-state isolation (F34): every spawned binary gets the FULL
+// ISOLATION.md variable set pointed at one fresh run root, so the smoke can
+// never write the invoking user's real cache/config/harness state. The
+// checklist and env builder are the single source of truth shared with the
+// test preload (test-isolation.mjs), imported in library mode.
+process.env["ACTION_HUB_TEST_ISOLATION_LIBRARY"] = "1";
+const { ISOLATION_CHECKLIST, createRunRoot, buildIsolatedEnv, rmRunRoot, containedIn } = await import("../test-isolation.mjs");
 
 function fail(message) {
   process.stderr.write(`SMOKE FAIL: ${message}\n`);
@@ -24,10 +32,38 @@ function resolveBinary() {
   return path;
 }
 
+let isolationEnv = {};
+let runRoot = null;
+
+/**
+ * Validate the FINAL env handed to a spawn: every checklist variable must
+ * resolve inside the run root, even after per-call overrides (ISOLATION.md
+ * final-value rule). File-shaped vars that a check pins deliberately (e.g.
+ * ACTION_HUB_CONFIG under the run root) must be inside the root too.
+ */
+function assertFinalEnvIsolated(env) {
+  for (const name of ISOLATION_CHECKLIST) {
+    const value = env[name];
+    if (value === undefined || value === "") continue;
+    if (!containedIn(value, runRoot)) {
+      fail(`isolation violation: final ${name}=${value} is outside the run root ${runRoot}`);
+    }
+  }
+}
+
+function checkDir(name) {
+  const dir = join(runRoot, "checks", name);
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
 function runBinary(bin, args, env = {}) {
+  const finalEnv = { ...process.env, ...isolationEnv, ...env };
+  assertFinalEnvIsolated(finalEnv);
   const result = spawnSync(bin, args, {
     encoding: "utf8",
-    env: { ...process.env, ...env },
+    env: finalEnv,
     timeout: 30_000,
   });
   if (result.error) fail(`spawning ${bin} ${args.join(" ")} threw: ${result.error.message}`);
@@ -51,7 +87,7 @@ function checkHelp(bin) {
 }
 
 function checkDoctor(bin) {
-  const dir = mkdtempSync(join(tmpdir(), "ah-smoke-doctor-"));
+  const dir = checkDir("doctor");
   const cfg = join(dir, "servers.json");
   writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
   const { status, stdout } = runBinary(bin, ["doctor", "--config", cfg]);
@@ -61,7 +97,7 @@ function checkDoctor(bin) {
 }
 
 function checkLightweightCommand(bin) {
-  const dir = mkdtempSync(join(tmpdir(), "ah-smoke-"));
+  const dir = checkDir("list");
   const cfg = join(dir, "servers.json");
   writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
   const { status, stdout } = runBinary(bin, ["list"], { ACTION_HUB_CONFIG: cfg });
@@ -89,7 +125,7 @@ function checkHarnessExport(bin) {
 }
 
 function checkDaemonLifecycle(bin) {
-  const dir = mkdtempSync(join(tmpdir(), "ah-smoke-daemon-"));
+  const dir = checkDir("daemon");
   const cfg = join(dir, "servers.json");
   const runtime = join(dir, "runtime");
   writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
@@ -118,12 +154,12 @@ function checkDaemonLifecycle(bin) {
 // was bundled into the binary correctly.
 function checkMcpHandshake(bin) {
   return new Promise((resolvePromise) => {
-    const dir = mkdtempSync(join(tmpdir(), "ah-smoke-mcp-"));
+    const dir = checkDir("mcp");
     const cfg = join(dir, "servers.json");
     writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
 
     const child = spawn(bin, ["start"], {
-      env: { ...process.env, ACTION_HUB_CONFIG: cfg },
+      env: { ...process.env, ...isolationEnv, ACTION_HUB_CONFIG: cfg },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -178,14 +214,20 @@ function checkMcpHandshake(bin) {
 async function main() {
   const bin = resolveBinary();
   const version = await readCliVersion();
-  process.stderr.write(`Smoke testing ${bin} (expecting v${version})\n`);
-  checkVersion(bin, version);
-  checkHelp(bin);
-  checkLightweightCommand(bin);
-  checkHarnessExport(bin);
-  checkDoctor(bin);
-  checkDaemonLifecycle(bin);
-  await checkMcpHandshake(bin);
+  runRoot = createRunRoot();
+  isolationEnv = buildIsolatedEnv(runRoot);
+  process.stderr.write(`Smoke testing ${bin} (expecting v${version}); isolated run root: ${runRoot}\n`);
+  try {
+    checkVersion(bin, version);
+    checkHelp(bin);
+    checkLightweightCommand(bin);
+    checkHarnessExport(bin);
+    checkDoctor(bin);
+    checkDaemonLifecycle(bin);
+    await checkMcpHandshake(bin);
+  } finally {
+    rmRunRoot(runRoot);
+  }
   process.stderr.write("SMOKE PASS\n");
 }
 
