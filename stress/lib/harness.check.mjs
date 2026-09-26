@@ -40,6 +40,21 @@ function aliveByProbe(pid) {
 await main(async () => {
   const checks = [];
 
+  // --- 0. env-table single source of truth (drift check) -------------------
+  {
+    // harness.mjs already put test-isolation.mjs in library mode.
+    const { ISOLATION_CHECKLIST } = await import("../../test-isolation.mjs");
+    const names = ISOLATION_VARS.map((v) => v.name).sort();
+    const shared = [...ISOLATION_CHECKLIST].sort();
+    assert.deepEqual(names, shared, "ISOLATION_VARS must derive exactly from test-isolation.mjs ISOLATION_CHECKLIST");
+    const { root, env } = createSandbox({ prefix: "harness-check-drift-" });
+    rmSync(root, { recursive: true, force: true });
+    for (const name of ISOLATION_CHECKLIST) {
+      assert.ok(env[name], `buildIsolatedEnv must set ${name} from the shared checklist`);
+    }
+    checks.push({ check: "isolation-table-single-source-of-truth", ok: true, shared: shared.length });
+  }
+
   // --- 1. hostile run-root location is refused with nothing created ---------
   {
     const hostile = join(ownerHome(), ".cache", "action-hub", "harness-check-hostile");

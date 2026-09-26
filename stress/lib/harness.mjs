@@ -21,31 +21,28 @@ import { performance } from "node:perf_hooks";
 export class FatalError extends Error {}
 
 // ---------------------------------------------------------------------------
-// Isolation variable table (ISOLATION.md). shape: "file" | "dir"
+// Isolation variable table — SINGLE SOURCE OF TRUTH: the ISOLATION_CHECKLIST
+// exported by the repo-root test-isolation.mjs (same module the test preload
+// and the smoke test use). This module derives its shaped view from it; drift
+// in either direction is caught by harness.check.mjs.
 // ---------------------------------------------------------------------------
 
-export const ISOLATION_VARS = [
-  { name: "HOME", shape: "dir" },
-  { name: "USERPROFILE", shape: "dir" },
-  { name: "APPDATA", shape: "dir" },
-  { name: "LOCALAPPDATA", shape: "dir" },
-  { name: "TMPDIR", shape: "dir" },
-  { name: "TMP", shape: "dir" },
-  { name: "TEMP", shape: "dir" },
-  { name: "XDG_CACHE_HOME", shape: "dir" },
-  { name: "XDG_CONFIG_HOME", shape: "dir" },
-  { name: "XDG_STATE_HOME", shape: "dir" },
-  { name: "XDG_DATA_HOME", shape: "dir" },
-  { name: "ACTION_HUB_CONFIG", shape: "file" },
-  { name: "ACTION_HUB_CACHE", shape: "file" },
-  { name: "ACTION_HUB_SKILLS_DIR", shape: "dir" },
-  { name: "ACTION_HUB_DAEMON_DIR", shape: "dir" },
-  { name: "ACTION_HUB_CREDENTIALS", shape: "file" },
-  { name: "ACTION_HUB_CONTROL", shape: "file" },
-  { name: "PI_CODING_AGENT_DIR", shape: "dir" },
-  { name: "CODEX_HOME", shape: "dir" },
-  { name: "CLAUDE_CONFIG_DIR", shape: "dir" },
-];
+// Library mode: import the shared module without its preload side effects.
+process.env["ACTION_HUB_TEST_ISOLATION_LIBRARY"] = "1";
+const { ISOLATION_CHECKLIST } = await import("../../test-isolation.mjs");
+
+/** Vars whose value is a FILE path rather than a directory. */
+const FILE_SHAPED_VARS = new Set([
+  "ACTION_HUB_CONFIG",
+  "ACTION_HUB_CACHE",
+  "ACTION_HUB_CREDENTIALS",
+  "ACTION_HUB_CONTROL",
+]);
+
+export const ISOLATION_VARS = ISOLATION_CHECKLIST.map((name) => ({
+  name,
+  shape: FILE_SHAPED_VARS.has(name) ? "file" : "dir",
+}));
 
 // ---------------------------------------------------------------------------
 // Owner home + protected state dirs
