@@ -1,5 +1,3 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import {
   discoverAll,
   executeMigration,
@@ -9,6 +7,7 @@ import {
   type DiscoveredSkill,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
+import { rawConfigDocument, writeConfigAtomic } from "../config-writer.js";
 
 /** Harness source filters accepted by the migrate command (servers, skills, and plugins). */
 export const MIGRATE_SOURCE_FILTERS = [
@@ -174,9 +173,7 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
   if (options.write) {
     // Preserve existing raw config to retain top-level settings like approvalTtlSeconds,
     // autoDiscover, and unexpanded environment variable references in servers.
-    const raw: Record<string, unknown> = currentConfig.raw
-      ? { ...currentConfig.raw }
-      : {};
+    const raw = rawConfigDocument(currentConfig);
 
     const existingRawServers: Record<string, unknown>[] = Array.isArray(raw["servers"])
       ? (raw["servers"].filter((s): s is Record<string, unknown> => typeof s === "object" && s !== null))
@@ -208,8 +205,9 @@ export async function migrateCommand(options: MigrateOptions = {}): Promise<numb
       raw["autoApproveAtOrAbove"] = currentConfig.autoApproveAtOrAbove;
     }
 
-    await mkdir(dirname(currentConfig.path), { recursive: true });
-    await writeFile(currentConfig.path, JSON.stringify(raw, null, 2) + "\n", "utf8");
+    // Atomic owner-only write: configs can contain credentials, and a
+    // concurrent reader must never observe a half-written file.
+    await writeConfigAtomic(currentConfig.path, raw);
 
     if (!isJson) {
       console.log(

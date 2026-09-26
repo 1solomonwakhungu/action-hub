@@ -1,7 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
 import { discoverMcpServers, redactServerConfig, type ServerConfig } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
+import { rawConfigDocument, writeConfigAtomic } from "../config-writer.js";
 
 /** Harness source filters accepted by the import command. */
 export const IMPORT_SOURCE_FILTERS = [
@@ -25,6 +24,11 @@ export interface ImportOptions {
 
 export async function importCommand(options: ImportOptions = {}): Promise<number> {
   console.log("Action Hub Server Import & Auto-Discovery\n");
+
+  // With --write, load (and validate) the config before any early return so a
+  // malformed existing config fails with exit 1 and is never overwritten.
+  const writeConfig = options.write ? await loadCliConfig(options.configPath) : undefined;
+  if (writeConfig) rawConfigDocument(writeConfig);
 
   const discovered = await discoverMcpServers();
   const filter = options.source && options.source !== "all" ? options.source : undefined;
@@ -50,32 +54,37 @@ export async function importCommand(options: ImportOptions = {}): Promise<number
   }
 
   if (options.write) {
-    const currentConfig = await loadCliConfig(options.configPath);
-    const existing = new Map<string, ServerConfig>(currentConfig.servers.map((s) => [s.id, s]));
+    const currentConfig = writeConfig!;
+
+    // The raw document is the merge base: skills, autoDiscover, custom
+    // top-level keys, and unexpanded env references in existing servers must
+    // all survive a write. Existing server entries always win — import only
+    // adds what is missing.
+    const raw = rawConfigDocument(currentConfig);
+    const existingRawServers: Record<string, unknown>[] = Array.isArray(raw["servers"])
+      ? raw["servers"].filter(
+          (s): s is Record<string, unknown> => typeof s === "object" && s !== null,
+        )
+      : [];
+    const serverEntries = [...existingRawServers];
 
     let added = 0;
     for (const d of filtered) {
-      if (!existing.has(d.id)) {
-        const cleanServer: ServerConfig = {
+      if (!serverEntries.some((s) => s["id"] === d.id)) {
+        const cleanServer = {
           id: d.id,
           displayName: d.displayName,
           transport: d.transport,
           trust: d.trust ?? "untrusted",
           enabled: d.enabled !== false,
-        };
-        existing.set(d.id, cleanServer);
+        } as Record<string, unknown>;
+        serverEntries.push(cleanServer);
         added++;
       }
     }
+    raw["servers"] = serverEntries;
 
-    const payload = {
-      servers: [...existing.values()],
-      bundles: currentConfig.bundles,
-      autoApproveAtOrAbove: currentConfig.autoApproveAtOrAbove,
-    };
-
-    await mkdir(dirname(currentConfig.path), { recursive: true });
-    await writeFile(currentConfig.path, JSON.stringify(payload, null, 2) + "\n", "utf8");
+    await writeConfigAtomic(currentConfig.path, raw);
     console.log(`\n✔ Saved ${added} new server(s) to ${currentConfig.path}`);
   } else {
     console.log("\nRun with `--write` to save discovered servers to your Action Hub config.");
