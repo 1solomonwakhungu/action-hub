@@ -7,7 +7,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { __test } from "./cli-scale.mjs";
 
@@ -433,13 +433,35 @@ test("hostile TMPDIR (=/dev/null): one ok:false JSON + nonzero + fallback artifa
   const summary = JSON.parse(lines[lines.length - 1]);
   assert.equal(summary.ok, false);
   assert.match(String(summary.error ?? ""), /run root creation failed/);
-  // Artifact parity: a best-effort failure artifact must exist under a usable
-  // fallback root and carry the same ok:false.
+  // TRUE parity (R4): the SAME final object is written to stdout and the
+  // artifact — both must carry ok:false, the same error, and early:true.
   assert.ok(existsSync("/tmp"), "fallback root sanity");
   const matches = String(r.stderr ?? "").match(/failure artifact \(best effort\): (\S+)/);
   assert.ok(matches, "stderr must announce the fallback artifact path");
   const artifact = JSON.parse(readFileSync(matches[1], "utf8"));
-  assert.equal(artifact.ok, false, "fallback failure artifact must be ok:false");
+  assert.deepEqual(artifact, summary, "artifact must be the same object as the stdout summary");
+});
+
+// R4 MUST-FIX (injectable-candidate regression): pickEarlyArtifactRoot must
+// skip a candidate inside owner state BEFORE any mkdtemp — zero bytes may be
+// created there — and fall through to a safe candidate. If EVERY candidate is
+// protected, the picker returns null and the artifact is skipped entirely.
+test("early-failure artifact candidates: protected candidate skipped pre-mkdtemp, all-protected => null", () => {
+  const { pickEarlyArtifactRoot } = __test;
+  const protectedCandidate = join(homedir(), ".cache", "action-hub", "cli-scale-protected-candidate-DO-NOT-CREATE");
+  const safeRoot = mkdtempSync(join(tmpdir(), "cli-scale-pick-"));
+  try {
+    // Protected candidate first in the list: must be refused WITHOUT creating
+    // any directory inside the owner-state path, then fall through to safe.
+    const root = pickEarlyArtifactRoot([protectedCandidate, safeRoot]);
+    assert.ok(root && root.startsWith(safeRoot), "must fall through to the safe candidate");
+    assert.ok(!existsSync(protectedCandidate), "protected candidate must have zero bytes written");
+    // All-protected: artifact skipped, not silently written to cwd.
+    assert.equal(pickEarlyArtifactRoot([protectedCandidate, protectedCandidate + "-b"]), null);
+    assert.ok(!existsSync(protectedCandidate), "still zero bytes after the all-protected case");
+  } finally {
+    rmSync(safeRoot, { recursive: true, force: true });
+  }
 });
 
 // Forced-hang control (S8-R6 R3 MUST-FIX 2): prove the teardown ladder, not

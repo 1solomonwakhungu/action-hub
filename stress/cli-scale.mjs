@@ -693,9 +693,26 @@ export const __test = {
   writeToolManifests, buildConfigSkills, writeSkillFixtures, FAKE_STDIO_SERVER, SCALES,
   isoEnv, assertIsoEnv, ISOLATION_PATH_VARS, spawnStep, padTomlServers, padJsonServers,
   pathContains, insideOwnerProtectedState,
-  observeFleet, validateFleet, expectedFleet,
+  observeFleet, validateFleet, expectedFleet, pickEarlyArtifactRoot,
   reseed: (seed) => { rng = mulberry32(seed); },
 };
+
+  // R4 MUST-FIX: a fallback candidate must never be INSIDE owner state. A
+// caller launched from ~/.cache/action-hub (or any protected app-state /
+// harness dir) must not get the best-effort artifact created there — every
+// candidate is owner-state-checked BEFORE any mkdtemp; if no safe candidate
+// exists the artifact is skipped entirely (the stdout failure JSON is
+// mandatory either way).
+function pickEarlyArtifactRoot(candidates) {
+  for (const root of candidates) {
+    if (refusedInsideOwnerState(root)) continue;
+    try {
+      return mkdtempSync(join(root, "cli-scale-fail-"));
+    } catch { /* try the next candidate root */ }
+  }
+  return null;
+}
+
 
 // S8-R6: ONE finish path via stress/lib/harness.mjs main() — stale-result
 // removal, guarded artifact write at <per-run root>/results/cli-scale.json
@@ -710,22 +727,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // throw, e.g. a hostile TMPDIR=/dev/null gives mkdtemp ENOTDIR — previously
   // an uncaught crash with ZERO stdout). Produces: one compact ok:false JSON
   // as the last stdout line, nonzero exit, and a best-effort durable failure
-  // artifact under the first USABLE candidate root (tmpdir, /tmp, cwd).
+  // artifact under the first SAFE+USABLE candidate root (tmpdir, /tmp, cwd).
+  // The SAME final object is written to stdout and the artifact (true parity).
   async function earlyFinish(err, stage) {
-    const message = stage + ": " + String((err && err.message) || err);
-    const candidates = [tmpdir(), "/tmp", process.cwd()];
-    let artifactPath = null;
-    for (const root of candidates) {
+    const final = { ok: false, error: stage + ": " + String((err && err.message) || err), early: true };
+    const root = pickEarlyArtifactRoot([tmpdir(), "/tmp", process.cwd()]);
+    if (root) {
+      const artifactPath = join(root, "results", "cli-scale.json");
       try {
-        const r = mkdtempSync(join(root, "cli-scale-fail-"));
-        artifactPath = join(r, "results", "cli-scale.json");
         mkdirSync(dirname(artifactPath), { recursive: true });
-        writeFileSync(artifactPath, JSON.stringify({ ok: false, error: message }, null, 2) + "\n");
-        break;
-      } catch { /* try the next candidate root */ }
+        writeFileSync(artifactPath, JSON.stringify(final, null, 2) + "\n");
+        console.error("failure artifact (best effort): " + artifactPath);
+      } catch { /* stdout JSON is still mandatory */ }
     }
-    if (artifactPath) console.error("failure artifact (best effort): " + artifactPath);
-    console.log(JSON.stringify({ ok: false, error: message, early: true }));
+    console.log(JSON.stringify(final));
     process.exitCode = 1;
   }
 
