@@ -375,6 +375,12 @@ class StdioMcpClient {
 // group). Handles are kept here so failure paths can kill+verify each one.
 const ownedHandles = new Set();
 
+// The real hub daemon is spawned detached by the product launcher (daemon
+// start), so it can NEVER have an owned handle — instead its recorded pid
+// is kept here. The lib's main() extraInterruptCleanup hook kills+verifies
+// it inline when an interrupt settles (no handle fabrication).
+let recordedDaemonPid = null;
+
 async function spawnNode(cmdArgs, env, stdio) {
   // spawnGroup (LIB2 Design C): async — resolves only after the workload
   // spawn is confirmed over the anchor's control channel. Handle fields:
@@ -1046,10 +1052,12 @@ async function runBench() {
       };
       try {
         daemonPid = (await startDaemon()).pid;
+        recordedDaemonPid = daemonPid;
       } catch (cause) {
         if (!cause.stalePid) throw cause;
         await new Promise((r) => setTimeout(r, 1500));
         daemonPid = (await startDaemon()).pid;
+        recordedDaemonPid = daemonPid;
       }
 
       // 20 clients boot; each initialize must answer.
@@ -1211,7 +1219,27 @@ async function main() {
   }
 }
 
-await harnessMain(main, { resultsPath: join(RESULTS_DIR, "bench-load.json") }).then((final) => {
+// PR 94 hook: the lib's interrupt sweep owns every REGISTRY group; this
+// hook covers the one product-spawned process no handle can ever own — the
+// detached hub daemon. Runs AFTER the registry loop, BEFORE the one
+// summary; survivors merge into that summary (fail-closed evidence).
+const extraInterruptCleanup = async () => {
+  const survivors = [];
+  if (typeof recordedDaemonPid === "number") {
+    try { process.kill(recordedDaemonPid, "SIGTERM"); } catch { /* gone */ }
+    // Bounded settle: TERM is already in flight; KILL after the deadline.
+    await new Promise((r) => setTimeout(r, 2_000));
+    try { process.kill(recordedDaemonPid, "SIGKILL"); } catch { /* gone */ }
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try { process.kill(recordedDaemonPid, 0); survivors.push(recordedDaemonPid); break; }
+      catch { /* gone */ }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+  return { survivors };
+};
+
+await harnessMain(main, { resultsPath: join(RESULTS_DIR, "bench-load.json"), extraInterruptCleanup, extraCleanupTimeoutMs: 15_000 }).then((final) => {
   // Shared lib contract: exitCode only, no force-exit (S3-R7).
   process.exitCode = final.ok ? 0 : 1;
 });
