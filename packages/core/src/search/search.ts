@@ -287,15 +287,22 @@ interface CorpusStats {
  * "to" flips a true paraphrase match. Articles, copulas, auxiliaries,
  * demonstratives, pronouns, and pure conjunctions are the conservative core.
  * A unit test asserts the intersection with the concept lexicon stays empty.
+ *
+ * INTENT-BEARING QUANTIFIERS ARE DELIBERATELY ABSENT (all, any, only, same,
+ * some, ...): they are real name tokens ("delete_all_users",
+ * "show_only_active_users", "find_any_open_ticket", "compare_same_branch"),
+ * and filtering them lets a keyword-collision near-duplicate outrank the
+ * exact-name match — breaking the ranking invariant that an exact name wins
+ * its own query. A regression test pins the four repro pairs.
  */
 export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
   "a", "an", "the", "and", "or", "of", "that", "this", "these", "those",
   "it", "its", "is", "are", "was", "were", "be", "been", "being", "am",
   "has", "have", "had", "do", "does", "did", "but", "when", "while",
-  "which", "who", "whom", "their", "them", "they", "all", "any", "can",
+  "which", "who", "whom", "their", "them", "they", "can",
   "could", "should", "would", "will", "shall", "may", "might", "must",
-  "if", "then", "than", "so", "too", "very", "just", "also", "some",
-  "such", "only", "same",
+  "if", "then", "than", "so", "too", "very", "just", "also",
+  "such",
 ]);
 
 const K1 = 1.2;

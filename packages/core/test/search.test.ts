@@ -183,3 +183,34 @@ test("a semantic scorer reorders lexically weaker matches", async () => {
   const hits = await engine.search("issue");
   assert.equal(hits[0]?.id, boosted);
 });
+
+test("intent-bearing quantifiers keep the exact name ranked above its near-duplicate (F5 rework)", async () => {
+  // Reviewer-1 repros: filtering quantifiers (all/any/only/same) let a
+  // keyword-collision near-duplicate outrank the EXACT name. The ranking
+  // invariant is that an exact name wins its own query.
+  const catalog = new Catalog();
+  catalog.addAll(
+    [
+      ...["delete_all_users", "delete_users"],
+      ...["show_only_active_users", "show_active_users"],
+      ...["find_any_open_ticket", "find_open_ticket"],
+      ...["compare_same_branch", "compare_branch"],
+    ].map((name) => record({ id: `ops:${name}`, name, summary: "" })),
+  );
+  const engine = new SearchEngine(catalog);
+  const cases: Array<[string, string]> = [
+    ["delete all users", "delete_all_users"],
+    ["show only active users", "show_only_active_users"],
+    ["find any open ticket", "find_any_open_ticket"],
+    ["compare same branch", "compare_same_branch"],
+  ];
+  for (const [query, exact] of cases) {
+    const hits = await engine.search(query);
+    assert.equal(hits[0]?.id, `ops:${exact}`, `query "${query}" must rank the exact name first`);
+    const rival = hits.find((h) => h.id !== `ops:${exact}`);
+    assert.ok(
+      (hits[0]?.score ?? 0) > (rival?.score ?? 0),
+      `exact "${exact}" must strictly outrank its near-duplicate for "${query}"`,
+    );
+  }
+});
