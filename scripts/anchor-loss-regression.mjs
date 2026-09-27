@@ -19,14 +19,22 @@ if (!entryArg) {
   }
 }
 const entry = entryArg ? resolve(entryArg) : resolve("packages/cli/dist/index.js");
+// A .js/.mjs entry is not executable: run it through node. Spawn errors are
+// handled explicitly (no unhandled ChildProcess error crash).
+const isJsEntry = entry.endsWith(".js") || entry.endsWith(".mjs");
 const isWin = process.platform === "win32";
 const fixture = resolve("packages/cli/test/fixtures/orphan-probe-server.mjs");
 const dir = mkdtempSync(join(tmpdir(), "anchor-loss-"));
 const pidsFile = join(dir, "tree.json");
 
-const anchor = spawn(entry, ["__anchor-run", "daemon", process.execPath, fixture], {
+const anchor = spawn(isJsEntry ? process.execPath : entry, isJsEntry ? [entry, "__anchor-run", "daemon", process.execPath, fixture] : ["__anchor-run", "daemon", process.execPath, fixture], {
   stdio: ["ignore", "ignore", "ignore"],
   env: { ...process.env, TREE_PIDS_FILE: pidsFile },
+});
+anchor.on("error", (cause) => {
+  console.error(`FAIL: could not spawn anchor entry ${entry}: ${cause.message}`);
+  rmSync(dir, { recursive: true, force: true });
+  process.exit(1);
 });
 const anchorPid = anchor.pid;
 const deadline = Date.now() + 20000;

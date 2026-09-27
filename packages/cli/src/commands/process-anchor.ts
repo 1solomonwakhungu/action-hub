@@ -375,6 +375,34 @@ export function runAnchorProcess(argvTail: string[]): void {
   setInterval(() => {}, 60000);
 }
 
+/**
+ * Guarded exhausted-retry loop (review round 12): after the bounded teardown
+ * attempts fail, the caller activates the retry chain via `exhaust()`. The
+ * guard guarantees ONE interval total — repeated `exhaust()` calls are
+ * no-ops, so neither the warning nor the retry chain can multiply into a
+ * timer storm — and `onExhausted` (the loud warning) runs exactly once.
+ * `stop()` clears the chain; production callers keep it running and die by
+ * their own kill, test callers use it to clean up.
+ */
+export function startGuardedRetryLoop(options: {
+  intervalMs: number;
+  attempt: () => void;
+  onExhausted?: () => void;
+}): { exhaust: () => void; stop: () => void } {
+  let started = false;
+  let timer: NodeJS.Timeout | null = null;
+  const exhaust = () => {
+    if (started) return;
+    started = true;
+    options.onExhausted?.();
+    timer = setInterval(options.attempt, options.intervalMs);
+  };
+  const stop = () => {
+    if (timer) { clearInterval(timer); timer = null; }
+  };
+  return { exhaust, stop };
+}
+
 export interface TeardownResult {
   /** PIDs that are still alive after teardown. Empty = all dead. */
   survivors: number[];

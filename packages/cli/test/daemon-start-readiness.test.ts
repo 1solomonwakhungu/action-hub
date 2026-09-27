@@ -6,7 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { daemonStartCommand } from "../dist/commands/daemon.js";
-import { spawnAnchor } from "../dist/commands/process-anchor.js";
+import { spawnAnchor, startGuardedRetryLoop } from "../dist/commands/process-anchor.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const stub = resolve(testDir, "fixtures/stub-daemon.mjs");
@@ -499,4 +499,33 @@ test("__wrapper-run refuses direct (unauthenticated) invocation", () => {
   ], { timeout: 15_000, encoding: "utf8" });
   assert.equal(result.status, 2, `expected refusal exit 2, got ${result.status}; stderr: ${result.stderr}`);
   assert.match(String(result.stderr), /cannot be invoked directly/);
+});
+
+// PR 77 rework round 12: the exhausted Windows teardown retry chain must be
+// a SINGLE guarded interval — repeated activation (which the old code did on
+// every verification tick) must not fan out into a timer storm. Injected
+// regression: activate the guard many times, then prove the attempt rate
+// stays at one chain and the warning fires exactly once.
+test("exhausted-teardown retry loop keeps a single retry chain (no fanout)", async () => {
+  let attempts = 0;
+  let warns = 0;
+  const loop = startGuardedRetryLoop({
+    intervalMs: 20,
+    attempt: () => { attempts++; },
+    onExhausted: () => { warns++; },
+  });
+  loop.exhaust();
+  loop.exhaust();
+  loop.exhaust();
+  await new Promise((r) => setTimeout(r, 120));
+  const firstWindow = attempts;
+  loop.exhaust(); // repeated activation must be a no-op
+  await new Promise((r) => setTimeout(r, 120));
+  const secondWindow = attempts - firstWindow;
+  loop.stop();
+  assert.equal(warns, 1, `warning must fire exactly once, got ${warns}`);
+  assert.ok(firstWindow >= 4, `retry chain must run (first window ${firstWindow})`);
+  // 120ms at 20ms interval = ~6 attempts from ONE chain; a fanout (new
+  // interval per activation/tick) would double or worse.
+  assert.ok(secondWindow <= 8, `single retry chain: ${secondWindow} attempts in the second window (fanout would exceed)`);
 });
