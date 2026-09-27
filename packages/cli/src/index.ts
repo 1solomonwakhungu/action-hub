@@ -128,6 +128,7 @@ async function main(): Promise<void> {
       })}\n`,
     );
     process.exit(ok ? 0 : 1);
+  }
 
   // Hidden internal anchor/wrapper modes (process-anchor.ts): the anchored
   // process tree re-invokes THIS CLI instead of requiring an external
