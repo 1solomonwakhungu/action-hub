@@ -86,6 +86,8 @@ let sawStdout = false;
 let killStarted = false;
 let serverExitCode = null;
 let serverSignalled = false;
+let escalated = false;
+let wrapperDiedUnexpectedly = false;
 // The anchor may receive SIGTERM from its host (bounded teardown): run the
 // cleanup sequence, then exit. It is NOT a member of the wrapper's group.
 process.on("SIGTERM", () => { startKillSequence("host-sigterm"); });
@@ -110,10 +112,19 @@ const EXIT_FAILED = 3;
 const startKillSequence = (why) => {
   if (killStarted) return;
   killStarted = true;
+  // An unexpected wrapper death means the group state is unverifiable —
+  // there is no reuse-safe way to signal a dead leader's group. Never
+  // convert it into proof.
+  if (wrapperDiedUnexpectedly) {
+    finalize(false);
+    return;
+  }
   if (isWin) {
     // child.kill is NOT a tree kill on Windows and the wrapper is not a
     // group leader there: taskkill /T /F the wrapper tree, await it, verify
-    // the wrapper is gone, then exit with the proof code.
+    // the wrapper is gone, then exit with the proof code. The taskkill is
+    // OUR kill: a wrapper exit from here is expected, not unexpected.
+    escalated = true;
     const tk = spawn("taskkill", ["/pid", String(wrapper.pid), "/T", "/F"], { stdio: "ignore" });
     const done = () => {
       if (tk.exitCode === 0 && !wrapperAlive()) finalize(true);
@@ -125,11 +136,16 @@ const startKillSequence = (why) => {
   }
   signalGroup("SIGTERM");
   const escalate = setTimeout(() => {
+    escalated = true;
     signalGroup("SIGKILL");
-    // Verify before claiming success: poll the wrapper until dead (bounded).
+    // Verify before claiming success: the wrapper must die BY OUR SIGKILL
+    // (wrapperDied after escalation) — poll bounded.
     const verifyDeadline = Date.now() + 2000;
     const verify = setInterval(() => {
-      if (!wrapperAlive()) {
+      if (wrapperDiedUnexpectedly) {
+        clearInterval(verify);
+        finalize(false);
+      } else if (!wrapperAlive()) {
         clearInterval(verify);
         finalize(true);
       } else if (Date.now() > verifyDeadline) {
@@ -152,9 +168,19 @@ const wrapper = spawn(process.execPath, ["-e", ${JSON.stringify(WRAPPER_SRC)}, c
 });
 wrapper.on("error", () => { startKillSequence("wrapper-error"); });
 wrapper.once("exit", () => {
-  // The wrapper must never exit on its own. If it dies unexpectedly, the
-  // group state is unverifiable — report failure (the host fails closed).
-  startKillSequence("wrapper-external-exit");
+  // The wrapper must never exit on its own. If it dies before OUR group
+  // SIGKILL (or taskkill) was sent, the group state is unverifiable —
+  // report failure (the host fails closed); never convert it into proof.
+  if (!escalated) {
+    wrapperDiedUnexpectedly = true;
+    startKillSequence("wrapper-external-exit");
+  }
+});
+wrapper.once("error", () => {
+  if (!escalated) {
+    wrapperDiedUnexpectedly = true;
+    startKillSequence("wrapper-error");
+  }
 });
 if (relayStdin) {
   process.stdin.on("data", (chunk) => { try { wrapper.stdin.write(chunk); } catch {} });
@@ -213,6 +239,8 @@ const isWindows = platform() === "win32";
 
 /** Anchor exit code meaning "group cleanup verified". */
 export const EXIT_PROVEN = 0;
+/** Anchor exit code meaning "cleanup could not be verified/failed". */
+export const EXIT_FAILED = 3;
 
 export const pidAlive = (pid: number): boolean => {
   try {
