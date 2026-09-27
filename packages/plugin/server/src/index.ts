@@ -407,10 +407,17 @@ async function dispatch(
       // response says so instead of presenting low-confidence hits as facts.
       // Additive and backward compatible: `results` is empty and `abstained`
       // explains why; `closestMatch` preserves the near miss for the agent.
-      // Calibration (SQ1 2d, disjoint rows, self-mode 15K corpus): threshold
-      // 0.8 refused 0/51 real matches and abstained 5/7 no-match queries;
-      // caveat: only 12 negative rows — thin calibration base.
-      if (abstention.enabled) {
+      // Bundle discovery runs FIRST and vetoes abstention: the general
+      // search route has a bundle-discovery contract, and a matching bundle
+      // is a confident capability the flag must not hide. The echoed query
+      // is deliberately omitted — every echoed field on this server carries
+      // an explicit output budget, and the agent already knows its own
+      // query. Calibration (SQ1 2d, disjoint rows, self-mode 15K corpus):
+      // threshold 0.8 refused 0/51 real matches and abstained 5/7 of the
+      // 7 held-out no-match queries (71%); caveat: only 12 negative rows in
+      // total — a thin calibration base.
+      const matchingBundles = hub.searchBundles(input.query ?? "");
+      if (abstention.enabled && matchingBundles.length === 0) {
         const topScore = hits[0]?.score ?? 0;
         if (hits.length === 0 || topScore < abstention.threshold) {
           return {
@@ -419,16 +426,14 @@ async function dispatch(
             results: [],
             abstained: true,
             reason: "no_confident_match",
-            query: input.query ?? "",
             threshold: abstention.threshold,
             closestMatch: hits[0]
               ? { id: hits[0].id, score: Math.round((hits[0].score ?? 0) * 1000) / 1000 }
               : null,
-            hint: "No action scored above the confidence threshold. Rephrase with the exact tool or domain name, or ask the user how to proceed.",
+            hint: "No action scored above the confidence threshold and no bundle matched. Rephrase with the exact tool or domain name, or ask the user how to proceed.",
           };
         }
       }
-      const matchingBundles = hub.searchBundles(input.query ?? "");
       return {
         ok: true,
         count: hits.length,

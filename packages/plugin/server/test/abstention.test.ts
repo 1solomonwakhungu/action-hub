@@ -41,11 +41,14 @@ const FAKE_CLIENT = {
   close: async () => {},
 };
 
-function buildRuntime(searchAbstention: { enabled: boolean; threshold: number }): HubRuntime {
+function buildRuntime(
+  searchAbstention: { enabled: boolean; threshold: number },
+  bundles: Array<{ id: string; displayName: string; description?: string }> = [],
+): HubRuntime {
   const hub = new ActionHub({
     clientFactory: async () => FAKE_CLIENT,
     servers: [{ id: "readmod", transport: { type: "stdio", command: "fake" }, trust: "trusted" }],
-    bundles: [],
+    bundles,
   });
   return {
     hub,
@@ -129,4 +132,28 @@ test("SQ3: config parsing — enabled flag, threshold clamped into [0,1], defaul
   await writeFile(path, JSON.stringify({ servers: [] }), "utf8");
   const off = await loadConfig(path);
   assert.deepEqual(off.searchAbstention, { enabled: false, threshold: 0.8 }, "default OFF");
+});
+
+
+test("SQ3 rework: a matching bundle vetoes abstention — bundle discovery stays visible", async () => {
+  const runtime = buildRuntime(
+    { enabled: true, threshold: 0.8 },
+    [{ id: "incident-review", displayName: "Incident Review", description: "Walk the incident checklist." }],
+  );
+  await runtime.hub.indexAll();
+  // The query has vocabulary overlap ONLY with the bundle; without the veto
+  // the action scores would abstain and hide a valid capability.
+  const payload = await callSearch(runtime, "incident review");
+  assert.equal(payload["abstained"], undefined, "a matching bundle is a confident capability — never abstain");
+  const bundles = payload["bundles"] as Array<{ bundle_id?: string }> | undefined;
+  assert.ok(bundles?.some((b) => b.bundle_id === "incident-review"), "bundle route preserved in the search response");
+});
+
+test("SQ3 rework: the abstention response echoes no raw query and stays bounded", async () => {
+  const runtime = buildRuntime({ enabled: true, threshold: 0.8 });
+  await runtime.hub.indexAll();
+  const payload = await callSearch(runtime, "x".repeat(100_000));
+  assert.equal(payload["query"], undefined, "the raw query is not echoed back uncapped");
+  assert.equal(payload["abstained"], true);
+  assert.equal(JSON.stringify(payload).length < 2000, true, "response stays within the output budget");
 });

@@ -312,9 +312,12 @@ An optional flag makes the search say so instead:
   `{ ok, count: 0, results: [], abstained: true, reason: "no_confident_match",
   query, threshold, closestMatch: { id, score } | null, hint }`.
 - `threshold` (default 0.8, clamped to [0, 1]): calibrated offline on
-  disjoint rows — at 0.8 no real match was refused and about half of all
-  no-match queries abstained. Scores scale with catalog size and IDF, so
-  recalibrate the threshold for your catalog before enabling the flag.
+  disjoint rows — at 0.8 no real match was refused and 5 of the 7 held-out
+  no-match queries (71%) abstained. The calibration base is thin (12
+  negative rows in total), and scores scale with catalog size and IDF, so
+  recalibrate the threshold for your catalog before enabling the flag. A
+  query that matches a bundle never abstains: bundle discovery runs first
+  and its matches are returned as usual.
 
 The response shape is additive: clients that only read `count`/`results`
 see an ordinary empty result.
