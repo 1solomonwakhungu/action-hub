@@ -455,18 +455,23 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
     // tmpdir itself is unusable (e.g. a TMPDIR pointing at a nonexistent
     // tree); a fresh private mkdtemp as the final filesystem resort. A base
     // that is foreign-owned or loose-mode is never reused or chmod'ed.
-    const usable = (dir: string): boolean => {
+    // POSIX-only ownership/mode semantics: Windows stat modes carry no
+    // meaningful group/other bits (directories report 0777), so the private
+    // check is a directory check there.
+    const isWin = process.platform === "win32";
+    const privateMode = (dir: string): boolean => {
       try {
         const st = statSync(dir);
         return (
           st.isDirectory() &&
-          !(st.mode & 0o077) &&
-          (typeof process.getuid !== "function" || st.uid === process.getuid())
+          (isWin ||
+            (!(st.mode & 0o077) && (typeof process.getuid !== "function" || st.uid === process.getuid())))
         );
       } catch {
         return false;
       }
     };
+    const usable = (dir: string): boolean => privateMode(dir);
     const userCache = join(
       process.env["XDG_CACHE_HOME"] || process.env["LOCALAPPDATA"] || join(process.env["HOME"] ?? tmpdir(), ".cache"),
       "action-hub",
@@ -554,9 +559,11 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
     // The extraction created intermediate dirs with the default mode; the
     // private tree must be 0700 end to end (we own it — chmod is safe).
     try {
-      const { chmodSync } = await import("node:fs");
-      chmodSync(root, 0o700);
-      chmodSync(join(root, "vendor"), 0o700);
+      if (!isWin) {
+        const { chmodSync } = await import("node:fs");
+        chmodSync(root, 0o700);
+        chmodSync(join(root, "vendor"), 0o700);
+      }
     } catch {
       /* gated below */
     }
@@ -564,8 +571,7 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
     // MOMENT (closes the swap-after-verify window as far as stat allows);
     // every file load() imports was hashed in verifyTree against the bytes
     // embedded in this binary.
-    const rootSt = statSync(root);
-    if (!rootSt.isDirectory() || rootSt.mode & 0o077 || (typeof process.getuid === "function" && rootSt.uid !== process.getuid())) {
+    if (!privateMode(root)) {
       throw new Error(`embeddings cache tree not private: ${root}`);
     }
     const ortDir = join(root, "vendor/ort");
