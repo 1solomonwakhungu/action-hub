@@ -76,6 +76,14 @@ function runBinary(bin, args, env = {}) {
  * score a query — a silent hashed-fallback must fail the smoke. One
  * machine-readable line is asserted.
  */
+/**
+ * Platform-safe cache-base suffix matching core's seaVendorRoot behavior
+ * (core uses "unknown" when process.getuid is unavailable, i.e. Windows).
+ */
+function cacheBaseSuffix() {
+  return typeof process.getuid === "function" ? String(process.getuid()) : "unknown";
+}
+
 function checkEmbeddingSelftest(bin) {
   const { status, stdout } = runBinary(bin, [], {
     ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
@@ -127,7 +135,7 @@ function checkExtractionCacheReuse(bin) {
   const env = { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
   const first = runBinary(bin, [], env);
   const cacheDirs = () => {
-    const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
+    const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
     try {
       return readdirSync(base).filter((n) => n.startsWith("vendor-"));
     } catch {
@@ -193,7 +201,7 @@ function checkValidModelOverride(bin) {
   if (parsed?.embeddingSelftest?.ok !== true) fail(`valid model override must succeed in SEA: ${line}`);
   // Only the ORT runtime (plus notices) may be extracted — NOT the embedded
   // 23MB model the caller already supplied.
-  const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
+  const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
   const trees = (readdirSync(base, { recursive: true, withFileTypes: true }) ?? []);
   const hasModelDir = trees.some((e) => e.isDirectory() && e.name === "models");
   if (hasModelDir) fail("valid-override run extracted the embedded model needlessly");
@@ -220,7 +228,7 @@ function checkTamperedCache(bin) {
     return parsed?.embeddingSelftest;
   };
   if (runSelftest()?.ok !== true) fail("tamper check: first clean run failed");
-  const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
+  const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
   const findFile = (name) => {
     const hits = readdirSync(base, { recursive: true, withFileTypes: true })
       .filter((e) => e.isFile() && e.name === name)
@@ -244,7 +252,7 @@ function checkTamperedCache(bin) {
  */
 function checkForeignCacheBase(bin) {
   const tmpRoot = checkDir("sea-foreign-base");
-  const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
+  const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
   mkdirSync(base, { recursive: true, mode: 0o777 });
   const { stdout } = runBinary(bin, [], { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" });
   const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
