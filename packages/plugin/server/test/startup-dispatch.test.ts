@@ -469,6 +469,23 @@ test("FX19/F6: empty search query is a JSON-RPC -32602, not an unfiltered top-10
     (cause: { code?: number; message?: string }) =>
       cause.code === -32602 && (cause.message ?? "").includes("action_id"),
   );
+  // FX19 rework: whitespace-only identifiers are invalid params too, and
+  // load keeps its second route: a nonblank bundle_id must reach dispatch.
+  await assert.rejects(
+    client.callTool({ name: "action_hub", arguments: { operation: "load", action_id: "   " } }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  await assert.rejects(
+    client.callTool({ name: "action_hub", arguments: { operation: "execute", action_id: "  " } }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  // A nonblank bundle_id must pass the guard and reach dispatch (an unknown
+  // bundle surfaces as a tool-level error result, NOT a -32602 rejection).
+  const bundleRoute = await client.callTool({
+    name: "action_hub",
+    arguments: { operation: "load", bundle_id: "no-such-bundle-probe" },
+  });
+  assert.equal(bundleRoute.isError, true, "bundle route reaches dispatch (tool-level error, not -32602)");
   // Valid calls keep working.
   const ok = await client.callTool({ name: "action_hub", arguments: { operation: "search", query: "lookup" } });
   assert.ok(!ok.isError);
@@ -485,6 +502,12 @@ test("FX19/F7: an unrecognized tools/list cursor is a JSON-RPC -32602", async ()
   await client.connect(clientTransport);
   await assert.rejects(
     client.listTools({ cursor: "bogus-cursor" }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  // FX19 rework: cursor presence is the trigger — "" is valid Cursor input
+  // syntax (z.string()) but identifies no page this server issued.
+  await assert.rejects(
+    client.listTools({ cursor: "" }),
     (cause: { code?: number }) => cause.code === -32602,
   );
   // No cursor: the single action_hub tool is still listed.
@@ -522,6 +545,8 @@ test("FX19: HTTP serve mode returns -32602 for the same violations", async () =>
     const badSearch = await post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "action_hub", arguments: { operation: "search" } } });
     assert.equal(badSearch.status, 200);
     assert.equal((badSearch.body?.error as { code?: number } | undefined)?.code, -32602, "empty search query -> JSON-RPC -32602");
+    const emptyCursor = await post({ jsonrpc: "2.0", id: 5, method: "tools/list", params: { cursor: "" } });
+    assert.equal((emptyCursor.body?.error as { code?: number } | undefined)?.code, -32602, "empty cursor -> JSON-RPC -32602");
     const badCursor = await post({ jsonrpc: "2.0", id: 3, method: "tools/list", params: { cursor: "bogus" } });
     assert.equal((badCursor.body?.error as { code?: number } | undefined)?.code, -32602, "unknown cursor -> JSON-RPC -32602");
     const goodList = await post({ jsonrpc: "2.0", id: 4, method: "tools/list" });

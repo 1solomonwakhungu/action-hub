@@ -291,11 +291,14 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
         if (input.operation === "search" && (typeof input.query !== "string" || input.query.trim() === "")) {
           throw new McpError(ErrorCode.InvalidParams, "query is required");
         }
-        if ((input.operation === "load" || input.operation === "execute") && !input.action_id) {
-          throw new McpError(
-            ErrorCode.InvalidParams,
-            `"action_id" is required for operation "${input.operation}"`,
-          );
+        const actionId = typeof input.action_id === "string" ? input.action_id.trim() : "";
+        if (input.operation === "load" && actionId === "" && (typeof input.bundle_id !== "string" || input.bundle_id.trim() === "")) {
+          // load supports two routes (action_id or bundle_id, dispatch "load"
+          // case); at least one nonblank identifier is required.
+          throw new McpError(ErrorCode.InvalidParams, `"action_id" (or "bundle_id") is required for operation "load"`);
+        }
+        if (input.operation === "execute" && actionId === "") {
+          throw new McpError(ErrorCode.InvalidParams, `"action_id" is required for operation "execute"`);
         }
         return originalCallTool(request, extra);
       });
@@ -303,9 +306,10 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
     const originalListTools = requestHandlers.get("tools/list");
     if (originalListTools) {
       requestHandlers.set("tools/list", async (request, extra) => {
-        const cursor = (request as { params?: { cursor?: string } }).params?.cursor;
-        if (typeof cursor === "string" && cursor !== "") {
-          // The hub issues no pagination cursors, so any cursor is unknown.
+        // The hub issues no pagination cursors, so ANY cursor — including
+        // the empty string, which is valid Cursor input syntax (z.string())
+        // but identifies no page — is unknown (FX19 rework).
+        if ("cursor" in ((request as { params?: object }).params ?? {})) {
           throw new McpError(ErrorCode.InvalidParams, "Unknown pagination cursor");
         }
         return originalListTools(request, extra);
