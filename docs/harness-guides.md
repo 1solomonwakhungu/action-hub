@@ -310,7 +310,8 @@ An optional flag makes the search say so instead:
 - `enabled` (default **false**): when true, a search whose top hit scores
   below `threshold` returns an abstention response instead of hits:
   `{ ok, count: 0, results: [], abstained: true, reason: "no_confident_match",
-  query, threshold, closestMatch: { id, score } | null, hint }`.
+  threshold, closestMatch: { id, score } | null, hint }` (the query itself
+  is deliberately not echoed — every echoed field carries an output budget).
 - `threshold` (default 0.8, clamped to [0, 1]): calibrated offline on
   disjoint rows — at 0.8 no real match was refused and 5 of the 7 held-out
   no-match queries (71%) abstained. The calibration base is thin (12
