@@ -361,9 +361,11 @@ test("timeout path tears down before consulting the winner probe", async () => {
   const daemonDir = join(root, "daemon");
   const pidFile = join(root, "recorded-pids.txt");
   await writeFile(pidFile, "");
-  // A short no-progress window (not a 1ms cap): the fixture takes a few
-  // hundred ms to spawn, so the break must happen after it is up but before
-  // it becomes ready (it only becomes ready once orphaned).
+  // The wrapper must die only AFTER the no-progress break (400ms): the OLD
+  // code prints "did not become ready" and then probes the winner for 5s —
+  // the kill lands inside that grace, the fixture orphans and becomes ready,
+  // and the old code reports "already running" (exit 0). The fixed code tears
+  // down at the break BEFORE any probe; the late kill is a no-op there.
   const env = stubEnv({ TREE_PIDS_FILE: pidFile, ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS: "400" });
   const ownedPids: number[] = [];
   const captured = captureConsole();
@@ -375,26 +377,35 @@ test("timeout path tears down before consulting the winner probe", async () => {
       configPath: join(root, "servers.json"),
       onSpawn: (pid) => void ownedPids.push(pid),
     });
-    // SIGKILL only the wrapper during the winner grace, exactly like the
-    // reviewer's repro. startTimeoutMs=1 sends the start into the timeout
-    // break at once, then the path enters the CONCURRENT_START_GRACE_MS
-    // winner-probe window — the kill must land during that window.
-    const killDeadline = Date.now() + 10_000;
-    let wrapperKilled = false;
-    while (!wrapperKilled && Date.now() < killDeadline) {
+    // Record the wrapper PID as soon as the fixture reports it.
+    let wrapperPid: number | undefined;
+    const recordDeadline = Date.now() + 10_000;
+    while (wrapperPid === undefined && Date.now() < recordDeadline) {
       try {
         const lines = (await readFile(pidFile, "utf8")).split("\n");
         const ppidLine = lines.find((l) => /^PPID:\d+$/.test(l.trim()));
-        if (ppidLine) {
-          process.kill(Number.parseInt(ppidLine.trim().slice(5), 10), "SIGKILL");
-          wrapperKilled = true;
-        }
+        if (ppidLine) wrapperPid = Number.parseInt(ppidLine.trim().slice(5), 10);
       } catch {
         // not written yet
       }
-      if (!wrapperKilled) await new Promise((r) => setTimeout(r, 25));
+      if (wrapperPid === undefined) await new Promise((r) => setTimeout(r, 25));
     }
-    assert.ok(wrapperKilled, "fixture must report the wrapper PID in time");
+    assert.ok(wrapperPid, "fixture must report the wrapper PID in time");
+    // Kill ONLY after the break happened (the "did not become ready" line is
+    // printed before the winner-probe consultation on both old and new code).
+    const breakDeadline = Date.now() + 10_000;
+    let broke = false;
+    while (!broke && Date.now() < breakDeadline) {
+      broke = captured.errors.join("\n").includes("did not become ready");
+      if (!broke) await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(broke, "start must hit the no-progress break");
+    try {
+      process.kill(wrapperPid, "SIGKILL");
+    } catch {
+      // fixed code already tore the tree down — acceptable; the assertion
+      // below still exercises the proof-gated winner probe
+    }
     const code = await startPromise;
     assert.equal(code, 1, `expected fail-closed exit 1, got 0 (orphan satisfied the winner probe)`);
   } finally {
