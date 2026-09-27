@@ -1075,6 +1075,33 @@ ${hookBody}
     }
   }
 
+  // --- 10. F61: owner-state resultsPath refused BEFORE any fs op -------------
+  console.error("[progress] 10. F61 owner-state resultsPath refusal");
+  {
+    const target = join(ownerHome(), ".cache", "action-hub", "harness-check-f61", "results.json");
+    const ownerDir = refusedInsideOwnerState(target);
+    assert.ok(ownerDir, "precondition: the target must sit inside owner app state");
+    let threw = null;
+    try {
+      await main(async () => ({}), { resultsPath: target });
+    } catch (err) {
+      threw = err;
+    }
+    assert.ok(threw, "main() must refuse an owner-state resultsPath");
+    assert.ok(threw instanceof FatalError, "the refusal must be a FatalError");
+    assert.match(String(threw?.message ?? ""), /BEFORE any filesystem operation/, "the refusal must name the no-fs-op guarantee (F61)");
+    assert.equal(existsSync(target), false, "refusal must leave NOTHING behind (no rm, no write)");
+    assert.equal(existsSync(dirname(target)), false, "refusal must not create directories either");
+    // Control: the same main() accepts a resultsPath inside a temp root.
+    const { root: okRoot } = createSandbox({ prefix: "harness-check-f61-ok-" });
+    const okPath = join(okRoot, "results", "results.json");
+    const ctrl = await main(async () => ({ ok: true }), { resultsPath: okPath });
+    assert.equal(ctrl.ok, true, "a temp-root resultsPath must work normally");
+    assert.equal(existsSync(okPath), true, "the durable summary must be written in the temp root");
+    rmSync(okRoot, { recursive: true, force: true });
+    checks.push({ check: "f61-owner-state-resultspath-refused-before-any-fs-op", ok: true });
+  }
+
   return { checks, suite: "harness.check" };
 }, { resultsPath: RESULTS_PATH });
 

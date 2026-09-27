@@ -862,6 +862,17 @@ export async function main(fn, { resultsPath, extraInterruptCleanup, extraCleanu
   if (!resultsPath) {
     throw new TypeError("main() requires { resultsPath } — the final summary must have a durable home");
   }
+  // F61: refuse an owner-state resultsPath BEFORE ANY filesystem operation —
+  // the guarded region below starts with rmSync(resultsPath) and later
+  // writes the durable summary; both must never touch owner app state. The
+  // refusal is a pure check (nothing is created or removed by it).
+  const ownerDir = refusedInsideOwnerState(resultsPath);
+  if (ownerDir) {
+    throw new FatalError(
+      `resultsPath ${resolve(resultsPath)} lies inside owner app state ${ownerDir}; ` +
+      "refusing BEFORE any filesystem operation (F61)",
+    );
+  }
   const started = performance.now();
   let ok = true;
   let error = null;
