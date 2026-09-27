@@ -119,9 +119,9 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  // MIG2-R1: every spec run's cleanup verdict is load-bearing.
+  for (const r of runs) foldCleanupVerdict(r, r.stepVerdict, `spec ${r.label}`);
   foldCleanupVerdict(summary, serveCleanup, "serve");
-  // MIG2-R1: the tool step's own cleanup verdict is load-bearing too.
-  foldCleanupVerdict(summary, res, "step");
   await finish(summary);
 }
 
@@ -143,6 +143,8 @@ async function runSpec(env, args, label) {
     reportDir: outDir,
     durationMs: res.durationMs,
     stdoutTail: res.stdoutTail.slice(-2000),
+    // MIG2-R1: the step verdict rides on the run row and is folded below.
+    stepVerdict: res,
     stderr: res.stderrTail.slice(-3000),
     spawnError: res.spawnError,
   };

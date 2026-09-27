@@ -160,9 +160,9 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  // MIG2-R1: every fuzz run's cleanup verdict is load-bearing.
+  for (const r of fuzzRuns) foldCleanupVerdict(r, r.stepVerdict, `fuzz ${r.label}`);
   foldCleanupVerdict(summary, serveCleanup, "serve");
-  // MIG2-R1: the tool step's own cleanup verdict is load-bearing too.
-  foldCleanupVerdict(summary, res, "step");
   await finish(summary);
 }
 
@@ -184,6 +184,8 @@ async function runFuzzer(env, args, label, runStamp) {
     stderr: res.stderrTail.slice(-3000),
     stdoutTail: res.stdoutTail.slice(-1500),
     spawnError: res.spawnError,
+    // MIG2-R1: the step verdict rides on the run row and is folded below.
+    stepVerdict: res,
   };
   // Strict evidence parse: positive tool count, not blocked, exit 0, no timeout.
   let report = null;

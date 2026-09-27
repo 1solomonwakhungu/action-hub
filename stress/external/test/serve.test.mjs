@@ -145,3 +145,22 @@ test("CALLER-LEVEL: aggregateRuns fails a row with cleanup failures", async () =
   assert.equal(bad.ok, false, "a cleanup-failed row must fail the aggregate even with exit 0 + summary ok");
   assert.match(bad.failures[0], /cleanup/);
 });
+
+test("CALLER-LEVEL: stubbed runTool code 0 + groupEmpty:false through fold + aggregateRuns", async () => {
+  // The exact reviewer-1/intake repro chained through the REAL production
+  // path: a stubbed runTool verdict (green workload, failed cleanup) flows
+  // through foldCleanupVerdict (what every runner calls) into a row, then
+  // through the real aggregateRuns — the row and the aggregate must be red.
+  const { aggregateRuns } = await import("../verdict.mjs");
+  const stubbedRunToolVerdict = {
+    code: 0, timedOut: false, spawnError: null,
+    groupEmpty: false, survivors: [], killError: "taskkill failed (status 1): injected",
+    pgid: 12345,
+  };
+  const row = { label: "k6", requiresSummary: true, exitCode: 0, summary: { ok: true } };
+  foldCleanupVerdict(row, stubbedRunToolVerdict, "k6");
+  assert.equal(row.ok, false, "the fold must fail the row on the stubbed verdict");
+  const agg = aggregateRuns([row]);
+  assert.equal(agg.ok, false, "the aggregate must be red through the real path");
+  assert.match(agg.failures[0], /cleanup/);
+});

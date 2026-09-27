@@ -136,8 +136,6 @@ async function main() {
     at: new Date().toISOString(),
   };
   foldCleanupVerdict(summary, serveCleanup, "serve");
-  // MIG2-R1: the tool step's own cleanup verdict is load-bearing too.
-  foldCleanupVerdict(summary, res, "step");
   await finish(summary);
 }
 
@@ -168,7 +166,7 @@ async function runInspector(env, args, label) {
   } else {
     evidenceReason = "unrecognized probe (no strict evidence rule)";
   }
-  return {
+  const probe = {
     label,
     command: [...CLI, ...args].join(" "),
     inspectorVersion: INSPECTOR_VERSION,
@@ -180,6 +178,10 @@ async function runInspector(env, args, label) {
     parsed,
     stderr: res.stderrTail.slice(-2000),
   };
+  // MIG2-R1: each inspector probe folds its OWN step verdict — a green
+  // probe with a failed teardown fails the row.
+  foldCleanupVerdict(probe, res, `inspector ${label}`);
+  return probe;
 }
 
 main().catch(async (cause) => {

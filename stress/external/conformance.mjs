@@ -119,6 +119,8 @@ async function main() {
       stderr: res.stderrTail.slice(-3000),
       stdoutTail: res.stdoutTail.slice(-2000),
       spawnError: res.spawnError,
+      // MIG2-R1: the step verdict rides on the run row and is folded below.
+      stepVerdict: res,
     };
   } finally {
     serveCleanup = serve ? await killTree(serve.handle) : null;
@@ -167,9 +169,10 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  // MIG2-R1: the tool step's own cleanup verdict is load-bearing — a green
+  // suite with a failed teardown fails the row (and thus the summary).
+  foldCleanupVerdict(run, run.stepVerdict, "conformance suite");
   foldCleanupVerdict(summary, serveCleanup, "serve");
-  // MIG2-R1: the tool step's own cleanup verdict is load-bearing too.
-  foldCleanupVerdict(summary, res, "step");
   await finish(summary);
 }
 
