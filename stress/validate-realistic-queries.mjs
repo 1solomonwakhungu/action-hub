@@ -7,24 +7,28 @@
  * (stress/.generated/tools/*.json; regenerates it via gen-tools.mjs if
  * missing) so gold labels can never reference a tool that does not exist.
  *
- * Checks:
- *  (1) mix: 40 paraphrase, 30 goal-only, 20 near-duplicate, 15 multi,
- *      15 no-match; every query string unique; 120 rows total.
+ * Checks (full v2 rules):
+ *  (1) mix: 40 paraphrase, 30 goal-only, 20 near-duplicate, 16 multi,
+ *      15 no-match (121 rows — intake 00:16Z split the 6-gold get_invoice
+ *      multi row into two scope-clued rows); every query unique; v2 types
+ *      (expected string id or null; expectedAll array of ids); difficulty
+ *      consistent with subtype.
  *  (2) existence: every expected / expectedAll id "<serverId>:<name>"
  *      exists in the corpus.
- *  (3) multi rows: expected null, expectedAll non-empty.
- *  (4) goal-only: the query shares NO token with the gold tool's name
- *      (intent must be expressed without the tool's own vocabulary).
- *  (5) near-duplicate: the gold name is a clone (>= 2 servers in the
- *      corpus) and the query carries a domain clue (a token of the gold
- *      serverId, e.g. "crm", "billing", "initech").
+ *  (3) multi rows: expected null, expectedAll 2-4 ids (v2 bound).
+ *  (4) goal-only: the query shares NO token with the gold tool's VERB
+ *      (entity wording is allowed — that is what makes it goal-only).
+ *  (5) near-duplicate: the gold name is a clone (>= 2 servers) and the
+ *      query carries a domain clue (a token of the gold serverId).
  *  (6) no-match: after stopword removal the query shares ZERO tokens with
- *      the full corpus vocabulary (tool names, summaries, descriptions,
- *      serverIds).
+ *      the corpus vocabulary; expected null, no expectedAll.
  *
  * Output contract: one compact JSON summary as the last stdout line with
  * ok:true/false; writes stress/.generated/results/validate-realistic-queries.json;
  * exits nonzero iff ok is false. `--samples N` prints N random queries.
+ * `--self-test` feeds deliberately invalid rows (6-gold multi, expectedAll
+ * on a non-multi row, wrong difficulty) through the same row checker and
+ * exits 0 only if every violation is caught.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -58,6 +62,12 @@ function contentTokens(text) {
   return tokens(text).filter((t) => t.length >= 2 && !STOPWORDS.has(t));
 }
 
+// 121 rows: intake 00:16Z split the 6-member get_invoice multi row into
+// two scope-clued rows (v2 expectedAll max 4), so multi is 16.
+const MIX = { paraphrase: 40, "goal-only": 30, "near-duplicate": 20, multi: 16, "no-match": 15 };
+const DIFFICULTY = { paraphrase: "paraphrase", "goal-only": "hard", "near-duplicate": "hard", multi: "hard", "no-match": "hard" };
+const TOTAL_ROWS = 121;
+
 function finish(summary) {
   try {
     fs.mkdirSync(path.dirname(RESULTS_PATH), { recursive: true });
@@ -70,16 +80,10 @@ function finish(summary) {
   process.exitCode = summary.ok ? 0 : 1;
 }
 
-try {
-  const rows = JSON.parse(fs.readFileSync(FIXTURE, "utf8"));
-  if (!fs.existsSync(TOOLS_DIR) || fs.readdirSync(TOOLS_DIR).filter((f) => f.endsWith(".json")).length === 0) {
-    const r = spawnSync("node", [path.join(HERE, "gen-tools.mjs")], { stdio: "inherit" });
-    if (r.status !== 0) throw new Error("corpus manifests missing and gen-tools.mjs failed to regenerate them");
-  }
-
-  const corpus = new Map(); // id -> { name, serverId }
+function loadCorpus() {
+  const corpus = new Map(); // id -> tool
   const vocab = new Set();
-  const byName = new Map();
+  const byName = new Map(); // name -> Set(serverId)
   for (const f of fs.readdirSync(TOOLS_DIR).filter((f) => f.endsWith(".json"))) {
     const m = JSON.parse(fs.readFileSync(path.join(TOOLS_DIR, f), "utf8"));
     for (const t of m.tools) {
@@ -93,12 +97,11 @@ try {
     for (const tok of tokens(m.serverId)) vocab.add(tok);
     for (const tok of contentTokens(m.serverDescription ?? "")) vocab.add(tok);
   }
+  return { corpus, vocab, byName };
+}
 
+function checkRows(rows, { corpus, vocab, byName }) {
   const problems = [];
-  // 121 rows: intake 00:16Z split the 6-member get_invoice multi row into
-  // two scope-clued rows (v2 expectedAll max 4), so multi is 16.
-  const MIX = { paraphrase: 40, "goal-only": 30, "near-duplicate": 20, multi: 16, "no-match": 15 };
-  const DIFFICULTY = { paraphrase: "paraphrase", "goal-only": "hard", "near-duplicate": "hard", multi: "hard", "no-match": "hard" };
   const counts = {};
   const seen = new Set();
   for (const row of rows) {
@@ -162,21 +165,48 @@ try {
         problems.push(`near-dup query missing domain clue (gold serverId token): ${row.query}`);
       }
     }
-    if (row.subtype === "no-match") {
-      const hits = contentTokens(row.query).filter((t) => vocab.has(t));
-      if (hits.length > 0) problems.push(`no-match overlaps corpus vocabulary [${hits}]: ${row.query}`);
-    }
   }
   for (const [sub, want] of Object.entries(MIX)) {
     if ((counts[sub] ?? 0) !== want) problems.push(`mix ${sub}: got ${counts[sub] ?? 0}, want ${want}`);
   }
-  if (rows.length !== 121) problems.push(`row count: got ${rows.length}, want 121`);
+  if (rows.length !== TOTAL_ROWS) problems.push(`row count: got ${rows.length}, want ${TOTAL_ROWS}`);
+  return problems;
+}
 
+try {
+  const rows = JSON.parse(fs.readFileSync(FIXTURE, "utf8"));
+  if (!fs.existsSync(TOOLS_DIR) || fs.readdirSync(TOOLS_DIR).filter((f) => f.endsWith(".json")).length === 0) {
+    const r = spawnSync("node", [path.join(HERE, "gen-tools.mjs")], { stdio: "inherit" });
+    if (r.status !== 0) throw new Error("corpus manifests missing and gen-tools.mjs failed to regenerate them");
+  }
+  const ctx = loadCorpus();
+
+  if (process.argv.includes("--self-test")) {
+    // Negative regression: the same checker must catch the concrete defects
+    // that reached review — a 6-gold multi row (the original get_invoice row),
+    // expectedAll on a non-multi row, and a wrong difficulty.
+    const bad = [
+      { query: "find every tool that can get an invoice", expected: null, expectedAll: ["acme-corp-analytics:get_invoice", "acme-corp-legal:get_invoice", "acme-corp-payments:get_invoice", "globex-cloud-infra:get_invoice", "globex-search:get_invoice", "initech-billing:get_invoice"], subtype: "multi", difficulty: "hard" },
+      { query: "lock the budget so nobody edits it", expected: "acme-corp-cloud-infra:lock_budget", expectedAll: ["acme-corp-cloud-infra:lock_budget"], subtype: "paraphrase", difficulty: "paraphrase" },
+      { query: "the batch needs a tidy up", expected: "acme-corp-hr:prune_batch", subtype: "goal-only", difficulty: "paraphrase" },
+    ];
+    const caught = checkRows(bad, ctx);
+    const need = [
+      caught.some((p) => p.includes("2-4 ids")),
+      caught.some((p) => p.includes("non-multi row has expectedAll")),
+      caught.some((p) => p.includes("difficulty")),
+    ];
+    const ok = need.every(Boolean);
+    finish({ ok, selfTest: "v2-row-checker", caughtCount: caught.length, need });
+    process.exit(process.exitCode ?? 0);
+  }
+
+  const problems = checkRows(rows, ctx);
   const summary = {
     ok: problems.length === 0,
     rows: rows.length,
-    counts,
-    corpusTools: corpus.size,
+    counts: Object.fromEntries(Object.keys(MIX).map((k) => [k, rows.filter((r) => r.subtype === k).length])),
+    corpusTools: ctx.corpus.size,
     problems: problems.slice(0, 40),
     problemCount: problems.length,
   };

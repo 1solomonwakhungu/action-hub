@@ -496,7 +496,10 @@ function tryPush(q) {
   const key = q.query.trim().toLowerCase();
   if (usedQueryText.has(key)) return false;
   usedQueryText.add(key);
-  queries.push(q);
+  // FX13-R3: every generated row is synthetic regression data — the flag is
+  // part of the row schema for BOTH generators (enforced by the file's
+  // validate(); README documents the split from the realistic fixture).
+  queries.push({ ...q, synthetic: true });
   return true;
 }
 const shuffled = shuffle(skills);
@@ -876,6 +879,12 @@ await writeFile(
 
 // --- Summary --------------------------------------------------------------------
 const durationMs = Date.now() - startedAt;
+// FX13-R3: every generated row must be marked synthetic (README documents
+// that both generated sets are synthetic regression data, so the claim is
+// enforced here, not just documented).
+const unflagged = queries.filter((q) => q.synthetic !== true).length;
+if (unflagged > 0) throw new Error(`FX13-R3: ${unflagged} generated skill rows missing synthetic:true`);
+
 const summary = {
   script: "gen-skills.mjs",
   generatorVersion: 3,
@@ -907,6 +916,7 @@ const summary = {
   totalBytes,
   skillsDir: SKILLS_DIR,
   queryQuality: { generatorVersion: 3, lint: skillLint, lintHits: skillLintTotal, sampleCount: paraphraseSamples.length },
+  syntheticRows: queries.length - unflagged,
 };
 await writeFile(join(RESULTS_DIR, "gen-skills.json"), JSON.stringify(summary, null, 2), "utf8");
 console.log(JSON.stringify(summary));
