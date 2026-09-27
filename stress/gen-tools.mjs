@@ -14,6 +14,21 @@
 // 10% multi, 5% no-match. difficulty: exact|paraphrase|hard (everything but
 // exact/paraphrase is hard).
 //
+// FX13-R3 (intake scope decision, qitem-20260926235542-5149e2ba): generated
+// queries are SYNTHETIC REGRESSION DATA, not a naturalness benchmark. Every
+// emitted row carries synthetic: true. Verbs use a tiny hand-checked plain
+// canonical synonym list (VERB_SYN); entities appear VERBATIM (no entity
+// synonyms). Consequences baked into the bands: goal-only expresses intent
+// through the verb with a generic object; near-duplicates are built only
+// from same-verb/different-entity siblings (a verbatim entity would be
+// ambiguous across a clone group) with the raw entity token excluded from
+// the zero-overlap rule; multi excludes the shared verbatim entity from the
+// union rule; no-match uses off-corpus generic nouns. The naturalness /
+// collocation gate was REMOVED as false evidence by construction — the
+// grammar/debris lint, uniqueness/ambiguity validation and the v2 schema
+// remain. The natural-language headline measure is the hand-written
+// realistic fixture (stress/fixtures/realistic-queries.json + its validator).
+//
 // Reviewer-2 checks, enforced by validate() (exit 1 on violation):
 //  (1) every query string unique; single-answer unless subtype === 'multi'
 //      (only multi carries expectedAll; no-match uses expected: null)
@@ -45,6 +60,8 @@ function argNum(name, dflt) {
 const SEED = argNum('--seed', 0x5337c0de) >>> 0;
 const OUT_DIR = resolve(argValue('--out-dir') ?? 'stress/.generated/tools');
 const RESULTS_DIR = resolve('stress/.generated/results');
+// Clean (pre-noise) paraphrase texts collected during generation for the FX13 lint gate.
+const paraphraseClean = [];
 const SMALL_SERVERS = argNum('--small-servers', 40);
 const SMALL_TOOLS = argNum('--small-tools', 200);
 const BIG_SERVERS = argNum('--big-servers', 4);
@@ -161,88 +178,48 @@ const QUALIFIERS = ['recent','archived','active','pending','overdue','stale','or
 // verb and entity appear here are eligible as gold targets for goal-only /
 // near-duplicate / multi queries.
 const VERB_SYN = {
-  list: ['enumerate', 'line up', 'round up'], get: ['fetch', 'pull', 'grab'],
-  create: ['set up', 'spin up', 'stand up'], update: ['amend', 'adjust', 'revise'],
-  delete: ['wipe', 'erase', 'scrub'], search: ['hunt down', 'dig up', 'track down'],
-  archive: ['shelve', 'box up'], restore: ['bring back', 'put back'],
-  assign: ['hand off', 'delegate'], move: ['relocate', 'shuttle'],
-  merge: ['fold together', 'combine'], export: ['dump out', 'download'],
-  validate: ['sanity check', 'vet'], preview: ['peek at', 'dry look at'],
-  publish: ['go live', 'put out'], cancel: ['call off', 'scrap'],
-  retry: ['have another go', 'rerun'], approve: ['green light', 'sign off on'],
-  reject: ['turn down', 'veto'], close: ['wrap up', 'shut'],
-  reopen: ['reopen'.replace('reopen', 'un shut'), 'un shut'], clone: ['duplicate', 'copy'],
-  diff: ['compare', 'contrast'], sync: ['mesh up', 'reconcile'] /* reconcile unused in names here */,
-  rotate: ['roll over', 'swap out'], revoke: ['claw back', 'withdraw'],
-  send: ['fire off', 'zap', 'dispatch'], schedule: ['slot in', 'book'],
-  acknowledge: ['confirm', 'own up to'], escalate: ['ratchet up', 'bump up'],
-  count: ['tally', 'census'], summarize: ['boil down', 'recap'],
-  compare: ['weigh', 'juxtapose'], enable: ['switch on', 'activate'],
-  disable: ['switch off', 'deactivate'], pause: ['freeze'] /* freeze exists; second choice below */,
-  resume: ['unpause', 'carry on'], transfer: ['reassign', 'wire over'],
-  attach: ['hook up', 'fasten'], detach: ['unhook', 'unfasten'],
-  link: ['tie together', 'connect'], unlink: ['untie', 'disconnect'],
-  resolve: ['settle', 'close out'], split: ['carve up', 'split apart'],
-  purge: ['obliterate', 'incinerate'], rollback: ['roll back', 'undo'],
-  promote: ['elevate', 'bump up'], invite: ['bring in', 'recruit'],
-  verify: ['double check', 'authenticate'], resend: ['fire off again', 'bounce again'],
-  share: ['hand out', 'circulate'], lock: ['bolt shut', 'seal'],
-  unlock: ['unseal', 'unbolt'], freeze: ['put on ice', 'deep six'],
-  unfreeze: ['thaw', 'let thaw'], finalize: ['nail down', 'lock down'],
-  void: ['nullify', 'torpedo'], reindex: ['reshuffle'],
-  rebuild: ['reassemble', 'reconstruct'], recalculate: ['recompute', 'rework the math on'],
-  prune: ['trim', 'thin out'], migrate: ['transport', 'carry over'],
-  backfill: ['retrofill', 'catch up'], replay: ['run back', 'restage'],
-  redact: ['black out', 'mask'],
+  list: ['show all'], get: ['fetch', 'show'],
+  create: ['make', 'add'], update: ['change', 'edit'],
+  delete: ['remove'], search: ['look for', 'find'],
+  archive: ['file away'], restore: ['bring back'],
+  assign: ['hand off', 'give'], move: ['shift', 'relocate'],
+  merge: ['combine'], export: ['download', 'copy out'],
+  validate: ['check'], preview: ['look over', 'show'],
+  publish: ['release'], cancel: ['stop'],
+  retry: ['rerun'], approve: ['sign off on', 'authorize'],
+  reject: ['turn down'], close: ['wrap up', 'finish'],
+  reopen: ['open again'], clone: ['duplicate', 'copy'],
+  diff: ['contrast'], sync: ['reconcile'],
+  rotate: ['cycle'], revoke: ['take back'],
+  send: ['send out'], schedule: ['book'],
+  acknowledge: ['confirm'], escalate: ['raise'],
+  count: ['tally up'], summarize: ['recap'],
+  compare: ['weigh'], enable: ['turn on'],
+  disable: ['turn off'], pause: ['freeze'],
+  resume: ['unpause'], transfer: ['hand over'],
+  attach: ['append'], detach: ['separate'],
+  link: ['connect'], unlink: ['disconnect'],
+  resolve: ['settle'], split: ['split up'],
+  purge: ['clear'], rollback: ['undo'],
+  promote: ['advance'], invite: ['add'],
+  verify: ['double check'], resend: ['repeat'],
+  share: ['pass along'], lock: ['seal'],
+  unlock: ['unseal'], freeze: ['halt'],
+  unfreeze: ['thaw'], finalize: ['nail down'],
+  void: ['nullify'], reindex: ['refresh'],
+  rebuild: ['reconstruct'], recalculate: ['recompute'],
+  amend: ['adjust'], snapshot: ['capture'],
+  prune: ['trim'], migrate: ['port'],
+  backfill: ['fill in'], replay: ['play back'],
+  redact: ['mask'],
 };
 
-const ENTITY_SYN = {
-  issue: ['defect', 'bug report'], ticket: ['complaint', 'grievance'],
-  user: ['teammate', 'person'], account: ['client profile'],
-  contact: ['person'], invoice: ['bill'],
-  payment: ['remittance'], payout: ['disbursement'],
-  refund: ['rebate'], dispute: ['claim'],
-  chargeback: ['reversal'], settlement: ['payoff'],
-  project: ['initiative'], task: ['chore'],
-  event: ['occurrence'], meeting: ['get together'],
-  comment: ['remark'], message: ['note'],
-  conversation: ['exchange'], thread: ['back and forth'],
-  file: ['dossier'], document: ['writeup'],
-  report: ['digest'], dashboard: ['panel'],
-  metric: ['gauge'], trace: ['span'],
-  log: ['trail'], alert: ['notification'],
-  employee: ['staffer'], expense: ['outlay'],
-  budget: ['allocation'], contract: ['agreement'],
-  signature: ['sign off'], clause: ['stipulation'],
-  secret: ['credential'], key: ['passcode'],
-  token: ['pass'], session: ['login'],
-  policy: ['guideline'], role: ['position'],
-  permission: ['rights'], webhook: ['callback'],
-  deployment: ['rollout'], release: ['ship out'],
-  artifact: ['build'], tag: ['marker'],
-  pipeline: ['conduit'], vm: ['machine'],
-  bucket: ['bin'], object: ['blob'],
-  zone: ['area'], certificate: ['cert'],
-  cluster: ['farm'], node: ['box'],
-  campaign: ['promotion'], email: ['correspondence'],
-  subscriber: ['opt in'], audience: ['demographic'],
-  creative: ['artwork'], shipment: ['parcel'],
-  carrier: ['shipper'], warehouse: ['depot'],
-  supplier: ['vendor'], order: ['purchase'],
-  subscription: ['membership'], plan: ['package'],
-  usage: ['consumption'], quota: ['allowance'],
-  experiment: ['trial'], cohort: ['wave'],
-  retention: ['stickiness'], churn: ['attrition'],
-  incident: ['outage'], queue: ['backlog'],
-  review: ['assessment'], timesheet: ['hours sheet'],
-  benefit: ['perk'], lead: ['prospect'],
-  shipment_planned: ['parcel'], index: ['registry'],
-  table: ['sheet'], view: ['lens'],
-  channel: ['room'], branch: ['limb'],
-  repository: ['code home'], pull_request: ['code review request'],
-  deployment: ['rollout'], calendar: ['datebook'],
-  campaign_: ['promotion'],
-};
+// FX13-R3 (intake scope decision): no entity synonyms — the entity appears
+// verbatim, so generated paraphrases are plain, boring commands, not a
+// naturalness benchmark. Keys are preserved because the band logic indexes
+// by raw entity kind; each maps to exactly its own raw phrase.
+const ENTITY_KEYS = ["issue", "user", "contact", "payment", "refund", "chargeback", "project", "event", "comment", "conversation", "file", "report", "metric", "log", "employee", "budget", "signature", "secret", "token", "policy", "permission", "deployment", "artifact", "pipeline", "bucket", "zone", "cluster", "campaign", "subscriber", "creative", "carrier", "supplier", "subscription", "usage", "experiment", "retention", "incident", "review", "benefit", "shipment_planned", "table", "channel", "repository", "deployment", "campaign_"];
+const ENTITY_SYN = Object.fromEntries(ENTITY_KEYS.map((k) => [k, [k.replace(/_/g, ' ')]]));
 
 // Safe filler vocabulary: none of these tokens may appear anywhere in the
 // corpus' indexed text (names, descriptions, server descs, server ids). The
@@ -258,27 +235,32 @@ function contentOverlapNoStop(text, banned) {
   return [...new Set(tokenize(text))].filter((t) => t.length >= 3 && !STOPWORDS.has(t) && banned.has(t));
 }
 
+// FX13-R3: no entity synonyms anywhere — goal-only rows express the intent
+// through the verb alone (generic object), which keeps the documented
+// zero-overlap rule reachable without pretending synonyms are natural.
 const GOAL_TEMPLATES = [
-  'where should I go when I need {V} {E}',
-  'point me at whatever handles {E} so I can {V} them',
-  'which app lets me {V} {E} around here',
-  'looking to {V} some {E} today, who do I ask',
-  'give me a way to {V} {E} quickly please',
-  'our team wants to {V} {E} tonight, options?',
-  'need {E} handled, who does {V} that',
+  'where should I go when I need to {V} something',
+  'point me at whatever can {V} for me',
+  'which app lets me {V} things around here',
+  'looking to {V} something today, who do I ask',
+  'give me a way to {V} something quickly please',
+  'our team wants to {V} a few things tonight, options?',
+  'I just need to {V} something, what handles that',
 ];
 const NEARDUP_TEMPLATES = [
-  'somewhere in our stack there is a spot to {V} {E}, find that one',
-  'I remember a tool that can {V} {E}, which product was it',
-  'whatever thing {V} {E} for us, use that',
-  'need {E} {V} before tomorrow, pick correctly',
-  'which of our apps should {V} {E} here',
+  'somewhere in our stack there is a spot to {V} the {E}, find that one',
+  'I remember a tool that can {V} the {E}, which product was it',
+  'whatever thing can {V} the {E} for us, use that',
+  'point me to whatever will {V} the {E}',
+  'which of our apps should {V} the {E} here',
 ];
 const MULTI_TEMPLATES = [
-  'line up every spot where our tools can {V} {E}',
-  'all places {E} can be {V} across our stack',
-  'round up each app able to {V} {E}',
+  'line up every spot where our tools can {V} the {E}',
+  'all the places that can {V} the {E} across our stack',
+  'round up each app able to {V} the {E}',
 ];
+// FX13-R3: article-free by design — the paraphrase overlap ceiling counts
+// every >=3-char token, and 'the' sits in every generated description.
 const PARAPHRASE_TEMPLATES = [
   'Can you {V} {E} when you get a chance?',
   'I would love to {V} {E} if possible',
@@ -442,6 +424,11 @@ function overlap(queryText, banned) {
   return tokenize(queryText).filter((t) => banned.has(t));
 }
 
+// Function words are never meaningful overlap: every generated description
+// contains 'the'/'in'/'for', so zero-overlap bands exclude them plus the raw
+// entity token (the entity is the query's payload, not accidental overlap).
+const FX_FUNCTION_WORDS = new Set(['the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'for', 'with', 'that', 'this', 'is', 'are', 'be', 'can', 'will', 'should', 'would', 'our', 'your', 'us', 'we', 'i', 'me', 'my', 'it']);
+
 function buildQueries(manifests, serverDescs) {
   const allTools = [];
   const byName = new Map(); // tool name -> [{serverId, tool, indexed}]
@@ -492,7 +479,7 @@ function buildQueries(manifests, serverDescs) {
       if (!c) continue;
       if (used.has(c.query)) continue;
       used.add(c.query);
-      const q = { query: c.query, expected: c.expected ?? null, subtype, difficulty };
+      const q = { query: c.query, expected: c.expected ?? null, subtype, difficulty, synthetic: true };
       if (c.expectedAll) q.expectedAll = c.expectedAll;
       queries.push(q);
       bySubtype[subtype] = (bySubtype[subtype] || 0) + 1;
@@ -525,20 +512,63 @@ function buildQueries(manifests, serverDescs) {
   }
 
   // PARAPHRASE: synonyms only, never tool name / serverId verbatim,
-  // documented overlap ceiling 30% of content tokens.
+  // documented overlap ceiling 30% of content tokens. FX13 (F31): when the
+  // gold tool name is cloned across servers, a bare synonym query is
+  // underdetermined — the query MUST carry a domain clue (org + server
+  // domain words) that uniquely picks the gold server, or generation fails.
   {
+    const domainOf = (sid) => DOMAINS.find((dd) => `${dd.org}-${dd.name}` === sid);
+    // Minimal clue: if every clone lives in the same org, the domain name
+    // alone disambiguates (fewer indexed tokens keeps the 30% overlap ceiling
+    // reachable); otherwise org + domain. Inserted before terminal
+    // punctuation so the sentence stays grammatical.
+    const clueOf = (rec) => {
+      const group = byName.get(rec.tool.name) ?? [];
+      const d = domainOf(rec.serverId);
+      const sameOrg = group.every((r) => domainOf(r.serverId)?.org === d.org);
+      return sameOrg
+        ? `in the ${d.name.replace(/-/g, ' ')} system`
+        : `in the ${d.org.replace(/-/g, ' ')} ${d.name.replace(/-/g, ' ')} system`;
+    };
     const gen = [];
     for (const rec of shuffled(eligible)) {
       gen.push(() => {
         let text = pick(PARAPHRASE_TEMPLATES)
           .replace('{V}', pick(verbSynOf(rec.tool)))
           .replace('{E}', pick(entSynOf(rec.tool)));
+        const clones = (byName.get(rec.tool.name) ?? []).length;
+        if (clones > 1) {
+          text = `${text.replace(/[?.!]*$/, "")}, ${clueOf(rec)}.`;
+        }
+        paraphraseClean.push(text);
         if (rnd() < TYPO_RATE) text = text.replace(/\b\w{4,}\b/, (w) => injectTypo(w));
+        // Drop candidates whose overlap would break the documented 30%
+        // ceiling (clued queries carry extra indexed tokens; plain synonyms
+        // can also exceed it with long multiword verbs) — tryEmit retries
+        // with another candidate.
+        const ct = contentTokens(text);
+        const ratio = ct.filter((t) => rec.indexed.has(t)).length / Math.max(1, ct.length);
+        if (ratio > 0.3) return null;
         return { query: text, expected: rec.id };
       });
     }
     for (let i = 0; i < quotas[1][1]; i++) {
       if (!tryEmit('paraphrase', 'paraphrase', gen)) throw new Error('could not fill paraphrase quota');
+    }
+    // Ambiguity validator (FX13 #2): fail generation if any paraphrase's gold
+    // is underdetermined by construction — cloned name without a clue, or a
+    // clue that does not actually pick the gold server out of the clone group.
+    for (let i = 0; i < queries.length; i++) {
+      if (queries[i].subtype !== 'paraphrase') continue;
+      const [sid, tname] = queries[i].expected.split(':');
+      const group = byName.get(tname) ?? [];
+      if (group.length <= 1) continue;
+      const goldTokens = new Set(tokenize(sid.replace(/-/g, ' ')));
+      const queryTokens = new Set(tokenize(queries[i].query));
+      const disambiguating = [...goldTokens].some((t) => queryTokens.has(t));
+      if (!disambiguating) {
+        throw new Error(`ambiguous paraphrase: cloned tool name "${tname}" without a disambiguating server clue: ${queries[i].query}`);
+      }
     }
   }
 
@@ -562,13 +592,12 @@ function buildQueries(manifests, serverDescs) {
   // NEAR-DUPLICATE: gold must have >= 1 genuinely confusable distractor
   // (sibling-server clone with the same name, or same verb different object).
   {
-    // Direct construction: pick gold from clone groups or same-verb siblings.
-    const cloneNames = [...byName.entries()].filter(([, g]) => g.length >= 2).map(([n]) => n);
-    const eligibleNames = new Set(eligible.map((r) => r.tool.name));
+    // FX13-R3: entities appear verbatim, so near-duplicates are built ONLY
+    // from same-verb/different-entity sibling pairs (a cloned name would make
+    // the verbatim entity ambiguous across the clone group). The zero-overlap
+    // rule ignores the raw entity token — the entity is the disambiguator
+    // between the same-verb siblings, by construction.
     const candidates = [];
-    for (const name of cloneNames) {
-      for (const gold of byName.get(name)) candidates.push({ gold, kind: 'clone', group: byName.get(name) });
-    }
     for (const gold of shuffled(eligible)) {
       const verb = gold.tool.name.split('_')[0];
       const sibling = eligible.find((r) => r.id !== gold.id && r.tool.name.split('_')[0] === verb && r.tool.name.split('_')[1] !== gold.tool.name.split('_')[1]);
@@ -582,13 +611,14 @@ function buildQueries(manifests, serverDescs) {
         .replace('{V}', pick(vs))
         .replace('{E}', pick(es));
       if (rnd() < TYPO_RATE) text = text.replace(/\b\w{4,}\b/, (w) => injectTypo(w));
-      if (overlap(text, gold.indexed).length > 0) return null;
+      const entityTokens = new Set(parts[1].split('_'));
+      // Function words are not meaningful overlap (every generated description
+      // contains 'the'/'in'/'for'); the rule targets content tokens.
+      const goldTokensExceptEntity = new Set([...gold.indexed].filter((t) => !entityTokens.has(t) && !FX_FUNCTION_WORDS.has(t)));
+      if (overlap(text, goldTokensExceptEntity).length > 0) return null;
       // verify distractors share no gold tokens with query but do share structure
-      const distractors = group.filter((r) => r.id !== gold.id);
-      if (kind === 'verb') {
-        const sib = group[1];
-        if (!siblingConfusable(gold, sib)) return null;
-      }
+      const sib = group[1];
+      if (!siblingConfusable(gold, sib)) return null;
       return { query: text, expected: gold.id, _kind: kind, _group: group };
     });
     for (let i = 0; i < quotas[3][1]; i++) {
@@ -609,8 +639,12 @@ function buildQueries(manifests, serverDescs) {
           const parts = name.split('_');
           const vs = VERB_SYN[parts[0]]; const es = ENTITY_SYN[parts[1]];
           if (!vs || !es) return null;
+          // FX13-R3: the verbatim entity is the shared subject of the multi
+          // group — it is the query's payload, not accidental overlap — so
+          // the zero-overlap rule excludes it (and function words).
+              const entityTokens = new Set(name.split('_')[1].split('_'));
           const union = new Set();
-          for (const g of golds) for (const t of g.indexed) union.add(t);
+          for (const g of golds) for (const t of g.indexed) if (!entityTokens.has(t) && !FX_FUNCTION_WORDS.has(t)) union.add(t);
           const text = pick(MULTI_TEMPLATES).replace('{V}', pick(vs)).replace('{E}', pick(es));
           if (overlap(text, union).length > 0) return null;
           return { query: text, expected: golds[0].id, expectedAll: golds.map((g) => g.id) };
@@ -627,17 +661,17 @@ function buildQueries(manifests, serverDescs) {
   // absent from every tool name in the corpus.
   {
     const FAKE_ADJ = ['lunar', 'underwater', 'holographic', 'invisible', 'quantum', 'haunted', 'zero-g', 'abandoned'];
+    // FX13-R3: entities are verbatim now, so the off-corpus object comes from
+    // a generic noun list instead of an entity synonym.
+    const OFFCORPUS_NOUNS = ['widget', 'gizmo', 'doodad', 'contraption', 'trinket', 'bauble', 'whatchamacallit', 'doohickey'];
     const gen = [];
     for (let i = 0; i < 400; i++) {
-      const v = pick(Object.keys(VERB_SYN)); const e = pick(Object.keys(ENTITY_SYN));
+      const v = pick(Object.keys(VERB_SYN));
       const adj = pick(FAKE_ADJ);
+      const noun = pick(OFFCORPUS_NOUNS);
       gen.push(() => {
-        const vs = pick(VERB_SYN[v]); const es = pick(ENTITY_SYN[e]);
-        const text = `${pick(vs.split(' '))} the ${adj} ${es.split(' ')[0]} please`;
-        // Rule (intake 16:56Z): no-match queries must have ZERO overlap on
-        // content tokens (query tokens minus the documented stopword list)
-        // with the whole indexed corpus (tool name words, description,
-        // serverId, server description). Validated on the final emitted string.
+        const vs = pick(VERB_SYN[v]);
+        const text = `${pick(vs.split(' '))} the ${adj} ${noun} please`;
         if (contentOverlapNoStop(text, corpusTokens).length > 0) return null;
         return { query: text, expected: null };
       });
@@ -695,6 +729,15 @@ function validate(manifests, queries, serverDescs, staleRemoved, finalFiles) {
       const toolName = id.slice(m.serverId.length + 1);
       const t = m.tools.find((tt) => tt.name === toolName);
       const banned = indexedTokens(m.serverId, t, serverDescs[m.serverId]);
+      // FX13-R3: for near-duplicate and multi, the verbatim entity is the
+      // query's payload (disambiguator between same-verb siblings / shared
+      // subject of the multi group), so the rule excludes it and function
+      // words. Goal-only keeps the strict zero-overlap rule.
+      if (q.subtype !== 'goal-only') {
+        const entityTokens = new Set(toolName.split('_').slice(1));
+        for (const tok of entityTokens) banned.delete(tok);
+        for (const tok of FX_FUNCTION_WORDS) banned.delete(tok);
+      }
       const ov = overlap(q.query, banned);
       if (ov.length > 0) violations.push(`overlap ${JSON.stringify(ov)} in ${q.subtype} query: ${q.query}`);
     }
@@ -804,6 +847,70 @@ function main() {
   const finalFiles = readdirSync(OUT_DIR).filter((f) => f.endsWith('.json'));
   const { violations, minDistractors } = validate(manifests, queries, serverDescs, staleRemoved, finalFiles);
 
+  // --- FX13 query-quality self-check ------------------------------------------------
+  // Lint CLEAN paraphrase texts (before noise/typos). Zero lint hits is the gate.
+  const toolStopwords = new Set(['can','you','would','love','to','please','whenever','could','someone','today','any','chance','if','possible','when','get','a','i','me','my','the','in','of','for','and','or','on','at','is','are','with','what','how','find','do','our']);
+  const toolVocab = new Set(toolStopwords);
+  for (const table of [VERB_SYN, ENTITY_SYN]) {
+    for (const [k, vals] of Object.entries(table)) {
+      for (const t of tokenize(k)) toolVocab.add(t);
+      for (const v of vals) for (const t of tokenize(v)) toolVocab.add(t);
+    }
+  }
+  for (const d of DOMAINS) {
+    for (const t of tokenize(d.name)) toolVocab.add(t);
+    for (const t of tokenize(d.org.replace(/-/g, ' '))) toolVocab.add(t);
+  }
+  for (const t of ['system', 'recent', 'convenient']) toolVocab.add(t);
+  const toolLint = { debris: 0, doubleSpace: 0, malformed: 0, unknownVocab: 0, ambiguous: 0 };
+
+  const unknownSamples = [];
+  for (const clean of paraphraseClean) {
+    // Debris = two consecutive prepositions (mid-sentence deletion class).
+    if (/\b(?:for|against|with|of|to|in)\s+(?:for|against|with|of|to|in)\b/i.test(clean)) toolLint.debris += 1;
+    if (/ {2,}/.test(clean)) toolLint.doubleSpace += 1;
+    // Malformed = lowercase start, or ends on a dangling function word (the
+    // mid-sentence deletion signature). Casual templates without terminal
+    // punctuation are fine; dangling connectives are not.
+    if (!/^[A-Z]/.test(clean) || /\b(?:for|against|with|of|to|in|and|or|the|a|an)$/i.test(clean.trim())) {
+      toolLint.malformed += 1;
+    }
+    const unknown = tokenize(clean).filter((t) => !toolVocab.has(t));
+    if (unknown.length > 0) {
+      toolLint.unknownVocab += 1;
+      unknownSamples.push(...unknown.slice(0, 5));
+    }
+  }
+  // Ambiguity count for the record: the validator inside buildQueries already
+  // fails hard on ambiguous paraphrases; this recomputes the same predicate
+  // over the emitted rows so the results file carries the number.
+  const cloneCounts = new Map();
+  for (const m of manifests) for (const t of m.tools) cloneCounts.set(t.name, (cloneCounts.get(t.name) ?? 0) + 1);
+  const ambiguousCount = queries.filter((q) => {
+    if (q.subtype !== 'paraphrase' || !q.expected) return false;
+    const [sid, tname] = q.expected.split(':');
+    if ((cloneCounts.get(tname) ?? 0) <= 1) return false;
+    const goldTokens = new Set(tokenize(sid.replace(/-/g, ' ')));
+    return ![...goldTokens].some((t) => tokenize(q.query).includes(t));
+  }).length;
+  toolLint.ambiguous = ambiguousCount;
+  const toolLintTotal = Object.values(toolLint).reduce((a, b) => a + b, 0);
+
+  const emittedParaphrases = queries.filter((q) => q.subtype === 'paraphrase');
+  const sampleStride = Math.max(1, Math.floor(emittedParaphrases.length / 30));
+  const paraphraseSamples = emittedParaphrases.filter((_, i) => i % sampleStride === 0).slice(0, 30).map((q) => q.query);
+  console.log('--- FX13 tool paraphrase samples (30) ---');
+  for (const sample of paraphraseSamples) console.log('  ' + sample);
+  console.log('--- FX13 tool lint counts (clean text, gate = all zero) ---');
+  console.log(JSON.stringify(toolLint));
+  if (toolLintTotal > 0) {
+    throw new Error(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
+  }
+  writeFileSync(
+    join(RESULTS_DIR, 'query-quality-tools.json'),
+    JSON.stringify({ generatorVersion: 3, lint: toolLint, samples: paraphraseSamples }, null, 2),
+  );
+
   const bySubtype = {};
   const byDifficulty = {};
   for (const q of queries) {
@@ -812,11 +919,13 @@ function main() {
   }
   const summary = {
     script: 'gen-tools.mjs',
+    generatorVersion: 3,
     seed: SEED,
     manifestCount: manifests.length,
     totalTools: manifests.reduce((a, m) => a + m.tools.length, 0),
     bigManifests: BIG_MANIFEST_COUNT,
     queryTotal: queries.length,
+    queryQuality: { generatorVersion: 3, lint: toolLint, lintHits: toolLintTotal, sampleCount: paraphraseSamples.length },
     bySubtype,
     byDifficulty,
     checks: {
