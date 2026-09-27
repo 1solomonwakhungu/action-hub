@@ -42,6 +42,44 @@ function stubEnv(vars: Record<string, string>): { restore: () => void } {
   };
 }
 
+/** Escalates to SIGKILL only after a bounded wait, and re-verifies death. */
+async function reapOwnedPids(ownedPids: number[]): Promise<void> {
+  for (const pid of ownedPids) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {}
+  }
+  const verify = async (): Promise<number[]> =>
+    ownedPids.filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  const deadline = Date.now() + 5_000;
+  let alive = await verify();
+  while (alive.length > 0 && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    alive = await verify();
+  }
+  // Final escalation: SIGKILL stragglers, then RE-VERIFY they died.
+  for (const pid of alive) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+  if (alive.length > 0) {
+    const kDeadline = Date.now() + 5_000;
+    do {
+      await new Promise((r) => setTimeout(r, 250));
+      alive = await verify();
+    } while (alive.length > 0 && Date.now() < kDeadline);
+  }
+  assert.deepEqual(alive, [], `owned processes survived cleanup: ${alive.join(", ")}`);
+}
+
 /** Kills only PIDs THIS test spawned, then asserts they are all dead. */
 async function cleanupSpawned(daemonDir: string, spawnedPids: number[]): Promise<void> {
   // SIGTERM first: the anchor runs its own gated group cleanup (SIGKILLing
@@ -307,29 +345,67 @@ test("a failed anchor proof never yields the concurrent-winner success path", as
         if (m) ownedPids.push(Number.parseInt(m[1]!, 10));
       }
     } catch {}
-    for (const pid of ownedPids) {
+    await reapOwnedPids(ownedPids);
+    env.restore();
+    captured.restore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+
+// PR 77 rework round 6: the timeout/no-progress break must ALSO tear down and
+// consult the proof BEFORE the sibling winner probe — otherwise the orphan
+// from this failed start satisfies "already running" during the grace window.
+test("timeout path tears down before consulting the winner probe", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ah-dstart-timeout-"));
+  const daemonDir = join(root, "daemon");
+  const pidFile = join(root, "recorded-pids.txt");
+  await writeFile(pidFile, "");
+  // A short no-progress window (not a 1ms cap): the fixture takes a few
+  // hundred ms to spawn, so the break must happen after it is up but before
+  // it becomes ready (it only becomes ready once orphaned).
+  const env = stubEnv({ TREE_PIDS_FILE: pidFile, ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS: "400" });
+  const ownedPids: number[] = [];
+  const captured = captureConsole();
+  try {
+    const startPromise = daemonStartCommand({
+      daemonDir,
+      entryPath: resolve(testDir, "fixtures/wrapper-victim-daemon.mjs"),
+      startTimeoutMs: 30_000,
+      configPath: join(root, "servers.json"),
+      onSpawn: (pid) => void ownedPids.push(pid),
+    });
+    // SIGKILL only the wrapper during the winner grace, exactly like the
+    // reviewer's repro. startTimeoutMs=1 sends the start into the timeout
+    // break at once, then the path enters the CONCURRENT_START_GRACE_MS
+    // winner-probe window — the kill must land during that window.
+    const killDeadline = Date.now() + 10_000;
+    let wrapperKilled = false;
+    while (!wrapperKilled && Date.now() < killDeadline) {
       try {
-        process.kill(pid, "SIGTERM");
-      } catch {}
-    }
-    const deadline = Date.now() + 5_000;
-    let alive: number[] = [];
-    do {
-      await new Promise((r) => setTimeout(r, 250));
-      alive = ownedPids.filter((pid) => {
-        try {
-          process.kill(pid, 0);
-          return true;
-        } catch {
-          return false;
+        const lines = (await readFile(pidFile, "utf8")).split("\n");
+        const ppidLine = lines.find((l) => /^PPID:\d+$/.test(l.trim()));
+        if (ppidLine) {
+          process.kill(Number.parseInt(ppidLine.trim().slice(5), 10), "SIGKILL");
+          wrapperKilled = true;
         }
-      });
-    } while (alive.length > 0 && Date.now() < deadline);
-    for (const pid of alive) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {}
+      } catch {
+        // not written yet
+      }
+      if (!wrapperKilled) await new Promise((r) => setTimeout(r, 25));
     }
+    assert.ok(wrapperKilled, "fixture must report the wrapper PID in time");
+    const code = await startPromise;
+    assert.equal(code, 1, `expected fail-closed exit 1, got 0 (orphan satisfied the winner probe)`);
+  } finally {
+    try {
+      const recorded = (await readFile(pidFile, "utf8")).split("\n");
+      for (const line of recorded) {
+        const m = line.match(/^SERVER:(\d+)$/);
+        if (m) ownedPids.push(Number.parseInt(m[1]!, 10));
+      }
+    } catch {}
+    await reapOwnedPids(ownedPids);
     env.restore();
     captured.restore();
     await rm(root, { recursive: true, force: true });
