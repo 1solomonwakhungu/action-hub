@@ -476,7 +476,7 @@ function makeTool(serverId, domainName, orgName, forced) {
   const h = hash32(name);
   const d1 = matched.length ? matched[h % matched.length] : details[h % details.length];
   const d2pool = details.filter((d) => d !== d1);
-  const d2 = d2pool.length && h % 3 === 0 ? d2pool[(h >> 3) % d2pool.length] : '';
+  const d2 = d2pool.length && h % 3 === 0 ? d2pool[(h >>> 3) % d2pool.length] : '';
   const automation = !bigResponse && rnd() < 0.5;
   const suffix = automation ? ' for automation workflows' : '';
   // Tail/annotations follow the NAME's semantics, not the random kind — a
