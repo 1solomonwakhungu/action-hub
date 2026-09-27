@@ -256,7 +256,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
  */
 async function killAndReapSpawned(child: ChildProcess): Promise<void> {
   if (!child.pid) return;
-  const result = await teardownAnchorChild(child.pid, 5_000);
+  const result = await teardownAnchorChild(child, 5_000);
   if (!result.proven || result.survivors.length > 0) {
     console.error(
       `Warning: daemon start teardown could not be proven (anchor pid ${child.pid}${result.survivors.length > 0 ? `, surviving: ${result.survivors.join(", ")}` : ""}).`,

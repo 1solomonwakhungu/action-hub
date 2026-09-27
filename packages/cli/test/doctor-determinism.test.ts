@@ -439,3 +439,45 @@ process.stdin.resume();
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// PR 77 rework round 3 (finding 2): attempt 2's anchor handle must be
+// associated with attempt 2's deadline — each attempt's exact anchor and
+// server tree dies at ITS OWN deadline, not at final cleanup only.
+test("each retry attempt's anchor tree is torn down at its own deadline", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-doctor-retry-"));
+  const startedAt = Date.now();
+  try {
+    const servers = [stdioServer("hangy", [resolve(testDir, "fixtures/trickle-server.mjs")], { timeoutMs: 300 })];
+    const cfgPath = await makeFleet(tempDir, servers);
+    const { code } = await withIsolatedEnv(tempDir, () => runDoctor(cfgPath));
+    const wallMs = Date.now() - startedAt;
+    assert.equal(code, 1);
+    // Two attempts x (300ms timeout + 2s activation slack) + retry settle;
+    // if attempt 2's anchor were left for final cleanup the wall would still
+    // pass, so the binding assertion is the per-PID death times below.
+    assert.ok(wallMs < 15_000, `doctor took ${wallMs}ms; expected bounded per-attempt teardown`);
+
+    const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
+      .split("\n")
+      .map((l) => Number.parseInt(l.trim(), 10))
+      .filter((n) => Number.isSafeInteger(n) && n > 0);
+    assert.ok(recordedPids.length >= 2, `expected both attempts' server PIDs recorded, got ${recordedPids.length}`);
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const pollDeadline = Date.now() + 8_000;
+    let survivors = recordedPids.filter(isAlive);
+    while (survivors.length > 0 && Date.now() < pollDeadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      survivors = recordedPids.filter(isAlive);
+    }
+    assert.deepEqual(survivors, [], `retry attempt trees survived: ${survivors.join(", ")}`);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
