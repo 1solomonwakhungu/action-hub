@@ -8,7 +8,7 @@
  *
  * Metrics (CONTRACT.md query schema v2): recall@1/3/5/10/20, MRR@10, nDCG@10,
  * Completeness@10, Sufficiency@10 (multi-gold), no-match false-positive rate,
- * stage-separated retrieval-vs-rank reporting, warm p50/p95 after an excluded
+ * warm p50/p95 after an excluded
  * warmup pass, context token cost per response, definition-token savings.
  * Reported by difficulty (exact|paraphrase|hard), subtype, and kind.
  *
@@ -418,6 +418,7 @@ async function warmAndTime(hub, queries) {
       goldRanks,
       firstGoldRank: golds.length ? Math.min(...golds.map((g, i) => (goldRanks[i] ?? Infinity))) : null,
       top1: ids[0] ?? null,
+      resultCount: hits.length,
       top1Score: hits[0]?.score ?? 0,
       top3: hits.slice(0, 3).map((h) => ({ id: h.id, name: h.name, score: Number((h.score ?? 0).toFixed(4)) })),
       responseTokens: tokens(JSON.stringify(hits)),
@@ -503,9 +504,12 @@ function scoreEngine(rows, latencies, fpThreshold) {
 
   let fpRate = null, fpDefinition = null, noMatchTop1Mean = null;
   if (noMatch.length > 0) {
-    const threshold = percentileOf(matched.map((r) => r.top1Score), 25);
-    fpRate = noMatch.filter((r) => r.top1Score >= threshold).length / noMatch.length;
-    fpDefinition = "top-1 score >= P25 of matched-query top-1 scores";
+    // BINDING (reviewer-1 P1): observable system behavior only. The hub's
+    // search API always returns up to `limit` hits and applies no rejection
+    // threshold, so ANY nonempty hit list on a no-match query is a false
+    // positive. No score threshold is involved in the binding rate.
+    fpRate = noMatch.filter((r) => r.resultCount > 0).length / noMatch.length;
+    fpDefinition = "fraction of no-match queries returning any hits (observable behavior; the API applies no rejection threshold)";
     noMatchTop1Mean = mean(noMatch.map((r) => r.top1Score));
   }
 
@@ -546,6 +550,25 @@ function scoreEngine(rows, latencies, fpThreshold) {
       fpDefinition,
       meanTop1Score: noMatchTop1Mean,
       matchedMeanTop1Score: matched.length ? mean(matched.map((r) => r.top1Score)) : null,
+      // INFORMATIONAL ONLY (reviewer-1 P1): score separability, NOT a system
+      // capability — the hub applies no threshold. Calibration and evaluation
+      // are disjoint: threshold = P25 of matched-query top-1 scores; the rate
+      // is measured on the held-out HALF of no-match rows (deterministic
+      // index-parity split).
+      scoreSeparability: noMatch.length > 1
+        ? {
+            informational: true,
+            thresholdDefinition: "P25 of matched-query top-1 scores",
+            threshold: matched.length ? Number(percentileOf(matched.map((r) => r.top1Score), 25).toFixed(4)) : null,
+            fpRateHeldOut: (() => {
+              const heldOut = noMatch.filter((_, i) => i % 2 === 0);
+              if (heldOut.length === 0 || !matched.length) return null;
+              const threshold = percentileOf(matched.map((r) => r.top1Score), 25);
+              return heldOut.filter((r) => r.top1Score >= threshold).length / heldOut.length;
+            })(),
+            heldOutCount: noMatch.filter((_, i) => i % 2 === 0).length,
+          }
+        : null,
     },
     latency: {
       warmP50Ms: Number(percentileOf(lat, 50).toFixed(2)),
@@ -623,13 +646,21 @@ function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idM
     if ((mix[st] ?? 0) !== want) errors.push(`tool query mix ${st}: expected ${want}, got ${mix[st] ?? 0}`);
   }
   if ((idMismatches ?? 0) !== 0) errors.push(`${idMismatches} skill id mismatches vs parseSkillContent`);
-  for (const q of queries) {
-    if (typeof q.query !== "string" || q.query.trim() === "") { errors.push(`invalid query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
-    const hasExpected = typeof q.expected === "string" || q.expected === null;
-    const hasExpectedAll = Array.isArray(q.expectedAll);
-    if (!hasExpected && !hasExpectedAll) { errors.push(`query without expected/expectedAll: ${String(q.query).slice(0, 60)}`); break; }
-    if (hasExpectedAll && (q.expectedAll.length < 2 || q.expectedAll.length > 4 || q.expectedAll.some((g) => typeof g !== "string"))) {
-      errors.push(`invalid expectedAll on: ${String(q.query).slice(0, 60)}`); break;
+  for (const set of [queries, ...(skillQueries ? [skillQueries] : [])]) {
+    for (const q of set) {
+      if (typeof q.query !== "string" || q.query.trim() === "") { errors.push(`invalid query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
+      if (!["exact", "paraphrase", "hard"].includes(q.difficulty)) { errors.push(`unknown difficulty "${q.difficulty}" on: ${String(q.query).slice(0, 60)}`); break; }
+      const hasExpected = typeof q.expected === "string" || q.expected === null;
+      const hasExpectedAll = Array.isArray(q.expectedAll);
+      if (!hasExpected && !hasExpectedAll) { errors.push(`query without expected/expectedAll: ${String(q.query).slice(0, 60)}`); break; }
+      if (hasExpectedAll && (q.expectedAll.length < 2 || q.expectedAll.length > 4 || q.expectedAll.some((g) => typeof g !== "string"))) {
+        errors.push(`invalid expectedAll on: ${String(q.query).slice(0, 60)}`); break;
+      }
+      // Subtype semantics (reviewer-1): the label must match the row shape,
+      // or the binding by-difficulty/by-subtype gates are unprotected.
+      if (q.subtype === "no-match" && (q.expected !== null || hasExpectedAll)) { errors.push(`no-match row with a gold: ${String(q.query).slice(0, 60)}`); break; }
+      if (q.subtype === "multi" && !(hasExpectedAll && q.expectedAll.length >= 2)) { errors.push(`multi row without 2-4 golds: ${String(q.query).slice(0, 60)}`); break; }
+      if (q.subtype !== "multi" && q.subtype !== "no-match" && !(hasExpected && !hasExpectedAll)) { errors.push(`${q.subtype} row must have a single gold and no expectedAll: ${String(q.query).slice(0, 60)}`); break; }
     }
   }
   const uniqueQueries = new Set(queries.map((q) => q.query));
@@ -854,7 +885,7 @@ async function runEval() {
   // full-corpus blend run on all 1,500 queries at the full 15K corpus.
   const blend = gateRows.blend?.scored ?? results.blend;
   gateChecks.sufficiencyAt10 = { target: GATES.sufficiencyAt10, actual: blend.sufficiencyAt10, pass: (blend.sufficiencyAt10 ?? 0) >= GATES.sufficiencyAt10 };
-  gateChecks.noMatchFpRate = { target: GATES.noMatchFpRate, actual: blend.noMatch.fpRate, pass: blend.noMatch.fpRate !== null && blend.noMatch.fpRate <= GATES.noMatchFpRate };
+    gateChecks.noMatchFpRate = { target: GATES.noMatchFpRate, actual: blend.noMatch.fpRate, pass: blend.noMatch.fpRate !== null && blend.noMatch.fpRate <= GATES.noMatchFpRate, definition: blend.noMatch.fpDefinition };
   const fullBlendP95 = gateRows.blend?.scored.latency.warmP95Ms ?? null;
   gateChecks.warmP95MsAt15K = { target: GATES.warmP95MsAt15K, actual: fullBlendP95, pass: (fullBlendP95 ?? Infinity) <= GATES.warmP95MsAt15K };
 
