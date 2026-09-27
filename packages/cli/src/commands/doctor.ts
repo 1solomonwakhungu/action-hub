@@ -9,6 +9,8 @@ import {
   type ServerConfig,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
+import { anchorSpawnArgs, EXIT_PROVEN, teardownAnchorChild, type TeardownResult } from "./process-anchor.js";
+import type { ChildProcess } from "node:child_process";
 import { createSdkClientFactory } from "../client-factory.js";
 
 export interface DoctorOptions {
@@ -43,148 +45,35 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Supervisor for doctor-spawned stdio servers (run via `node -e`).
- *
- * The SDK transport spawns the downstream server itself, and when a server
- * hangs during initialize (the F27 gap — activation has no deadline in core),
- * nothing ever closes the transport, so the child process would leak. This
- * supervisor sits between the transport and the real server and guarantees
- * the child dies when either:
- *  - the parent closes stdin (normal transport close / hub shutdown), or
- *  - the activation deadline passes without a single stdout byte (the child
- *    never answered initialize — kill it, which unblocks the pending connect
- *    with a closed-pipe error instead of an infinitely pending one).
- * A server that has answered initialize is never deadline-killed, so
- * long-lived health-probe connections are unaffected.
- */
-const SUPERVISOR_SCRIPT = `
-const { spawn } = require("node:child_process");
-// With: node -e <script> a b c  ->  process.argv is [node, a, b, c].
-const deadlineMs = Number(process.argv[1] || 0);
-const command = process.argv[2];
-const args = process.argv.slice(3);
-if (!command) process.exit(2);
-const isWindows = process.platform === "win32";
-// detached on POSIX makes the child a process-group leader, so the whole
-// downstream tree (grandchildren included) can be signalled at once.
-const child = spawn(command, args, {
-  stdio: ["pipe", "pipe", "pipe"],
-  env: process.env,
-  cwd: process.cwd(),
-  detached: !isWindows,
-});
-let sawStdout = false;
-let killed = false;
-let childExitCode = null;
-let killSequenceDone = false;
-const maybeFinish = () => {
-  // Only exit once any started kill sequence has fully completed (escalation
-  // sent AND the downstream process group verified dead) — otherwise a
-  // grandchild with a SIGTERM handler could outlive the supervisor.
-  if (killed && !killSequenceDone) return;
-  process.exit(childExitCode ?? 1);
-};
-const groupAlive = () => {
-  if (isWindows) return false;
-  try {
-    process.kill(-child.pid, 0);
-    return true;
-  } catch (err) {
-    return err && err.code !== "ESRCH";
-  }
-};
-const killTree = (signal) => {
-  if (killed) return;
-  killed = true;
-  try {
-    if (isWindows) {
-      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
-    } else {
-      process.kill(-child.pid, signal);
-    }
-  } catch {}
-  // Ref'd on purpose: the supervisor must stay alive to send the escalation
-  // and verify the group is actually gone before exiting.
-  const escalate = setTimeout(() => {
-    try {
-      if (isWindows) {
-        const tk = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
-        tk.on("exit", () => { killSequenceDone = true; maybeFinish(); });
-        tk.on("error", () => { killSequenceDone = true; maybeFinish(); });
-      } else {
-        process.kill(-child.pid, "SIGKILL");
-        killSequenceDone = true;
-      }
-    } catch {}
-    maybeFinish();
-  }, 1000);
-  // After escalation, poll (bounded) until the whole group is dead, then exit.
-  const reapDeadline = Date.now() + 5000;
-  const reap = setInterval(() => {
-    if (!groupAlive()) {
-      clearInterval(reap);
-      killSequenceDone = true;
-      maybeFinish();
-    } else if (Date.now() > reapDeadline) {
-      clearInterval(reap);
-      killSequenceDone = true;
-      maybeFinish();
-    }
-  }, 50);
-};
-if (deadlineMs > 0) {
-  const t = setTimeout(() => { if (!sawStdout) { killTree("SIGKILL"); } }, deadlineMs);
-  t.unref?.();
-}
-process.stdin.on("data", (chunk) => {
-  try { child.stdin.write(chunk); } catch {}
-});
-// Downstream stdin closure must not surface as an unhandled EPIPE stack.
-process.stdin.on("end", () => { killTree("SIGTERM"); });
-process.stdin.on("error", () => { killTree("SIGKILL"); });
-child.stdin.on("error", () => {});
-child.stdout.on("data", (chunk) => { sawStdout = true; process.stdout.write(chunk); });
-child.stderr.on("data", (chunk) => process.stderr.write(chunk));
-child.stdout.on("error", () => {});
-child.stderr.on("error", () => {});
-child.on("error", () => process.exit(1));
-child.on("exit", (code) => {
-  childExitCode = code;
-  if (killed) {
-    // A kill sequence is already in flight — keep waiting for it.
-    maybeFinish();
-  } else {
-    // The downstream server exited on its own, but its process group may
-    // still hold a TERM-ignoring grandchild. Start (and await) the full
-    // group cleanup instead of exiting immediately: process.on("exit")
-    // hooks cannot keep the process alive for async escalation.
-    killTree("SIGTERM");
-  }
-});
-`;
-
 function serverTimeoutMs(srv: ServerConfig | undefined): number {
   return typeof srv?.timeoutMs === "number" && srv.timeoutMs > 0 ? srv.timeoutMs : DEFAULT_SERVER_TIMEOUT_MS;
 }
 
 /**
- * Routes stdio servers through the supervisor (see SUPERVISOR_SCRIPT) so a
- * child that hangs during initialize is killed at the activation deadline
- * instead of leaking forever. HTTP servers are unaffected. The original
- * transport description is preserved for display.
+ * Routes stdio servers through the anchored supervisor (process-anchor.ts) so
+ * every server runs inside a wrapper-owned process group whose leader we
+ * spawned ourselves. The anchor is held directly by the factory (its
+ * ChildProcess), so a server that hangs during initialize (F27: activation
+ * has no deadline in core) can be torn down exactly — regardless of whether
+ * it ever wrote valid stdout, and with no disk metadata the untrusted server
+ * could see or forge. HTTP servers are unaffected. The original transport
+ * description is preserved for display.
  */
 function supervisedServers(servers: readonly ServerConfig[]): ServerConfig[] {
   return servers.map((srv) => {
     if (srv.transport.type !== "stdio") return srv;
     const transport = srv.transport;
+    const env = {
+      ...(transport.env ?? {}),
+      ANCHOR_STDOUT_DEADLINE_MS: String(Math.max(1_000, serverTimeoutMs(srv))),
+    };
     return {
       ...srv,
       transport: {
         type: "stdio",
         command: process.execPath,
-        args: ["-e", SUPERVISOR_SCRIPT, String(Math.max(1_000, serverTimeoutMs(srv))), transport.command, ...(transport.args ?? [])],
-        ...(transport.env ? { env: transport.env } : {}),
+        args: anchorSpawnArgs("doctor", transport.command, transport.args ?? []),
+        env,
         ...(transport.cwd ? { cwd: transport.cwd } : {}),
       },
     } as ServerConfig;
@@ -223,62 +112,46 @@ function withDeadline<T>(label: string, op: () => Promise<T>, ms: number): Promi
  * eventual client (if it ever connects) is closed so no transport or child
  * process survives the attempt.
  */
-function boundedClientFactory(inner: (config: ServerConfig) => Promise<McpClient>, spawnedPids: Set<number>): (config: ServerConfig) => Promise<McpClient> {
-  return async (config: ServerConfig): Promise<McpClient> => {
+function boundedClientFactory(
+  inner: (config: ServerConfig) => Promise<McpClient>,
+  config: ServerConfig,
+  anchorRef: () => ChildProcess | undefined,
+  anchorTeardowns: Promise<void>[],
+  onTeardownResult: (res: TeardownResult) => void,
+): Promise<McpClient> {
+  return (async () => {
     const deadline = attemptBudgetMs(config);
     const clientPromise = (async () => inner(config))();
     // Swallow a late rejection so the loser of the race cannot surface as an
     // unhandled rejection after the race has already decided.
     clientPromise.catch(() => undefined);
-    const recordPid = (client: McpClient | undefined): void => {
-      const transport = (client as unknown as { transport?: { pid?: number | null } } | undefined)?.transport;
-      if (transport && typeof transport.pid === "number") spawnedPids.add(transport.pid);
-    };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        // Close the transport of a timed-out attempt: no child survives.
-        void clientPromise
-          .then((client) => {
-            recordPid(client);
-            return client.close();
-          })
-          .catch(() => undefined);
+        // Bounded activation: terminate THIS attempt's anchor (the exact
+        // handle the SDK issued; the anchor runs its own gated group cleanup
+        // from inside) — a partial-stdout server that never completes
+        // initialize is still torn down — then close the eventual transport
+        // of the timed-out attempt if it ever connects.
+        const anchorChild = anchorRef();
+        if (anchorChild) {
+          // Awaited at doctor teardown: only proven:true with zero survivors
+          // counts as success; any false result fails the doctor.
+          anchorTeardowns.push(
+            teardownAnchorChild(anchorChild, 5_000).then(onTeardownResult),
+          );
+        }
+        void clientPromise.then((client) => client.close()).catch(() => undefined);
         reject(new Error(`connect timed out after ${deadline}ms`));
       }, deadline);
     });
     try {
       const client = (await Promise.race([clientPromise, timeout])) as McpClient;
-      recordPid(client);
       return client;
     } finally {
       if (timer) clearTimeout(timer);
     }
-  };
-}
-
-/**
- * Resolves once every recorded supervisor process has exited (or the deadline
- * passes). The supervisors are reaped by their owning transports; polling
- * here guarantees the downstream process TREES they killed are gone before
- * the doctor returns instead of dying asynchronously afterwards.
- */
-async function waitForProcessesExit(pids: Iterable<number>, timeoutMs: number): Promise<void> {
-  const unique = [...new Set(pids)];
-  if (unique.length === 0) return;
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const alive = unique.filter((pid) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    });
-    if (alive.length === 0 || Date.now() >= deadline) return;
-    await delay(50);
-  }
+  })();
 }
 
 function describeTransport(transport: ServerConfig["transport"]): string {
@@ -329,16 +202,39 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
   }
 
   // 4. Downstream Server Connectivity & Indexing Status
-  const supervisorPids = new Set<number>();
+  const supervised = supervisedServers(config.servers);
+  // The doctor HOLDS each attempt's anchor ChildProcess (captured from the
+  // transport child at spawn via the client-factory hook) — no disk PID
+  // metadata anywhere, and identity is the exact handle the SDK issued, not
+  // a reconstructed number. Attempt 2's spawn replaces attempt 1's handle in
+  // THIS attempt's closure, so retries are associated correctly.
+  const anchorTeardowns: Promise<void>[] = [];
+  const heldAnchors: ChildProcess[] = [];
+  let teardownSurvivors: number[] = [];
+  let teardownProven = true;
   const hub = new ActionHub({
-    servers: supervisedServers(config.servers),
+    servers: supervised,
     bundles: config.bundles,
     // Bounded activation: the core's execution timeout starts only AFTER the
     // client connects, and client.connect() has no deadline of its own, so a
     // permanently hanging initialize would otherwise hang the doctor. The
-    // wrapped factory bounds every connect attempt and closes the transport
-    // of a timed-out attempt (no child survives).
-    clientFactory: boundedClientFactory(createSdkClientFactory(), supervisorPids),
+    // wrapped factory bounds every connect attempt and tears the attempt's
+    // own anchor tree down at its deadline (no child survives).
+    clientFactory: (config) => {
+      let anchorChild: ChildProcess | undefined;
+      const childFactory = createSdkClientFactory({
+        onChildSpawn: (spawnedConfig, child) => {
+          if (spawnedConfig.id === config.id) {
+            anchorChild = child;
+            heldAnchors.push(child);
+          }
+        },
+      });
+      return boundedClientFactory(childFactory, config, () => anchorChild, anchorTeardowns, (res) => {
+        if (!res.proven) teardownProven = false;
+        teardownSurvivors.push(...res.survivors);
+      });
+    },
   });
 
   // Total budget across all servers and both attempts, so worst case cannot
@@ -347,6 +243,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
   const budget = doctorBudgetMs(options.deadlineMs);
   const budgetLeft = (): number => Math.max(0, budget - (Date.now() - budgetStart));
 
+  let result = 0;
   try {
     console.log("\nServer Connectivity & Indexing Status:");
     // Deterministic rule (F17): a fleet with flapping servers used to make the
@@ -496,13 +393,43 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
         : 0;
     console.log(`  Estimated token savings per turn: ~${savings}%`);
 
-    return criticalFailures > 0 ? 1 : 0;
+    result = criticalFailures > 0 ? 1 : 0;
   } finally {
-    await hub.close();
-    // Every stdio server runs under a doctor supervisor that killed (and was
-    // killed with) its whole downstream process tree. Wait for the
-    // supervisors themselves to be reaped so no descendant outlives the
-    // doctor, then return.
-    await waitForProcessesExit(supervisorPids, 5_000);
+    // Bounded teardown: hub.close() normally ends every anchor (each anchor
+    // then kills its wrapper group), but a wedged close must not hang the
+    // doctor — the anchor meta files allow exact, reuse-safe tree teardown.
+    // Bounded close; the anchored teardown below does not depend on it
+    // succeeding — proof comes from each anchor's own exit status.
+    const closeBudget = Math.max(2_000, Math.min(10_000, budgetLeft()));
+    try {
+      await withDeadline("hub.close", () => hub.close(), closeBudget);
+    } catch {
+      // Bounded: fall through to the anchored teardown below.
+    }
+    // Every attempt teardown fired at a deadline must be settled and proven.
+    await Promise.allSettled(anchorTeardowns);
+    // Every anchor still held by the transport that hub.close() terminated:
+    // proof is the anchor's OWN exit code (0 = verified cleanup), never a
+    // dead-PID inference.
+    for (const anchorChild of heldAnchors) {
+      if (anchorChild.exitCode === EXIT_PROVEN) continue;
+      if (anchorChild.exitCode === null && anchorChild.signalCode === null) {
+        const res = await teardownAnchorChild(anchorChild, 5_000);
+        if (!res.proven) {
+          teardownProven = false;
+          teardownSurvivors.push(...res.survivors);
+        }
+      } else {
+        // Exited nonzero/signalled: the anchor itself reported failure.
+        teardownProven = false;
+      }
+    }
+    if (teardownSurvivors.length > 0 || !teardownProven) {
+      console.error(
+        `Doctor teardown failed closed${teardownSurvivors.length > 0 ? ` (surviving PIDs ${teardownSurvivors.join(", ")})` : ""}; treating as a failure.`,
+      );
+      result = 1;
+    }
   }
+  return result;
 }

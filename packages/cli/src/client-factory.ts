@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -32,6 +33,14 @@ export interface SdkClientFactoryOptions {
   env?: NodeJS.ProcessEnv;
   /** Diagnostics sink. stdout is the MCP channel, so this must not use it. */
   onWarning?: (message: string) => void;
+  /**
+   * Called with the spawned stdio transport child PROCESS HANDLE as soon as
+   * the child exists — BEFORE the client connection resolves. Hosts that own
+   * anchored teardown (doctor) hold the exact ChildProcess issued by the SDK
+   * transport; there is no disk PID metadata and no numeric identity
+   * reconstruction (F39 ruling).
+   */
+  onChildSpawn?: (config: ServerConfig, child: ChildProcess) => void;
 }
 
 /**
@@ -55,6 +64,16 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
     if (config.transport.type === "stdio") {
       const stdioTransport = transport as StdioClientTransport;
       attachSanitizedStderr(stdioTransport, config, options);
+      const onChildSpawn = options.onChildSpawn;
+      if (onChildSpawn && typeof stdioTransport.start === "function") {
+        const startFn = stdioTransport.start;
+        const originalStart = startFn.bind(stdioTransport) as () => Promise<void>;
+        stdioTransport.start = async () => {
+          await originalStart();
+          const child = (stdioTransport as unknown as { _process?: ChildProcess })._process;
+          if (child) onChildSpawn(config, child);
+        };
+      }
     }
 
     // Positively track transport closure so callTool rejections can be

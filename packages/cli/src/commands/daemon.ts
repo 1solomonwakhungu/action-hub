@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile } from "node:fs/promises";import { connect, type Socket } from "node:net";
+import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
+import { spawnAnchor, teardownAnchorChild, type TeardownResult } from "./process-anchor.js";import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { runDaemonServer } from "@action-hub/mcp-server";
@@ -150,7 +151,11 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     ...(options.configPath ? { ACTION_HUB_CONFIG: resolvePath(options.configPath) } : {}),
   };
   let spawnError: Error | undefined;
-  const child = spawn(process.execPath, daemonChildArgs(options.entryPath), {
+  // The daemon runs inside an anchored process group (process-anchor.ts):
+  // the anchor's wrapper is the group leader, so every later group signal is
+  // provably safe (the leader is verified alive before each signal) and the
+  // leader can never be a reused PGID.
+  const child = spawnAnchor("daemon", process.execPath, daemonChildArgs(options.entryPath), {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env,
@@ -178,16 +183,26 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
 
   for (;;) {
     if (spawnError) {
+      await killAndReapSpawned(child);
       // Another concurrent start may have won the race even though ours
       // failed to spawn — report success if a daemon is already ready.
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child);
       console.error(`Could not start Action Hub daemon: ${spawnError.message}`);
       return 1;
     }
     if (childExited) {
+      // Teardown FIRST and consult its PROOF: a failed anchor proof (e.g.
+      // unexpected wrapper death) must never be papered over by a probe that
+      // happens to find the orphaned server of THIS failed start answering.
+      const res = await killAndReapSpawned(child);
+      if (!res.proven || res.survivors.length > 0) {
+        console.error(
+          `Action Hub daemon start teardown failed closed (anchor proof invalid). See ${paths.log}`,
+        );
+        return 1;
+      }
       // Concurrent starts are allowed: if OUR child exited but a daemon is
       // already answering (e.g. a sibling start won the lock), succeed. The
       // sibling may still be mid-startup, so poll briefly instead of a single
@@ -195,7 +210,6 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child);
       console.error(
         `Action Hub daemon exited during startup (code ${childExitCode ?? "signal"}). See ${paths.log}`,
       );
@@ -203,6 +217,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     }
 
     const ready = await daemonReady(paths);
+    if (childExited) continue; // an exited child must take the proof-checked path below
     if (ready?.ok) {
       console.log(`Action Hub daemon started (pid ${ready.pid}).`);
       return 0;
@@ -236,70 +251,32 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   }
 
   console.error(`Action Hub daemon did not become ready. See ${paths.log}`);
+  // Teardown FIRST and consult the proof (same as the childExited path): the
+  // orphaned server of THIS failed start must never satisfy the sibling
+  // winner probe.
+  const res = await killAndReapSpawned(child);
+  if (!res.proven || res.survivors.length > 0) return 1;
   if (await waitForAnotherDaemon(paths)) return 0;
-  await killAndReapSpawned(child);
   return 1;
 }
 
 /**
- * Terminates and reaps the detached child (and its whole process group) this
- * start spawned. Called on EVERY failure path before returning: a daemon that
- * never became ready must not survive its own failed start as an orphan.
+ * Terminates and reaps the anchored daemon tree this start spawned. Called on
+ * EVERY failure path before returning: a daemon that never became ready must
+ * not survive its own failed start as an orphan. The host only signals the
+ * ANCHOR it spawned (single-PID, always safe); the anchor performs its own
+ * gated group cleanup from inside. If the anchor cannot be proven cleaned,
+ * the result fails closed — no group is ever signalled on guesswork.
  */
-async function killAndReapSpawned(child: ChildProcess): Promise<void> {
-  if (!child.pid) return;
-  const pid = child.pid;
-  const isWindows = platform() === "win32";
-  // True while ANY member of the daemon's process group still lives — direct
-  // child exit is NOT tree death, so verification must always target the
-  // group, even when the leader has already exited.
-  const groupAlive = (): boolean => {
-    if (isWindows) return false;
-    try {
-      process.kill(-pid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException)?.code !== "ESRCH";
-    }
-  };
-  const signalTree = (signal: NodeJS.Signals): void => {
-    if (isWindows) {
-      // child.kill does not kill a Windows process tree; taskkill /T /F does.
-      const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
-      tk.on("error", () => {
-        try {
-          child.kill("SIGKILL");
-        } catch {}
-      });
-      return;
-    }
-    try {
-      process.kill(-pid, signal);
-    } catch {
-      // Leader already exited and no group members remain.
-    }
-    try {
-      child.kill(signal);
-    } catch {}
-  };
-  signalTree("SIGTERM");
-  await delay(150);
-  if (isWindows) {
-    // Await the force kill before verifying.
-    await new Promise<void>((resolve) => {
-      const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
-      tk.on("exit", () => resolve());
-      tk.on("error", () => resolve());
-    });
-  } else {
-    signalTree("SIGKILL");
+async function killAndReapSpawned(child: ChildProcess): Promise<TeardownResult> {
+  if (!child.pid) return { survivors: [], proven: false };
+  const result = await teardownAnchorChild(child, 5_000);
+  if (!result.proven || result.survivors.length > 0) {
+    console.error(
+      `Warning: daemon start teardown could not be proven (anchor pid ${child.pid}${result.survivors.length > 0 ? `, surviving: ${result.survivors.join(", ")}` : ""}).`,
+    );
   }
-  const deadline = Date.now() + 5_000;
-  for (;;) {
-    if (!groupAlive()) return;
-    if (Date.now() >= deadline) return;
-    await delay(50);
-  }
+  return result;
 }
 
 /**

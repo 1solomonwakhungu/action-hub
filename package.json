@@ -21,7 +21,7 @@
     "build:bundle": "node scripts/bundle.mjs",
     "build:binary": "node scripts/build-binary.mjs",
     "dist": "npm run build && npm run build:bundle && npm run build:binary",
-    "smoke:binary": "node scripts/smoke-test.mjs",
+    "smoke:binary": "node scripts/smoke-test.mjs && node scripts/anchor-loss-regression.mjs",
     "checksums": "node scripts/checksums.mjs",
     "gen:homebrew": "node scripts/gen-homebrew.mjs",
     "gen:winget": "node scripts/gen-winget.mjs",
