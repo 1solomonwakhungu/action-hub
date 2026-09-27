@@ -204,6 +204,24 @@ Edit `~/.codeium/windsurf/mcp_config.json` and add:
 
 Restart Windsurf or reload the window, then check the MCP servers panel.
 
+## MCP startup timeouts (verified)
+
+MCP hosts kill a server spawn if `initialize` doesn't complete within their
+startup budget. The budgets verified against real harnesses at fleet scale
+(44 servers / 10,000 tools / 5,000 skills):
+
+| Harness | MCP startup budget | Source |
+| --- | --- | --- |
+| pi (pi-mcp-adapter) | **30 s** (`INIT_WAIT_TIMEOUT_MS`) | pi-mcp-adapter `index.ts:30` |
+| Codex | **30 s** (`DEFAULT_STARTUP_TIMEOUT`) | [openai/codex `rust-v0.154.0`](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/codex-mcp/src/rmcp_client.rs#L102) (`codex-rs/codex-mcp/src/rmcp_client.rs:102`); the 1.1 s constant is `DEFAULT_OPTIONAL_MCP_STARTUP_GRACE`, not a spawn kill |
+
+Typical hub startup at 15K actions: cold `createHubRuntime` ≈ **20 s**
+(warm cache ≈ **13 s**); with the deferred-startup refresh (#68) a warm hub
+serves `initialize` immediately and re-indexes afterwards (PR #68 measured
+warm initialize at **1.5 s**, down from 4.1 s). Hosts with tight defaults —
+e.g. Codex's optional-server 1.1 s grace — should point the config at the
+shared daemon or raise `startup_timeout_ms` in their MCP config.
+
 ## Verifying the setup
 
 From the checkout, run:
