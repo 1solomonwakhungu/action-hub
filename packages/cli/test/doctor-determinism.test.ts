@@ -490,9 +490,11 @@ test("unexpected wrapper death yields a failed anchor proof, not a green teardow
   const tempDir = await mkdtemp(join(tmpdir(), "ah-anchor-victim-"));
   const { spawnAnchor, EXIT_PROVEN, teardownAnchorChild, EXIT_FAILED } =
     await import("../dist/commands/process-anchor.js");
+  const ownedPids: number[] = [];
+  let savedPidFile: string | undefined;
   try {
     await writeFile(join(tempDir, "recorded-pids.txt"), "");
-    const savedPidFile = process.env["TREE_PIDS_FILE"];
+    savedPidFile = process.env["TREE_PIDS_FILE"];
     process.env["TREE_PIDS_FILE"] = join(tempDir, "recorded-pids.txt");
     const anchor = spawnAnchor(
       "daemon",
@@ -534,18 +536,44 @@ test("unexpected wrapper death yields a failed anchor proof, not a green teardow
       .map((l) => Number.parseInt(l.trim(), 10))
       .filter((n) => Number.isSafeInteger(n) && n > 0);
     assert.equal(recordedPids.length, 1, "expected exactly one recorded server PID");
+    ownedPids.push(...recordedPids);
     let serverWasAlive = false;
     try {
       process.kill(recordedPids[0]!, 0);
       serverWasAlive = true;
     } catch {}
     assert.equal(serverWasAlive, true, "server survivor must not be killed by a guessed group signal");
-    try {
-      process.kill(recordedPids[0]!, "SIGKILL");
-    } catch {}
     void spawn;
     void EXIT_PROVEN;
   } finally {
+    // Cleanup MUST run even when the regression is red: restore env and kill
+    // only the exact PIDs this test owns (never leak the survivor).
+    if (savedPidFile === undefined) delete process.env["TREE_PIDS_FILE"];
+    else process.env["TREE_PIDS_FILE"] = savedPidFile;
+    for (const pid of ownedPids) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    // Give owned processes a bounded window to die, then verify.
+    const cleanupDeadline = Date.now() + 5_000;
+    let stillAlive: number[] = [];
+    do {
+      await new Promise((r) => setTimeout(r, 250));
+      stillAlive = ownedPids.filter((pid) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    } while (stillAlive.length > 0 && Date.now() < cleanupDeadline);
+    for (const pid of stillAlive) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
     await rm(tempDir, { recursive: true, force: true });
   }
 });

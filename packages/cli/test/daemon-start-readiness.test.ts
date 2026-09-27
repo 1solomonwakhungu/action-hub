@@ -254,3 +254,84 @@ test("failed start reaps the process group even when the daemon exits on its own
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// PR 77 rework round 5: an anchor EXIT_FAILED proof must NEVER take the
+// concurrent-winner success path. The orphaned server of THIS failed start
+// answers the ready probe; the old code reported "already running" and exit 0.
+test("a failed anchor proof never yields the concurrent-winner success path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ah-dstart-victim-"));
+  const daemonDir = join(root, "daemon");
+  const pidFile = join(root, "recorded-pids.txt");
+  await writeFile(pidFile, "");
+  const env = stubEnv({ TREE_PIDS_FILE: pidFile });
+  const ownedPids: number[] = [];
+  const captured = captureConsole();
+  try {
+    const startPromise = daemonStartCommand({
+      daemonDir,
+      entryPath: resolve(testDir, "fixtures/wrapper-victim-daemon.mjs"),
+      startTimeoutMs: 30_000,
+      configPath: join(root, "servers.json"),
+      onSpawn: (pid) => void ownedPids.push(pid),
+    });
+    // Kill ONLY the wrapper as soon as the fixture reports its PPID, exactly
+    // like the reviewer's manual repro (kill after daemon start, before the
+    // child-exit path is considered).
+    const killDeadline = Date.now() + 10_000;
+    let wrapperKilled = false;
+    while (!wrapperKilled && Date.now() < killDeadline) {
+      try {
+        const lines = (await readFile(pidFile, "utf8")).split("\n");
+        const ppidLine = lines.find((l) => /^PPID:\d+$/.test(l.trim()));
+        if (ppidLine) {
+          const wrapperPid = Number.parseInt(ppidLine.trim().slice(5), 10);
+          process.kill(wrapperPid, "SIGKILL");
+          wrapperKilled = true;
+        }
+      } catch {
+        // file not written yet
+      }
+      if (!wrapperKilled) await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(wrapperKilled, "fixture must report the wrapper PID in time");
+    const code = await startPromise;
+    assert.equal(code, 1, `expected fail-closed exit 1, got 0 (false green winner path)`);
+  } finally {
+    // Cleanup MUST run even when the regression is red: restore env, kill
+    // only the exact PIDs this test owns (the orphaned server included).
+    // The fixture records SERVER:<pid> and PPID:<wrapper> in pidFile.
+    try {
+      const recorded = (await readFile(pidFile, "utf8")).split("\n");
+      for (const line of recorded) {
+        const m = line.match(/^SERVER:(\d+)$/);
+        if (m) ownedPids.push(Number.parseInt(m[1]!, 10));
+      }
+    } catch {}
+    for (const pid of ownedPids) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {}
+    }
+    const deadline = Date.now() + 5_000;
+    let alive: number[] = [];
+    do {
+      await new Promise((r) => setTimeout(r, 250));
+      alive = ownedPids.filter((pid) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    } while (alive.length > 0 && Date.now() < deadline);
+    for (const pid of alive) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {}
+    }
+    env.restore();
+    captured.restore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
