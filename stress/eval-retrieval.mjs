@@ -480,6 +480,36 @@ function percentileSelfTest() {
   ];
   eq(Number(macroRecallAt(fakeRows, 5).toFixed(4)), 0.625, "macro recall@5 per-query mean");
   eq(Number(microRecallAt(fakeRows, 5).toFixed(4)), 0.4, "micro recall@5 gold-weighted");
+  // F52: the validators must reject malformed rows (fail closed), including
+  // the previously-passing expected=null single-gold hole.
+  const good = [{ query: "q1", expected: "a:tool", subtype: "exact", difficulty: "exact" }];
+  const goodSkill = [{ query: "s1", expected: "skill:x", subtype: "noisy", difficulty: "hard" }];
+  const vbase = { manifests: [], skills: [], idMismatches: 0 };
+  validateGeneratedCorpus({ ...vbase, queries: good, skillQueries: [], expectCounts: false });
+  validateGeneratedCorpus({ ...vbase, queries: [], skillQueries: goodSkill, expectCounts: false });
+  // Negative tests through the skillQueries path as well (reviewer-2).
+  const badSkillPairs = [
+    [{ query: "s", expected: "skill:x", subtype: "exact", difficulty: "hard" }],
+    [{ query: "s", expected: null, expectedAll: ["skill:a", "skill:b"], subtype: "multi", difficulty: "paraphrase" }],
+  ];
+  for (const bad of badSkillPairs) {
+    let threw = false;
+    try { validateGeneratedCorpus({ ...vbase, queries: [], skillQueries: bad, expectCounts: false }); } catch { threw = true; }
+    eq(threw, true, `validator must reject malformed skill row: ${JSON.stringify(bad)}`);
+  }
+  for (const bad of [
+    [{ query: "q", expected: null, subtype: "exact", difficulty: "exact" }],
+    [{ query: "q", expected: null, expectedAll: ["a", "b"], subtype: "exact", difficulty: "exact" }],
+    [{ query: "q", expected: "g", subtype: "bogus", difficulty: "exact" }],
+    [{ query: "q", expected: "g", subtype: "exact", difficulty: "weird" }],
+    [{ query: "q", expected: null, expectedAll: ["only1"], subtype: "multi", difficulty: "hard" }],
+    [{ query: "q", expected: null, expectedAll: ["a", "b"], subtype: "no-match", difficulty: "hard" }],
+  ]) {
+    let threw = false;
+    try { validateGeneratedCorpus({ ...vbase, queries: bad, skillQueries: [], expectCounts: false }); } catch { threw = true; }
+    eq(threw, true, `validator must reject malformed row: ${JSON.stringify(bad)}`);
+  }
+  console.error("[eval-retrieval] validator self-test passed");
 }
 
 function scoreEngine(rows, latencies, fpThreshold) {
@@ -632,24 +662,44 @@ function goldsOf(q) {
  * Fail-closed corpus validation (reviewer-2 blocker 5): a partial or
  * malformed fixture set must never silently pass as "full-generated".
  */
-function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idMismatches }) {
+const VALID_SUBTYPES = ["exact", "paraphrase", "goal-only", "near-duplicate", "noisy", "multi", "no-match"];
+const VALID_DIFFICULTIES = ["exact", "paraphrase", "hard"];
+// F52 rework (reviewer-2): subtype->difficulty is part of the contract, not a
+// free pair. exact/paraphrase map to themselves; everything else is hard.
+const SUBTYPE_DIFFICULTY = {
+  exact: "exact",
+  paraphrase: "paraphrase",
+  "goal-only": "hard",
+  "near-duplicate": "hard",
+  noisy: "hard",
+  multi: "hard",
+  "no-match": "hard",
+};
+
+function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idMismatches, expectCounts = true }) {
   const errors = [];
-  const toolCount = manifests.reduce((s, m) => s + m.tools.length, 0);
-  if (manifests.length !== 44) errors.push(`expected 44 server manifests, got ${manifests.length}`);
-  if (toolCount !== 10000) errors.push(`expected 10,000 tools, got ${toolCount}`);
-  if (skills.length !== 5000) errors.push(`expected 5,000 skills, got ${skills.length}`);
-  if (queries.length !== 1500) errors.push(`expected 1,500 tool queries, got ${queries.length}`);
-  if (skillQueries?.length !== 500) errors.push(`expected 500 skill queries, got ${skillQueries?.length ?? 0}`);
-  const mix = countBy(queries, (q) => q.subtype);
-  const CONTRACT_MIX = { exact: 300, paraphrase: 300, "goal-only": 300, "near-duplicate": 375, multi: 150, "no-match": 75 };
-  for (const [st, want] of Object.entries(CONTRACT_MIX)) {
-    if ((mix[st] ?? 0) !== want) errors.push(`tool query mix ${st}: expected ${want}, got ${mix[st] ?? 0}`);
+  if (expectCounts) {
+    // Count guards run only on REAL generated corpora; the self-test bypasses
+    // them to exercise the row-shape rules on tiny synthetic fixtures.
+    const toolCount = manifests.reduce((s, m) => s + m.tools.length, 0);
+    if (manifests.length !== 44) errors.push(`expected 44 server manifests, got ${manifests.length}`);
+    if (toolCount !== 10000) errors.push(`expected 10,000 tools, got ${toolCount}`);
+    if (skills.length !== 5000) errors.push(`expected 5,000 skills, got ${skills.length}`);
+    if (queries.length !== 1500) errors.push(`expected 1,500 tool queries, got ${queries.length}`);
+    if (skillQueries?.length !== 500) errors.push(`expected 500 skill queries, got ${skillQueries?.length ?? 0}`);
+    const mix = countBy(queries, (q) => q.subtype);
+    const CONTRACT_MIX = { exact: 300, paraphrase: 300, "goal-only": 300, "near-duplicate": 375, multi: 150, "no-match": 75 };
+    for (const [st, want] of Object.entries(CONTRACT_MIX)) {
+      if ((mix[st] ?? 0) !== want) errors.push(`tool query mix ${st}: expected ${want}, got ${mix[st] ?? 0}`);
+    }
   }
   if ((idMismatches ?? 0) !== 0) errors.push(`${idMismatches} skill id mismatches vs parseSkillContent`);
   for (const set of [queries, ...(skillQueries ? [skillQueries] : [])]) {
     for (const q of set) {
       if (typeof q.query !== "string" || q.query.trim() === "") { errors.push(`invalid query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
-      if (!["exact", "paraphrase", "hard"].includes(q.difficulty)) { errors.push(`unknown difficulty "${q.difficulty}" on: ${String(q.query).slice(0, 60)}`); break; }
+      if (!VALID_DIFFICULTIES.includes(q.difficulty)) { errors.push(`unknown difficulty "${q.difficulty}" on: ${String(q.query).slice(0, 60)}`); break; }
+      if (SUBTYPE_DIFFICULTY[q.subtype] !== q.difficulty) { errors.push(`subtype/difficulty mismatch: ${q.subtype} requires difficulty "${SUBTYPE_DIFFICULTY[q.subtype]}", got "${q.difficulty}" on: ${String(q.query).slice(0, 60)}`); break; }
+      if (!VALID_SUBTYPES.includes(q.subtype)) { errors.push(`unknown subtype "${q.subtype}" on: ${String(q.query).slice(0, 60)}`); break; }
       const hasExpected = typeof q.expected === "string" || q.expected === null;
       const hasExpectedAll = Array.isArray(q.expectedAll);
       if (!hasExpected && !hasExpectedAll) { errors.push(`query without expected/expectedAll: ${String(q.query).slice(0, 60)}`); break; }
@@ -660,7 +710,9 @@ function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idM
       // or the binding by-difficulty/by-subtype gates are unprotected.
       if (q.subtype === "no-match" && (q.expected !== null || hasExpectedAll)) { errors.push(`no-match row with a gold: ${String(q.query).slice(0, 60)}`); break; }
       if (q.subtype === "multi" && !(hasExpectedAll && q.expectedAll.length >= 2)) { errors.push(`multi row without 2-4 golds: ${String(q.query).slice(0, 60)}`); break; }
-      if (q.subtype !== "multi" && q.subtype !== "no-match" && !(hasExpected && !hasExpectedAll)) { errors.push(`${q.subtype} row must have a single gold and no expectedAll: ${String(q.query).slice(0, 60)}`); break; }
+      // F52: single-gold rows require a NON-NULL string expected — the old
+      // hasExpected accepted expected=null and let a goldless row pass.
+      if (q.subtype !== "multi" && q.subtype !== "no-match" && !(typeof q.expected === "string" && q.expected.length > 0 && !hasExpectedAll)) { errors.push(`${q.subtype} row must have a non-empty single gold and no expectedAll: ${String(q.query).slice(0, 60)}`); break; }
     }
   }
   const uniqueQueries = new Set(queries.map((q) => q.query));
@@ -718,7 +770,13 @@ async function runEval() {
   // gates stay on the generated corpus (binding until the contract changes).
   const REALISTIC_PATH = join(STRESS_DIR, "fixtures", "realistic-queries.json");
   let realistic = null;
-  if (existsSync(REALISTIC_PATH)) {
+  // The realistic fixture's gold ids exist only in the generated corpus; in
+  // self-fixtures mode (clean-clone --quick smoke) they are absent by
+  // construction, so the headline set is skipped with an explicit note
+  // instead of failing closed on a known-good fixture (F52 ledger item 2).
+  if (mode !== "full-generated") {
+    console.error(`[eval-retrieval] realistic fixture skipped: self-fixtures mode has none of the realistic gold ids (full-generated corpus required)`);
+  } else if (existsSync(REALISTIC_PATH)) {
     const raw = JSON.parse(readFileSync(REALISTIC_PATH, "utf8"));
     const list = Array.isArray(raw) ? raw : raw.queries;
     // Fail closed with the FULL v2 schema on the realistic fixture as well
@@ -726,13 +784,18 @@ async function runEval() {
     // subtype whitelist, mix counts, unique queries.
     const rErrors = [];
     if (list.length !== 121) rErrors.push(`expected 121 realistic rows, got ${list.length}`);
-    const SUBTYPES = ["paraphrase", "goal-only", "near-duplicate", "multi", "no-match"];
+    const SUBTYPES = VALID_SUBTYPES;
     const EXPECTED_MIX = { paraphrase: 40, "goal-only": 30, "near-duplicate": 20, multi: 16, "no-match": 15 };
     const seenMix = {};
     for (const q of list) {
       if (typeof q.query !== "string" || q.query.trim() === "") { rErrors.push(`invalid realistic query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
       if (!SUBTYPES.includes(q.subtype)) { rErrors.push(`unknown realistic subtype: ${q.subtype}`); break; }
-      if (!q.difficulty) { rErrors.push(`missing difficulty on realistic row: ${q.query.slice(0, 60)}`); break; }
+      // F52: whitelist difficulty and enforce full subtype/shape semantics.
+      if (!VALID_DIFFICULTIES.includes(q.difficulty)) { rErrors.push(`unknown realistic difficulty "${q.difficulty}": ${q.query.slice(0, 60)}`); break; }
+      if (SUBTYPE_DIFFICULTY[q.subtype] !== q.difficulty) { rErrors.push(`subtype/difficulty mismatch: ${q.subtype} requires difficulty "${SUBTYPE_DIFFICULTY[q.subtype]}", got "${q.difficulty}": ${q.query.slice(0, 60)}`); break; }
+      if (q.subtype === "no-match" && (q.expected !== null || "expectedAll" in q)) { rErrors.push(`realistic no-match row with a gold: ${q.query.slice(0, 60)}`); break; }
+      if (q.subtype === "multi" && !(Array.isArray(q.expectedAll) && q.expectedAll.length >= 2 && q.expectedAll.length <= 4)) { rErrors.push(`realistic multi row without 2-4 golds: ${q.query.slice(0, 60)}`); break; }
+      if (q.subtype !== "multi" && q.subtype !== "no-match" && !(typeof q.expected === "string" && q.expected.length > 0 && !("expectedAll" in q))) { rErrors.push(`realistic ${q.subtype} row must have a non-empty single gold and no expectedAll: ${q.query.slice(0, 60)}`); break; }
       const hasExpected = typeof q.expected === "string" || q.expected === null;
       const hasExpectedAll = Array.isArray(q.expectedAll);
       if (!hasExpected && !hasExpectedAll) { rErrors.push(`realistic row without expected/expectedAll: ${q.query.slice(0, 60)}`); break; }
@@ -950,19 +1013,6 @@ async function runEval() {
   // harness contract turns it into the exit code and the last stdout line.
   summary.ok = Object.values(gateChecks).every((c) => c.pass);
   return summary;
-  // Human-readable tail (stdout), then the machine-readable JSON as the LAST line.
-  console.log(`# mode=${mode} tools=${summary.corpus.tools} skills=${summary.corpus.skills} queries=${queries.length} (${excluded} excluded)`);
-  for (const [name, r] of Object.entries(results)) {
-    console.log(`# ${name}: r@1=${fmt(r.recallAt1)} r@5=${fmt(r.recallAt5)} r@10=${fmt(r.recallAt10)} r@20=${fmt(r.recallAt20)} mrr@10=${fmt(r.mrrAt10)} ndcg@10=${fmt(r.ndcgAt10)} p95=${r.latency.warmP95Ms}ms`);
-  }
-  for (const row of sweep) {
-    console.log(`# prefix ${row.prefixSize}: ` + SWEEP_ENGINES.map((n) => `${n} r@5=${fmt(row.engines[n].recallAt5)} p95=${row.engines[n].warmP95Ms.toFixed(0)}ms build=${row.engines[n].indexBuildMs}ms`).join(" | "));
-  }
-  for (const [check, res] of Object.entries(gateChecks)) {
-    console.log(`# gate ${check}: ${res.pass ? "PASS" : "FAIL"} (actual=${fmt(res.actual)} target=${res.target})`);
-  }
-  console.log(`# token savings: ${(savings * 100).toFixed(1)}% (all-def=${allDefTokens} per-response=${hubPerResponseTokens})`);
-  console.log(JSON.stringify(summary));
 }
 
 function fmt(v) {
@@ -980,13 +1030,15 @@ function countBy(arr, keyFn) {
 // Shared-harness failure envelope (PR 64): isolation, summary contract and
 // exit code all come from stress/lib/harness.mjs. setupIsolation, the local
 // withTimeout-guarded runner and the local write/exit logic are gone.
-percentileSelfTest();
-
 harnessMain(async () => {
   // Isolate THIS process first: every checklist env var is replaced under one
   // fresh run root before any hub construction.
   const sandbox = createSandbox({ prefix: "action-hub-eval-" });
   Object.assign(process.env, sandbox.env);
   assertIsolated(process.env, sandbox.root);
+  // Self-tests run INSIDE the harness finish path (reviewer-2 blocker 3): a
+  // self-test regression must produce the final ok:false JSON + failure
+  // artifact + nonzero exit, not a bare crash outside the contract.
+  percentileSelfTest();
   return runEval();
 }, { resultsPath: join(RESULTS_DIR, "eval-retrieval.json") });
