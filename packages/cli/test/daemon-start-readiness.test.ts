@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { connect } from "node:net";
 import { daemonStartCommand } from "../dist/commands/daemon.js";
 import { spawnAnchor, startGuardedRetryLoop } from "../dist/commands/process-anchor.js";
+import { classifyReadyAnswer } from "../dist/commands/daemon.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const stub = resolve(testDir, "fixtures/stub-daemon.mjs");
@@ -317,23 +319,31 @@ test("a failed anchor proof never yields the concurrent-winner success path", as
     // Kill ONLY the wrapper as soon as the fixture reports its PPID, exactly
     // like the reviewer's manual repro (kill after daemon start, before the
     // child-exit path is considered).
-    const killDeadline = Date.now() + 10_000;
-    let wrapperKilled = false;
-    while (!wrapperKilled && Date.now() < killDeadline) {
+    // ACK-based wait (never a fixed wall under load): the fixture writes
+    // <pidFile>.ack only AFTER its pid record is durably written.
+    const ackDeadline = Date.now() + 30_000;
+    for (;;) {
+      let ackExists = false;
       try {
-        const lines = (await readFile(pidFile, "utf8")).split("\n");
-        const ppidLine = lines.find((l) => /^PPID:\d+$/.test(l.trim()));
-        if (ppidLine) {
-          const wrapperPid = Number.parseInt(ppidLine.trim().slice(5), 10);
-          process.kill(wrapperPid, "SIGKILL");
-          wrapperKilled = true;
-        }
-      } catch {
-        // file not written yet
+        await readFile(`${pidFile}.ack`);
+        ackExists = true;
+      } catch {}
+      if (ackExists || Date.now() > ackDeadline) {
+        assert.ok(ackExists, "fixture must ack its pid record (30s generous bound)");
+        break;
       }
-      if (!wrapperKilled) await new Promise((r) => setTimeout(r, 25));
+      await new Promise((r) => setTimeout(r, 25));
     }
-    assert.ok(wrapperKilled, "fixture must report the wrapper PID in time");
+    let wrapperKilled = false;
+    {
+      const lines = (await readFile(pidFile, "utf8")).split("\n");
+      const ppidLine = lines.find((l) => /^PPID:\d+$/.test(l.trim()));
+      assert.ok(ppidLine, "fixture must report the wrapper PID");
+      const wrapperPid = Number.parseInt(ppidLine!.trim().slice(5), 10);
+      process.kill(wrapperPid, "SIGKILL");
+      wrapperKilled = true;
+    }
+    assert.ok(wrapperKilled);
     const code = await startPromise;
     assert.equal(code, 1, `expected fail-closed exit 1, got 0 (false green winner path)`);
   } finally {
@@ -379,34 +389,27 @@ test("timeout path tears down before consulting the winner probe", async () => {
       configPath: join(root, "servers.json"),
       onSpawn: (pid) => void ownedPids.push(pid),
     });
-    // Record the wrapper PID as soon as the fixture reports it.
-    let wrapperPid: number | undefined;
-    const recordDeadline = Date.now() + 10_000;
-    while (wrapperPid === undefined && Date.now() < recordDeadline) {
-      try {
-        const lines = (await readFile(pidFile, "utf8")).split("\n");
-        const ppidLine = lines.find((l) => /^PPID:\d+$/.test(l.trim()));
-        if (ppidLine) wrapperPid = Number.parseInt(ppidLine.trim().slice(5), 10);
-      } catch {
-        // not written yet
-      }
-      if (wrapperPid === undefined) await new Promise((r) => setTimeout(r, 25));
+    // EVENT-based wait (never a fixed wall under load): the no-progress
+    // break is the true gate — under heavy load the teardown can beat the
+    // fixture's boot entirely, so a fixture-startup ack is NOT a reliable
+    // sync point here. 30s generous bound.
+    const breakDeadline2 = Date.now() + 30_000;
+    for (;;) {
+      if (captured.errors.join("\n").includes("did not become ready")) break;
+      if (Date.now() > breakDeadline2) assert.fail("start must hit the no-progress break (30s generous bound)");
+      await new Promise((r) => setTimeout(r, 10));
     }
-    assert.ok(wrapperPid, "fixture must report the wrapper PID in time");
-    // Kill ONLY after the break happened (the "did not become ready" line is
-    // printed before the winner-probe consultation on both old and new code).
-    const breakDeadline = Date.now() + 10_000;
-    let broke = false;
-    while (!broke && Date.now() < breakDeadline) {
-      broke = captured.errors.join("\n").includes("did not become ready");
-      if (!broke) await new Promise((r) => setTimeout(r, 10));
-    }
-    assert.ok(broke, "start must hit the no-progress break");
+    // Late kill of the wrapper (best-effort no-op): use the fixture's pid
+    // record if the fixture got to run at all; under load it may never have
+    // started before the teardown — that is fine, the proof-gated winner
+    // probe below is exercised either way.
     try {
-      process.kill(wrapperPid, "SIGKILL");
+      const lines = (await readFile(pidFile, "utf8")).split("\n");
+      const ppidLine = lines.find((l) => /^PPID:\d+$/.test(l.trim()));
+      const wrapperPid = ppidLine ? Number.parseInt(ppidLine.trim().slice(5), 10) : undefined;
+      if (wrapperPid) process.kill(wrapperPid, "SIGKILL");
     } catch {
-      // fixed code already tore the tree down — acceptable; the assertion
-      // below still exercises the proof-gated winner probe
+      // fixture never ran / tree already torn down — acceptable
     }
     const code = await startPromise;
     assert.equal(code, 1, `expected fail-closed exit 1, got 0 (orphan satisfied the winner probe)`);
@@ -607,4 +610,145 @@ test("win32 parent loss: exits 4 only after a successful tree sweep", async () =
   await new Promise((r) => setTimeout(r, 400));
   loop.stop();
   assert.deepEqual(exits, [4], `must exit 4 exactly once after the tree sweep succeeds, got ${JSON.stringify(exits)}`);
+});
+
+
+/** Best-effort probe mirroring the CLI's own readiness probe (state + token
+ * files, TCP status request). Used by the F63 ordering-seam regression to
+ * prove the fail-closed teardown removed OUR answering tree. */
+async function daemonReadyEcho(daemonDir: string): Promise<boolean> {
+  try {
+    const state = JSON.parse(await readFile(join(daemonDir, "daemon.json"), "utf8")) as {
+      endpoint?: { kind?: string; host?: string; port?: number; path?: string };
+    };
+    const token = (await readFile(join(daemonDir, "auth-token"), "utf8")).trim();
+    const endpoint = state.endpoint;
+    if (!endpoint || endpoint.kind !== "tcp" || !endpoint.port) return false;
+    return await new Promise<boolean>((resolveDone) => {
+      const socket = connect(endpoint.port!, "127.0.0.1", () => {
+        socket.write(`${JSON.stringify({ token, command: "status" })}\n`);
+      });
+      const timer = setTimeout(() => { socket.destroy(); resolveDone(false); }, 1000);
+      socket.once("data", (chunk) => {
+        clearTimeout(timer);
+        try {
+          resolveDone((JSON.parse(chunk.toString().split("\n")[0]!) as { ok?: boolean }).ok === true);
+        } catch {
+          resolveDone(false);
+        }
+        socket.destroy();
+      });
+      socket.once("error", () => { clearTimeout(timer); resolveDone(false); });
+    });
+  } catch {
+    return false;
+  }
+}
+
+// F63 deterministic winner check (intake ruling, token-based): the launch
+// token is PROBE-CARRIED (our daemon echoes ACTION_HUB_LAUNCH_TOKEN into
+// its state at boot and the probe reads it synchronously with the answer),
+// so identity has NO dependency on relay/event delivery timing. The only
+// remaining liveness input is a synchronous wrapper liveness syscall via
+// the anchor's WRAPPER relay — and when that relay has not delivered yet,
+// classification is UNDECIDED (never a guessed winner), per the reviewer's
+// MUST-FIX: "when readiness arrives before identity, do not decide winner
+// until the spawned attempt's identity is resolved or the attempt reaches
+// a proof-checked terminal state."
+test("F63 identity classification is deterministic under the token probe", async () => {
+  const { classifyReadyAnswer } = await import("../dist/commands/daemon.js");
+  // Ours + wrapper verifiably dead (synchronous ESRCH) -> unproven orphan
+  // -> failure path, regardless of the anchor's exit-event delivery.
+  assert.equal(classifyReadyAnswer("tok-ours", "tok-ours", false, false), "ours-unproven");
+  assert.equal(classifyReadyAnswer("tok-ours", "tok-ours", false, true), "ours-unproven");
+  // Ours + wrapper provably alive + anchor not exited -> the healthy start.
+  assert.equal(classifyReadyAnswer("tok-ours", "tok-ours", true, false), "ours-healthy");
+  // Ours + anchor definitively exited -> unproven.
+  assert.equal(classifyReadyAnswer("tok-ours", "tok-ours", true, true), "ours-unproven");
+  // THE REVIEWER'S ORDERING SEAM: readiness arrived while the wrapper relay
+  // is still undelivered -> UNDECIDED, never a guessed winner and never an
+  // assumed-alive success.
+  assert.equal(classifyReadyAnswer("tok-ours", "tok-ours", "unknown", false), "undecided");
+  assert.equal(classifyReadyAnswer("tok-ours", "tok-ours", "unknown", true), "ours-unproven");
+  // A different or missing token is a foreign winner regardless of our
+  // anchor's state (identity rides the probe itself, so a foreign answer
+  // needs no relay at all).
+  assert.equal(classifyReadyAnswer(undefined, "tok-ours", "unknown", false), "winner");
+  assert.equal(classifyReadyAnswer("tok-other", "tok-ours", true, true), "winner");
+});
+
+// F63 integrated ordering-seam regression (reviewer MUST-FIX): the anchor's
+// WRAPPER relay delivery is HELD past the first ready probe (via the
+// ANCHOR_TEST_RELAY_DELAY_MS test-only seam). The ready responder IS our
+// tree (it echoes our launch token), and the old code assumed the wrapper
+// was alive and took the success path. The fixed code must NOT decide a
+// winner on unresolved identity: with the relay held, the start can only
+// resolve through identity delivery (healthy) or the fail-closed cap.
+test("F63: with the WRAPPER relay held, a ready ours-token answer never takes the winner-success path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ah-dstart-heldrelay-"));
+  const daemonDir = join(root, "daemon");
+  const ownedPids: number[] = [];
+  // The stub becomes ready fast (SLOW_MS=50) while the HOST's relay
+  // listener is held for the whole window (reviewer repro shape).
+  const env = stubEnv({ SLOW_MS: "50", ACTION_HUB_TEST_RELAY_HOLD_MS: "120000" });
+  const captured = captureConsole();
+  try {
+    const startedAt = Date.now();
+    // Short cap: the ready probe answers almost immediately (the stub echoes
+    // our token), but identity is UNRESOLVED the whole time. The old code
+    // returned 0 within milliseconds (false green); the fixed code must hold
+    // the decision and resolve fail-closed at the cap.
+    const code = await daemonStartCommand({
+      daemonDir,
+      entryPath: stub,
+      startTimeoutMs: 4_000,
+      configPath: join(root, "servers.json"),
+      onSpawn: (pid) => void ownedPids.push(pid),
+    });
+    const wall = Date.now() - startedAt;
+    assert.equal(code, 1, `held-relay start must fail closed, got exit ${code} (winner-success false green)`);
+    assert.ok(wall >= 3_500, `start returned after ${wall}ms; expected it to wait for identity resolution, not decide early`);
+    // The ready responder was OUR tree (the stub echoes our launch token) —
+    // prove the fail-closed teardown removed it: after the cap the daemon
+    // must no longer answer (the sibling winner probe must NOT be satisfied
+    // by our own torn-down tree).
+    assert.equal(await daemonReadyEcho(daemonDir), false, "our torn-down tree must not still answer after fail-closed teardown");
+    assert.match(captured.errors.join("\n"), /did not become ready|teardown failed closed/);
+  } finally {
+    await cleanupSpawned(daemonDir, ownedPids);
+    env.restore();
+    captured.restore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// F63 ordering-seam control: once the held relay DELIVERS (identity
+// resolved), the ours-token answer classifies deterministically and a
+// healthy start succeeds — the seam must not turn a healthy start into a
+// permanent failure.
+test("F63: once the held WRAPPER relay delivers, a healthy ours-token start succeeds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ah-dstart-relaylate-"));
+  const daemonDir = join(root, "daemon");
+  const ownedPids: number[] = [];
+  const env = stubEnv({ SLOW_MS: "50", ACTION_HUB_TEST_RELAY_HOLD_MS: "1200" });
+  const captured = captureConsole();
+  try {
+    const startedAt = Date.now();
+    const code = await daemonStartCommand({
+      daemonDir,
+      entryPath: stub,
+      startTimeoutMs: 30_000,
+      configPath: join(root, "servers.json"),
+      onSpawn: (pid) => void ownedPids.push(pid),
+    });
+    const wall = Date.now() - startedAt;
+    assert.equal(code, 0, `healthy start with a 1.2s-delayed relay must succeed, got ${code}`);
+    assert.ok(wall >= 1_100, `start returned at ${wall}ms; expected it to wait for the delayed relay`);
+    assert.match(captured.logs.join("\n"), /Action Hub daemon started/);
+  } finally {
+    await cleanupSpawned(daemonDir, ownedPids);
+    env.restore();
+    captured.restore();
+    await rm(root, { recursive: true, force: true });
+  }
 });

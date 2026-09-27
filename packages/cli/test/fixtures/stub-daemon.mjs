@@ -55,9 +55,10 @@ if (slowMs > 0) {
         version: 1,
         pid: process.pid,
         startedAt: new Date().toISOString(),
+        launchToken: process.env["ACTION_HUB_LAUNCH_TOKEN"],
         endpoint: { kind: "tcp", host: "127.0.0.1", port },
       };
-      writeFileSync(join(daemonDir, "daemon.json"), JSON.stringify(state));
+      writeFileSync(join(daemonDir, "daemon.json"), JSON.stringify({ ...state, launchToken: process.env["ACTION_HUB_LAUNCH_TOKEN"] }));
       chmodSync(join(daemonDir, "daemon.json"), 0o600);
       writeFileSync(join(daemonDir, "auth-token"), `${"0".repeat(64)}\n`);
       chmodSync(join(daemonDir, "auth-token"), 0o600);

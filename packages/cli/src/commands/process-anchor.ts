@@ -203,6 +203,11 @@ export function runWrapperProcess(argvTail: string[]): void {
       env: serverEnv,
       cwd: process.cwd(),
     });
+    // Identity relay (F63 deterministic winner check): report the server's
+    // pid to the anchor IMMEDIATELY — long before the server could be ready
+    // — so the host can classify any ready answer as ours-vs-foreign on
+    // ordering-stable ground truth instead of the loop-scheduled exit event.
+    if (server.pid) report("PID:" + server.pid);
     for (const chunk of preAuthStdin) { try { server.stdin!.write(chunk); } catch {} }
     preAuthStdin.length = 0;
     server.stdin!.on("error", () => {});
@@ -320,6 +325,13 @@ export function runAnchorProcess(argvTail: string[]): void {
   const anchorControlEnd = wrapper.stdio![4] as import("node:stream").Writable | null;
   try { anchorControlEnd?.write(`ANCHOR_AUTH:${controlToken}\n`); } catch {}
   anchorControlEnd?.on?.("error", () => {});
+  // Identity relay (F63): in daemon mode the host holds the anchor's fd 3 —
+  // report the WRAPPER pid immediately (the SERVER pid follows via the
+  // wrapper's own PID report). In doctor mode fd 3 belongs to the factory's
+  // own protocol; never write there.
+  if (!relayStdin && wrapper.pid) {
+    try { fs.writeSync(3, `WRAPPER:${wrapper.pid}\n`); } catch {}
+  }
   wrapper.on("error", () => { startKillSequence("wrapper-error"); });
   wrapper.once("exit", () => {
     // The wrapper must never exit on its own. If it dies before OUR group
@@ -347,7 +359,7 @@ export function runAnchorProcess(argvTail: string[]): void {
     const t = setTimeout(() => { if (!sawStdout) startKillSequence("stdout-deadline"); }, stdoutDeadlineMs);
     t.unref?.();
   }
-  const reportFd = wrapper.stdio![3];
+    const reportFd = wrapper.stdio![3];
   if (reportFd && typeof (reportFd as import("node:stream").Readable).on === "function") {
     let buffered = "";
     (reportFd as import("node:stream").Readable).on("data", (chunk: Buffer) => {
@@ -358,6 +370,12 @@ export function runAnchorProcess(argvTail: string[]): void {
         buffered = buffered.slice(idx + 1);
         if (line.startsWith("EXIT:")) {
           startKillSequence("server-exit");
+        } else if (line.startsWith("PID:")) {
+          // Identity relay (F63): forward the server pid to the HOST over
+          // the anchor's own control pipe (fd 3, present in daemon mode).
+          // This lands long before the server can become ready, giving the
+          // host an ordering-stable identity for its winner check.
+          try { fs.writeSync(3, `SERVER:${line.slice(4)}\n`); } catch {}
         }
       }
     });

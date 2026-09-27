@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
@@ -36,6 +37,13 @@ interface DaemonState {
   version: number;
   pid: number;
   startedAt: string;
+  /**
+   * F63 launch identity: the per-start token daemonStartCommand passes to
+   * the daemon via env (ACTION_HUB_LAUNCH_TOKEN) and the daemon echoes into
+   * its state. Probe-carried (read synchronously with the ready answer), so
+   * identity never depends on relay/event timing.
+   */
+  launchToken?: string;
   configPath?: string;
   endpoint:
     | { kind: "unix"; path: string }
@@ -63,10 +71,10 @@ export interface DaemonOptions {
 /** Isolated readiness predicate: a single place to change the readiness signal. */
 async function daemonReady(
   paths: DaemonPaths,
-): Promise<{ ok: boolean; pid?: number } | undefined> {
+): Promise<{ ok: boolean; pid?: number; launchToken?: string } | undefined> {
   const result = await probe(paths).catch(() => undefined);
   if (!result) return undefined;
-  return { ok: result.ok, pid: result.state?.pid };
+  return { ok: result.ok, pid: result.state?.pid, launchToken: result.state?.launchToken };
 }
 
 function daemonStartCapMs(explicit?: number): number {
@@ -84,11 +92,56 @@ function daemonStartCapMs(explicit?: number): number {
  * ready-probe success under CPU load. A dead-but-unreported anchor means
  * THIS attempt failed closed — and a ready answer may be OUR OWN orphaned
  * server (the wrapper's group died externally while the server survived),
- * not a concurrent winner. Before declaring success on the winner path, the
- * loop gives the exit event a bounded grace and then decides on the
- * freshest ground truth (event flag OR synchronous exitCode/signalCode).
+ * not a concurrent winner. PRIMARY decision (intake ruling, deterministic):
+ * the winner path compares the answering pid with OUR relayed SERVER pid —
+ * an answer from our own tree is never a winner; it resolves through the
+ * anchor's state (healthy = normal start, wrapper-gone = unproven orphan =
+ * proof-checked failure). The relay (SERVER/WRAPPER over the anchor's
+ * control pipe) is written at spawn time — long before any server could be
+ * ready — so it is ordering-stable, unlike the loop-scheduled exit event,
+ * which only bounds the residual zombie window (secondary aid below).
  */
 const WINNER_EXIT_GRACE_MS = 300;
+
+/** Deterministic F63 identity classification (intake ruling, token-based;
+ * exported for the regression suite): how a ready answer relates to OUR
+ * spawned attempt. The launch token is PROBE-CARRIED — our daemon echoes
+ * ACTION_HUB_LAUNCH_TOKEN into its state at boot and the probe reads it
+ * synchronously with the answer — so identity has NO dependency on relay or
+ * event delivery timing. Wrapper liveness is a SYNCHRONOUS liveness syscall
+ * (via the anchor's WRAPPER:<pid> relay), so the ours/healthy-vs-unproven
+ * decision is deterministic even when the anchor's exit event has not been
+ * delivered yet.
+ */
+export type ReadyAnswerClass = "winner" | "ours-healthy" | "ours-unproven" | "undecided";
+export function classifyReadyAnswer(
+  readyToken: string | undefined,
+  ourToken: string,
+  wrapperAlive: boolean | "unknown",
+  anchorExited: boolean,
+): ReadyAnswerClass {
+  // An answer without OUR token (foreign daemon, or a token-less legacy
+  // state) is a legitimate winner regardless of our anchor's state.
+  if (readyToken !== ourToken) return "winner";
+  // The answer IS our daemon. Reviewer MUST-FIX (PR 97 r1): when readiness
+  // arrives before identity, the winner decision is NOT made on a guess —
+  // an unresolved wrapper-liveness relay classifies as "undecided" and the
+  // caller keeps waiting until the relay delivers, the anchor reaches a
+  // proof-checked terminal state, or the start cap expires (fail closed).
+  // A DEFINITIVE terminal state resolves the decision regardless of the
+  // relay: with the anchor exited, the answer is an unproven orphan.
+  if (anchorExited) return "ours-unproven";
+  // Healthy only while our wrapper provably leads the tree (synchronous
+  // liveness syscall, not an event); anything else is an unproven orphan of
+  // a failed attempt (never a winner, never a silent success).
+  if (wrapperAlive === "unknown") return "undecided";
+  if (wrapperAlive) return "ours-healthy";
+  return "ours-unproven";
+}
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
 
 function noProgressWindowMs(): number {
   const envRaw = process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"];
@@ -156,9 +209,13 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   if (platform() !== "win32") await chmod(paths.dir, 0o700);
 
   const logFd = openSync(paths.log, "a", 0o600);
+  const launchToken = randomBytes(24).toString("hex");
   const env = {
     ...process.env,
     ACTION_HUB_DAEMON_DIR: paths.dir,
+    // F63 launch identity: the daemon echoes this into its state, so every
+    // ready answer is self-identifying (probe-carried token, no relay race).
+    ACTION_HUB_LAUNCH_TOKEN: launchToken,
     ...(options.configPath ? { ACTION_HUB_CONFIG: resolvePath(options.configPath) } : {}),
   };
   let spawnError: Error | undefined;
@@ -168,9 +225,54 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   // leader can never be a reused PGID.
   const child = spawnAnchor("daemon", process.execPath, daemonChildArgs(options.entryPath), {
     detached: true,
-    stdio: ["ignore", logFd, logFd],
+    stdio: ["ignore", logFd, logFd, "pipe"],
     env,
   });
+  // F63 liveness relay: the anchor reports WRAPPER:<pid> at spawn so the
+  // host's ours/unproven decision can use a synchronous liveness syscall.
+  // IDENTITY itself is token-based (probe-carried — see launchToken), so
+  // no winner adoption depends on THIS relay's delivery timing: with the
+  // wrapper pid unknown, an ours-token answer simply waits (bounded) for
+  // the relay or the attempt's terminal state before classifying.
+  let ourWrapperPid: number | undefined;
+  if (child.stdio && child.stdio[3] && typeof (child.stdio[3] as import("node:stream").Readable).on === "function") {
+    let relayBuffer = "";
+    // TEST-ONLY ordering seam (reviewer repro shape): delay only the HOST's
+    // relay data-listener processing, so readiness can arrive while the
+    // wrapper identity is still undelivered. The anchor stays fully
+    // responsive (no blocking); never set in production.
+    const relayHoldRaw = Number.parseInt(process.env["ACTION_HUB_TEST_RELAY_HOLD_MS"] ?? "", 10);
+    const relayHoldMs = Number.isSafeInteger(relayHoldRaw) && relayHoldRaw > 0 ? relayHoldRaw : 0;
+    const processRelayBuffer = () => {
+      let idx;
+      while ((idx = relayBuffer.indexOf("\n")) >= 0) {
+        const line = relayBuffer.slice(0, idx).trim();
+        relayBuffer = relayBuffer.slice(idx + 1);
+        if (line.startsWith("WRAPPER:")) {
+          const parsed = Number.parseInt(line.slice(8), 10);
+          if (Number.isSafeInteger(parsed) && parsed > 0) ourWrapperPid = parsed;
+        }
+      }
+    };
+    (child.stdio[3] as import("node:stream").Readable).on("data", (chunk: Buffer) => {
+      relayBuffer += chunk.toString("utf8");
+      if (relayHoldMs > 0) {
+        // unref'd: a pending hold must never keep the CLI (or the test
+        // runner) alive after daemon start returns.
+        const t = setTimeout(processRelayBuffer, relayHoldMs);
+        t.unref?.();
+      } else {
+        processRelayBuffer();
+      }
+    });
+    (child.stdio[3] as import("node:stream").Readable).on("error", () => {});
+    // The relay stream MUST NOT hold the host's event loop open: the pipe
+    // lives as long as the anchor does, and `daemon start` must exit after
+    // reporting success. (Found via the binary smoke: without this, the
+    // CLI hung forever after printing "daemon started".) The stdio entry
+    // is a net Socket at runtime; only its static type is Readable.
+    (child.stdio[3] as unknown as { unref?: () => void }).unref?.();
+  }
   child.once("error", (cause) => {
     spawnError = cause;
   });
@@ -193,6 +295,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   });
 
   for (;;) {
+    if (Date.now() >= totalDeadline) break;
     if (spawnError) {
       await killAndReapSpawned(child);
       // Another concurrent start may have won the race even though ours
@@ -228,26 +331,56 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     }
 
     const ready = await daemonReady(paths);
-    // F63 winner-path grace: if the anchor is alive at probe-success, give
-    // its exit event a bounded window to land before adopting the answer —
-    // a dead anchor means this attempt failed closed and the ready answer
-    // may be our own orphaned server.
-    if (ready?.ok && !childExited && child.exitCode === null && child.signalCode === null) {
-      await Promise.race([
-        new Promise<void>((resolve) => child.once("exit", () => resolve())),
-        new Promise<void>((resolve) => setTimeout(resolve, WINNER_EXIT_GRACE_MS)),
-      ]);
-    }
-    if (childExited || child.exitCode !== null || child.signalCode !== null) {
-      continue; // an exited child must take the proof-checked path below
-    }
+    if (childExited) continue; // an exited child must take the proof-checked path below
     if (ready?.ok) {
+      // F63 DETERMINISTIC identity check (intake ruling, token-based): the
+      // ready answer carries the launch token OUR daemon echoed into its
+      // state — probe-carried, so identity has no relay/event timing
+      // dependency. An answer WITHOUT our token is a foreign winner. An
+      // answer WITH our token is NEVER a winner: it is ours-healthy only
+      // while the anchor/wrapper are provably alive (synchronous liveness
+      // syscalls + the anchor's exit flag), else it takes the proof-checked
+      // failure path.
+      if (ready.launchToken === launchToken) {
+        if (ourWrapperPid === undefined) {
+          // Reviewer MUST-FIX (PR 97 r1): readiness arrived before identity.
+          // Do NOT decide winner (and do not assume the wrapper is alive):
+          // keep waiting until the anchor's spawn-time relay delivers the
+          // wrapper pid (identity resolved), the attempt reaches a
+          // proof-checked terminal state (child exit -> the childExited path
+          // at the top of the loop), or the start cap expires (fail closed
+          // via the teardown-first path below). The relay is written at
+          // spawn time, long before any server can become ready, so this
+          // wait is microseconds in practice; the delayed-listener false
+          // green can no longer reach any success path.
+          continue;
+        }
+        // Secondary grace (PR 96 semantics): give the anchor's loop-scheduled
+        // exit event one bounded turn (bounds the wrapper-zombie window)
+        // before the deterministic classification below.
+        if (!childExited && child.exitCode === null && child.signalCode === null) {
+          await Promise.race([
+            new Promise<void>((resolve) => child.once("exit", () => resolve())),
+            new Promise<void>((resolve) => setTimeout(resolve, WINNER_EXIT_GRACE_MS)),
+          ]);
+        }
+        const anchorExitedNow = childExited || child.exitCode !== null || child.signalCode !== null;
+        // Synchronous liveness syscall on the relayed wrapper pid — never a
+        // guess: identity is resolved here, so "unknown" cannot occur.
+        const wrapperAliveNow = pidAlive(ourWrapperPid);
+        if (classifyReadyAnswer(ready.launchToken, launchToken, wrapperAliveNow, anchorExitedNow) === "ours-unproven") {
+          childExited = true;
+          continue;
+        }
+        console.log(`Action Hub daemon started (pid ${ready.pid}).`);
+        return 0;
+      }
+      // A foreign (token-less or different-token) answer is a legitimate winner.
       console.log(`Action Hub daemon started (pid ${ready.pid}).`);
       return 0;
     }
 
     const now = Date.now();
-    if (now >= totalDeadline) break;
 
     // Any sign of life resets the no-progress window.
     let progressed = false;
