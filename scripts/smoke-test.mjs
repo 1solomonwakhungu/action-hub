@@ -343,16 +343,18 @@ function checkHostileCacheBases(bin) {
   if (plantedA.length > 0) fail(`extraction happened under hostile-a/private-tmp (${plantedA.length} trees)`);
   process.stderr.write(`  ok  private leaf under non-sticky 0777 parent: no vendor tree there (fail closed or safe fallback)\n`);
 
-  // (b) safe-looking XDG symlink into hostile ancestry (review-1 round 6
-  // repro 2): cachelink -> <hostile>/target-0700; the effective ancestry is
-  // hostile, so the run must fail closed and extract nothing.
-  const hostileB = join(tmpRoot, "hostile-b");
-  mkdirSync(join(hostileB, "target"), { recursive: true, mode: 0o700 });
-  // mkdir mode is umask-masked — make hostility explicit.
-  chmodSync(hostileB, 0o777);
+  // (b) safe-looking XDG symlink into an attacker-private target (review-2
+  // round 5 repro B): cachelink -> 0700 target with no hostile ancestry, so
+  // a symlink-following implementation EXTRACTS THROUGH THE SWAPPABLE LINK
+  // (the old vulnerable behavior — this regression fails on it); the fixed
+  // gate rejects the user-planted link, both candidates are unusable, and
+  // the run must fail closed with ok:false and no vendor tree anywhere
+  // beneath the link target.
+  const linkTarget = join(tmpRoot, "private-target");
+  mkdirSync(linkTarget, { recursive: true, mode: 0o700 });
   const safeHome = join(tmpRoot, "safe-home");
   mkdirSync(safeHome, { recursive: true, mode: 0o700 });
-  symlinkSync(join(hostileB, "target"), join(safeHome, "cachelink"));
+  symlinkSync(linkTarget, join(safeHome, "cachelink"));
   // BOTH candidates hostile: the tmp base is 0777 (non-sticky) AND the XDG
   // cache is a symlink into the hostile target — no safe base exists, so the
   // run MUST fail closed (ok:false) and extract NOTHING anywhere beneath the
@@ -370,19 +372,19 @@ function checkHostileCacheBases(bin) {
   const lineB = (runB.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
   const okB = JSON.parse(lineB ?? "{}")?.embeddingSelftest?.ok;
   if (okB !== false) fail(`XDG symlink with no safe base must fail closed (ok:false): ${lineB}`);
-  const plantedB = readdirSync(join(hostileB, "target"), { recursive: true, withFileTypes: true })
+  const plantedB = readdirSync(linkTarget, { recursive: true, withFileTypes: true })
     .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
   if (plantedB.length > 0) fail(`extraction happened beneath the symlinked hostile target (${plantedB.join(", ")})`);
   // Negative control: plant vendor-SENTINEL under the target and prove the
   // predicate above WOULD catch it (a vulnerable implementation extracts
   // there, so this pins the search itself).
-  const sentinel = join(hostileB, "target", "action-hub", "vendor-SENTINEL");
+  const sentinel = join(linkTarget, "action-hub", "vendor-SENTINEL");
   mkdirSync(sentinel, { recursive: true });
-  const caught = readdirSync(join(hostileB, "target"), { recursive: true, withFileTypes: true })
+  const caught = readdirSync(linkTarget, { recursive: true, withFileTypes: true })
     .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
   if (caught.length !== 1) fail(`vendor-* search is not discriminating (planted sentinel not caught)`);
   rmSync(sentinel, { recursive: true });
-  const after = readdirSync(join(hostileB, "target"), { recursive: true, withFileTypes: true })
+  const after = readdirSync(linkTarget, { recursive: true, withFileTypes: true })
     .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
   if (after.length !== 0) fail(`sentinel cleanup left a tree beneath the hostile target`);
   process.stderr.write(`  ok  XDG symlink into hostile ancestry fails closed (no vendor tree)\n`);
@@ -392,12 +394,22 @@ function checkHostileCacheBases(bin) {
   const hostileC = join(tmpRoot, "hostile-c");
   mkdirSync(join(hostileC, "private-tmp", `action-hub-cache-${suffix}`), { recursive: true, mode: 0o700 });
   chmodSync(hostileC, 0o770);
+  // XDG hostile too (0777), so NO safe base exists anywhere: the vulnerable
+  // pre-rework implementation accepted the 0700 leaf by stopping the ancestry
+  // walk at the caller-controlled tmpdir (group-write ignored), which would
+  // extract beneath the 0770 parent and FAIL this check; the fixed walk
+  // rejects and must fail closed (ok:false, no tree).
+  const hostileXdg = join(tmpRoot, "hostile-xdg");
+  mkdirSync(join(hostileXdg, "action-hub"), { recursive: true });
+  chmodSync(join(hostileXdg, "action-hub"), 0o777);
   const runC = runBinary(bin, [], {
     TMPDIR: join(hostileC, "private-tmp"), TMP: join(hostileC, "private-tmp"), TEMP: join(hostileC, "private-tmp"),
+    XDG_CACHE_HOME: hostileXdg,
     ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
   });
   const lineC = (runC.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
-  void lineC;
+  const okC = JSON.parse(lineC ?? "{}")?.embeddingSelftest?.ok;
+  if (okC !== false) fail(`0770 parent with no safe base must fail closed (ok:false): ${lineC}`);
   const plantedC = readdirSync(join(hostileC, "private-tmp", `action-hub-cache-${suffix}`), {
     recursive: true,
     withFileTypes: true,
