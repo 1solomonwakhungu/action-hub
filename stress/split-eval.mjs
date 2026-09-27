@@ -20,7 +20,7 @@
  * Usage:
  *   node stress/split-eval.mjs [--split stress/fixtures/split-held.json] [--corpus DIR] [--fails]
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertIsolated, buildIsolatedEnv, FatalError, makeRunRoot, main } from "./lib/harness.mjs";
@@ -37,13 +37,15 @@ const corpusDir = resolve(flag("--corpus") ?? join(repoRoot, "stress", ".generat
 const withFails = args.includes("--fails");
 const resultsPath = join(repoRoot, "stress", ".generated", "results", "split-eval.json");
 
-// Self-isolate: pin every isolation var under a fresh run root so the eval
-// can never touch owner state, whatever the caller's environment.
-const root = makeRunRoot("split-eval-");
-Object.assign(process.env, buildIsolatedEnv(root));
-assertIsolated(process.env, root);
-
 await main(async () => {
+  // Self-isolate INSIDE main()'s guarded callback (SQ2-R4 review): preflight
+  // failures (e.g. TMPDIR=/dev/null making mkdtemp throw) must flow through
+  // the one-JSON/artifact path as ok:false, not bypass it as a raw crash.
+  // The run root is removed in finally on every outcome (no tmp debris).
+  const root = makeRunRoot("split-eval-");
+  try {
+    Object.assign(process.env, buildIsolatedEnv(root));
+    assertIsolated(process.env, root);
   const rows = JSON.parse(readFileSync(splitPath, "utf8"));
   if (!Array.isArray(rows)) throw new FatalError(`split file ${splitPath} is not a JSON array`);
 
@@ -126,4 +128,8 @@ await main(async () => {
     mrr10: +avg(mrr).toFixed(3),
     ...(noMatch.length > 0 ? { noMatchFp: `${fp}/${noMatch.length}` } : {}),
   };
+  return summary;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }, { resultsPath });

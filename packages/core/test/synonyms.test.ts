@@ -97,16 +97,44 @@ test("verb paraphrase reaches the canonical tool: hold -> pause_project", async 
   assert.equal(hits[0].id, "acme:pause_project");
 });
 
-test("stopword-bearing exact name beats a high-IDF synonym distractor (SQ2-R4 item 1)", async () => {
+test("stopword-bearing exact name beats a high-IDF synonym distractor in a realistic corpus (SQ2-R4 item 1)", async () => {
+  // Reviewer repro conditions: the exact action sits in a corpus where the
+  // delete/user terms are COMMON (so their BM25 idf is low) while the
+  // synonym "remove" stays rare. On the pre-fix parent (0d9efac) the
+  // expansion of "delete" -> "remove" made remove_account win (2.5035 vs
+  // 0.2409); with the symmetric filter the exact-name short-circuit fires
+  // and the exact action must stay rank 1.
   const catalog = new Catalog();
   catalog.add(record("acme:delete_the_user", "Deletes the user account and revokes sessions."));
-  catalog.add(record("other:remove_account", "Removes the user account permanently."));
+  catalog.add(record("other:remove_account", "Removes the account permanently."));
+  const fillers = [
+    // Common terms (delete / user) so their idf is low; "remove" stays rare
+    // (only the distractor carries it). No filler name contains BOTH query
+    // terms, so the exact name's two-term overlap wins on BM25 once the
+    // synonym expansion is skipped.
+    ["acme:delete_cache", "Deletes cached entries."],
+    ["acme:delete_drafts", "Deletes draft documents."],
+    ["acme:delete_attachments", "Deletes message attachments."],
+    ["acme:delete_history", "Deletes browsing history."],
+    ["acme:delete_snapshots", "Deletes old snapshots."],
+    ["acme:delete_backups", "Deletes stale backups."],
+    ["acme:delete_webhooks", "Deletes unused webhooks."],
+    ["acme:delete_keys", "Deletes expired keys."],
+    ["acme:delete_logs", "Deletes archived logs."],
+    ["acme:delete_labels", "Deletes unused labels."],
+    ["acme:user_report", "Generates a user report."],
+    ["acme:user_settings", "Shows the user settings."],
+    ["acme:user_directory", "Browses the user directory."],
+    ["acme:user_profile", "Edits the user profile."],
+    ["acme:user_sessions", "Lists the user sessions."],
+    ["acme:user_devices", "Lists the user devices."],
+    ["acme:user_invites", "Lists pending user invites."],
+    ["acme:user_activity", "Shows the user activity feed."],
+    ["acme:user_quota", "Shows the user quota usage."],
+    ["acme:user_groups", "Lists the user groups."],
+  ];
+  for (const [id, description] of fillers) catalog.add(record(id, description));
   const engine = new SearchEngine(catalog);
-  // The reviewer repro: the exact action name carries a stopword ("the").
-  // With the old asymmetric filter the short-circuit was missed and the
-  // high-IDF synonym "remove" (delete<->remove in VERB_SYNONYMS) let the
-  // distractor win. With the symmetric filter the short-circuit fires and
-  // the exact name stays rank 1.
   const words = await engine.search("delete the user");
   assert.equal(words[0].id, "acme:delete_the_user");
   const snake = await engine.search("delete_the_user");

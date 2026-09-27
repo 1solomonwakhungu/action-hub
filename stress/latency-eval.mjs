@@ -13,7 +13,7 @@
  *
  * Usage: node stress/latency-eval.mjs [--corpus DIR] [--passes 3]
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertIsolated, buildIsolatedEnv, makeRunRoot, main } from "./lib/harness.mjs";
@@ -29,13 +29,15 @@ const corpusDir = resolve(flag("--corpus", join(repoRoot, "stress", ".generated"
 const passes = Math.max(1, Number(flag("--passes", 3)));
 const resultsPath = join(repoRoot, "stress", ".generated", "results", "latency-eval.json");
 
-// Self-isolate: pin every isolation var under a fresh run root so the eval
-// can never touch owner state, whatever the caller's environment.
-const root = makeRunRoot("latency-eval-");
-Object.assign(process.env, buildIsolatedEnv(root));
-assertIsolated(process.env, root);
-
 await main(async () => {
+  // Self-isolate INSIDE main()'s guarded callback (SQ2-R4 review): preflight
+  // failures (e.g. TMPDIR=/dev/null making mkdtemp throw) must flow through
+  // the one-JSON/artifact path as ok:false, not bypass it as a raw crash.
+  // The run root is removed in finally on every outcome (no tmp debris).
+  const root = makeRunRoot("latency-eval-");
+  try {
+    Object.assign(process.env, buildIsolatedEnv(root));
+    assertIsolated(process.env, root);
   const { SearchEngine } = await import(join(repoRoot, "packages", "core", "dist", "search", "search.js"));
   const { LocalSemanticIndex } = await import(join(repoRoot, "packages", "core", "dist", "search", "semantic.js"));
   const { Catalog } = await import(join(repoRoot, "packages", "core", "dist", "catalog", "catalog.js"));
@@ -90,5 +92,9 @@ await main(async () => {
     const i = Math.min(samples.length - 1, Math.ceil((x / 100) * samples.length) - 1);
     return +samples[i].toFixed(1);
   };
-  return { counts, corpusDocs: catalog.all().length, n: queries.length, passes, p50: q(50), p95: q(95), p99: q(99) };
+  const summary = { counts, corpusDocs: catalog.all().length, n: queries.length, passes, p50: q(50), p95: q(95), p99: q(99) };
+  return summary;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 }, { resultsPath });
