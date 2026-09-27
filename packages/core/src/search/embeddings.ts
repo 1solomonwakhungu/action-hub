@@ -472,18 +472,64 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
       }
     };
     const usable = (dir: string): boolean => privateMode(dir);
-    // A base is only acceptable if its WHOLE ANCESTRY up to a trusted root
-    // (the user's home, the sticky system tmp, or a root-owned path) is owned
-    // by the user or root and not group/world-writable — the sticky system
-    // tmp itself is the only allowed world-writable ancestor. Otherwise
-    // another user could SWAP the cache child between verification and
-    // import (review-2 round 5 MUST-FIX 1).
+    // A base is only acceptable if (a) its LEXICAL path contains no symlinked
+    // component whose target lies outside the system-sanctioned prefixes (the
+    // default system tmp or the real home — e.g. macOS /var -> /private/var
+    // is sanctioned; a user-planted cachelink into a hostile tree is not),
+    // and (b) the EFFECTIVE (realpath) ancestry up to the filesystem root is
+    // owned by the user or root and not group/world-writable (0o020 or
+    // 0o002) — the sticky system tmp is the only allowed world/group-writable
+    // ancestor. The walk NEVER stops at an env-derived tmpdir/home: a private
+    // leaf under a hostile parent is rejected. Everything downstream uses the
+    // CANONICAL (realpath) base so a post-gate symlink swap cannot redirect
+    // the import (review-1/2 round 5 MUST-FIX).
+    const { realpathSync } = await import("node:fs");
+    const { resolve: pathResolve, sep } = await import("node:path");
+    const systemTmpReal = realpathSync(pathResolve(tmpdir()));
+    const homeReal = realpathSync(process.env["HOME"] ? pathResolve(process.env["HOME"]) : tmpdir());
+    // Sanctioned = the target IS a sanctioned tree, or is an ANCESTOR of one
+    // (root-owned system links like /var -> /private/var sit above the
+    // system tmp but below the filesystem root).
+    const underSanctioned = (p: string): boolean =>
+      p === systemTmpReal ||
+      p.startsWith(systemTmpReal + sep) ||
+      systemTmpReal.startsWith(p + sep) ||
+      p === homeReal ||
+      p.startsWith(homeReal + sep) ||
+      homeReal.startsWith(p + sep);
     const trustedAncestry = (dir: string): boolean => {
       if (isWin) return true;
       const uid = typeof process.getuid === "function" ? process.getuid() : null;
-      const systemTmp = resolve(tmpdir());
-      const home = process.env["HOME"] ? resolve(process.env["HOME"]) : null;
-      let cur = resolve(dir);
+      // Lexical pass: every component must be a real directory, except
+      // symlinked components whose target is system-sanctioned.
+      let cur = pathResolve(dir);
+      for (;;) {
+        let lst;
+        try {
+          lst = lstatSync(cur);
+        } catch {
+          return false;
+        }
+        if (lst.isSymbolicLink()) {
+          let target: string;
+          try {
+            target = realpathSync(cur);
+          } catch {
+            return false;
+          }
+          if (!underSanctioned(target)) return false;
+        } else if (!lst.isDirectory()) {
+          return false;
+        }
+        const parent = dirname(cur);
+        if (parent === cur) break;
+        cur = parent;
+      }
+      // Effective pass: walk the REAL ancestry to the filesystem root. No
+      // early stop at caller-controlled tmpdir/home; every ancestor must be
+      // owned by the user or root and not group/world-writable, except the
+      // sticky system tmp itself.
+      cur = realpathSync(pathResolve(dir));
       for (;;) {
         let st;
         try {
@@ -492,10 +538,9 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
           return false;
         }
         if (!st.isDirectory()) return false;
-        const worldWritable = (st.mode & 0o002) !== 0;
-        if (worldWritable && !(st.mode & 0o1000)) return false;
+        const worldOrGroupWritable = (st.mode & 0o022) !== 0;
+        if (worldOrGroupWritable && !(st.mode & 0o1000)) return false;
         if (uid !== null && st.uid !== uid && st.uid !== 0) return false;
-        if (cur === systemTmp || cur === "/" || (home !== null && cur === home)) return true;
         const parent = dirname(cur);
         if (parent === cur) return true; // filesystem root (root-owned)
         cur = parent;
@@ -533,6 +578,10 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
       }
     }
     if (base === null) throw new Error("no safe private embeddings cache base (fail closed)");
+    // Canonical base: every downstream path (extraction, reuse verification,
+    // ORT import) uses the realpath so a post-gate symlink swap cannot
+    // redirect the import.
+    base = realpathSync(base);
     const root = join(base, `vendor-${hash.digest("hex").slice(0, 16)}`);
     const readFileF = (await import("node:fs/promises")).readFile;
     const sha256Bytes = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");

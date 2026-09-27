@@ -3,7 +3,7 @@
 // `npm run smoke:binary`. Pass the binary path as the first argument, or let it
 // default to the host-target binary under dist-bin/.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync, appendFileSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync, appendFileSync, readFileSync, statSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
@@ -313,6 +313,52 @@ function checkHostileCacheBases(bin) {
     .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
   if (planted.length > 0) fail(`extraction happened under a hostile cache base (${planted.length} trees)`);
   process.stderr.write(`  ok  both-hostile cache bases fail closed (no extraction, no import)\n`);
+
+  // (a) private candidate beneath a non-sticky world-writable parent: the
+  // ANCESTRY must be rejected even though the leaf itself is 0700
+  // (review-1 round 6 repro 1).
+  const hostileA = join(tmpRoot, "hostile-a");
+  mkdirSync(join(hostileA, "private-tmp", `action-hub-cache-${suffix}`), { recursive: true, mode: 0o700 });
+  chmodSync(hostileA, 0o777);
+  const envA = {
+    TMPDIR: join(hostileA, "private-tmp"), TMP: join(hostileA, "private-tmp"), TEMP: join(hostileA, "private-tmp"),
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  };
+  const runA = runBinary(bin, [], envA);
+  const lineA = (runA.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  // Either fail closed (ok:false) or fail over to the sanctioned user cache;
+  // in BOTH cases nothing may be extracted beneath the hostile parent.
+  const okA = JSON.parse(lineA ?? "{}")?.embeddingSelftest?.ok;
+  if (okA !== false && okA !== true) fail(`private-leaf-under-hostile-parent: no JSON verdict: ${lineA}`);
+  const plantedA = readdirSync(join(hostileA, "private-tmp", `action-hub-cache-${suffix}`), {
+    recursive: true,
+    withFileTypes: true,
+  }).filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (plantedA.length > 0) fail(`extraction happened under hostile-a/private-tmp (${plantedA.length} trees)`);
+  process.stderr.write(`  ok  private leaf under non-sticky world-writable parent fails closed\n`);
+
+  // (b) safe-looking XDG symlink into hostile ancestry (review-1 round 6
+  // repro 2): cachelink -> <hostile>/target-0700; the effective ancestry is
+  // hostile, so the run must fail closed and extract nothing.
+  const hostileB = join(tmpRoot, "hostile-b");
+  mkdirSync(join(hostileB, "target"), { recursive: true, mode: 0o700 });
+  chmodSync(hostileB, 0o777);
+  const safeHome = join(tmpRoot, "safe-home");
+  mkdirSync(safeHome, { recursive: true, mode: 0o700 });
+  symlinkSync(join(hostileB, "target"), join(safeHome, "cachelink"));
+  const envB = {
+    TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
+    XDG_CACHE_HOME: join(safeHome, "cachelink"),
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  };
+  const runB = runBinary(bin, [], envB);
+  const lineB = (runB.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  const okB = JSON.parse(lineB ?? "{}")?.embeddingSelftest?.ok;
+  if (okB !== false && okB !== true) fail(`xdg-symlink-hostile: no JSON verdict: ${lineB}`);
+  const plantedB = readdirSync(join(hostileB, "target"), { recursive: true, withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith("action-hub-cache"));
+  if (plantedB.length > 0) fail(`extraction happened beneath the symlinked hostile target`);
+  process.stderr.write(`  ok  XDG symlink into hostile ancestry fails closed\n`);
 }
 
 /**
