@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createRequire } from "node:module";
 import { platform } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -67,46 +68,134 @@ export function anchorSpawnArgs(
 }
 
 /**
- * WRAPPER process (runs as `this-cli __wrapper-run <command> <serverArgs...>`).
- * Ported verbatim from the previous `-e` wrapper script: the wrapper is the
- * group leader and must stay alive (anchoring the PGID) until the anchor
- * SIGKILLs the whole group; it relays stdio and reports the server's exit to
- * the anchor over fd 3.
+ * WRAPPER process (runs as `this-cli __wrapper-run <command> <serverArgs...>`,
+ * but ONLY launchable by an anchor — see the authentication below). The
+ * wrapper is the group leader and must stay alive (anchoring the PGID) until
+ * the anchor SIGKILLs the whole group; it relays stdio and reports the
+ * server's exit to the anchor over fd 3.
  */
 export function runWrapperProcess(argvTail: string[]): void {
+  const isWin = process.platform === "win32";
   const command = argvTail[0];
   const serverArgs = argvTail.slice(1);
   if (!command) process.exit(2);
-  // The wrapper is the group leader and must stay alive (anchoring the PGID)
-  // until the anchor SIGKILLs the whole group. SIGTERM is ignored on purpose.
-  process.on("SIGTERM", () => {});
-  // SECURITY (PR 77 rework): the server is untrusted and must never see host
-  // control metadata. Strip every ANCHOR_* variable from its environment.
-  const serverEnv: NodeJS.ProcessEnv = { ...process.env };
-  for (const key of Object.keys(serverEnv)) {
-    if (key.startsWith("ANCHOR_")) delete serverEnv[key];
+  // --- Anchor-only launch authentication (review round 10) ---
+  // The anchor generates a one-time token and passes it both via the wrapper's
+  // environment and over a control pipe (fd 4) that only a live anchor holds
+  // the write end of. A direct argv invocation has no control pipe and no
+  // token, and exits 2 BEFORE any server is spawned: the wrapper is not a
+  // user-facing keep-alive primitive. (An attacker able to forge a connected
+  // control pipe already controls the spawn itself — outside this model.)
+  const expectedToken = process.env["ANCHOR_CONTROL_TOKEN"];
+  if (!expectedToken || !/^[0-9a-f]{64}$/.test(expectedToken)) {
+    process.stderr.write("__wrapper-run is an internal anchor mode and cannot be invoked directly\n");
+    process.exit(2);
   }
-  const server = spawn(command, serverArgs, {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: serverEnv,
-    cwd: process.cwd(),
+  let control: import("node:stream").Readable;
+  try {
+    control = fs.createReadStream(null as unknown as string, { fd: 4 });
+  } catch {
+    process.stderr.write("__wrapper-run is an internal anchor mode and cannot be invoked directly\n");
+    process.exit(2);
+  }
+  let authenticated = false;
+  let killStarted = false;
+  const preAuthStdin: Buffer[] = [];
+  const refuse = (why: string): never => {
+    process.stderr.write(`__wrapper-run: ${why}\n`);
+    process.exit(2);
+  };
+  // --- Parent-loss self-teardown (review round 10) ---
+  // The control pipe's write end lives only inside the anchor process: EOF
+  // here means the anchor is gone (crash or SIGKILL — nothing else ever
+  // closes it). The wrapper IS the group's live leader, so the PGID is
+  // provably ours and cannot have been reused; tear our own group down,
+  // bounded, instead of orphaning the server forever.
+  const selfTeardown = (why: string) => {
+    if (killStarted) return;
+    killStarted = true;
+    try { fs.writeSync(2, `__wrapper-run: anchor lost (${why}); tearing down group\n`); } catch {}
+    if (isWin) {
+      // No process groups on Windows: taskkill our own whole tree, then a
+      // bounded backstop exit in case the taskkill misses.
+      try { spawn("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
+      setTimeout(() => process.exit(4), 2000);
+      return;
+    }
+    // We are the group leader, so the PGID is ours by construction and
+    // cannot have been reused while we live. SIGTERM is ignored by us (see
+    // below), so only the server dies in phase 1; SIGKILL then takes the
+    // whole group — including this wrapper — boundedly.
+    try { process.kill(-process.pid, "SIGTERM"); } catch {}
+    setTimeout(() => {
+      try { process.kill(-process.pid, "SIGKILL"); } catch {}
+      // Only reachable if SIGKILL somehow did not include us; never linger.
+      process.exit(4);
+    }, 150);
+  };
+  const authTimer = setTimeout(() => {
+    if (!authenticated) refuse("anchor authentication handshake timed out");
+  }, 2000);
+  let buffered = "";
+  control.on("data", (chunk: Buffer) => {
+    if (authenticated) return;
+    buffered += chunk.toString("utf8");
+    const idx = buffered.indexOf("\n");
+    if (idx < 0) return;
+    const line = buffered.slice(0, idx).trim();
+    const expected = `ANCHOR_AUTH:${expectedToken}`;
+    const ok = line.length === expected.length && timingSafeEqual(Buffer.from(line), Buffer.from(expected));
+    if (!ok) { clearTimeout(authTimer); refuse("anchor authentication failed"); }
+    authenticated = true;
+    clearTimeout(authTimer);
+    startServer();
   });
+  control.on("end", () => {
+    if (!authenticated) { clearTimeout(authTimer); refuse("control channel closed before authentication"); }
+    else selfTeardown("anchor-lost");
+  });
+  control.on("error", () => {
+    if (!authenticated) { clearTimeout(authTimer); refuse("control channel unavailable"); }
+  });
+  let server: import("node:child_process").ChildProcess | null = null;
   const report = (line: string) => { try { fs.writeSync(3, line + "\n"); } catch {} };
-  const swallow = (fn: () => void) => () => { try { fn(); } catch {} };
-  process.stdin.on("data", (chunk) => { try { server.stdin!.write(chunk); } catch {} });
-  process.stdin.on("end", swallow(() => server.stdin!.end()));
+  process.stdin.on("data", (chunk) => {
+    if (server) { try { server.stdin!.write(chunk); } catch {} }
+    else preAuthStdin.push(chunk);
+  });
+  process.stdin.on("end", () => { try { server?.stdin!.end(); } catch {} });
   process.stdin.on("error", () => {});
-  server.stdin!.on("error", () => {});
-  server.stdout!.on("data", (chunk) => { try { fs.writeSync(1, chunk); } catch {} });
-  server.stderr!.on("data", (chunk) => { try { fs.writeSync(2, chunk); } catch {} });
-  server.stdout!.on("error", () => {});
-  server.stderr!.on("error", () => {});
-  server.on("error", () => report("EXIT:1"));
-  server.on("exit", (code) => report("EXIT:" + (code === null ? "signal" : code)));
-  // Never exit on our own: only the anchor's group SIGKILL ends us.
-  setInterval(() => {}, 60000);
+  const startServer = () => {
+    // The wrapper is the group leader and must stay alive (anchoring the
+    // PGID) until the anchor SIGKILLs the whole group or this wrapper's own
+    // parent-loss self-teardown ends it. SIGTERM is ignored on purpose.
+    process.on("SIGTERM", () => {});
+    // SECURITY (PR 77 rework): the server is untrusted and must never see host
+    // control metadata. Strip every ANCHOR_* variable (incl. the control
+    // token) from its environment.
+    const serverEnv: NodeJS.ProcessEnv = { ...process.env };
+    for (const key of Object.keys(serverEnv)) {
+      if (key.startsWith("ANCHOR_")) delete serverEnv[key];
+    }
+    server = spawn(command, serverArgs, {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: serverEnv,
+      cwd: process.cwd(),
+    });
+    for (const chunk of preAuthStdin) { try { server.stdin!.write(chunk); } catch {} }
+    preAuthStdin.length = 0;
+    server.stdin!.on("error", () => {});
+    server.stdout!.on("data", (chunk) => { try { fs.writeSync(1, chunk); } catch {} });
+    server.stderr!.on("data", (chunk) => { try { fs.writeSync(2, chunk); } catch {} });
+    server.stdout!.on("error", () => {});
+    server.stderr!.on("error", () => {});
+    server.on("error", () => report("EXIT:1"));
+    server.on("exit", (code) => report("EXIT:" + (code === null ? "signal" : code)));
+    // Never exit on our own: only the anchor's group SIGKILL or the wrapper's
+    // own parent-loss self-teardown ends us.
+    setInterval(() => {}, 60000);
+  };
 }
-
 /**
  * ANCHOR process (runs as `this-cli __anchor-run <mode> <command> <serverArgs...>`).
  * Ported verbatim from the previous `-e` anchor script, including the
@@ -194,12 +283,22 @@ export function runAnchorProcess(argvTail: string[]): void {
   // The wrapper is ALSO this CLI re-invoking itself (zero external deps, safe
   // inside the SEA binary), spawned detached so it is ALWAYS a fresh
   // process-group leader whose PGID cannot be reused while it lives.
+  // One-time token proving the wrapper was launched by THIS anchor, delivered
+  // both via env and over the control pipe (fd 4): a wrapper without a live
+  // anchor refuses to start a server at all (review round 10).
+  const controlToken = randomBytes(32).toString("hex");
   const wrapper = spawn(process.execPath, hostArgs(WRAPPER_MODE, [command, ...serverArgs]), {
     detached: !isWin,
-    stdio: relayStdin ? ["pipe", "pipe", "pipe", "pipe"] : ["ignore", "inherit", "inherit", "pipe"],
-    env: process.env,
+    stdio: relayStdin ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["ignore", "inherit", "inherit", "pipe", "pipe"],
+    env: { ...process.env, ANCHOR_CONTROL_TOKEN: controlToken },
     cwd: process.cwd(),
   });
+  // Hold the control pipe's write end for the anchor's whole life: its OS-level
+  // close (crash OR SIGKILL) is the wrapper's parent-loss signal. Never ended
+  // deliberately; only process exit closes it.
+  const anchorControlEnd = wrapper.stdio![4] as import("node:stream").Writable | null;
+  try { anchorControlEnd?.write(`ANCHOR_AUTH:${controlToken}\n`); } catch {}
+  anchorControlEnd?.on?.("error", () => {});
   wrapper.on("error", () => { startKillSequence("wrapper-error"); });
   wrapper.once("exit", () => {
     // The wrapper must never exit on its own. If it dies before OUR group

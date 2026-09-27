@@ -4,7 +4,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
 import { daemonStartCommand } from "../dist/commands/daemon.js";
+import { spawnAnchor } from "../dist/commands/process-anchor.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const stub = resolve(testDir, "fixtures/stub-daemon.mjs");
@@ -421,4 +423,80 @@ test("timeout path tears down before consulting the winner probe", async () => {
     captured.restore();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// PR 77 rework round 10 (reviewer-1 P1): SIGKILLing ONLY the anchor must not
+// orphan the detached wrapper or the server. The wrapper holds a control pipe
+// whose write end lives only inside the anchor; on EOF it tears down its own
+// group (TERM -> SIGKILL) boundedly. Both deaths are observed by exact PID.
+test("SIGKILLing only the anchor leaves no orphaned wrapper or server", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ah-anchor-orphan-"));
+  const pidFile = join(root, "pids.txt");
+  await writeFile(pidFile, "");
+  const env = stubEnv({ TREE_PIDS_FILE: pidFile });
+  const ownedPids: number[] = [];
+  const alive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  try {
+    const anchor = spawnAnchor("daemon", process.execPath, [
+      resolve(testDir, "fixtures/orphan-probe-server.mjs"),
+    ], {
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "ignore", "ignore"],
+      env: { ...process.env },
+    });
+    assert.ok(anchor.pid);
+    ownedPids.push(anchor.pid);
+    // Wait for the fixture to report the exact wrapper and server PIDs.
+    const reportDeadline = Date.now() + 15_000;
+    let serverPid = 0;
+    let wrapperPid = 0;
+    while (Date.now() < reportDeadline) {
+      try {
+        const lines = (await readFile(pidFile, "utf8")).split("\n").map((l) => l.trim());
+        const s = lines.find((l) => /^SERVER:\d+$/.test(l));
+        const w = lines.find((l) => /^PPID:\d+$/.test(l));
+        if (s && w) {
+          serverPid = Number.parseInt(s.slice(7), 10);
+          wrapperPid = Number.parseInt(w.slice(5), 10);
+          break;
+        }
+      } catch {
+        // not written yet
+      }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(serverPid && wrapperPid, "fixture must report wrapper+server PIDs in time");
+    ownedPids.push(wrapperPid, serverPid);
+    assert.ok(alive(wrapperPid) && alive(serverPid), "wrapper and server must be alive before the kill");
+    // THE regression: kill ONLY the anchor, exactly like the reviewer's repro.
+    process.kill(anchor.pid!, "SIGKILL");
+    const deadDeadline = Date.now() + 5_000;
+    let bothDead = false;
+    while (Date.now() < deadDeadline) {
+      if (!alive(wrapperPid) && !alive(serverPid)) { bothDead = true; break; }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.ok(bothDead, `wrapper ${wrapperPid} and server ${serverPid} must die boundedly after the anchor is SIGKILLed (orphaned)`);
+  } finally {
+    await reapOwnedPids(ownedPids);
+    env.restore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// The wrapper must be structurally anchor-only: a direct argv invocation has
+// no control pipe and no token, and must refuse BEFORE spawning any server.
+test("__wrapper-run refuses direct (unauthenticated) invocation", () => {
+  const distIndex = resolve(testDir, "../dist/index.js");
+  const result = spawnSync(process.execPath, [
+    distIndex,
+    "__wrapper-run",
+    process.execPath,
+    "-e",
+    "setInterval(() => {}, 1000)",
+  ], { timeout: 15_000, encoding: "utf8" });
+  assert.equal(result.status, 2, `expected refusal exit 2, got ${result.status}; stderr: ${result.stderr}`);
+  assert.match(String(result.stderr), /cannot be invoked directly/);
 });
