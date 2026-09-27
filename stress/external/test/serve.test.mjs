@@ -164,3 +164,36 @@ test("CALLER-LEVEL: stubbed runTool code 0 + groupEmpty:false through fold + agg
   assert.equal(agg.ok, false, "the aggregate must be red through the real path");
   assert.match(agg.failures[0], /cleanup/);
 });
+
+test("CALLER-LEVEL: conformance VALID evidence + poisoned cleanup is red (real evaluator)", async () => {
+  // Reviewer-1 MIG2-R1.5: the conformance seam could not discriminate
+  // (evidence parsing fails under the poison). This drives the REAL
+  // exported evaluator with genuinely VALID evidence and a poisoned step
+  // verdict — the fold must happen BEFORE ok is derived.
+  const { evaluateConformanceRun } = await import("../conformance.mjs");
+  const run = {
+    label: "http-server-suite",
+    exitCode: 0,
+    timedOut: false,
+    spawnError: null,
+    scenarios: 2,
+    // GENUINELY VALID evidence: green workload, all checks pass.
+    stepVerdict: {
+      code: 0, timedOut: false, spawnError: null, groupEmpty: false,
+      survivors: [], killError: "injected cleanup failure (poisoned)", pgid: null,
+    },
+  };
+  const evidence = { ok: true, success: 6, failure: 0, warning: 0, reason: null };
+  const evaluated = evaluateConformanceRun(run, evidence);
+  assert.equal(evaluated.ok, false, "valid evidence + failed cleanup must NOT be green");
+  assert.ok(Array.isArray(evaluated.cleanupFailures) && evaluated.cleanupFailures.length > 0);
+  assert.match(evaluated.cleanupFailures[0].problems[0], /groupEmpty !== true/);
+  // Sanity: the same evaluator with a GREEN cleanup stays green (a FRESH
+  // row — the poisoned fold left cleanupFailures/ok on the first one).
+  const cleanRun = {
+    label: "http-server-suite", exitCode: 0, timedOut: false, spawnError: null,
+    scenarios: 2,
+    stepVerdict: { code: 0, timedOut: false, spawnError: null, groupEmpty: true, survivors: [], killError: null, pgid: null },
+  };
+  assert.equal(evaluateConformanceRun(cleanRun, evidence).ok, true);
+});
