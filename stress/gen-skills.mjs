@@ -27,6 +27,8 @@
  */
 
 import { mkdir, writeFile, readdir, readFile, rm } from "node:fs/promises";
+import { existsSync, mkdtempSync, chmodSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -287,32 +289,6 @@ const DOMAINS = [
   },
 ];
 
-const INSTRUCTION_VERBS = [
-  "Confirm",
-  "Capture",
-  "Verify",
-  "Stage",
-  "Record",
-  "Cross-check",
-  "Escalate",
-  "Schedule",
-];
-const INSTRUCTION_CONDITIONS = [
-  "before the next handoff",
-  "when the threshold is crossed",
-  "at the start of the shift",
-  "after every change window",
-  "before the weekly review",
-  "once the queue is drained",
-];
-const INSTRUCTION_ACTIONS = [
-  "Update the tracking sheet and tag the owner",
-  "Announce the status in the shared channel",
-  "Log the outcome against the current cycle",
-  "Attach the evidence to the running doc",
-  "Summarize the deltas for the next reviewer",
-  "Archive the artifacts under the dated folder",
-];
 const QUALIFIERS = ["Blue-Green", "Canary", "Rolling", "Shadow", "Warm", "Cold"];
 
 // --- Slug derivation (must match core parseSkillContent exactly) ---------------
@@ -356,7 +332,123 @@ const DOMAIN_DETAILS = {
 // deliberate near-duplicates.
 
 // --- FX17: run body wrapped in the shared-lib finish path ---
+// HYG2 (F46, rework per review): on ANY failure the run-owned skills dir is
+// removed fail-closed (the dir is reconciled/wiped at startup, so a pre-write
+// failure also clears any prior corpus this generator owns). The cleanup
+// verdict is verified, never assumed: removedPartialSkillsDir is true only
+// when rm succeeded AND the dir is verifiably absent; on rm failure the
+// summary reports false + cleanupError and preserves the original error.
+async function cleanupPartialSkillsDir(dir = SKILLS_DIR, rmImpl = rm) {
+  try {
+    await rmImpl(dir, { recursive: true, force: true });
+  } catch (err) {
+    return { removedPartialSkillsDir: false, cleanupError: String(err?.message ?? err) };
+  }
+  if (existsSync(dir)) {
+    return { removedPartialSkillsDir: false, cleanupError: "skills dir still present after rm" };
+  }
+  return { removedPartialSkillsDir: true, cleanupError: null };
+}
+
 async function runSkills() {
+  try {
+    return await runSkillsInner();
+  } catch (err) {
+    const cleanup = await cleanupPartialSkillsDir();
+    return {
+      ok: false,
+      error: String(err?.message ?? err),
+      cleanup,
+    };
+  }
+}
+
+// HYG2 rework: Darwin-runnable regression for the cleanup failure branch.
+// Fails loudly (exit 1) if the cleanup verdict ever turns green while the
+// partial tree survives. --self-test-cleanup <dir>
+async function selfTestCleanup(baseDir) {
+  // The test owns a private parent dir so the read-only chmod in part 2
+  // never touches a shared tmp root.
+  const parent = baseDir
+    ? join(baseDir, "selftest-" + Date.now())
+    : mkdtempSync(join(tmpdir(), "hyg2-selftest-"));
+  await mkdir(parent, { recursive: true });
+  const targetDir = join(parent, "skills");
+  const failures = [];
+  let r2 = null; // set only if the E2E probe actually ran — no claimed
+  let childSurvived = null; // evidence from a skipped probe
+  let child = null;
+  // 1. Unit: an rm implementation that rejects must yield removed:false +
+  //    cleanupError, with the dir verifiably still present (sentinel intact).
+  const sentinel = join(targetDir, "SKILL.md");
+  await mkdir(targetDir, { recursive: true });
+  await writeFile(sentinel, "sentinel", "utf8");
+  const boom = new Error("forced rm failure");
+  const r1 = await cleanupPartialSkillsDir(targetDir, async () => {
+    throw boom;
+  });
+  if (r1.removedPartialSkillsDir !== false || !r1.cleanupError || !existsSync(sentinel)) {
+    failures.push(`failing-rm verdict wrong: ${JSON.stringify({ ...r1, sentinelPresent: existsSync(sentinel) })}`);
+  }
+  // 2. End-to-end with a real refusal: read-only parent prevents rm of the
+  //    child dir. Skipped when the platform has no getuid (Windows) or the
+  //    process runs as root (chmod is moot) — the summary must then say
+  //    skipped:true and claim NO survival evidence.
+  const probeRan = e2eProbeEnabled();
+  if (probeRan) {
+    child = join(parent, "ro-child");
+    await mkdir(child, { recursive: true });
+    await writeFile(join(child, "SKILL.md"), "sentinel", "utf8");
+    chmodSync(parent, 0o555);
+    try {
+      r2 = await cleanupPartialSkillsDir(child);
+      childSurvived = existsSync(child);
+      if (r2.removedPartialSkillsDir !== false || !childSurvived) {
+        failures.push(`read-only-parent verdict wrong: ${JSON.stringify({ ...r2, childPresent: childSurvived })}`);
+      }
+    } finally {
+      chmodSync(parent, 0o755);
+      rmSync(child, { recursive: true, force: true });
+    }
+  }
+  // 3. Regression for the skip branch itself (HYG2 rework 3): with no
+  //    getuid (Windows-style) or a root-style uid 0, the probe decision must
+  //    be "skip" — this check runs even when the probe above was skipped, so
+  //    the branch is exercised through the same finish path on every platform.
+  const savedGetuid = process.getuid;
+  let noGetuidSkipped = false;
+  let rootStyleSkipped = false;
+  try {
+    delete process.getuid;
+    noGetuidSkipped = !e2eProbeEnabled();
+    process.getuid = () => 0;
+    rootStyleSkipped = !e2eProbeEnabled();
+  } finally {
+    if (savedGetuid === undefined) delete process.getuid;
+    else process.getuid = savedGetuid;
+  }
+  if (!noGetuidSkipped) failures.push("no-getuid branch did not decide skip");
+  if (!rootStyleSkipped) failures.push("root-style uid=0 branch did not decide skip");
+  if (failures.length > 0) {
+    throw new FatalError(`HYG2 cleanup self-test FAILED: ${failures.join(" | ")}`);
+  }
+  return {
+    failingRm: { verdict: r1, sentinelSurvived: existsSync(sentinel) },
+    readOnlyParent: probeRan
+      ? { verdict: r2, childSurvived, skipped: false }
+      : { verdict: null, childSurvived: null, skipped: true },
+    skipBranchRegression: { noGetuidSkipped, rootStyleSkipped },
+  };
+}
+
+// Whether the read-only-parent E2E probe can produce meaningful evidence on
+// this platform: needs a getuid (not Windows) and a non-root uid (chmod 555
+// is moot for root, who bypasses permission checks).
+function e2eProbeEnabled() {
+  return typeof process.getuid === "function" && process.getuid() !== 0;
+}
+
+async function runSkillsInner() {
   const PER_DOMAIN = Math.ceil(COUNT / DOMAINS.length);
   const skills = [];
   const usedNames = new Set();
@@ -1019,4 +1111,24 @@ async function runSkills() {
 // One finish path via stress/lib/harness.mjs main(): stale-result removal,
 // reserved ok/error fields, guarded durable artifact write, exactly one
 // compact JSON summary as the last stdout line, nonzero exit on failure.
-await main(runSkills, { resultsPath: join(RESULTS_DIR, "gen-skills.json") });
+// HYG2 rework: the cleanup self-test runs through the SAME finish path
+// (compact JSON last line, durable artifact, exit derived from ok) — no
+// process.exit() and no human-text last line.
+if (args.includes("--self-test-cleanup")) {
+  const selfTestRun = async () => {
+    let tmpParent = null;
+    try {
+      const dirArg = args[args.indexOf("--self-test-cleanup") + 1];
+      const target = dirArg ?? (tmpParent = mkdtempSync(join(tmpdir(), "hyg2-selftest-")));
+      const checks = await selfTestCleanup(target);
+      return { ok: true, mode: "self-test-cleanup", checks };
+    } finally {
+      if (tmpParent) {
+        try { rmSync(tmpParent, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+    }
+  };
+  await main(selfTestRun, { resultsPath: join(RESULTS_DIR, "gen-skills-selftest.json") });
+} else {
+  await main(runSkills, { resultsPath: join(RESULTS_DIR, "gen-skills.json") });
+}
