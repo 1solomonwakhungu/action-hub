@@ -284,8 +284,11 @@ export class ActionHub {
     this.#semanticIndex?.index(this.#catalog.all());
     // Embeddings rebuild is async (model + embedding work); chain it so a
     // sync caller (registerSkills, direct catalog mutation) still gets fresh
-    // vectors. One rebuild in flight at a time; the next call after it
-    // settles starts a new one.
+    // vectors. One rebuild in flight at a time; the rebuild DRAINS catalog
+    // mutations: it re-runs whenever the catalog generation changed during
+    // or since the last pass (packaging/review round: an in-flight rebuild
+    // used to lose records registered mid-pass). Mutations that land after
+    // the drain exits are picked up by the next trigger call.
     if (this.#embedIndex && !this.#embedFailed) {
       this.#embedRebuild ??= (async () => {
         // In-flight rebuild: semantic channel is zero AND fusion drops to
@@ -293,15 +296,18 @@ export class ActionHub {
         // (D1-R4 score contract). Restored to rrf in the finally below.
         this.#search.setFusion("blend");
         try {
-          if (await this.#embedIndex!.load()) {
+          if (!(await this.#embedIndex!.load())) {
+            this.#embedFailed = true;
+            return;
+          }
+          for (;;) {
+            const generation = this.#catalog.generation;
             await this.#embedIndex!.index(this.#catalog.all(), {
               chunkSize: this.#indexChunkSize ?? 64,
               yieldFn: this.#indexYieldFn,
             });
             this.#embedIndex!.prune(new Set(this.#catalog.all().map((record) => record.id)));
-          } else {
-            this.#embedFailed = true;
-            this.#search.setFusion("blend");
+            if (this.#catalog.generation === generation) break;
           }
         } finally {
           this.#embedRebuild = undefined;

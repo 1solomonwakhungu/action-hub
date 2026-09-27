@@ -146,3 +146,120 @@ test("hub with embeddings finds the paraphrase and never demotes exact names", a
   const exact = await hub.search("disable_user");
   assert.equal(exact[0].id, "acme:disable_user");
 });
+
+// --- packaging/review round (R2-1..R6, R1-1..R4) ---
+
+test("chunkSize is normalized: NaN, 0, negative and fractional values all work", async () => {
+  const index = new EmbeddingSemanticIndex();
+  await index.load();
+  const records = [
+    record("acme:pause_project", "Pauses the project until further notice."),
+    record("acme:disable_user", "Disables the user account and revokes sessions."),
+    record("acme:enable_project", "Enables the project for all users."),
+  ];
+  let variant = 0;
+  for (const bad of [NaN, 0, -5, 1.5]) {
+    // Fresh text per case: unchanged docs are cached (0 to embed) by design.
+    const fresh = records.map((r) => ({ ...r, description: `${r.description} v${variant}`, summary: `${r.summary} v${variant}` }));
+    variant += 1;
+    const embedded = await index.index(fresh, { chunkSize: bad as number });
+    assert.equal(embedded, 3, `chunkSize ${bad} must still embed all docs`);
+  }
+});
+
+test("RRF with an all-zero semantic scorer returns [] for a zero-overlap query (no fabricated relevance)", async () => {
+  const catalog = new Catalog();
+  catalog.add(record("acme:alpha", "Alpha bravo charlie delta."));
+  catalog.add(record("acme:beta", "Echo foxtrot golf hotel."));
+  const engine = new SearchEngine(catalog);
+  engine.setFusion("rrf");
+  engine.setSemanticScorer(async () => new Array(catalog.all().length).fill(0));
+  const hits = await engine.search("quantum teleportation beans");
+  assert.deepEqual(hits, []);
+});
+
+test("RRF preserves exact-name priority over 100 same-prefix distractors", async () => {
+  const catalog = new Catalog();
+  catalog.add(record("acme:delete_user", "Deletes the user account permanently."));
+  for (let i = 0; i < 100; i += 1) {
+    catalog.add(record(`acme:delete_user_${i}`, `Delete user variant ${i} for distractor pressure.`));
+  }
+  const engine = new SearchEngine(catalog);
+  engine.setFusion("rrf");
+  // A disagreeing semantic channel: ranks distractors above the exact name.
+  engine.setSemanticScorer(async (_query, candidates) =>
+    candidates.map((c) => (c.id === "acme:delete_user" ? 0.01 : 0.99)),
+  );
+  const hits = await engine.search("delete_user");
+  assert.equal(hits[0].id, "acme:delete_user", `got ${hits.slice(0, 3).map((h) => h.id)}`);
+});
+
+test("cold cache write -> fresh cache load -> unchanged catalog re-embeds 0 documents", async () => {
+  const index = new EmbeddingSemanticIndex();
+  await index.load();
+  const records = [record("acme:pause_project", "Pauses the project until further notice.")];
+  await index.index(records);
+  const persisted = index.toPersisted();
+
+  // Coercion must carry the embeddings block through a cache round-trip.
+  const fresh = new EmbeddingSemanticIndex();
+  const loaded = fresh.hydrate(persisted);
+  assert.equal(loaded, 1, "persisted vectors must survive coercion");
+  assert.equal(await fresh.index(records), 0, "warm start must not re-embed unchanged docs");
+
+  // Backend pinning: a differently-labelled backend rejects the vectors.
+  assert.equal(fresh.hydrate({ ...persisted, backend: "wasm" }), 0);
+});
+
+test("rebuild drains catalog mutations: a skill registered mid-rebuild is embedded", async () => {
+  const clients = buildClients();
+  const { factory } = makeFactory(clients);
+  let parked: (() => void) | undefined;
+  const parkedPromise = new Promise<void>((resolve) => {
+    parked = resolve;
+  });
+  let gates = 0;
+  const release = () => {};
+  void release;
+  const hub = new ActionHub({
+    servers: [...servers],
+    clientFactory: factory,
+    // Park the FIRST rebuild at its first chunk boundary (2 tools, chunk 1),
+    // then behave normally so the drain loop can finish.
+    indexing: {
+      chunkSize: 1,
+      yieldFn: async () => {
+        gates += 1;
+        if (gates === 1) {
+          parked?.();
+          await new Promise<void>((done) => setTimeout(done, 5));
+        }
+      },
+    },
+  });
+  const building = hub.indexAll(); // kicks the rebuild (non-blocking)
+  void building;
+  await parkedPromise;
+  // Catalog is mutated WHILE the first rebuild is parked mid-pass.
+  hub.registerSkills([
+    {
+      id: "local:extra-skill",
+      serverId: "local",
+      name: "extra-skill",
+      summary: "A skill registered during an in-flight rebuild.",
+      trust: "trusted",
+    },
+  ]);
+  // Drain: must run through the NEWEST catalog generation.
+  await hub.semanticReady();
+  const persisted = (
+    hub as unknown as {
+      toPersisted(h: string): { embeddings?: { vectors: Record<string, unknown> } };
+    }
+  ).toPersisted("t");
+  assert.ok(persisted.embeddings, "persisted catalog carries vectors");
+  assert.ok(
+    "local:extra-skill" in (persisted.embeddings as { vectors: Record<string, unknown> }).vectors,
+    "the mid-rebuild skill must be embedded after the drain",
+  );
+});

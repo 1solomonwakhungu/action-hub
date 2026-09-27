@@ -3,7 +3,9 @@
  *
  * Replaces/augments the hashed subword scorer with a real sentence-embedding
  * model (int8 all-MiniLM-L6-v2 via @huggingface/transformers, ONNX WASM
- * backend — no native addon, SEA-binary friendly). The model is VENDORED in
+ * backend — native onnxruntime-node by default (the transformers Node build
+ * hard-requires it); WASM is the bundled-binary path via the packaging shim
+ * + ACTION_HUB_EMBEDDINGS_BACKEND=wasm. The model is VENDORED in
  * the repo (`packages/core/vendor/models`) and loaded with remote downloads
  * disabled: no network is touched, ever.
  *
@@ -33,6 +35,14 @@ export interface EmbeddingIndexOptions {
   /** Vendored model root (contains <modelId> subdirectories). */
   modelPath?: string;
   modelId?: string;
+  /**
+   * Execution backend. Default: probe ("native" when onnxruntime-node is
+   * loadable — the transformers Node build hard-requires it — else "wasm").
+   * The ACTION_HUB_EMBEDDINGS_BACKEND env var overrides the probe: a bundled
+   * binary that shims onnxruntime-node onto onnxruntime-web must declare
+   * "wasm" so the persisted-backend key stays truthful.
+   */
+  backend?: "native" | "wasm";
   /** Quantization of the ONNX file ("q8" matches the vendored artifact). */
   dtype?: "q8" | "fp32";
   /** Called with warnings (stderr by default, MCP-safe). */
@@ -76,6 +86,7 @@ export class EmbeddingSemanticIndex {
   readonly #onWarning: (message: string) => void;
   #vectors = new Map<string, StoredVector>();
   #pipe?: FeatureExtractionPipeline;
+  #backend = "native";
   #resolvedModelPath?: string;
   #loadFailed = false;
 
@@ -117,6 +128,17 @@ export class EmbeddingSemanticIndex {
     if (this.#pipe) return true;
     if (this.#loadFailed) return false;
     try {
+      // Backend truth (packaging review R1-1): the transformers Node build
+      // hard-requires onnxruntime-node, so a successful probe = native
+      // execution. Persisted vectors are keyed on this — never mix native
+      // and WASM vectors (they differ in low-order bits).
+      this.#backend =
+        this.#options.backend ??
+        process.env["ACTION_HUB_EMBEDDINGS_BACKEND"] ??
+        (await import("onnxruntime-node").then(
+          () => "native",
+          () => "wasm",
+        ));
       const { pipeline, env } = await import("@huggingface/transformers");
       // Vendored, offline: never touch the network, never consult the cache.
       env.allowRemoteModels = false;
@@ -159,14 +181,19 @@ export class EmbeddingSemanticIndex {
     { chunkSize = 64, yieldFn = defaultYield }: { chunkSize?: number; yieldFn?: () => Promise<void> } = {},
   ): Promise<number> {
     if (!this.#pipe && !(await this.load())) return 0;
+    // Normalize like LocalSemanticIndex: non-finite/non-positive/fractional
+    // chunk sizes would otherwise stall the loop (0) or throw inside the
+    // pipeline (NaN).
+    const effectiveChunk =
+      Number.isFinite(chunkSize) && chunkSize >= 1 ? Math.floor(chunkSize) : 64;
     const todo = records.filter((record) => {
       const fingerprint = fingerprintOf(record);
       const cached = this.#vectors.get(record.id);
       return !cached || cached.fingerprint !== fingerprint;
     });
     let embedded = 0;
-    for (let i = 0; i < todo.length; i += chunkSize) {
-      const batch = todo.slice(i, i + chunkSize);
+    for (let i = 0; i < todo.length; i += effectiveChunk) {
+      const batch = todo.slice(i, i + effectiveChunk);
       const outputs = await this.#pipe!(batch.map((r) => this.#documentText(r)), {
         pooling: "mean",
         normalize: true,
@@ -252,13 +279,13 @@ export class EmbeddingSemanticIndex {
     for (const [id, stored] of this.#vectors) {
       vectors[id] = { h: stored.fingerprint, q: encodeInt8(stored.q), s: stored.scale };
     }
-    return { modelId: this.#options.modelId, backend: "wasm", dims: EMBEDDING_DIMS, vectors };
+    return { modelId: this.#options.modelId, backend: this.#backend, dims: EMBEDDING_DIMS, vectors };
   }
 
   /** Hydrates vectors persisted by a previous run (same model only). */
   hydrate(persisted: PersistedEmbeddings | undefined): number {
     if (!persisted || persisted.modelId !== this.#options.modelId || persisted.dims !== EMBEDDING_DIMS) return 0;
-    if (persisted.backend !== "wasm") return 0;
+    if (persisted.backend !== this.#backend) return 0;
     let loaded = 0;
     for (const [id, entry] of Object.entries(persisted.vectors ?? {})) {
       try {

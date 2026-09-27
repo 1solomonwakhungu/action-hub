@@ -98,14 +98,16 @@ export class SearchEngine {
     // bearing exact name ("delete the user") never equal its own query
     // ("delete user"), so the short-circuit was missed and synonym noise
     // ("remove ...") could demote the exact match.
-    const exactNameHit =
-      literalTokens.length > 0 &&
-      candidates.some(
-        (record) =>
-          tokenize(record.name)
-            .filter((term) => !QUERY_STOPWORDS.has(term))
-            .join(" ") === literalKey,
-      );
+    const exactRecord =
+      literalTokens.length > 0
+        ? candidates.find(
+            (record) =>
+              tokenize(record.name)
+                .filter((term) => !QUERY_STOPWORDS.has(term))
+                .join(" ") === literalKey,
+          )
+        : undefined;
+    const exactNameHit = exactRecord !== undefined;
     const { terms, literalCount } = expandQuery(
       query,
       tokenize,
@@ -147,9 +149,23 @@ export class SearchEngine {
             }));
     }
 
+    // Exact-name invariant (SQ4 review): a query that spells an existing
+    // action's name is an exact lookup and must rank that action FIRST
+    // regardless of how the semantic channel ranks it — under RRF a
+    // disagreeing semantic rank could otherwise push the exact match out of
+    // the visible window entirely. Implemented as a REORDER of the sorted
+    // window (not a score boost) so the documented [0,1] score contract is
+    // preserved.
     const sorted = ranked
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id));
+    if (exactRecord) {
+      const pos = sorted.findIndex((entry) => entry.record === exactRecord);
+      if (pos > 0) {
+        const [exactHit] = sorted.splice(pos, 1);
+        sorted.unshift(exactHit!);
+      }
+    }
 
     // Optional relative cutoff: drop hits far below the best score so a weak
     // partial match cannot pad the result page. Off by default; ships only if
@@ -333,6 +349,11 @@ function rrfFuse(
   // catalog order): sort each signal descending and rank by position.
   const lexOrder = lexical
     .map((entry, index) => ({ index, score: entry.score }))
+    // Nonpositive lexical scores are EXCLUDED (SQ4 review): a zero-overlap
+    // candidate must not receive a fabricated relevance floor — an all-zero
+    // semantic channel over a no-overlap query used to return
+    // positive-scored hits instead of [].
+    .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score || lexical[a.index]!.record.id.localeCompare(lexical[b.index]!.record.id));
   const lexRank = new Map<number, number>();
   lexOrder.forEach((entry, position) => lexRank.set(entry.index, position + 1));
@@ -344,8 +365,11 @@ function rrfFuse(
   const semRank = new Map<number, number>();
   semOrder.forEach((entry, position) => semRank.set(entry.index, position + 1));
   return lexical.map((entry, i) => {
-    let score = weight * (1 / (k + (semRank.get(i) ?? k)));
-    score += 1 / (k + (lexRank.get(i) ?? k));
+    // Zero contribution for signals that did not rank the candidate: no
+    // fabricated floors for zero-overlap or unscored documents.
+    const lex = lexRank.get(i);
+    const sem = semRank.get(i);
+    const score = (lex !== undefined ? 1 / (k + lex) : 0) + (sem !== undefined ? weight / (k + sem) : 0);
     return { record: entry.record, score };
   });
 }
