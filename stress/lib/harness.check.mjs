@@ -9,15 +9,17 @@
 
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
+import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 
 import {
   ISOLATION_VARS, FatalError, ownerHome, ownerStateDirs, pathContains,
   refusedInsideOwnerState, makeRunRoot, buildIsolatedEnv, assertIsolated,
   createSandbox, runStep, lastJsonLine, main,
+  spawnGroup, killGroupAndVerify, registeredGroups,
 } from "./harness.mjs";
 
 const LIB_DIR = dirname(fileURLToPath(import.meta.url));
@@ -324,6 +326,147 @@ await main(async () => {
 
     process.exitCode = exitBefore === undefined ? null : exitBefore;
     rmSync(mainRoot, { recursive: true, force: true });
+  }
+
+  // --- 8. spawnGroup: long-lived child, killGroupAndVerify ladder -----------
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-group-" });
+    try {
+      assert.deepEqual(registeredGroups(), [], "registry starts empty");
+      // Long-lived child that writes its pid, then ignores TERM forever.
+      const marker = join(root, "group-child-pid");
+      const childCode =
+        `require('node:fs').writeFileSync(process.env.MARKER, String(process.pid));` +
+        `process.on('SIGTERM', () => {}); setInterval(() => {}, 500);`;
+      const handle = spawnGroup(process.execPath, ["-e", childCode], { env: { ...env, MARKER: marker }, cwd: root });
+      assert.equal(handle.pgid, handle.pid, "spawnGroup handle must expose the leader pid as pgid (ownership proof)");
+      assert.ok(registeredGroups().includes(handle.pgid), "spawnGroup must auto-register");
+      const deadline = performance.now() + 10_000;
+      while (!existsSync(marker) && performance.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(existsSync(marker), "long-lived child must have started (marker written)");
+      const childPid = Number(readFileSync(marker, "utf8").trim());
+      assert.equal(childPid, handle.pid, "the leader pid must be the spawned child");
+
+      // Ownership refusal: a BARE pgid (no owned handle) must NEVER be signalled.
+      const refused = await killGroupAndVerify(handle.pgid);
+      assert.equal(refused.groupEmpty, false);
+      assert.match(refused.error, /refused/);
+      assert.ok(aliveByProbe(childPid), "refused kill must not signal the group");
+
+      // The real ladder: owned handle, TERM-ignoring child -> SIGKILL -> empty.
+      const killed = await killGroupAndVerify(handle, { termGraceMs: 1_000, killDeadlineMs: 3_000 });
+      assert.equal(killed.groupEmpty, true, "TERM-ignoring long-lived child must be reaped to an EMPTY group");
+      assert.deepEqual(killed.survivors, []);
+      assert.ok(!aliveByProbe(childPid), "the child must be dead after killGroupAndVerify");
+      assert.ok(!registeredGroups().includes(handle.pgid), "verified-empty groups must unregister");
+
+      // F39: killing an ALREADY-EMPTY group must not signal anything.
+      const gone = await killGroupAndVerify(handle);
+      assert.equal(gone.groupEmpty, true, "an already-empty group verifies empty without signalling");
+      assert.deepEqual(gone.survivors, []);
+      checks.push({ check: "spawnGroup-killGroupAndVerify-ladder", ok: true, childPid });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8b. spawnGroup natural exit with an unref'd grandchild ----------------
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-group-adopt-" });
+    try {
+      const marker = join(root, "grandchild-pid");
+      const launcherCode =
+        `const { spawn } = require("node:child_process");` +
+        `const g = spawn(process.execPath, ["-e", "require('node:fs').writeFileSync(process.env.MARKER, String(process.pid)); setInterval(() => {}, 500)"], { env: process.env, stdio: "ignore" });` +
+        `g.unref();` +
+        `const w = Date.now(); while (!require('node:fs').existsSync(process.env.MARKER) && Date.now() - w < 10000) {}`;
+      const handle = spawnGroup(process.execPath, ["-e", launcherCode], { env: { ...env, MARKER: marker }, cwd: root });
+      await handle.exited; // leader exits naturally after the grandchild starts
+      const deadline = performance.now() + 10_000;
+      while (!existsSync(marker) && performance.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(existsSync(marker), "grandchild must have started");
+      const grandchildPid = Number(readFileSync(marker, "utf8").trim());
+      // The leader is gone but the group is NOT empty: the handle must STAY
+      // registered so the interrupt sweep can reap the survivor.
+      assert.ok(registeredGroups().includes(handle.pgid), "leader's natural exit must NOT unregister while the group still has members");
+      const killed = await killGroupAndVerify(handle, { termGraceMs: 1_000, killDeadlineMs: 3_000 });
+      assert.equal(killed.groupEmpty, true, "the surviving grandchild must be reaped by the owned kill");
+      assert.ok(!aliveByProbe(grandchildPid), "the orphaned grandchild must be dead");
+      checks.push({ check: "spawnGroup-leader-exit-keeps-registry-until-group-empty", ok: true, grandchildPid });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8c. main() SIGTERM: ONE interrupted JSON, groups dead, exit 143 -------
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-sigterm-" });
+    const resultsPath = join(root, "interrupted.json");
+    try {
+      // The script under test: registers a TERM-ignoring long-lived group via
+      // spawnGroup, then idles until signalled. It must serialize exactly one
+      // interrupted summary and die with exit code 143.
+      const scriptPath = join(root, "sigterm-target.mjs");
+      const targetResults = join(root, "target-results.json");
+      writeFileSync(scriptPath, `
+import { spawnGroup, main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+await main(async () => {
+  const handle = spawnGroup(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 500)"], { env: process.env, cwd: process.cwd() });
+  require('node:fs').writeFileSync(process.env.TARGET_PID_FILE, String(handle.pid));
+  await new Promise(() => {}); // idle forever; SIGTERM is the only way out
+}, { resultsPath: ${JSON.stringify(targetResults)} });
+`);
+      // NOTE: writeFileSync of an ESM script using require() would fail at
+      // runtime; use an fs import instead.
+      writeFileSync(scriptPath, `
+import { spawnGroup, main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+import { writeFileSync } from "node:fs";
+await main(async () => {
+  const handle = spawnGroup(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 500)"], { env: process.env, cwd: process.cwd() });
+  writeFileSync(process.env.TARGET_PID_FILE, String(handle.pid));
+  await new Promise(() => {}); // idle forever; SIGTERM is the only way out
+}, { resultsPath: ${JSON.stringify(targetResults)} });
+`);
+      const targetEnv = { ...env, TARGET_PID_FILE: join(root, "target-pid") };
+      const proc = spawn(process.execPath, [scriptPath], { env: targetEnv, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+      let procStdout = "";
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (d) => { procStdout += d; });
+      const pidDeadline = performance.now() + 10_000;
+      while (!existsSync(targetEnv.TARGET_PID_FILE) && performance.now() < pidDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(existsSync(targetEnv.TARGET_PID_FILE), "target must have registered its group");
+      const groupLeaderPid = Number(readFileSync(targetEnv.TARGET_PID_FILE, "utf8").trim());
+      assert.ok(aliveByProbe(groupLeaderPid), "the long-lived group must be alive before the signal");
+
+      proc.kill("SIGTERM");
+      const exitCode = await new Promise((resolveP) => {
+        const t0 = performance.now();
+        proc.on("exit", (code2, signal2) => resolveP({ code: code2, signal: signal2, waited: performance.now() - t0 }));
+      });
+      assert.equal(exitCode.code, 143, `SIGTERM must produce exit 143, got ${JSON.stringify(exitCode)}`);
+      assert.ok(exitCode.waited < 15_000, `interrupt cleanup must be bounded (took ${exitCode.waited}ms)`);
+      const lines = procStdout.split("\n").filter((l) => l.trim() !== "");
+      assert.equal(lines.length, 1, `exactly ONE stdout JSON line, got: ${JSON.stringify(lines)}`);
+      const summary = JSON.parse(lines[0]);
+      assert.equal(summary.ok, false);
+      assert.equal(summary.interrupted, "SIGTERM");
+      assert.ok(summary.groupsKilled >= 1, "the registered group must have been swept");
+      assert.equal("survivors" in summary, false, "no survivors may remain");
+      const disk = JSON.parse(readFileSync(targetResults, "utf8"));
+      assert.deepEqual(disk, summary, "interrupt summary: file must carry the SAME final object");
+      // The registered group leader must be DEAD.
+      await new Promise((r) => setTimeout(r, TERM_LADDER_GRACE_MS));
+      assert.ok(!aliveByProbe(groupLeaderPid), "the registered long-lived group must be dead after the interrupt");
+      checks.push({ check: "main-sigterm-one-json-groups-dead-exit-143", ok: true, groupLeaderPid, groupsKilled: summary.groupsKilled });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 
   return { checks, suite: "harness.check" };

@@ -288,21 +288,22 @@ function killTreeWindows(pid) {
  * ignore TERM or were spawned+unref'd by a successful launcher cannot outlive
  * the step — and the timeout path drives it INDEPENDENTLY of child exit/close
  * (a group leader that ignores SIGTERM must still be SIGKILLed and the step
- * must still settle). Never throws.
+ * must still settle). Never throws. Grace deadlines are parameterizable
+ * (killGroupAndVerify exposes them to callers); defaults match runStep.
  */
-async function reapGroup(pgid, { alreadyTermed = false } = {}) {
+async function reapGroup(pgid, { alreadyTermed = false, termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS } = {}) {
   if (process.platform === "win32") {
     // win32 has no process groups; taskkill /T walks the tree by pid.
     return true; // caller already ran taskkill against the root pid
   }
   if (!alreadyTermed) signalGroup(pgid, "SIGTERM");
-  const termDeadline = Date.now() + TERM_TO_KILL_MS;
+  const termDeadline = Date.now() + termGraceMs;
   while (Date.now() < termDeadline && !groupEmpty(pgid)) {
     await sleep(GROUP_POLL_MS);
   }
   if (!groupEmpty(pgid)) {
     signalGroup(pgid, "SIGKILL");
-    const killDeadline = Date.now() + KILL_GRACE_MS;
+    const killDeadline = Date.now() + killDeadlineMs;
     while (Date.now() < killDeadline && !groupEmpty(pgid)) {
       await sleep(GROUP_POLL_MS);
     }
@@ -338,6 +339,11 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       return;
     }
     const pgid = child.pid; // detached + first member => the group leader
+    // The in-flight step is registry-visible so an interrupt arriving DURING
+    // the step sweeps its group too (the step's own reaper still runs after).
+    const stepHandle = { pid: pgid, pgid, owned: true };
+    registerGroup(stepHandle);
+    const dropStep = () => unregisterGroup(pgid);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -368,6 +374,7 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      dropStep();
       resolveP(result);
     };
 
@@ -399,6 +406,7 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       if (settled || exitInfo === null || !closed) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      dropStep(); // the step is over; the group reaping below is bookkeeping
       // Reap the WHOLE group on every path: TERM -> bounded wait -> KILL ->
       // poll until empty. A successful launcher that spawned+unref'd a
       // grandchild leaves it in this group; it must not survive the step.
@@ -424,9 +432,163 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      dropStep();
       resolveP({ pid: pgid, code: null, signal: null, timedOut, killed, groupEmpty: false, error: "spawn error: " + err.message, stdout, stderr, lastJson: null });
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Long-lived process groups + interrupt handling (packet LIB2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Registry of live spawned process groups. spawnGroup registers on spawn;
+ * runStep registers while a step is in flight; entries drop when the group
+ * is verified empty (natural exit with no survivors, a successful kill, or
+ * settle). The registry is what main()'s SIGINT/SIGTERM handler sweeps.
+ */
+const liveGroups = new Map(); // pgid -> handle
+
+/** True once a SIGINT/SIGTERM interrupt has been received in this process. */
+let interruptReceived = false;
+
+function registerGroup(handle) {
+  if (handle && typeof handle.pgid === "number") liveGroups.set(handle.pgid, handle);
+}
+
+function unregisterGroup(pgid) {
+  if (typeof pgid === "number") liveGroups.delete(pgid);
+}
+
+/** Sorted pgids currently registered (test/introspection surface). */
+export function registeredGroups() {
+  return [...liveGroups.keys()].sort((a, b) => a - b);
+}
+
+/**
+ * Best-effort enumeration of the pids currently inside a process group
+ * (POSIX `ps -eo pid,pgid` filtering). [] when enumeration is impossible
+ * (win32, ps failure, timeout) — groupEmpty stays the authoritative verdict.
+ */
+function enumerateGroupPids(pgid) {
+  if (process.platform === "win32") return [];
+  try {
+    const out = spawnSync("ps", ["-eo", "pid,pgid"], { encoding: "utf8", timeout: 2_000 });
+    if (out.status !== 0 || typeof out.stdout !== "string") return [];
+    const members = [];
+    for (const line of out.stdout.split("\n")) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length === 2 && Number(parts[1]) === pgid) members.push(Number(parts[0]));
+    }
+    return members;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Spawn a LONG-LIVED child (hub/daemon under chaos) as its own detached
+ * process group — the same group shape runStep uses, but without a timeout:
+ * the caller decides when the group dies.
+ *
+ * Returns a handle:
+ *   { pid, pgid, child, stdout, stderr, exited, owned }
+ *   - pid/pgid: the group leader (pgid === pid by construction: the child is
+ *     detached, so it leads a FRESH group — this is the ownership proof that
+ *     makes killing the group safe).
+ *   - stdout/stderr: the child's pipe streams.
+ *   - exited: promise resolving { code, signal } (or { error }) — never rejects.
+ *   - owned: marker consumed by killGroupAndVerify (see the refusal below).
+ *
+ * The handle auto-registers in the live-group registry (swept by main()'s
+ * interrupt handler) and unregisters when the group is verified empty.
+ * After an interrupt has been received, spawnGroup REFUSES (FatalError):
+ * main() has promised to stop starting work.
+ */
+export function spawnGroup(cmd, args, { env, cwd } = {}) {
+  if (interruptReceived) {
+    throw new FatalError("interrupt received; refusing to start new group work");
+  }
+  let child;
+  try {
+    child = spawn(cmd, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  } catch (err) {
+    return {
+      pid: null,
+      pgid: null,
+      child: null,
+      stdout: null,
+      stderr: null,
+      owned: true,
+      exited: Promise.resolve({ code: null, signal: null, error: "spawn failed: " + err.message }),
+    };
+  }
+  const handle = {
+    pid: child.pid ?? null,
+    pgid: child.pid ?? null,
+    child,
+    stdout: child.stdout,
+    stderr: child.stderr,
+    owned: true,
+    exited: null,
+  };
+  handle.exited = new Promise((resolveP) => {
+    child.on("error", (err) => {
+      unregisterGroup(child.pid);
+      resolveP({ code: null, signal: null, error: "spawn error: " + err.message });
+    });
+    child.on("exit", (code, signal) => {
+      // Natural death: drop the registry entry ONLY when nothing remains in
+      // the group — a leader that spawned+unref'd grandchildren must stay
+      // registered so the interrupt sweep can still reap the survivors.
+      if (groupEmpty(child.pid)) unregisterGroup(child.pid);
+      resolveP({ code, signal });
+    });
+  });
+  if (child.pid != null) registerGroup(handle); // registered as soon as the pid exists
+  return handle;
+}
+
+/**
+ * Kill a spawned process group with the SAME ladder as runStep's reaper —
+ * TERM -> termGraceMs bounded wait -> SIGKILL -> killDeadlineMs bounded wait
+ * -> poll kill(-pgid, 0) until ESRCH — and report what happened:
+ *   { groupEmpty, survivors, error? }
+ *
+ * Ownership: only spawnGroup handles (or {pgid, owned:true} handles this
+ * module produced) are honored. A BARE pgid number is REFUSED — a recycled
+ * pid could name a group this process never created, and "we can't prove the
+ * anchor is ours" is exactly the case the packet forbids signaling.
+ *
+ * F39: a group verified empty is NEVER signalled — the probe runs first and
+ * the ladder is skipped entirely. groupEmpty:false means the ladder ran to
+ * its SIGKILL deadline and members may remain; survivors[] (best-effort,
+ * POSIX ps enumeration) names them.
+ */
+export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS } = {}) {
+  if (typeof target === "number" || !target || typeof target !== "object" || target.owned !== true || typeof target.pgid !== "number") {
+    return {
+      groupEmpty: false,
+      survivors: [],
+      error: "refused: target has no ownership proof — pass a spawnGroup handle (bare pgids could name a recycled group this process never created)",
+    };
+  }
+  const pgid = target.pgid;
+  if (process.platform === "win32") {
+    killTreeWindows(pgid);
+    unregisterGroup(pgid);
+    return { groupEmpty: true, survivors: [] }; // win32 has no probeable groups
+  }
+  // F39: verified-empty groups are never signalled.
+  if (groupEmpty(pgid)) {
+    unregisterGroup(pgid);
+    return { groupEmpty: true, survivors: [] };
+  }
+  const empty = await reapGroup(pgid, { termGraceMs, killDeadlineMs });
+  const survivors = empty ? [] : enumerateGroupPids(pgid);
+  if (empty) unregisterGroup(pgid);
+  return empty ? { groupEmpty: true, survivors: [] } : { groupEmpty: false, survivors };
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +612,14 @@ export function lastJsonLine(stdout) {
 /**
  * Script wrapper implementing the final-summary contract:
  *   - removes the stale results file at start
+ *   - installs SIGINT/SIGTERM interrupt handling (LIB2): the FIRST signal
+ *     stops work (spawnGroup refuses new groups), kills and verifies every
+ *     registered group with the shared ladder, then serializes ONE summary
+ *     shaped like an ordinary failure: {ok:false, interrupted:<signal>,
+ *     survivors, ...result-so-far} to the results file AND as the last
+ *     stdout line, with exitCode 130 (SIGINT) / 143 (SIGTERM). No
+ *     process.exit before stdout flush; a SECOND signal after cleanup is
+ *     honored with process.exit(code) — it means "die now".
  *   - catches FatalError / any error ONCE
  *   - writes the same final object (with ok) to the results file AND prints
  *     it as ONE compact JSON last stdout line
@@ -463,6 +633,51 @@ export async function main(fn, { resultsPath } = {}) {
   let ok = true;
   let error = null;
   let result = null;
+
+  // --- interrupt path (LIB2) ----------------------------------------------
+  // Installed BEFORE the guarded region so a signal can never arrive between
+  // work starting and the handler existing. Serialization goes through the
+  // SAME emit path as every other final summary: identical object to the
+  // results file and the last stdout line, then exitCode — never process.exit
+  // before flush.
+  let interruptSettled = false;
+  const onInterrupt = async (signal) => {
+    const code = signal === "SIGINT" ? 130 : 143;
+    if (interruptSettled) {
+      // Second signal: the operator means "die now". Stdio has already been
+      // flushed by the first pass; exit immediately.
+      process.exit(code);
+    }
+    interruptSettled = true;
+    interruptReceived = true; // spawnGroup now refuses new work
+    const pgids = registeredGroups();
+    let survivors = [];
+    for (const pgid of pgids) {
+      const verdict = await killGroupAndVerify({ pgid, owned: true }, { termGraceMs: 2_000, killDeadlineMs: 2_000 });
+      if (!verdict.groupEmpty) survivors.push(...(verdict.survivors.length ? verdict.survivors : [pgid]));
+    }
+    const final = {
+      ok: false,
+      interrupted: signal,
+      groupsKilled: pgids.length,
+      ...(survivors.length ? { survivors } : {}),
+      totalMs: Math.round(performance.now() - started),
+    };
+    try {
+      mkdirSync(dirname(resultsPath), { recursive: true });
+      writeFileSync(resultsPath, JSON.stringify(final, null, 2) + "\n");
+    } catch {
+      // The interrupt summary must still reach stdout even if the disk refuses.
+    }
+    process.stdout.write(JSON.stringify(final) + "\n", () => process.exit(code));
+    // Hard fallback if the write callback never fires (pipe edge cases).
+    setTimeout(() => process.exit(code), 1_000).unref();
+  };
+  const wasRawSigint = process.listenerCount("SIGINT");
+  const wasRawSigterm = process.listenerCount("SIGTERM");
+  if (wasRawSigint === 0) process.on("SIGINT", onInterrupt);
+  if (wasRawSigterm === 0) process.on("SIGTERM", onInterrupt);
+
   try {
     // Stale results from previous runs must not survive into this run.
     // Inside the guarded region: a hostile resultsPath must produce a final
@@ -473,6 +688,11 @@ export async function main(fn, { resultsPath } = {}) {
     ok = false;
     error = err instanceof FatalError ? err.message : String((err && err.stack) || err);
     console.error("run failed: " + error);
+  } finally {
+    // Normal completion: the interrupt handler must not fire after the
+    // summary contract has taken over (and must not keep the loop alive).
+    if (wasRawSigint === 0) process.off("SIGINT", onInterrupt);
+    if (wasRawSigterm === 0) process.off("SIGTERM", onInterrupt);
   }
   // `ok` and `error` are RESERVED: the task may override ok (that is the
   // point of the contract), so the FINAL object decides the exit code.
