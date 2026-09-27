@@ -16,6 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { connectMcpClient, createHubRuntime, type HubRuntime } from "./index.js";
+import { createDeferredTrigger } from "./deferred-trigger.js";
 
 const AUTH_TIMEOUT_MS = 5_000;
 const MAX_AUTH_BYTES = 8 * 1024;
@@ -53,40 +54,6 @@ export function defaultDaemonDir(): string {
 }
 
 
-/**
- * The daemon's deferred authoritative-refresh trigger (FX12-R5 rework).
- *
- * The refresh is scheduled one turn after the listener comes up, but
- * shutdown can win that race: a queued callback that fires after cleanup
- * must not start an authoritative index against a closed hub. The handle
- * therefore tracks the pending Immediate; `cancel()` clears a trigger that
- * has not run yet, and a callback that runs late re-checks `isStopped`.
- * An already-STARTED refresh is awaited by `runtime.close()` (memoised).
- * Exported for the deterministic lifecycle regression.
- */
-export function createDeferredRefreshTrigger(
-  startRefresh: () => Promise<unknown>,
-  isStopped: () => boolean,
-): { schedule(): void; cancel(): void } {
-  let pending: NodeJS.Immediate | undefined;
-  return {
-    schedule(): void {
-      if (pending) return;
-      pending = setImmediate(() => {
-        pending = undefined;
-        if (isStopped()) return;
-        void startRefresh().catch(() => undefined);
-      });
-    },
-    cancel(): void {
-      if (pending) {
-        clearImmediate(pending);
-        pending = undefined;
-      }
-    },
-  };
-}
-
 export async function runDaemon(): Promise<void> {
   const paths = daemonPaths(defaultDaemonDir());
   await secureDirectory(paths.dir);
@@ -96,10 +63,7 @@ export async function runDaemon(): Promise<void> {
   let listener: NetServer | undefined;
   const clients = new Map<Socket, McpServer>();
   let stopping = false;
-  const deferredRefresh = createDeferredRefreshTrigger(
-    () => runtime!.startRefresh(),
-    () => stopping,
-  );
+  const deferredRefresh = createDeferredTrigger(() => stopping);
   let resolveStopped!: () => void;
   let rejectStopped!: (cause: unknown) => void;
   const stopped = new Promise<void>((resolve, reject) => {
@@ -202,7 +166,11 @@ export async function runDaemon(): Promise<void> {
     // settling; daemon clients connecting mid-refresh are served from the
     // warm cache (startRefresh is memoised, so their handshake trigger is a
     // no-op).
-    deferredRefresh.schedule();
+    // FX12-R5: a warm-started daemon may never see a client, so the
+    // deferred refresh starts one turn after the listener is up. Mid-refresh
+    // clients are served from the warm cache; their handshake trigger hits
+    // the memoised startRefresh and is a no-op.
+    deferredRefresh.schedule(() => void runtime!.startRefresh().catch(() => undefined));
 
     // The hub answers from the warm cache immediately; the authoritative
     // re-index runs behind it. Publish its settlement so hosts and the CLI can

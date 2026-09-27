@@ -219,18 +219,14 @@ test("FX12-R5/FX18: a daemon client connecting mid-refresh is served from the wa
 });
 
 test("FX12-R5 rework: the deferred refresh trigger is cancelled by cleanup and guarded after it", async () => {
-  const { createDeferredRefreshTrigger } = await import("../dist/daemon.js");
+  const { createDeferredTrigger } = await import("../dist/deferred-trigger.js");
   let started = 0;
   let stopped = false;
-  const trigger = createDeferredRefreshTrigger(
-    () => {
-      started += 1;
-      return Promise.resolve([]);
-    },
-    () => stopped,
-  );
+  const trigger = createDeferredTrigger(() => stopped);
   // Normal path: one turn later the refresh starts exactly once.
-  trigger.schedule();
+  trigger.schedule(() => {
+    started += 1;
+  });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(started, 1);
   // Re-scheduling while the callback is pending would be a bug; after it ran, a second schedule starts a second refresh — not our concern here.
@@ -238,13 +234,17 @@ test("FX12-R5 rework: the deferred refresh trigger is cancelled by cleanup and g
   // Shutdown wins the race: schedule, cancel (cleanup), then the captured
   // callback fires anyway — nothing may start.
   stopped = false;
-  trigger.schedule();
+  trigger.schedule(() => {
+    started += 1;
+  });
   trigger.cancel();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(started, 1, "cancelled trigger must not start the refresh");
   // Even if the queued callback runs after cleanup (the reviewer's race):
   stopped = true;
-  trigger.schedule();
+  trigger.schedule(() => {
+    started += 1;
+  });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(started, 1, "a callback firing after shutdown must not start the refresh");
 });

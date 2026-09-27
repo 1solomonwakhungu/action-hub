@@ -3,6 +3,7 @@ import http from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createHubRuntime, createMcpServer, type HubRuntime } from "./index.js";
+import { createDeferredTrigger } from "./deferred-trigger.js";
 
 /**
  * Streamable HTTP MCP server mode.
@@ -205,7 +206,9 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
         // can never extend the client-observed response latency even if its
         // work is synchronous. Memoised in the runtime, so repeated
         // stateless requests cannot duplicate it.
-        scheduleRefresh(res);
+        const fire = () => void runtime.startRefresh().catch(() => undefined);
+        if (res.writableFinished) refreshTrigger.schedule(fire);
+        else res.once("finish", () => refreshTrigger.schedule(fire));
       } finally {
         await requestTransport.close().catch(() => undefined);
       }
@@ -228,39 +231,16 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   const address = httpServer.address();
   const boundPort = typeof address === "object" && address !== null ? address.port : port;
 
-  // The deferred refresh is scheduled with an untracked setImmediate after a
-  // response flushes; close() must cancel a trigger that has not run yet, or
-  // it would start an authoritative index against an already-closed hub
-  // (rework round 3). A trigger that has already STARTED the refresh is
-  // awaited by runtime.close() (memoised in the runtime).
+  // The deferred refresh is triggered after a response flushes plus one
+  // turn (shared deferred-trigger lifecycle, FX12-R4): close() cancels a
+  // trigger that has not run, and a late callback re-checks `closing` — so
+  // the authoritative re-index can never start against a closed hub.
   let closing = false;
-  let pendingTrigger: NodeJS.Immediate | undefined;
-  const scheduleRefresh = (res: ServerResponse): void => {
-    if (closing) return;
-    if (res.writableFinished) {
-      pendingTrigger = setImmediate(() => {
-        pendingTrigger = undefined;
-        if (closing) return;
-        void runtime.startRefresh().catch(() => undefined);
-      });
-    } else {
-      res.once("finish", () => {
-        if (closing) return;
-        pendingTrigger = setImmediate(() => {
-          pendingTrigger = undefined;
-          if (closing) return;
-          void runtime.startRefresh().catch(() => undefined);
-        });
-      });
-    }
-  };
+  const refreshTrigger = createDeferredTrigger(() => closing);
 
   async function close(): Promise<void> {
     closing = true;
-    if (pendingTrigger) {
-      clearImmediate(pendingTrigger);
-      pendingTrigger = undefined;
-    }
+    refreshTrigger.cancel();
     await new Promise<void>((resolve, reject) => {
       httpServer.close((cause) => (cause ? reject(cause) : resolve()));
     });
