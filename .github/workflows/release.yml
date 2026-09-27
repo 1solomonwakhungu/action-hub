@@ -114,6 +114,16 @@ jobs:
           cp dist-bin/SHA256SUMS.txt dist-bin/action-hub-SHA256SUMS.txt || true
           tar -czf dist-bin/winget-manifests.tar.gz -C packaging/winget .
           cp packaging/homebrew/action-hub.rb dist-bin/action-hub.rb
+      - name: Package third-party license notice
+        # The standalone binaries redistribute the Apache-2.0 MiniLM model
+        # and the MIT onnxruntime-web subset; their terms ship next to the
+        # binaries (review-1/2 round 4). The binaries also carry the texts
+        # internally (action-hub licenses); this file is the release-asset copy.
+        run: |
+          cat packages/core/vendor/VENDOR.md \
+              packages/core/vendor/licenses/Apache-2.0.txt \
+              packages/core/vendor/licenses/onnxruntime-LICENSE.txt \
+            > dist-bin/THIRD_PARTY_LICENSES.txt
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -127,6 +137,7 @@ jobs:
             dist-bin/action-hub-linux-arm64
             dist-bin/action-hub-windows-x64.exe
             dist-bin/SHA256SUMS.txt
+            dist-bin/THIRD_PARTY_LICENSES.txt
             dist-bin/action-hub.rb
             dist-bin/winget-manifests.tar.gz
           )

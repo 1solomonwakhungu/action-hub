@@ -90,7 +90,12 @@ test("indexAll embeds cooperatively: yields between chunks and serves the event 
     lastTick = now;
   }, 1);
   try {
+    // SQ4: the embedding rebuild is the semantic index now; it runs
+    // cooperatively and is awaited via semanticReady (indexAll itself stays
+    // lexical-fast so per-server restart backoff timers cannot fire
+    // mid-index — see the failing-server test).
     const results = await hub.indexAll();
+    await hub.semanticReady();
     assert.equal(results.every((result) => !result.error), true);
   } finally {
     clearInterval(heartbeat);

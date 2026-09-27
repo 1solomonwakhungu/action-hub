@@ -74,6 +74,7 @@ export async function bootstrapCatalog(
   if (!entry) {
     const results = await hub.indexAll();
     await cache.write(hub.toPersisted(configHash));
+    persistVectorsWhenReady(hub, cache, configHash, options.onWarning);
     return {
       fromCache: false,
       actions: hub.catalog.size,
@@ -113,6 +114,26 @@ export async function bootstrapCatalog(
 }
 
 /**
+ * SQ4: after the embedding rebuild drains, re-persist the catalog so the
+ * document vectors land in the cache. Fire-and-forget by design (never blocks
+ * startup); a failure becomes a warning — the next re-index re-embeds.
+ */
+function persistVectorsWhenReady(
+  hub: ActionHub,
+  cache: CatalogCache,
+  configHash: string,
+  onWarning?: (message: string) => void,
+): void {
+  void hub
+    .semanticReady()
+    .then(() => cache.write(hub.toPersisted(configHash)))
+    .catch((cause: unknown) => {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      onWarning?.(`post-embedding cache write failed: ${message}`);
+    });
+}
+
+/**
  * A background refresh that rejects would surface as an unhandled rejection
  * and kill the process, so failures are reduced to a warning. The stale
  * catalog remains serviceable in the meantime.
@@ -126,6 +147,10 @@ async function reindexAndPersist(
   try {
     const results = await hub.indexAll();
     await cache.write(hub.toPersisted(configHash));
+    // SQ4: indexAll returns before the (off-critical-path) embedding rebuild
+    // finishes, so this first write carries no vectors. Re-persist once the
+    // rebuild drains so a warm start hydrates them instead of re-embedding.
+    persistVectorsWhenReady(hub, cache, configHash, onWarning);
     return results;
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);

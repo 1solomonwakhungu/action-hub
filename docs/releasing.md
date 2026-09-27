@@ -105,3 +105,16 @@ npm distribution is unchanged. The `@action-hub/cli` package still exposes the
 `action-hub` bin via `dist/index.js`, and the meta-MCP server via
 `@action-hub/mcp-server`. The standalone binaries are an additional channel,
 not a replacement.
+
+## Third-party license notice (SQ4)
+
+The standalone binary redistributes the Apache-2.0 MiniLM model and the MIT
+onnxruntime-web subset. Their terms ship in three places; all are covered by
+the binary smoke:
+
+- **Inside the binary** as SEA assets — `action-hub licenses` prints the
+  vendored provenance notice (VENDOR.md) and both license texts;
+- **Next to the binaries** in the release assets as `THIRD_PARTY_LICENSES.txt`
+  (uploaded by the release workflow);
+- **In the npm package** under `packages/core/vendor/` (VENDOR.md +
+  `licenses/`), asserted by the packaging regression test.

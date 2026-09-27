@@ -88,9 +88,24 @@ await main(async () => {
   }
 
   const engine = new SearchEngine(catalog);
-  const index = new LocalSemanticIndex({});
-  await index.index(catalog.all());
-  engine.setSemanticScorer(index.asScorer());
+  // --semantic hashed (default, PR 83 continuity) | embeddings (SQ4)
+  const semanticMode = flag("--semantic", "hashed");
+  if (semanticMode === "embeddings") {
+    const { EmbeddingSemanticIndex } = await import(join(repoRoot, "packages", "core", "dist", "search", "embeddings.js"));
+    const embed = new EmbeddingSemanticIndex({});
+    if (!(await embed.load())) {
+      return { ok: false, error: "embedding model failed to load" };
+    }
+    const tEmbed0 = performance.now();
+    await embed.index(catalog.all(), { chunkSize: 256 });
+    engine.setFusion("rrf");
+    engine.setSemanticScorer(embed.asScorer());
+    var coldEmbedMs = performance.now() - tEmbed0;
+  } else {
+    const index = new LocalSemanticIndex({});
+    await index.index(catalog.all());
+    engine.setSemanticScorer(index.asScorer());
+  }
 
   const queries = JSON.parse(readFileSync(join(repoRoot, "stress", "fixtures", "realistic-queries.json"), "utf8")).map((r) => r.query);
   // warm
@@ -108,7 +123,7 @@ await main(async () => {
     const i = Math.min(samples.length - 1, Math.ceil((x / 100) * samples.length) - 1);
     return +samples[i].toFixed(1);
   };
-  const summary = { counts, corpusDocs: catalog.all().length, n: queries.length, passes, p50: q(50), p95: q(95), p99: q(99) };
+  const summary = { counts, corpusDocs: catalog.all().length, semantic: semanticMode, ...(coldEmbedMs !== undefined ? { coldEmbedMs: Math.round(coldEmbedMs) } : {}), n: queries.length, passes, p50: q(50), p95: q(95), p99: q(99) };
   return summary;
   } finally {
     rmSync(root, { recursive: true, force: true });

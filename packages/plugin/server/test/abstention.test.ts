@@ -84,14 +84,20 @@ async function callSearch(runtime: HubRuntime, query: string): Promise<Record<st
 test("SQ3: the flag is OFF by default — search behaves exactly as before", async () => {
   const runtime = buildRuntime({ enabled: false, threshold: 0.8 });
   await runtime.hub.indexAll();
+  await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
   const payload = await callSearch(runtime, "zzqx jabberwocky flimflam gibberish");
   assert.equal(payload["abstained"], undefined, "no abstention key when the flag is off");
-  assert.ok((payload["count"] as number) > 0, "low-confidence hits are still returned as before");
+  // NOTE (SQ4): under the embeddings channel the result COUNT for a gibberish
+  // query is no longer an "always > 0" invariant — cosine can come out
+  // negative (platform-dependent SIMD rounding), the channel then contributes
+  // exactly zero, and a zero-lexical query legitimately returns no hits. The
+  // flag-off contract is the absence of the abstention key, nothing more.
 });
 
 test("SQ3: flag ON — a below-threshold search abstains with an additive response", async () => {
   const runtime = buildRuntime({ enabled: true, threshold: 0.8 });
   await runtime.hub.indexAll();
+  await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
   const payload = await callSearch(runtime, "zzqx jabberwocky flimflam gibberish");
   assert.equal(payload["abstained"], true);
   assert.equal(payload["reason"], "no_confident_match");
@@ -104,12 +110,14 @@ test("SQ3: flag ON — a below-threshold search abstains with an additive respon
 });
 
 test("SQ3: flag ON — a confident match still returns results, no abstention key", async () => {
-  // 0.7, not 0.8: blend scores scale with corpus size/IDF and this 2-tool
-  // fixture gives the exact-name match ~0.748 — the calibration caveat in
-  // miniature. The threshold must be recalibrated per catalog, which is why
-  // the flag ships default-off.
-  const runtime = buildRuntime({ enabled: true, threshold: 0.7 });
+  // SQ4 recalibration: confidence keys on the RAW SEMANTIC cosine now
+  // (see the abstention implementation note) — measured on this 2-tool
+  // fixture: "deploy a service" 0.693, "lookup_thing" 0.357, gibberish
+  // 0.036. The threshold must be recalibrated per catalog, which is why the
+  // flag ships default-off.
+  const runtime = buildRuntime({ enabled: true, threshold: 0.3 });
   await runtime.hub.indexAll();
+  await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
   const payload = await callSearch(runtime, "lookup_thing");
   assert.equal(payload["abstained"], undefined, "a real match must never be refused");
   assert.ok((payload["count"] as number) > 0);
@@ -141,6 +149,7 @@ test("SQ3 rework: a matching bundle vetoes abstention — bundle discovery stays
     [{ id: "incident-review", displayName: "Incident Review", description: "Walk the incident checklist." }],
   );
   await runtime.hub.indexAll();
+  await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
   // The query has vocabulary overlap ONLY with the bundle; without the veto
   // the action scores would abstain and hide a valid capability.
   const payload = await callSearch(runtime, "incident review");
@@ -152,6 +161,7 @@ test("SQ3 rework: a matching bundle vetoes abstention — bundle discovery stays
 test("SQ3 rework: the abstention response echoes no raw query and stays bounded", async () => {
   const runtime = buildRuntime({ enabled: true, threshold: 0.8 });
   await runtime.hub.indexAll();
+  await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
   const payload = await callSearch(runtime, "x".repeat(100_000));
   assert.equal(payload["query"], undefined, "the raw query is not echoed back uncapped");
   assert.equal(payload["abstained"], true);

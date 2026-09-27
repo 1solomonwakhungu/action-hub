@@ -11,6 +11,7 @@ import type {
   TrustTier,
 } from "../types.js";
 import { TRUST_TIERS } from "../types.js";
+import type { PersistedEmbeddings } from "../search/embeddings.js";
 
 /**
  * Bumped whenever the on-disk shape changes. A mismatch discards the entry
@@ -37,6 +38,11 @@ export interface PersistedCatalog {
   skills: number;
   context: { actions: number; eagerTokensEstimate: number; hubTokensEstimate: number };
   history: InvocationRecord[];
+  /**
+   * SQ4: quantized document vectors keyed by action id. Optional and
+   * additive; absent when embeddings are disabled or the model never loaded.
+   */
+  embeddings?: PersistedEmbeddings;
 }
 
 /**
@@ -266,7 +272,29 @@ function coerceEntry(value: unknown): PersistedCatalog | undefined {
       ? (value["context"] as PersistedCatalog["context"])
       : { actions: actions.length, eagerTokensEstimate: 0, hubTokensEstimate: 0 },
     history: Array.isArray(value["history"]) ? (value["history"] as InvocationRecord[]) : [],
+    // SQ4: carry the persisted document vectors through validation. A badly
+    // shaped embeddings block is dropped (vectors re-embed) rather than
+    // invalidating the whole cache.
+    ...(coerceEmbeddings(value["embeddings"]) ? { embeddings: coerceEmbeddings(value["embeddings"])! } : {}),
   };
+}
+
+/** Validates an optional persisted-embeddings block (SQ4). */
+function coerceEmbeddings(value: unknown): PersistedEmbeddings | undefined {
+  if (!isRecord(value)) return undefined;
+  if (typeof value["modelId"] !== "string" || value["modelId"].length === 0) return undefined;
+  if (typeof value["backend"] !== "string" || value["backend"].length === 0) return undefined;
+  if (value["dims"] !== 384) return undefined;
+  if (!isRecord(value["vectors"])) return undefined;
+  const vectors: PersistedEmbeddings["vectors"] = {};
+  for (const [id, entry] of Object.entries(value["vectors"])) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry["h"] !== "string" || typeof entry["q"] !== "string" || typeof entry["s"] !== "number") continue;
+    if (!Number.isFinite(entry["s"]) || entry["s"] <= 0) continue;
+    vectors[id] = { h: entry["h"], q: entry["q"], s: entry["s"] };
+  }
+  if (Object.keys(vectors).length === 0) return undefined;
+  return { modelId: value["modelId"] as string, backend: value["backend"] as string, dims: 384, vectors };
 }
 
 /**
