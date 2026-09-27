@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { doctorCommand } from "../dist/commands/doctor.js";
@@ -323,20 +324,14 @@ test("doctor bounds a partial-stdout-then-hang server and leaves no survivors", 
     assert.equal(code, 1, "a server that never initializes must fail the doctor");
     assert.ok(wallMs < 25_000, `doctor took ${wallMs}ms for a hanging server; expected a tight bound`);
 
+    // Exact recorded-PID evidence: every trickle server instance (2 attempts)
+    // must be dead. The wrapper/anchor cleanup is anchored in-process; the
+    // host proves the downstream tree via the server PIDs.
     const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
       .split("\n")
       .map((l) => Number.parseInt(l.trim(), 10))
       .filter((n) => Number.isSafeInteger(n) && n > 0);
     assert.ok(recordedPids.length >= 2, `expected >=2 recorded server PIDs (2 attempts), got ${recordedPids.length}`);
-
-    // The anchor meta file records the wrapper (group leader) PID before
-    // connect resolves; it must be dead too.
-    const { anchorMetaPath } = await import("../dist/commands/process-anchor.js");
-    const meta = JSON.parse(await readFile(anchorMetaPath("doctor", "trickle"), "utf8")) as {
-      anchor: number;
-      wrapper: number;
-    };
-    const allPids = [...recordedPids, meta.anchor, meta.wrapper];
     const isAlive = (pid: number): boolean => {
       try {
         process.kill(pid, 0);
@@ -346,12 +341,100 @@ test("doctor bounds a partial-stdout-then-hang server and leaves no survivors", 
       }
     };
     const pollDeadline = Date.now() + 8_000;
-    let survivors = allPids.filter(isAlive);
+    let survivors = recordedPids.filter(isAlive);
     while (survivors.length > 0 && Date.now() < pollDeadline) {
       await new Promise((r) => setTimeout(r, 250));
-      survivors = allPids.filter(isAlive);
+      survivors = recordedPids.filter(isAlive);
     }
     assert.deepEqual(survivors, [], `partial-stdout hang tree survived: ${survivors.join(", ")}`);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+// PR 77 rework P1 (security): the untrusted server must never see host
+// control metadata (ANCHOR_* env) — metadata poisoning must be impossible —
+// and teardown must never touch processes the doctor does not own.
+test("doctor control state is invisible to the server and teardown spares unrelated processes", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-doctor-poison-"));
+  try {
+    // Poison fixture: if ANY ANCHOR_* env var is visible, write the poison
+    // marker (an attempt to redirect control state).
+    const poisonFixture = join(tempDir, "poison-server.mjs");
+    await writeFile(
+      poisonFixture,
+      `import { writeFileSync, appendFileSync } from "node:fs";
+const leaked = Object.keys(process.env).filter((k) => k.startsWith("ANCHOR_"));
+if (leaked.length > 0 && process.env["POISON_MARKER"]) {
+  writeFileSync(process.env["POISON_MARKER"], leaked.join(","));
+}
+if (process.env["TREE_PIDS_FILE"]) appendFileSync(process.env["TREE_PIDS_FILE"], String(process.pid));
+process.stdout.write("x");
+process.stdin.resume();
+`,
+    );
+    // Unrelated sentinel owned by the TEST itself.
+    const sentinel = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    sentinel.unref();
+    assert.ok(sentinel.pid);
+
+    const servers = [
+      {
+        id: "poison",
+        transport: {
+          type: "stdio",
+          command: process.execPath,
+          args: [poisonFixture],
+          env: { POISON_MARKER: join(tempDir, "poison-marker.txt") },
+        },
+        timeoutMs: 1000,
+      },
+    ];
+    const cfgPath = await makeFleet(tempDir, servers);
+    const { code } = await withIsolatedEnv(tempDir, () => runDoctor(cfgPath));
+    assert.equal(code, 1, "a never-initializing server must fail the doctor");
+
+    // The poison marker must NOT exist: no ANCHOR_* metadata reached the server.
+    await assert.rejects(readFile(join(tempDir, "poison-marker.txt"), "utf8"), { code: "ENOENT" });
+
+    // The unrelated sentinel must still be alive after the doctor returned.
+    const pollDeadline = Date.now() + 8_000;
+    let sentinelAlive = true;
+    let recordedDead = false;
+    while (Date.now() < pollDeadline) {
+      sentinelAlive = (() => {
+        try {
+          process.kill(sentinel.pid!, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
+        .split("\n")
+        .map((l) => Number.parseInt(l.trim(), 10))
+        .filter((n) => Number.isSafeInteger(n) && n > 0)
+        .filter((pid) => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        });
+      recordedDead = sentinelAlive && recordedPids.length === 0;
+      if (recordedDead) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.equal(sentinelAlive, true, "an unrelated process must never be killed by doctor teardown");
+    assert.equal(recordedDead, true, "poison server processes must be dead after the doctor returned");
+
+    try {
+      process.kill(sentinel.pid!, "SIGKILL");
+    } catch {}
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

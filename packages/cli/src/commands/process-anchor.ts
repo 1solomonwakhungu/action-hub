@@ -1,7 +1,4 @@
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { readFile } from "node:fs/promises";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { platform } from "node:os";
 
 /**
@@ -28,10 +25,13 @@ import { platform } from "node:os";
  *  - The wrapper reports the server's exit to the anchor over fd 3
  *    ("EXIT:<code>"); the anchor then runs the kill sequence and exits with
  *    the server's code.
- *  - The anchor writes a META file (anchor/wrapper/server PIDs) as soon as
- *    the wrapper is spawned — BEFORE any client connects — so hosts can
- *    bound activation and tear the exact tree down even when the server
- *    never completes initialize.
+ *  - The HOST holds the anchor's PID directly (its own ChildProcess, or the
+ *    transport child captured at spawn). There is NO disk PID metadata: the
+ *    untrusted server can never see or forge control state. Host teardown
+ *    only ever signals the anchor (single-PID, always safe) and lets the
+ *    anchor do the gated group work it can prove from inside. If the anchor
+ *    is unexpectedly dead, the host FAILS CLOSED and reports — it never
+ *    signals a group it cannot prove is its own.
  */
 
 const KILLER_REQUIRED = false; // no detached killer needed: gated signals only
@@ -45,9 +45,15 @@ if (!command) process.exit(2);
 // The wrapper is the group leader and must stay alive (anchoring the PGID)
 // until the anchor SIGKILLs the whole group. SIGTERM is ignored on purpose.
 process.on("SIGTERM", () => {});
+// SECURITY (PR 77 rework): the server is untrusted and must never see host
+// control metadata. Strip every ANCHOR_* variable from its environment.
+const serverEnv = { ...process.env };
+for (const key of Object.keys(serverEnv)) {
+  if (key.startsWith("ANCHOR_")) delete serverEnv[key];
+}
 const server = spawn(command, serverArgs, {
   stdio: ["pipe", "pipe", "pipe"],
-  env: process.env,
+  env: serverEnv,
   cwd: process.cwd(),
 });
 const report = (line) => { try { fs.writeSync(3, line + "\\n"); } catch {} };
@@ -74,7 +80,6 @@ const mode = process.argv[1];
 const command = process.argv[2];
 const serverArgs = process.argv.slice(3);
 if (!command) process.exit(2);
-const metaFile = process.env["ANCHOR_META_FILE"] || "";
 const stdoutDeadlineMs = Number(process.env["ANCHOR_STDOUT_DEADLINE_MS"] || 0);
 const relayStdin = mode === "doctor";
 let sawStdout = false;
@@ -85,12 +90,6 @@ let serverSignalled = false;
 // cleanup sequence, then exit. It is NOT a member of the wrapper's group.
 process.on("SIGTERM", () => { startKillSequence("host-sigterm"); });
 process.on("SIGINT", () => { startKillSequence("host-sigint"); });
-const writeMeta = () => {
-  if (!metaFile) return;
-  try {
-    fs.writeFileSync(metaFile, JSON.stringify({ anchor: process.pid, wrapper: wrapper.pid }));
-  } catch {}
-};
 const wrapperAlive = () => {
   try { process.kill(wrapper.pid, 0); return true; } catch { return false; }
 };
@@ -106,6 +105,16 @@ const signalGroup = (signal) => {
 const startKillSequence = (why) => {
   if (killStarted) return;
   killStarted = true;
+  if (isWin) {
+    // child.kill is NOT a tree kill on Windows and the wrapper is not a
+    // group leader there: taskkill /T /F the wrapper tree, await it, then
+    // exit. The anchor stays a live tree root until this completes.
+    const tk = spawn("taskkill", ["/pid", String(wrapper.pid), "/T", "/F"], { stdio: "ignore" });
+    const done = () => finalize();
+    tk.on("exit", done);
+    tk.on("error", () => { try { wrapper.kill("SIGKILL"); } catch {} done(); });
+    return;
+  }
   signalGroup("SIGTERM");
   const escalate = setTimeout(() => {
     signalGroup("SIGKILL");
@@ -127,20 +136,14 @@ const wrapper = spawn(process.execPath, ["-e", ${JSON.stringify(WRAPPER_SRC)}, c
   env: process.env,
   cwd: process.cwd(),
 });
-writeMeta();
 wrapper.on("error", () => { startKillSequence("wrapper-error"); });
 wrapper.once("exit", () => {
   // The wrapper must never exit on its own; if it was killed externally with
   // descendants still inside, do a single gated attempt (best effort) and
   // exit. There is no reuse-safe way to signal a dead leader's group, so
   // this is intentionally a single shot with a liveness check.
-  if (!killStarted) {
-    killStarted = true;
-    signalGroup("SIGTERM");
-    setTimeout(() => { signalGroup("SIGKILL"); finalize(); }, 150);
-  } else {
-    finalize();
-  }
+  if (!killStarted) startKillSequence("wrapper-external-exit");
+  else finalize();
 });
 if (relayStdin) {
   process.stdin.on("data", (chunk) => { try { wrapper.stdin.write(chunk); } catch {} });
@@ -183,28 +186,21 @@ if (reportFd && typeof reportFd.on === "function") {
 setInterval(() => {}, 60000);
 `.replace("${JSON.stringify(WRAPPER_SRC)}", "'\" + JSON.stringify(WRAPPER_SRC) + \"'");
 
-export interface AnchorMeta {
-  anchor: number;
-  wrapper: number;
-}
-
-export function anchorMetaPath(scope: string, id: string): string {
-  return join(tmpdir(), `action-hub-anchor-${process.pid}-${scope}-${id.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
-}
-
-export async function readAnchorMeta(metaFile: string): Promise<AnchorMeta | undefined> {
-  try {
-    const parsed = JSON.parse(await readFile(metaFile, "utf8")) as AnchorMeta;
-    if (typeof parsed.anchor === "number" && typeof parsed.wrapper === "number") return parsed;
-  } catch {
-    // Meta never written (spawn failed very early).
-  }
-  return undefined;
+export interface TeardownResult {
+  /** PIDs that are still alive after teardown. Empty = all dead. */
+  survivors: number[];
+  /**
+   * True when teardown of the anchored tree was proven (the anchor was
+   * alive, ran its own gated cleanup, and exited). False = fail closed: the
+   * host must treat the tree as unverified and report a failure rather than
+   * signal anything it cannot prove is its own.
+   */
+  proven: boolean;
 }
 
 const isWindows = platform() === "win32";
 
-const pidAlive = (pid: number): boolean => {
+export const pidAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
@@ -216,52 +212,43 @@ const pidAlive = (pid: number): boolean => {
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Gated, reuse-safe teardown of one anchor tree. Sends SIGTERM to the anchor
- * (the anchor runs its own cleanup and exits), waits bounded, then — only if
- * the WRAPPER is verifiably still alive — signals the wrapper's group. No
- * group signal ever happens after the wrapper died.
+ * Gated teardown of ONE anchored tree whose anchor PID the host holds
+ * directly. The host only ever signals the ANCHOR (single-PID signal, safe
+ * unconditionally): a living anchor performs its own group cleanup from
+ * inside, where the wrapper PID is known and every group signal is gated on
+ * the wrapper being alive. If the anchor cannot be proven dead-and-cleaned,
+ * the result is fail-closed — the host NEVER guesses at group PIDs.
  */
-export async function teardownAnchorTree(meta: AnchorMeta, timeoutMs = 5_000): Promise<number[]> {
-  const survivors: number[] = [];
-  if (isWindows) {
-    for (const pid of [meta.anchor, meta.wrapper]) {
-      if (pidAlive(pid)) {
-        try {
-          spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
-        } catch {}
-      }
-    }
-    await delay(500);
-    for (const pid of [meta.anchor, meta.wrapper]) if (pidAlive(pid)) survivors.push(pid);
-    return survivors;
-  }
-  if (pidAlive(meta.anchor)) {
-    try {
-      process.kill(meta.anchor, "SIGTERM");
-    } catch {}
-  }
+export async function teardownAnchorChild(
+  anchorPid: number,
+  timeoutMs = 5_000,
+): Promise<TeardownResult> {
+  if (!pidAlive(anchorPid)) return { survivors: [], proven: false };
+  try {
+    process.kill(anchorPid, "SIGTERM");
+  } catch {}
   const deadline = Date.now() + timeoutMs;
-  while (pidAlive(meta.anchor) && Date.now() < deadline) await delay(50);
-  // Wrapper still alive (anchor stuck or died mid-cleanup): gated group kill.
-  if (pidAlive(meta.wrapper)) {
+  while (pidAlive(anchorPid) && Date.now() < deadline) await delay(50);
+  if (!pidAlive(anchorPid)) return { survivors: [], proven: true };
+  if (isWindows) {
+    // The anchor is a live tree root: taskkill /T /F covers wrapper + server.
     try {
-      process.kill(-meta.wrapper, "SIGTERM");
+      await new Promise<void>((resolve) => {
+        const tk = spawn("taskkill", ["/pid", String(anchorPid), "/T", "/F"], { stdio: "ignore" });
+        tk.on("exit", () => resolve());
+        tk.on("error", () => resolve());
+      });
     } catch {}
-    await delay(150);
-    if (pidAlive(meta.wrapper)) {
-      try {
-        process.kill(-meta.wrapper, "SIGKILL");
-      } catch {}
-    }
+    await delay(500);
+    return { survivors: pidAlive(anchorPid) ? [anchorPid] : [], proven: !pidAlive(anchorPid) };
   }
-  const verifyDeadline = Date.now() + 2_000;
-  while (Date.now() < verifyDeadline) {
-    const alive = [meta.anchor, meta.wrapper].filter(pidAlive);
-    if (alive.length === 0) return survivors;
-    await delay(50);
-  }
-  for (const pid of [meta.anchor, meta.wrapper]) if (pidAlive(pid)) survivors.push(pid);
-  return survivors;
+  // POSIX: the anchor ignored our TERM long enough to be wedged. SIGKILLing
+  // it cannot be proven to clean the group, so fail closed and report.
+  try {
+    process.kill(anchorPid, "SIGKILL");
+  } catch {}
+  await delay(100);
+  return { survivors: pidAlive(anchorPid) ? [anchorPid] : [], proven: false };
 }
 
 /** Bounded spawn of the anchor used by hosts. Returns the child. */
@@ -269,10 +256,9 @@ export function spawnAnchor(
   mode: "daemon" | "doctor",
   command: string,
   args: string[],
-  options: { detached: boolean; stdio: ("ignore" | "inherit" | "pipe" | number)[]; env: NodeJS.ProcessEnv; metaFile?: string; stdoutDeadlineMs?: number },
+  options: { detached: boolean; stdio: ("ignore" | "inherit" | "pipe" | number)[]; env: NodeJS.ProcessEnv; stdoutDeadlineMs?: number },
 ): ChildProcess {
   const env = { ...options.env };
-  if (options.metaFile) env["ANCHOR_META_FILE"] = options.metaFile;
   if (options.stdoutDeadlineMs) env["ANCHOR_STDOUT_DEADLINE_MS"] = String(options.stdoutDeadlineMs);
   return spawn(process.execPath, ["-e", ANCHOR_SRC, mode, command, ...args], {
     detached: options.detached,
@@ -283,4 +269,3 @@ export function spawnAnchor(
 
 // Silence unused warnings for optional knobs kept for clarity.
 void KILLER_REQUIRED;
-void spawnSync;

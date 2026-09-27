@@ -9,7 +9,7 @@ import {
   type ServerConfig,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
-import { ANCHOR_SRC, anchorMetaPath, readAnchorMeta, teardownAnchorTree } from "./process-anchor.js";
+import { ANCHOR_SRC, pidAlive, teardownAnchorChild } from "./process-anchor.js";
 import { createSdkClientFactory } from "../client-factory.js";
 
 export interface DoctorOptions {
@@ -57,36 +57,24 @@ function serverTimeoutMs(srv: ServerConfig | undefined): number {
  * of whether it ever wrote valid stdout. HTTP servers are unaffected. The
  * original transport description is preserved for display.
  */
-interface SupervisedServer {
-  config: ServerConfig;
-  metaFile: string;
-}
-
-function supervisedServers(servers: readonly ServerConfig[]): SupervisedServer[] {
+function supervisedServers(servers: readonly ServerConfig[]): ServerConfig[] {
   return servers.map((srv) => {
-    if (srv.transport.type !== "stdio") {
-      return { config: srv, metaFile: "" };
-    }
+    if (srv.transport.type !== "stdio") return srv;
     const transport = srv.transport;
-    const metaFile = anchorMetaPath("doctor", srv.id);
     const env = {
       ...(transport.env ?? {}),
-      ANCHOR_META_FILE: metaFile,
       ANCHOR_STDOUT_DEADLINE_MS: String(Math.max(1_000, serverTimeoutMs(srv))),
     };
     return {
-      config: {
-        ...srv,
-        transport: {
-          type: "stdio",
-          command: process.execPath,
-          args: ["-e", ANCHOR_SRC, "doctor", transport.command, ...(transport.args ?? [])],
-          env,
-          ...(transport.cwd ? { cwd: transport.cwd } : {}),
-        },
-      } as ServerConfig,
-      metaFile,
-    };
+      ...srv,
+      transport: {
+        type: "stdio",
+        command: process.execPath,
+        args: ["-e", ANCHOR_SRC, "doctor", transport.command, ...(transport.args ?? [])],
+        env,
+        ...(transport.cwd ? { cwd: transport.cwd } : {}),
+      },
+    } as ServerConfig;
   });
 }
 
@@ -122,7 +110,7 @@ function withDeadline<T>(label: string, op: () => Promise<T>, ms: number): Promi
  * eventual client (if it ever connects) is closed so no transport or child
  * process survives the attempt.
  */
-function boundedClientFactory(inner: (config: ServerConfig) => Promise<McpClient>, metaFileFor: (config: ServerConfig) => string): (config: ServerConfig) => Promise<McpClient> {
+function boundedClientFactory(inner: (config: ServerConfig) => Promise<McpClient>, anchorPids: Map<number, string>, tornDownAnchors: Set<number>): (config: ServerConfig) => Promise<McpClient> {
   return async (config: ServerConfig): Promise<McpClient> => {
     const deadline = attemptBudgetMs(config);
     const clientPromise = (async () => inner(config))();
@@ -132,14 +120,18 @@ function boundedClientFactory(inner: (config: ServerConfig) => Promise<McpClient
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        // Bounded activation: kill the exact anchor tree via its meta file
-        // (recorded before connect resolved, so a partial-stdout server that
-        // never completes initialize is still torn down), then close the
-        // eventual transport of the timed-out attempt if it ever connects.
-        void (async () => {
-          const meta = await readAnchorMeta(metaFileFor(config));
-          if (meta) await teardownAnchorTree(meta);
-        })().catch(() => undefined);
+        // Bounded activation: terminate the anchor whose PID was captured at
+        // spawn (the anchor runs its own gated group cleanup from inside) —
+        // a partial-stdout server that never completes initialize is still
+        // torn down — then close the eventual transport of the timed-out
+        // attempt if it ever connects.
+        const anchorPid = [...anchorPids.entries()].find(([, id]) => id === config.id)?.[0];
+        if (anchorPid !== undefined) {
+          tornDownAnchors.add(anchorPid);
+          void teardownAnchorChild(anchorPid, 5_000).then((res) => {
+            if (res.survivors.length > 0) tornDownAnchors.delete(anchorPid); // surfaced at teardown
+          });
+        }
         void clientPromise.then((client) => client.close()).catch(() => undefined);
         reject(new Error(`connect timed out after ${deadline}ms`));
       }, deadline);
@@ -225,18 +217,27 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
 
   // 4. Downstream Server Connectivity & Indexing Status
   const supervised = supervisedServers(config.servers);
-  const anchorMetaFiles = supervised.map((s) => s.metaFile).filter((m) => m !== "");
-  const metaFileFor = (serverConfig: ServerConfig): string => supervised.find((s) => s.config === serverConfig)?.metaFile ?? "";
+  // The doctor HOLDS each anchor PID (captured from the transport child at
+  // spawn via the client-factory hook) — no disk PID metadata anywhere.
+  const anchorPids = new Map<number, string>();
+  const tornDownAnchors = new Set<number>();
+  const supervisedIds = new Set(supervised.filter((s) => s.transport.type === "stdio").map((s) => s.id));
+  const childFactory = createSdkClientFactory({
+    onChildSpawn: (serverConfig, pid) => {
+      if (supervisedIds.has(serverConfig.id)) anchorPids.set(pid, serverConfig.id);
+    },
+  });
   let teardownSurvivors: number[] = [];
+  let teardownProven = true;
   const hub = new ActionHub({
-    servers: supervised.map((s) => s.config),
+    servers: supervised,
     bundles: config.bundles,
     // Bounded activation: the core's execution timeout starts only AFTER the
     // client connects, and client.connect() has no deadline of its own, so a
     // permanently hanging initialize would otherwise hang the doctor. The
     // wrapped factory bounds every connect attempt and closes the transport
     // of a timed-out attempt (no child survives).
-    clientFactory: boundedClientFactory(createSdkClientFactory(), metaFileFor),
+    clientFactory: boundedClientFactory(childFactory, anchorPids, tornDownAnchors),
   });
 
   // Total budget across all servers and both attempts, so worst case cannot
@@ -401,23 +402,39 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
     // then kills its wrapper group), but a wedged close must not hang the
     // doctor — the anchor meta files allow exact, reuse-safe tree teardown.
     const closeBudget = Math.max(2_000, Math.min(10_000, budgetLeft()));
+    let closeOk = true;
     try {
       await withDeadline("hub.close", () => hub.close(), closeBudget);
     } catch {
-      // Bounded: fall through to the exact-tree teardown below.
+      // Bounded: fall through to the anchored teardown below.
+      closeOk = false;
     }
-    const anchorPids: number[] = [];
-    for (const metaFile of anchorMetaFiles) {
-      const meta = await readAnchorMeta(metaFile);
-      if (meta) {
-        anchorPids.push(meta.anchor, meta.wrapper);
-        teardownSurvivors.push(...(await teardownAnchorTree(meta)));
+    for (const [pid, serverId] of anchorPids) {
+      if (tornDownAnchors.has(pid) && !pidAlive(pid)) continue; // already torn down at the activation deadline
+      if (!pidAlive(pid)) {
+        // hub.close() SIGTERMed the anchor and it exited: the anchor only
+        // ever exits after its own gated group cleanup, so this is proven —
+        // UNLESS hub.close() itself failed, in which case the anchor's death
+        // is unexplained and we fail closed (F39 ruling).
+        if (closeOk) continue;
+        teardownProven = false;
+        console.error(`  ✖ [${serverId}] anchor (pid ${pid}) died during an unbounded close; state unverifiable.`);
+        continue;
+      }
+      const res = await teardownAnchorChild(pid, 5_000);
+      if (!res.proven) {
+        // Fail closed: the anchor wedged — the group state is unverifiable,
+        // so this is a failure even with no PID to name.
+        teardownSurvivors.push(...res.survivors);
+        teardownProven = false;
+        console.error(`  ✖ [${serverId}] anchor teardown could not be proven (pid ${pid}).`);
+      } else if (res.survivors.length > 0) {
+        teardownSurvivors.push(...res.survivors);
       }
     }
-    teardownSurvivors.push(...(await waitForProcessesExit(anchorPids, 2_000)));
-    if (teardownSurvivors.length > 0) {
+    if (teardownSurvivors.length > 0 || !teardownProven) {
       console.error(
-        `Doctor teardown left surviving processes (PIDs ${teardownSurvivors.join(", ")}); treating as a failure.`,
+        `Doctor teardown failed closed${teardownSurvivors.length > 0 ? ` (surviving PIDs ${teardownSurvivors.join(", ")})` : ""}; treating as a failure.`,
       );
       result = 1;
     }
