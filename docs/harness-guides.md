@@ -333,8 +333,8 @@ the same way — the response gives you no confidence signal by itself.
 ## Raw MCP clients
 
 If you hand-roll an MCP client instead of using an SDK, three framing
-details matter. Malformed frames are rejected explicitly, not silently
-(verified against the running server, both transports):
+details matter. Malformed-frame behavior is transport-specific (verified
+against the running server, both transports):
 
 - **Body is not valid JSON at all (HTTP):** the HTTP layer answers `400`
   with a plain `{ "error": "Invalid JSON body" }` — the payload never
