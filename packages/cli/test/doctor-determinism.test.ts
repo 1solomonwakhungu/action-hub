@@ -481,3 +481,71 @@ test("each retry attempt's anchor tree is torn down at its own deadline", async 
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// PR 77 rework round 4 (reviewer-1): killing ONLY the wrapper must make the
+// anchor report FAILURE (exit 3) — never a false EXIT_PROVEN — and the host
+// must fail closed. The downstream server survivor must not yield a green
+// result anywhere.
+test("unexpected wrapper death yields a failed anchor proof, not a green teardown", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-anchor-victim-"));
+  const { spawnAnchor, EXIT_PROVEN, teardownAnchorChild, EXIT_FAILED } =
+    await import("../dist/commands/process-anchor.js");
+  try {
+    await writeFile(join(tempDir, "recorded-pids.txt"), "");
+    const savedPidFile = process.env["TREE_PIDS_FILE"];
+    process.env["TREE_PIDS_FILE"] = join(tempDir, "recorded-pids.txt");
+    const anchor = spawnAnchor(
+      "daemon",
+      process.execPath,
+      [resolve(testDir, "fixtures/wrapper-victim-server.mjs"), "__daemon-run"],
+      { detached: false, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env } },
+    );
+    const stderr = anchor.stderr!.setEncoding("utf8");
+    let wrapperPid: number | undefined;
+    stderr.on("data", (chunk: string) => {
+      const m = chunk.match(/PPID:(\d+)/);
+      if (m && wrapperPid === undefined) wrapperPid = Number.parseInt(m[1]!, 10);
+    });
+    // Wait for the wrapper PID to arrive.
+    const waitDeadline = Date.now() + 5_000;
+    while (wrapperPid === undefined && Date.now() < waitDeadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.ok(wrapperPid, "fixture must report the wrapper PID");
+    // Kill ONLY the wrapper (SIGKILL, exact PID).
+    try {
+      process.kill(wrapperPid, "SIGKILL");
+    } catch {}
+    // The anchor must exit with the FAILURE proof code.
+    const exitDeadline = Date.now() + 5_000;
+    while (anchor.exitCode === null && anchor.signalCode === null && Date.now() < exitDeadline) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.equal(anchor.exitCode, EXIT_FAILED, `anchor must report failure, got exitCode=${anchor.exitCode}`);
+    assert.notEqual(anchor.exitCode, EXIT_PROVEN);
+    // Host-side teardown of the already-dead anchor must FAIL CLOSED.
+    const res = await teardownAnchorChild(anchor, 2_000);
+    assert.equal(res.proven, false, "teardown must be unproven after unexpected wrapper death");
+
+    // The recorded server survivor must NOT have been killed by any guessed
+    // group signal — the test owns it and kills it itself.
+    const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
+      .split("\n")
+      .map((l) => Number.parseInt(l.trim(), 10))
+      .filter((n) => Number.isSafeInteger(n) && n > 0);
+    assert.equal(recordedPids.length, 1, "expected exactly one recorded server PID");
+    let serverWasAlive = false;
+    try {
+      process.kill(recordedPids[0]!, 0);
+      serverWasAlive = true;
+    } catch {}
+    assert.equal(serverWasAlive, true, "server survivor must not be killed by a guessed group signal");
+    try {
+      process.kill(recordedPids[0]!, "SIGKILL");
+    } catch {}
+    void spawn;
+    void EXIT_PROVEN;
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
