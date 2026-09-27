@@ -301,6 +301,26 @@ export async function teardownAnchorChild(
 }
 
 /** Bounded spawn of the anchor used by hosts. Returns the child. */
+/**
+ * The interpreter that runs `-e` anchor/wrapper scripts. Under a SEA binary
+ * (dist-bin single-file build) process.execPath is the SEA binary itself,
+ * which rejects `-e` — the anchor and wrapper must run under real node.
+ */
+function anchorInterpreter(command: string): { node: string; args: string[] } {
+  let sea = false;
+  try {
+    // node:sea exists on Node >= 20.12; isSea() is true inside SEA binaries.
+    sea = (require("node:sea") as { isSea(): boolean }).isSea();
+  } catch {
+    sea = false;
+  }
+  if (!sea) return { node: process.execPath, args: [] };
+  // Inside a SEA binary the bundled node runtime is not addressable; run the
+  // anchor scripts under a real node from PATH (or an explicit override).
+  const override = process.env["ACTION_HUB_NODE_BIN"];
+  return { node: override && override.trim() ? override : "node", args: [] };
+}
+
 export function spawnAnchor(
   mode: "daemon" | "doctor",
   command: string,
@@ -309,7 +329,8 @@ export function spawnAnchor(
 ): ChildProcess {
   const env = { ...options.env };
   if (options.stdoutDeadlineMs) env["ANCHOR_STDOUT_DEADLINE_MS"] = String(options.stdoutDeadlineMs);
-  return spawn(process.execPath, ["-e", ANCHOR_SRC, mode, command, ...args], {
+  const { node } = anchorInterpreter(command);
+  return spawn(node, ["-e", ANCHOR_SRC, mode, command, ...args], {
     detached: options.detached,
     stdio: options.stdio,
     env,
