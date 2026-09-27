@@ -483,8 +483,20 @@ function percentileSelfTest() {
   // F52: the validators must reject malformed rows (fail closed), including
   // the previously-passing expected=null single-gold hole.
   const good = [{ query: "q1", expected: "a:tool", subtype: "exact", difficulty: "exact" }];
+  const goodSkill = [{ query: "s1", expected: "skill:x", subtype: "noisy", difficulty: "hard" }];
   const vbase = { manifests: [], skills: [], idMismatches: 0 };
   validateGeneratedCorpus({ ...vbase, queries: good, skillQueries: [], expectCounts: false });
+  validateGeneratedCorpus({ ...vbase, queries: [], skillQueries: goodSkill, expectCounts: false });
+  // Negative tests through the skillQueries path as well (reviewer-2).
+  const badSkillPairs = [
+    [{ query: "s", expected: "skill:x", subtype: "exact", difficulty: "hard" }],
+    [{ query: "s", expected: null, expectedAll: ["skill:a", "skill:b"], subtype: "multi", difficulty: "paraphrase" }],
+  ];
+  for (const bad of badSkillPairs) {
+    let threw = false;
+    try { validateGeneratedCorpus({ ...vbase, queries: [], skillQueries: bad, expectCounts: false }); } catch { threw = true; }
+    eq(threw, true, `validator must reject malformed skill row: ${JSON.stringify(bad)}`);
+  }
   for (const bad of [
     [{ query: "q", expected: null, subtype: "exact", difficulty: "exact" }],
     [{ query: "q", expected: null, expectedAll: ["a", "b"], subtype: "exact", difficulty: "exact" }],
@@ -650,8 +662,19 @@ function goldsOf(q) {
  * Fail-closed corpus validation (reviewer-2 blocker 5): a partial or
  * malformed fixture set must never silently pass as "full-generated".
  */
-const VALID_SUBTYPES = ["exact", "paraphrase", "goal-only", "near-duplicate", "multi", "no-match"];
+const VALID_SUBTYPES = ["exact", "paraphrase", "goal-only", "near-duplicate", "noisy", "multi", "no-match"];
 const VALID_DIFFICULTIES = ["exact", "paraphrase", "hard"];
+// F52 rework (reviewer-2): subtype->difficulty is part of the contract, not a
+// free pair. exact/paraphrase map to themselves; everything else is hard.
+const SUBTYPE_DIFFICULTY = {
+  exact: "exact",
+  paraphrase: "paraphrase",
+  "goal-only": "hard",
+  "near-duplicate": "hard",
+  noisy: "hard",
+  multi: "hard",
+  "no-match": "hard",
+};
 
 function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idMismatches, expectCounts = true }) {
   const errors = [];
@@ -674,7 +697,8 @@ function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idM
   for (const set of [queries, ...(skillQueries ? [skillQueries] : [])]) {
     for (const q of set) {
       if (typeof q.query !== "string" || q.query.trim() === "") { errors.push(`invalid query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
-      if (!["exact", "paraphrase", "hard"].includes(q.difficulty)) { errors.push(`unknown difficulty "${q.difficulty}" on: ${String(q.query).slice(0, 60)}`); break; }
+      if (!VALID_DIFFICULTIES.includes(q.difficulty)) { errors.push(`unknown difficulty "${q.difficulty}" on: ${String(q.query).slice(0, 60)}`); break; }
+      if (SUBTYPE_DIFFICULTY[q.subtype] !== q.difficulty) { errors.push(`subtype/difficulty mismatch: ${q.subtype} requires difficulty "${SUBTYPE_DIFFICULTY[q.subtype]}", got "${q.difficulty}" on: ${String(q.query).slice(0, 60)}`); break; }
       if (!VALID_SUBTYPES.includes(q.subtype)) { errors.push(`unknown subtype "${q.subtype}" on: ${String(q.query).slice(0, 60)}`); break; }
       const hasExpected = typeof q.expected === "string" || q.expected === null;
       const hasExpectedAll = Array.isArray(q.expectedAll);
@@ -768,6 +792,7 @@ async function runEval() {
       if (!SUBTYPES.includes(q.subtype)) { rErrors.push(`unknown realistic subtype: ${q.subtype}`); break; }
       // F52: whitelist difficulty and enforce full subtype/shape semantics.
       if (!VALID_DIFFICULTIES.includes(q.difficulty)) { rErrors.push(`unknown realistic difficulty "${q.difficulty}": ${q.query.slice(0, 60)}`); break; }
+      if (SUBTYPE_DIFFICULTY[q.subtype] !== q.difficulty) { rErrors.push(`subtype/difficulty mismatch: ${q.subtype} requires difficulty "${SUBTYPE_DIFFICULTY[q.subtype]}", got "${q.difficulty}": ${q.query.slice(0, 60)}`); break; }
       if (q.subtype === "no-match" && (q.expected !== null || "expectedAll" in q)) { rErrors.push(`realistic no-match row with a gold: ${q.query.slice(0, 60)}`); break; }
       if (q.subtype === "multi" && !(Array.isArray(q.expectedAll) && q.expectedAll.length >= 2 && q.expectedAll.length <= 4)) { rErrors.push(`realistic multi row without 2-4 golds: ${q.query.slice(0, 60)}`); break; }
       if (q.subtype !== "multi" && q.subtype !== "no-match" && !(typeof q.expected === "string" && q.expected.length > 0 && !("expectedAll" in q))) { rErrors.push(`realistic ${q.subtype} row must have a non-empty single gold and no expectedAll: ${q.query.slice(0, 60)}`); break; }
@@ -1005,13 +1030,15 @@ function countBy(arr, keyFn) {
 // Shared-harness failure envelope (PR 64): isolation, summary contract and
 // exit code all come from stress/lib/harness.mjs. setupIsolation, the local
 // withTimeout-guarded runner and the local write/exit logic are gone.
-percentileSelfTest();
-
 harnessMain(async () => {
   // Isolate THIS process first: every checklist env var is replaced under one
   // fresh run root before any hub construction.
   const sandbox = createSandbox({ prefix: "action-hub-eval-" });
   Object.assign(process.env, sandbox.env);
   assertIsolated(process.env, sandbox.root);
+  // Self-tests run INSIDE the harness finish path (reviewer-2 blocker 3): a
+  // self-test regression must produce the final ok:false JSON + failure
+  // artifact + nonzero exit, not a bare crash outside the contract.
+  percentileSelfTest();
   return runEval();
 }, { resultsPath: join(RESULTS_DIR, "eval-retrieval.json") });
