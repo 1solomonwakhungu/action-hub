@@ -44,10 +44,22 @@
 //  (6) near-duplicate queries only target genuinely confusable tools: the gold
 //      must have >= 1 distractor that is a sibling-server clone (same tool name
 //      on another server) or shares its verb token (same verb, different object)
-import { mkdirSync, writeFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
+import fs, { mkdirSync, writeFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 const ARGS = process.argv.slice(2);
+function gateError(message) {
+  const err = new Error(message);
+  err.summary = { script: 'gen-tools.mjs', generatorVersion: 3, ok: false, error: message };
+  return err;
+}
+// Generated-output paths written by THIS run; unlinked on failure so no
+// partial corpus/query data survives a failed generation.
+const WRITTEN = [];
+function writeOut(filePath, data) {
+  WRITTEN.push(filePath);
+  writeFileSync(filePath, data);
+}
 function argValue(name) {
   const i = ARGS.indexOf(name);
   return i >= 0 && i + 1 < ARGS.length ? ARGS[i + 1] : undefined;
@@ -401,26 +413,26 @@ const DESC_LEAD = {
 // second half so schema/description text carries retrieval signal beyond
 // the tool name.
 const DOMAIN_DETAILS = {
-  crm: ['for account and contact records, including deal stage and owner', 'with pipeline activity and next-step notes'],
-  billing: ['for a customer invoice, including line items and due date', 'against the billing ledger with idempotency keys'],
-  ticketing: ['for a support ticket, including queue, SLA clock, and assignee', 'with the customer conversation thread attached'],
-  'git-hosting': ['for a repository branch, including the latest commit and CI status', 'with pull request checks and release tags'],
-  'cloud-infra': ['for a compute resource, including region, instance size, and tags', 'against the network and storage inventory'],
-  analytics: ['for an analytics event stream, including funnel and cohort breakdown', 'with dashboard widget references'],
-  email: ['for an email campaign, including template, bounce, and delivery stats', 'with recipient list and send window'],
-  calendar: ['for a calendar meeting, including room booking and attendee availability', 'with scheduling window and recurrence rules'],
-  hr: ['for an employee record, including time-off balance and review cycle', 'with payroll run references'],
-  docs: ['for a knowledge base document, including space, section, and last editor', 'with comment threads and permission scope'],
-  observability: ['for a log or trace stream, including alert thresholds and on-call routing', 'with metric series and dashboard links'],
-  iam: ['for a role binding, including policy version and session scope', 'with user and service identity references'],
-  'data-warehouse': ['for a warehouse table, including materialized view and query credits', 'with export formats and refresh schedule'],
-  search: ['for a search index entry, including content source and ranking hints', 'with semantic embedding metadata'],
-  chat: ['for a chat channel, including membership roster and pinned messages', 'with thread history and notification rules'],
-  shipping: ['for a shipment record, including carrier, tracking number, and delivery window', 'with warehouse pickup and customs paperwork'],
-  inventory: ['for a stock item, including warehouse bin, count, and reorder point', 'with supplier lead times'],
-  payments: ['for a payment transaction, including capture status and settlement batch', 'with refund and chargeback references'],
-  marketing: ['for a marketing segment, including campaign source and conversion metrics', 'with audience filters and AB test arms'],
-  legal: ['for a legal record, including matter number, counsel of record, and retention class', 'with redaction and privilege review notes'],
+  crm: ['with account, contact, and deal-stage references', 'with pipeline activity and next-step notes', 'against CRM records with owner assignment'],
+  billing: ['with billing ledger and invoice line-item references', 'including due dates and proration rules', 'against customer accounts and payment methods'],
+  ticketing: ['with queue, SLA clock, and assignee references', 'with the customer conversation thread attached', 'against the support desk backlog and priorities'],
+  'git-hosting': ['with repository, branch, and commit references', 'with pull request checks and release tags', 'against CI hook and pipeline status'],
+  'cloud-infra': ['with region, instance size, and tag references', 'against the network and storage inventory', 'with IAM scope and change-window references'],
+  analytics: ['with event, funnel, and cohort references', 'with dashboard widget and metric references', 'against product usage segments'],
+  email: ['with campaign, template, and delivery-stat references', 'with bounce and send-window details', 'against recipient lists and suppression rules'],
+  calendar: ['with room booking and attendee availability references', 'with scheduling window and recurrence rules', 'against calendar invitations and responses'],
+  hr: ['with employee record and time-off balance references', 'with payroll run and review-cycle details', 'against people-ops headcount and role data'],
+  docs: ['with knowledge base space, section, and editor references', 'with comment thread and permission scope', 'against document version history'],
+  observability: ['with alert threshold and on-call routing references', 'with metric series and dashboard links', 'against log and trace retention windows'],
+  iam: ['with role binding and policy version references', 'with session scope and identity references', 'against access review and audit trails'],
+  'data-warehouse': ['with warehouse table and materialized view references', 'with query credits and refresh schedule', 'against export formats and row-level filters'],
+  search: ['with index entry and ranking hint references', 'with content source and embedding metadata', 'against search relevance and recall metrics'],
+  chat: ['with channel membership and pinned message references', 'with thread history and notification rules', 'against workspace conversation archives'],
+  shipping: ['with carrier, tracking, and delivery window references', 'with warehouse pickup and customs paperwork', 'against shipment manifests and rates'],
+  inventory: ['with warehouse bin, count, and reorder point references', 'with supplier lead times', 'against stock movement and cycle counts'],
+  payments: ['with capture status and settlement batch references', 'with refund and chargeback references', 'against payment method and currency records'],
+  marketing: ['with campaign source and conversion metric references', 'with audience filters and AB test arms', 'against segment membership and attribution data'],
+  legal: ['with matter number and counsel-of-record references', 'with retention class and privilege review notes', 'against redaction and legal-hold records'],
 };
 
 // ---------- Manifest / tool generation ----------
@@ -453,15 +465,18 @@ function makeTool(serverId, domainName, orgName, forced) {
   const entityHead = parts[1];
   const entityPhrase = qualifier ? `${qualifier} ${parts.slice(1, -1).join(' ')}` : parts.slice(1).join(' ');
   const lead = DESC_LEAD[parts[0]];
-  // Prefer a domain detail that actually mentions the tool's entity so the
-  // sentence stays coherent; fall back to a generic in-domain operation.
+  // Every tool carries 1-2 REAL domain-specific details (FX16 rework:
+  // 100% coverage, no generic fallback). Fragments are written to be
+  // object-agnostic but anchored on the domain's nouns, so any tool object
+  // reads coherently. An entity-matching fragment is preferred when one
+  // exists. Selection is hash-keyed — no rnd consumption.
   const details = DOMAIN_DETAILS[domainName] ?? [];
+  if (details.length === 0) throw new Error(`FX16: no DOMAIN_DETAILS pool for domain "${domainName}"`);
   const matched = details.filter((d) => d.includes(entityHead));
-  const generic = 'with standard audit and access controls';
   const h = hash32(name);
-  const d1 = matched.length ? matched[h % matched.length] : generic;
-  const d2pool = matched.filter((d) => d !== d1);
-  const d2 = d2pool.length && h % 3 === 0 ? d2pool[h % d2pool.length] : '';
+  const d1 = matched.length ? matched[h % matched.length] : details[h % details.length];
+  const d2pool = details.filter((d) => d !== d1);
+  const d2 = d2pool.length && h % 3 === 0 ? d2pool[(h >> 3) % d2pool.length] : '';
   const automation = !bigResponse && rnd() < 0.5;
   const suffix = automation ? ' for automation workflows' : '';
   // Tail/annotations follow the NAME's semantics, not the random kind — a
@@ -908,6 +923,14 @@ function validate(manifests, queries, serverDescs, staleRemoved, finalFiles) {
 
 // ---------- Main ----------
 function main() {
+  // Validate numeric args before any side effect (FX16 rework: setup
+  // failures must be reported through the finish path, not crash silently).
+  const numericArgs = { '--small-servers': SMALL_SERVERS, '--small-tools': SMALL_TOOLS, '--big-servers': BIG_SERVERS, '--big-tools': BIG_TOOLS, '--queries': QUERY_TOTAL };
+  for (const [flag, value] of Object.entries(numericArgs)) {
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+      throw new Error(`invalid ${flag}: must be a non-negative integer, got ${JSON.stringify(argValue(flag))}`);
+    }
+  }
   mkdirSync(OUT_DIR, { recursive: true });
   mkdirSync(RESULTS_DIR, { recursive: true });
 
@@ -938,12 +961,12 @@ function main() {
   const queries = buildQueries(manifests, serverDescs);
 
   for (const m of manifests) {
-    writeFileSync(join(OUT_DIR, `${m.serverId}.json`), JSON.stringify(m, null, 2));
+    writeOut(join(OUT_DIR, `${m.serverId}.json`), JSON.stringify(m, null, 2));
   }
   // Contract: queries are a direct array at stress/.generated/tools-queries.json
   // (same shape as skills-queries.json). Never inside the manifest directory —
   // make-config scans tools/*.json as fake-server manifests.
-  writeFileSync(resolve('stress/.generated/tools-queries.json'), JSON.stringify(queries, null, 2));
+  writeOut(resolve('stress/.generated/tools-queries.json'), JSON.stringify(queries, null, 2));
 
   const finalFiles = readdirSync(OUT_DIR).filter((f) => f.endsWith('.json'));
   const { violations, minDistractors } = validate(manifests, queries, serverDescs, staleRemoved, finalFiles);
@@ -1002,7 +1025,24 @@ function main() {
       if (!t.description.includes(entityPhrase)) descLint.descEntity += 1;
     }
   }
-  const descLintTotal = descLint.descVerb + descLint.descEntity;
+  // FX16 rework: domain-detail coverage — every tool's description must
+  // contain at least one actual DOMAIN_DETAILS fragment of its own domain.
+  const genericFallback = 'standard audit and access controls';
+  // Reverse-lookup each serverId against DOMAINS (org prefix lengths vary:
+  // acme-corp has two segments, globex/initech one).
+  const domainOfServer = new Map(DOMAINS.map((dd) => [`${dd.org}-${dd.name}`, dd.name]));
+  const coverage = { covered: 0, total: 0, generic: 0 };
+  for (const m of manifests) {
+    const domainName = domainOfServer.get(m.serverId);
+    const pool = DOMAIN_DETAILS[domainName] ?? [];
+    for (const t of m.tools) {
+      coverage.total += 1;
+      if (pool.some((f) => t.description.includes(f))) coverage.covered += 1;
+      if (t.description.includes(genericFallback)) coverage.generic += 1;
+    }
+  }
+  descLint.domainCoverage = coverage;
+  const descLintTotal = descLint.descVerb + descLint.descEntity + (coverage.covered < coverage.total ? 1 : 0);
 
   // Ambiguity count for the record: the validator inside buildQueries already
   // fails hard on ambiguous paraphrases; this recomputes the same predicate
@@ -1027,10 +1067,13 @@ function main() {
   console.log('--- FX13 tool lint counts (clean text, gate = all zero) ---');
   console.log(JSON.stringify(toolLint));
   if (toolLintTotal > 0) {
-    throw new Error(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
+    throw gateError(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
   }
   if (descLintTotal > 0) {
-    throw new Error(`FX16 description lint failed: ${JSON.stringify(descLint)} samples: ${descBadSamples.slice(0, 10).join(' | ')}`);
+    const covMsg = descLint.domainCoverage && descLint.domainCoverage.covered < descLint.domainCoverage.total
+      ? ` coverage ${descLint.domainCoverage.covered}/${descLint.domainCoverage.total} (generic fallback used ${descLint.domainCoverage.generic}x)`
+      : '';
+    throw gateError(`FX16 description lint failed: ${JSON.stringify(descLint)}${covMsg} samples: ${descBadSamples.slice(0, 10).join(' | ')}`);
   }
   const descSamples = manifests.flatMap((m) => m.tools).filter((_, i) => i % Math.max(1, Math.floor(10000 / 30)) === 0).slice(0, 30)
     .map((t) => `${t.name}: ${t.description}`);
@@ -1046,7 +1089,7 @@ function main() {
   }
   console.log('--- FX16 description lint (gate = all zero) ---');
   console.log(JSON.stringify(descLint));
-  writeFileSync(
+  writeOut(
     join(RESULTS_DIR, 'query-quality-tools.json'),
     JSON.stringify({ generatorVersion: 3, lint: toolLint, samples: paraphraseSamples }, null, 2),
   );
@@ -1057,6 +1100,8 @@ function main() {
     bySubtype[q.subtype] = (bySubtype[q.subtype] || 0) + 1;
     byDifficulty[q.difficulty] = (byDifficulty[q.difficulty] || 0) + 1;
   }
+  const uniqueQueryStrings = new Set(queries.map((q) => q.query)).size === queries.length;
+  const unresolvedExpected = queries.filter((q) => q.expected !== null && !idExists(manifests, q.expected)).length;
   const summary = {
     script: 'gen-tools.mjs',
     generatorVersion: 3,
@@ -1070,8 +1115,8 @@ function main() {
     bySubtype,
     byDifficulty,
     checks: {
-      uniqueQueryStrings: new Set(queries.map((q) => q.query)).size === queries.length,
-      unresolvedExpected: queries.filter((q) => q.expected !== null && !idExists(manifests, q.expected)).length,
+      uniqueQueryStrings,
+      unresolvedExpected,
       paraphraseCeiling: 0.3,
       noMatchRule: 'zero content-token overlap with the whole indexed corpus (tool name words, description, serverId, server description) after removing the documented stopword list: ' + [...STOPWORDS].join(','),
       staleRemoved,
@@ -1079,15 +1124,16 @@ function main() {
       violations: violations.slice(0, 20),
       violationCount: violations.length,
     },
-    ok: violations.length === 0,
+    ok:
+      violations.length === 0 &&
+      toolLintTotal === 0 &&
+      descLintTotal === 0 &&
+      uniqueQueryStrings &&
+      unresolvedExpected === 0,
   };
-  writeFileSync(join(RESULTS_DIR, 'gen-tools.json'), JSON.stringify(summary, null, 2));
-  // Contract: last stdout line is a single-line machine-readable JSON summary.
-  const summaryLine = JSON.stringify(summary);
-  console.log(summaryLine);
-  if (!summary.ok) process.exit(1);
-  // Smoke assertion: the last stdout line parses as JSON.
-  JSON.parse(summaryLine.trim());
+  // Contract: the finish path writes the artifact and prints the last
+  // stdout line — main() just returns the summary.
+  return summary;
 }
 function idExists(manifests, id) {
   const i = id.indexOf(':');
@@ -1095,4 +1141,33 @@ function idExists(manifests, id) {
   const m = manifests.find((x) => x.serverId === sid);
   return !!m && m.tools.some((t) => t.name === tn);
 }
-main();
+function finish(summary) {
+  try {
+    fs.mkdirSync(RESULTS_DIR, { recursive: true });
+    // Always overwrite the results artifact — a failure must never leave a
+    // stale ok:true summary behind (FX16 rework: failure contract).
+    writeFileSync(join(RESULTS_DIR, 'gen-tools.json'), JSON.stringify(summary, null, 2));
+  } catch (err) {
+    summary.ok = false;
+    summary.artifactError = String(err?.message ?? err);
+  }
+  // Contract: exactly one compact machine-readable JSON line on stdout.
+  console.log(JSON.stringify(summary));
+  process.exitCode = summary.ok ? 0 : 1;
+}
+
+try {
+  const summary = main();
+  finish(summary);
+} catch (err) {
+  // Remove artifacts this run wrote so consumers cannot read partial data.
+  for (const p of WRITTEN) {
+    try { fs.rmSync(p); } catch { /* best effort */ }
+  }
+  finish(err?.summary ?? {
+    script: 'gen-tools.mjs',
+    generatorVersion: 3,
+    ok: false,
+    error: String(err?.message ?? err),
+  });
+}
