@@ -276,6 +276,11 @@ const FRAGMENT_RATE = 0.05;  // share of exact queries that are fragments
 
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function titleFromName(name) { return name.split('_').map(cap).join(' '); }
+function hash32(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
 
 function injectTypo(word) {
   if (word.length < 4) return word;
@@ -308,7 +313,7 @@ function makeSchema(name, opts = {}) {
   const used = new Set();
   if (rnd() < 0.8) {
     const n = pick(ID_NAMES);
-    props[n] = { type: 'string', description: `Unique ${titleFromName(n)} for this ${name}.` };
+    props[n] = { type: 'string', description: `Unique ${titleFromName(n)} for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
     used.add(n);
   }
   let guard = 0;
@@ -317,7 +322,7 @@ function makeSchema(name, opts = {}) {
     if (used.has(n)) continue; // no numeric serials: resample instead of suffixing
     used.add(n);
     const t = rnd() < 0.55 ? 'string' : pick(SCALAR_TYPES);
-    const p = { type: t, description: `${titleFromName(n)} of the ${name.replace(/_/g, ' ')}.` };
+    const p = { type: t, description: `${titleFromName(n)} of the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
     if (t === 'string' && rnd() < 0.4) p.format = pick(STRING_FORMATS);
     if (t === 'string' && rnd() < 0.15) { p.enum = pick(ENUM_SETS); p.description += ` One of: ${p.enum.join(', ')}.`; }
     if ((t === 'number' || t === 'integer') && rnd() < 0.5) { p.minimum = int(0, 100); p.maximum = p.minimum + int(1, 10000); }
@@ -329,21 +334,21 @@ function makeSchema(name, opts = {}) {
     const depth = opts.deep ? int(2, 3) : 1;
     for (let d = 0; d < int(1, 3); d++) {
       const n = pick(NESTED_NAMES);
-      const root = { type: 'object', properties: {}, additionalProperties: false, description: `Structured ${titleFromName(n)} for this request.` };
+      const root = { type: 'object', properties: {}, additionalProperties: false, description: `Structured ${titleFromName(n)} for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')} request.` };
       let cur = root;
       for (let level = 0; level < depth; level++) {
         const childName = level === depth - 1 ? 'details' : 'inner';
         const child = { type: 'object', properties: {}, additionalProperties: false };
         for (let k = 0; k < int(2, 5); k++) {
           const pn = pick(ENTITY_WORDS) + '_l' + level;
-          child.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} at nesting level ${level}.` };
+          child.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} of the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}, nesting level ${level}.` };
         }
         cur.properties[childName] = child;
         cur = child;
       }
       for (let k = 0; k < int(2, 6); k++) {
         const pn = pick(ENTITY_WORDS);
-        cur.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} for ${titleFromName(n)}.` };
+        cur.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
       }
       props[n] = root;
     }
@@ -353,13 +358,70 @@ function makeSchema(name, opts = {}) {
     while (Object.keys(props).length < 22 && g2++ < 200) {
       const n = pick(ENTITY_WORDS) + '_x' + Object.keys(props).length;
       if (n in props) continue;
-      props[n] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(n)} extension field.` };
+      props[n] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(n)} extension for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
     }
   }
   const schema = { type: 'object', properties: props, additionalProperties: false };
   if (req.length) schema.required = req;
   return schema;
 }
+
+// ---------- FX16: verb-consistent realistic descriptions ----------
+// Leading phrase is keyed by the tool-name verb: the description's action
+// can never contradict the name. Entities appear in plain words.
+const DESC_LEAD = {
+  list: 'Lists', get: 'Returns', search: 'Searches',
+  create: 'Creates a new', update: 'Updates the', delete: 'Permanently deletes the',
+  revoke: 'Revokes the', purge: 'Permanently purges the', cancel: 'Cancels the',
+  void: 'Voids the', retry: 'Retries the', resend: 'Resends the',
+  approve: 'Approves the', reject: 'Rejects the', close: 'Closes the',
+  reopen: 'Reopens the', archive: 'Archives the', restore: 'Restores the',
+  assign: 'Assigns the', move: 'Moves the', merge: 'Merges the',
+  export: 'Exports the', validate: 'Validates the', preview: 'Previews the',
+  publish: 'Publishes the', clone: 'Duplicates the', diff: 'Compares the',
+  sync: 'Synchronizes the', rotate: 'Rotates the', send: 'Sends the',
+  schedule: 'Schedules the', acknowledge: 'Acknowledges the', escalate: 'Escalates the',
+  count: 'Counts the', summarize: 'Summarizes the', compare: 'Compares the',
+  enable: 'Enables the', disable: 'Disables the', pause: 'Pauses the',
+  resume: 'Resumes the', transfer: 'Transfers the', attach: 'Attaches the',
+  detach: 'Detaches the', link: 'Links the', unlink: 'Unlinks the',
+  resolve: 'Resolves the', split: 'Splits the', rollback: 'Rolls back the',
+  promote: 'Promotes the', invite: 'Invites the', verify: 'Verifies the',
+  share: 'Shares the', lock: 'Locks the', unlock: 'Unlocks the',
+  freeze: 'Freezes the', unfreeze: 'Unfreezes the', finalize: 'Finalizes the',
+  reindex: 'Reindexes the', rebuild: 'Rebuilds the', recalculate: 'Recalculates the',
+  amend: 'Amends the', snapshot: 'Snapshots the', prune: 'Prunes the',
+  migrate: 'Migrates the', backfill: 'Backfills the', replay: 'Replays the',
+  redact: 'Redacts the',
+  add: 'Adds the', resize: 'Resizes the', run: 'Runs the',
+  trigger: 'Triggers the', upload: 'Uploads the',
+};
+
+// 1-2 domain-specific details per domain, woven into the description's
+// second half so schema/description text carries retrieval signal beyond
+// the tool name.
+const DOMAIN_DETAILS = {
+  crm: ['for account and contact records, including deal stage and owner', 'with pipeline activity and next-step notes'],
+  billing: ['for a customer invoice, including line items and due date', 'against the billing ledger with idempotency keys'],
+  ticketing: ['for a support ticket, including queue, SLA clock, and assignee', 'with the customer conversation thread attached'],
+  'git-hosting': ['for a repository branch, including the latest commit and CI status', 'with pull request checks and release tags'],
+  'cloud-infra': ['for a compute resource, including region, instance size, and tags', 'against the network and storage inventory'],
+  analytics: ['for an analytics event stream, including funnel and cohort breakdown', 'with dashboard widget references'],
+  email: ['for an email campaign, including template, bounce, and delivery stats', 'with recipient list and send window'],
+  calendar: ['for a calendar meeting, including room booking and attendee availability', 'with scheduling window and recurrence rules'],
+  hr: ['for an employee record, including time-off balance and review cycle', 'with payroll run references'],
+  docs: ['for a knowledge base document, including space, section, and last editor', 'with comment threads and permission scope'],
+  observability: ['for a log or trace stream, including alert thresholds and on-call routing', 'with metric series and dashboard links'],
+  iam: ['for a role binding, including policy version and session scope', 'with user and service identity references'],
+  'data-warehouse': ['for a warehouse table, including materialized view and query credits', 'with export formats and refresh schedule'],
+  search: ['for a search index entry, including content source and ranking hints', 'with semantic embedding metadata'],
+  chat: ['for a chat channel, including membership roster and pinned messages', 'with thread history and notification rules'],
+  shipping: ['for a shipment record, including carrier, tracking number, and delivery window', 'with warehouse pickup and customs paperwork'],
+  inventory: ['for a stock item, including warehouse bin, count, and reorder point', 'with supplier lead times'],
+  payments: ['for a payment transaction, including capture status and settlement batch', 'with refund and chargeback references'],
+  marketing: ['for a marketing segment, including campaign source and conversion metrics', 'with audience filters and AB test arms'],
+  legal: ['for a legal record, including matter number, counsel of record, and retention class', 'with redaction and privilege review notes'],
+};
 
 // ---------- Manifest / tool generation ----------
 function makeTool(serverId, domainName, orgName, forced) {
@@ -376,7 +438,46 @@ function makeTool(serverId, domainName, orgName, forced) {
   const bigResponse = rnd() < 0.04;
   const errorRate = rnd() < 0.03 ? +(rnd() * 0.15).toFixed(3) : 0;
   const latencyMs = int(0, 50);
-  const desc = `${isRead ? 'Retrieves' : kind === 'danger' ? 'Permanently removes or revokes' : 'Creates, updates, or manages'} ${titleFromName(name).toLowerCase()} in the ${orgName} ${domainName} service. ${bigResponse ? 'Returns a large paginated payload with full embedded records, audit history, and related entities.' : `Supports ${isRead ? 'filtering and pagination' : 'partial updates and idempotency keys'}${rnd() < 0.5 ? ' for automation workflows' : ''}.`}`;
+  // FX16: 1-2 sentences, verb-consistent lead (DESC_LEAD keyed by the
+  // tool-name verb, so the description's action can never contradict the
+  // name), entity in plain words, 1-2 details drawn from the server's
+  // domain. Detail selection is keyed by a hash of the tool name, NOT the
+  // global rnd stream, and the original rnd() consumption shape is kept
+  // exactly (one call when !bigResponse) — otherwise every subsequent tool
+  // name/id would shift and invalidate the realistic fixture's gold labels.
+  const parts = name.split('_');
+  // Qualifier reads as an adjective before the entity ("the escalated
+  // user") — but only when the last segment IS a qualifier: multi-word
+  // entities (burn_rate, golden_signal, credit_note) keep their order.
+  const qualifier = parts.length > 2 && QUALIFIERS.includes(parts[parts.length - 1]) ? parts[parts.length - 1] : '';
+  const entityHead = parts[1];
+  const entityPhrase = qualifier ? `${qualifier} ${parts.slice(1, -1).join(' ')}` : parts.slice(1).join(' ');
+  const lead = DESC_LEAD[parts[0]];
+  // Prefer a domain detail that actually mentions the tool's entity so the
+  // sentence stays coherent; fall back to a generic in-domain operation.
+  const details = DOMAIN_DETAILS[domainName] ?? [];
+  const matched = details.filter((d) => d.includes(entityHead));
+  const generic = 'with standard audit and access controls';
+  const h = hash32(name);
+  const d1 = matched.length ? matched[h % matched.length] : generic;
+  const d2pool = matched.filter((d) => d !== d1);
+  const d2 = d2pool.length && h % 3 === 0 ? d2pool[h % d2pool.length] : '';
+  const automation = !bigResponse && rnd() < 0.5;
+  const suffix = automation ? ' for automation workflows' : '';
+  // Tail/annotations follow the NAME's semantics, not the random kind — a
+  // description must never contradict the tool name (FX16 hard rule).
+  const semanticRead = /^(list|get|search|preview|diff|compare|count|summarize|validate|verify)_/.test(name);
+  const semanticDanger = /^(delete|revoke|purge|void)_/.test(name);
+  const tail = bigResponse
+    ? ' Results are paginated with full embedded records and audit history.'
+    : semanticDanger
+      ? ' This action is irreversible and is recorded in the audit log.'
+      : semanticRead
+        ? ` Supports filtering and pagination${suffix}.`
+        : ` Supports partial updates with idempotency keys${suffix}.`;
+  const desc = lead
+    ? `${lead} ${entityPhrase} in the ${orgName} ${domainName.replace(/-/g, ' ')} workspace${d1 ? `, ${d1}` : ''}${d2 ? `; also ${d2}` : ''}.${tail}`
+    : '';
   const input = makeSchema(name, {
     nested: rnd() < 0.3,
     deep: rnd() < 0.12,
@@ -385,8 +486,8 @@ function makeTool(serverId, domainName, orgName, forced) {
     maxProps: 26,
   });
   const tool = { name, description: desc, inputSchema: input, annotations: {} };
-  if (isRead) tool.annotations.readOnlyHint = true;
-  if (kind === 'danger') tool.annotations.destructiveHint = true;
+  if (semanticRead) tool.annotations.readOnlyHint = true;
+  if (semanticDanger) tool.annotations.destructiveHint = true;
   const behavior = { latencyMs };
   if (errorRate > 0) behavior.errorRate = errorRate;
   if (bigResponse) behavior.responseBytes = int(600_000, 1_000_000);
@@ -881,6 +982,28 @@ function main() {
       unknownSamples.push(...unknown.slice(0, 5));
     }
   }
+  // FX16 verb-agreement lint: the description's leading action phrase must
+  // come from DESC_LEAD for the tool-name verb, and the entity phrase (with
+  // qualifier reordered as an adjective) must appear verbatim. Any mismatch
+  // or missing verb fails generation.
+  const descLint = { descVerb: 0, descEntity: 0 };
+  const descBadSamples = [];
+  for (const m of manifests) {
+    for (const t of m.tools) {
+      const parts = t.name.split('_');
+      const lead = DESC_LEAD[parts[0]];
+      const qualifier = parts.length > 2 && QUALIFIERS.includes(parts[parts.length - 1]) ? parts[parts.length - 1] : '';
+      const entityPhrase = qualifier ? `${qualifier} ${parts.slice(1, -1).join(' ')}` : parts.slice(1).join(' ');
+      if (!lead || !t.description.startsWith(lead + ' ')) {
+        descLint.descVerb += 1;
+        if (descBadSamples.length < 10) descBadSamples.push(`${m.serverId}:${t.name} -> ${t.description.slice(0, 80)}`);
+        continue;
+      }
+      if (!t.description.includes(entityPhrase)) descLint.descEntity += 1;
+    }
+  }
+  const descLintTotal = descLint.descVerb + descLint.descEntity;
+
   // Ambiguity count for the record: the validator inside buildQueries already
   // fails hard on ambiguous paraphrases; this recomputes the same predicate
   // over the emitted rows so the results file carries the number.
@@ -906,6 +1029,23 @@ function main() {
   if (toolLintTotal > 0) {
     throw new Error(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
   }
+  if (descLintTotal > 0) {
+    throw new Error(`FX16 description lint failed: ${JSON.stringify(descLint)} samples: ${descBadSamples.slice(0, 10).join(' | ')}`);
+  }
+  const descSamples = manifests.flatMap((m) => m.tools).filter((_, i) => i % Math.max(1, Math.floor(10000 / 30)) === 0).slice(0, 30)
+    .map((t) => `${t.name}: ${t.description}`);
+  console.log('--- FX16 description samples (30) ---');
+  for (const sample of descSamples) console.log('  ' + sample);
+  console.log('--- FX16 previously-contradictory cases, fixed ---');
+  for (const m of manifests) {
+    for (const t of m.tools) {
+      if (['compare_dispute', 'delete_team', 'replay_node', 'count_transfer'].includes(t.name)) {
+        console.log(`  ${m.serverId}:${t.name}: ${t.description}`);
+      }
+    }
+  }
+  console.log('--- FX16 description lint (gate = all zero) ---');
+  console.log(JSON.stringify(descLint));
   writeFileSync(
     join(RESULTS_DIR, 'query-quality-tools.json'),
     JSON.stringify({ generatorVersion: 3, lint: toolLint, samples: paraphraseSamples }, null, 2),
@@ -926,6 +1066,7 @@ function main() {
     bigManifests: BIG_MANIFEST_COUNT,
     queryTotal: queries.length,
     queryQuality: { generatorVersion: 3, lint: toolLint, lintHits: toolLintTotal, sampleCount: paraphraseSamples.length },
+    descriptionQuality: { lint: descLint, lintHits: descLintTotal, sampleCount: descSamples.length },
     bySubtype,
     byDifficulty,
     checks: {
