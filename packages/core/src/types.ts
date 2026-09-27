@@ -168,6 +168,13 @@ export interface SearchOptions {
   minTrust?: TrustTier;
   /** When true, includes the inputSchema on retrieved hits */
   includeSchema?: boolean;
+  /**
+   * Optional relative cutoff: drop hits whose score is below
+   * `minScoreRatio * bestScore` (ratio clamped to (0, 1]). Off by default;
+   * enable when the retrieval eval shows fewer no-match false positives
+   * without a recall regression.
+   */
+  minScoreRatio?: number;
 }
 
 /** Returned by `load`; this is the only path that exposes a full schema. */
