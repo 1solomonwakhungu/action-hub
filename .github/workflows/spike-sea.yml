@@ -1,10 +1,14 @@
 name: spike-sea-embeddings
 # THROWAWAY spike branch (never merged to main): verifies that a Node SEA
 # with @huggingface/transformers + vendored int8 MiniLM-L6 builds and runs
-# fully offline on all three OSes. workflow_dispatch only.
+# fully offline on all three OSes. workflow_dispatch + pull_request (intake-authorized throwaway PR; never merged).
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/spike-sea.yml
+      - spike/**
 
 permissions:
   contents: read
