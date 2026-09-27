@@ -275,11 +275,20 @@ function signalGroup(pgid, signal) {
   }
 }
 
+/**
+ * win32 group kill via `taskkill /T /F`. Returns a TRUTHFUL verdict —
+ * {ok:true} only when taskkill exited 0 (or 128 = already gone); a failed
+ * kill must surface, never become a false green (reviewer LIB2-R2.3).
+ */
 function killTreeWindows(pid) {
   const result = spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)]);
-  if (result.error || (result.status !== 0 && result.status !== 128)) {
-    // 128 = process not found; anything else is logged, never thrown.
+  if (result.error) {
+    return { ok: false, status: null, error: String(result.error?.message ?? result.error) };
   }
+  if (result.status === 0 || result.status === 128) {
+    return { ok: true, status: result.status }; // 128 = process not found (already gone)
+  }
+  return { ok: false, status: result.status, error: `taskkill exited ${result.status}` };
 }
 
 /**
@@ -330,6 +339,11 @@ async function drainPipes(child, ms = 250) {
  * Resolves { pid, code, signal, timedOut, killed, groupEmpty, stdout, stderr, lastJson, error }.
  */
 export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
+  // Reviewer LIB2-R2.1: once an interrupt has been received, no NEW work may
+  // start — the sweep has already snapshotted the registry.
+  if (interruptReceived) {
+    return Promise.resolve({ pid: null, code: null, signal: null, timedOut: false, killed: false, groupEmpty: true, error: "interrupt received; refusing to start new step work", stdout: "", stderr: "", lastJson: null });
+  }
   return new Promise((resolveP) => {
     let child;
     try {
@@ -340,10 +354,10 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
     }
     const pgid = child.pid; // detached + first member => the group leader
     // The in-flight step is registry-visible so an interrupt arriving DURING
-    // the step sweeps its group too (the step's own reaper still runs after).
-    const stepHandle = { pid: pgid, pgid, owned: true };
+    // the step sweeps its group too. Registration is held until the group is
+    // VERIFIED empty (reaping complete) — never dropped at settle time.
+    const stepHandle = issueHandle({ pid: pgid, pgid, owned: true });
     registerGroup(stepHandle);
-    const dropStep = () => unregisterGroup(pgid);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -374,7 +388,6 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      dropStep();
       resolveP(result);
     };
 
@@ -406,21 +419,24 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       if (settled || exitInfo === null || !closed) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      dropStep(); // the step is over; the group reaping below is bookkeeping
       // Reap the WHOLE group on every path: TERM -> bounded wait -> KILL ->
       // poll until empty. A successful launcher that spawned+unref'd a
       // grandchild leaves it in this group; it must not survive the step.
+      // Registration is dropped only AFTER the reaping verdict (reviewer
+      // LIB2-R2.1: the step must stay registry-visible until verified empty).
       if (pgid) {
         if (process.platform === "win32" && !timedOut) {
           killTreeWindows(pgid);
         }
         const empty = await reapGroup(pgid, { alreadyTermed: timedOut });
+        if (empty) markTerminal(stepHandle);
         resolveP({
           ...buildResult(timedOut ? `timeout after ${timeoutMs}ms` : killed ? "terminated by runner" : undefined),
           groupEmpty: empty === true,
         });
         return;
       }
+      markTerminal(stepHandle);
       resolveP({
         ...buildResult(timedOut ? `timeout after ${timeoutMs}ms` : undefined),
         groupEmpty: true,
@@ -432,7 +448,7 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      dropStep();
+      markTerminal(stepHandle); // spawn error: never signal this handle again
       resolveP({ pid: pgid, code: null, signal: null, timedOut, killed, groupEmpty: false, error: "spawn error: " + err.message, stdout, stderr, lastJson: null });
     });
   });
@@ -445,25 +461,68 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
 /**
  * Registry of live spawned process groups. spawnGroup registers on spawn;
  * runStep registers while a step is in flight; entries drop when the group
- * is verified empty (natural exit with no survivors, a successful kill, or
- * settle). The registry is what main()'s SIGINT/SIGTERM handler sweeps.
+ * is verified empty — but the HANDLE stays authoritative: once verified
+ * empty, a handle is marked terminal and can never signal again, even if a
+ * later pid reuse makes a probe of its old pgid look non-empty (F39).
+ *
+ * Ownership is enforced by OBJECT IDENTITY against this registry (plus a
+ * module-private WeakSet of every handle this module ever issued): a copied
+ * handle shape ({pgid, owned:true}) proves nothing and is refused.
  */
-const liveGroups = new Map(); // pgid -> handle
+const liveGroups = new Map(); // pgid -> issued handle
+const issuedHandles = new WeakSet(); // every handle this module ever issued
 
 /** True once a SIGINT/SIGTERM interrupt has been received in this process. */
 let interruptReceived = false;
+
+function issueHandle(shape) {
+  const handle = { ...shape, terminal: false };
+  issuedHandles.add(handle);
+  return handle;
+}
 
 function registerGroup(handle) {
   if (handle && typeof handle.pgid === "number") liveGroups.set(handle.pgid, handle);
 }
 
-function unregisterGroup(pgid) {
-  if (typeof pgid === "number") liveGroups.delete(pgid);
+function unregisterGroup(handleOrPgid) {
+  if (typeof handleOrPgid === "number") liveGroups.delete(handleOrPgid);
+  else if (handleOrPgid && typeof handleOrPgid.pgid === "number") {
+    // Drop the registry entry only if it still maps to THIS handle (a pgid
+    // reuse must not evict a newer handle).
+    if (liveGroups.get(handleOrPgid.pgid) === handleOrPgid) liveGroups.delete(handleOrPgid.pgid);
+  }
 }
 
-/** Sorted pgids currently registered (test/introspection surface). */
+/** Mark a handle terminal: verified empty (or dead) — it may NEVER signal again. */
+function markTerminal(handle) {
+  if (handle) handle.terminal = true;
+  unregisterGroup(handle);
+}
+
+/**
+ * Sorted pgids currently registered (test/introspection surface).
+ * Terminal handles are never listed: their groups are verified gone.
+ */
 export function registeredGroups() {
-  return [...liveGroups.keys()].sort((a, b) => a - b);
+  return [...liveGroups.entries()].filter(([, h]) => !h.terminal).map(([pgid]) => pgid).sort((a, b) => a - b);
+}
+
+/**
+ * True when `target` may be signalled by this module: it must be a handle
+ * OBJECT this module ISSUED (private WeakSet, unforgeable by copying), AND
+ * either still authoritative in the registry (liveGroups maps its pgid to
+ * this exact handle) or already terminal (verified empty — the safe no-op
+ * path). A handle that was unregistered WITHOUT being terminal was replaced
+ * by a newer spawn on the same pgid: it must NOT be signalled anymore.
+ */
+function isAuthoritativeHandle(target) {
+  return (
+    target &&
+    typeof target === "object" &&
+    issuedHandles.has(target) &&
+    (target.terminal === true || liveGroups.get(target.pgid) === target)
+  );
 }
 
 /**
@@ -493,13 +552,17 @@ function enumerateGroupPids(pgid) {
  * the caller decides when the group dies.
  *
  * Returns a handle:
- *   { pid, pgid, child, stdout, stderr, exited, owned }
+ *   { pid, pgid, child, stdout, stderr, exited, owned, terminal }
  *   - pid/pgid: the group leader (pgid === pid by construction: the child is
- *     detached, so it leads a FRESH group — this is the ownership proof that
- *     makes killing the group safe).
+ *     detached, so it leads a FRESH group).
  *   - stdout/stderr: the child's pipe streams.
  *   - exited: promise resolving { code, signal } (or { error }) — never rejects.
- *   - owned: marker consumed by killGroupAndVerify (see the refusal below).
+ *   - owned: informational marker; ownership is enforced by OBJECT IDENTITY
+ *     against this module's registry, not by this flag (a copied handle shape
+ *     proves nothing).
+ *   - terminal: set true once the group is VERIFIED empty (or the spawn
+ *     failed) — a terminal handle refuses to signal FOREVER, even if the old
+ *     pgid is later reused by an unrelated process (F39, reviewer LIB2-R2.2).
  *
  * The handle auto-registers in the live-group registry (swept by main()'s
  * interrupt handler) and unregisters when the group is verified empty.
@@ -514,17 +577,19 @@ export function spawnGroup(cmd, args, { env, cwd } = {}) {
   try {
     child = spawn(cmd, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
   } catch (err) {
-    return {
+    const failed = issueHandle({
       pid: null,
       pgid: null,
       child: null,
       stdout: null,
       stderr: null,
       owned: true,
+      terminal: true, // nothing was spawned; nothing may ever be signalled
       exited: Promise.resolve({ code: null, signal: null, error: "spawn failed: " + err.message }),
-    };
+    });
+    return failed;
   }
-  const handle = {
+  const handle = issueHandle({
     pid: child.pid ?? null,
     pgid: child.pid ?? null,
     child,
@@ -532,17 +597,17 @@ export function spawnGroup(cmd, args, { env, cwd } = {}) {
     stderr: child.stderr,
     owned: true,
     exited: null,
-  };
+  });
   handle.exited = new Promise((resolveP) => {
     child.on("error", (err) => {
-      unregisterGroup(child.pid);
+      markTerminal(handle); // spawn error: never signal this handle again
       resolveP({ code: null, signal: null, error: "spawn error: " + err.message });
     });
     child.on("exit", (code, signal) => {
-      // Natural death: drop the registry entry ONLY when nothing remains in
-      // the group — a leader that spawned+unref'd grandchildren must stay
-      // registered so the interrupt sweep can still reap the survivors.
-      if (groupEmpty(child.pid)) unregisterGroup(child.pid);
+      // Natural death: mark terminal ONLY when nothing remains in the group
+      // — a leader that spawned+unref'd grandchildren must stay live in the
+      // registry so the interrupt sweep can still reap the survivors.
+      if (groupEmpty(child.pid)) markTerminal(handle);
       resolveP({ code, signal });
     });
   });
@@ -556,38 +621,54 @@ export function spawnGroup(cmd, args, { env, cwd } = {}) {
  * -> poll kill(-pgid, 0) until ESRCH — and report what happened:
  *   { groupEmpty, survivors, error? }
  *
- * Ownership: only spawnGroup handles (or {pgid, owned:true} handles this
- * module produced) are honored. A BARE pgid number is REFUSED — a recycled
- * pid could name a group this process never created, and "we can't prove the
- * anchor is ours" is exactly the case the packet forbids signaling.
+ * Ownership (reviewer LIB2-R2.2): `target` must be a handle OBJECT this
+ * module ISSUED (object identity via the module-private WeakSet) AND still
+ * authoritative in the registry (liveGroups maps its pgid to this exact
+ * handle). Copies, plain {pgid, owned:true} shapes, and bare pgid numbers
+ * are all REFUSED without signalling — possession of a copied handle proves
+ * nothing, and a recycled pgid could name a group this process never created.
+ *
+ * Terminal: once a handle is verified empty (or its spawn failed) it is
+ * marked terminal and REFUSES forever — a stale terminal handle can never
+ * signal a reused pgid (F39). Terminal state lives on the handle itself, so
+ * it remains authoritative after unregistration.
  *
  * F39: a group verified empty is NEVER signalled — the probe runs first and
  * the ladder is skipped entirely. groupEmpty:false means the ladder ran to
  * its SIGKILL deadline and members may remain; survivors[] (best-effort,
  * POSIX ps enumeration) names them.
  */
-export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS } = {}) {
-  if (typeof target === "number" || !target || typeof target !== "object" || target.owned !== true || typeof target.pgid !== "number") {
+export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner } = {}) {
+  if (!isAuthoritativeHandle(target)) {
     return {
       groupEmpty: false,
       survivors: [],
-      error: "refused: target has no ownership proof — pass a spawnGroup handle (bare pgids could name a recycled group this process never created)",
+      error: "refused: target is not an authoritative spawnGroup handle (object identity required; bare pgids and copied handles can name a recycled group this process never created)",
     };
+  }
+  if (target.terminal) {
+    return { groupEmpty: true, survivors: [] }; // verified gone before; never probe, never signal (F39)
   }
   const pgid = target.pgid;
   if (process.platform === "win32") {
-    killTreeWindows(pgid);
-    unregisterGroup(pgid);
+    const taskkill = taskkillRunner ?? killTreeWindows;
+    const verdict = taskkill(pgid);
+    if (!verdict.ok) {
+      // A failed taskkill is NOT a green: report it truthfully so callers
+      // (and the interrupt summary) surface the possible orphan tree.
+      return { groupEmpty: false, survivors: [], error: `taskkill failed (status ${verdict.status ?? "?"}): ${verdict.error ?? "unknown"}` };
+    }
+    markTerminal(target);
     return { groupEmpty: true, survivors: [] }; // win32 has no probeable groups
   }
   // F39: verified-empty groups are never signalled.
   if (groupEmpty(pgid)) {
-    unregisterGroup(pgid);
+    markTerminal(target);
     return { groupEmpty: true, survivors: [] };
   }
   const empty = await reapGroup(pgid, { termGraceMs, killDeadlineMs });
   const survivors = empty ? [] : enumerateGroupPids(pgid);
-  if (empty) unregisterGroup(pgid);
+  if (empty) markTerminal(target);
   return empty ? { groupEmpty: true, survivors: [] } : { groupEmpty: false, survivors };
 }
 
@@ -634,32 +715,41 @@ export async function main(fn, { resultsPath } = {}) {
   let error = null;
   let result = null;
 
-  // --- interrupt path (LIB2) ----------------------------------------------
+  // --- interrupt path (LIB2, reworked per reviewer LIB2-R2.1) --------------
   // Installed BEFORE the guarded region so a signal can never arrive between
-  // work starting and the handler existing. Serialization goes through the
-  // SAME emit path as every other final summary: identical object to the
-  // results file and the last stdout line, then exitCode — never process.exit
-  // before flush.
-  let interruptSettled = false;
+  // work starting and the handler existing.
+  //
+  // ONE coordinated finish: `interruptBegun` suppresses the normal summary —
+  // once the sweep starts, the interrupt summary is the ONLY final object
+  // this run may serialize. The sweep iterates the REAL registry handles (no
+  // fabricated {pgid, owned:true} shapes), and because runStep/spawnGroup
+  // refuse to start after interruptReceived, nothing can join the registry
+  // after the snapshot below. A second signal after cleanup exits immediately.
+  let interruptBegun = false;
+  let interruptDone = false;
+  let interruptCode = null;
   const onInterrupt = async (signal) => {
     const code = signal === "SIGINT" ? 130 : 143;
-    if (interruptSettled) {
+    if (interruptDone) {
       // Second signal: the operator means "die now". Stdio has already been
       // flushed by the first pass; exit immediately.
       process.exit(code);
     }
-    interruptSettled = true;
-    interruptReceived = true; // spawnGroup now refuses new work
-    const pgids = registeredGroups();
+    if (interruptBegun) return; // a sweep is already in flight for this signal
+    interruptBegun = true;
+    interruptReceived = true; // spawnGroup/runStep now refuse new work
+    const handles = [...liveGroups.values()]; // the REAL issued handles
     let survivors = [];
-    for (const pgid of pgids) {
-      const verdict = await killGroupAndVerify({ pgid, owned: true }, { termGraceMs: 2_000, killDeadlineMs: 2_000 });
-      if (!verdict.groupEmpty) survivors.push(...(verdict.survivors.length ? verdict.survivors : [pgid]));
+    for (const handle of handles) {
+      const verdict = await killGroupAndVerify(handle, { termGraceMs: 2_000, killDeadlineMs: 2_000 });
+      if (!verdict.groupEmpty) {
+        survivors.push(...(verdict.survivors.length ? verdict.survivors : [handle.pgid]));
+      }
     }
     const final = {
       ok: false,
       interrupted: signal,
-      groupsKilled: pgids.length,
+      groupsKilled: handles.length,
       ...(survivors.length ? { survivors } : {}),
       totalMs: Math.round(performance.now() - started),
     };
@@ -669,6 +759,8 @@ export async function main(fn, { resultsPath } = {}) {
     } catch {
       // The interrupt summary must still reach stdout even if the disk refuses.
     }
+    interruptDone = true;
+    interruptCode = code;
     process.stdout.write(JSON.stringify(final) + "\n", () => process.exit(code));
     // Hard fallback if the write callback never fires (pipe edge cases).
     setTimeout(() => process.exit(code), 1_000).unref();
@@ -693,6 +785,15 @@ export async function main(fn, { resultsPath } = {}) {
     // summary contract has taken over (and must not keep the loop alive).
     if (wasRawSigint === 0) process.off("SIGINT", onInterrupt);
     if (wasRawSigterm === 0) process.off("SIGTERM", onInterrupt);
+  }
+  // Reviewer LIB2-R2.1: once an interrupt settlement has begun, the normal
+  // completion path is SUPPRESSED — the interrupt summary is the only final
+  // object. fn() returning (or throwing) while the sweep is in flight must
+  // not emit a second (possibly ok:true) summary; wait for the interrupt
+  // serializer to exit this process instead.
+  if (interruptBegun) {
+    const idle = () => new Promise(() => {}); // never resolves; exit comes from onInterrupt
+    return idle();
   }
   // `ok` and `error` are RESERVED: the task may override ok (that is the
   // point of the contract), so the FINAL object decides the exit code.
