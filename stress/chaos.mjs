@@ -78,39 +78,58 @@ function refusal(reason, phase) {
 // owner app-state/harness directories (os.userInfo()-derived home, dynamic
 // .claude*/.codex* families) and assertIsolated validates the FINAL env with
 // separator-safe containment after every assignment.
-const runRoot = makeRunRoot("action-hub-chaos-");
-for (const [k, v] of Object.entries(buildIsolatedEnv(runRoot))) {
-  process.env[k] = v; // REPLACE, never forward the caller's value
+//
+// All sandbox setup happens INSIDE the shared main()'s guarded region
+// (REWORK-MIG1-1): a hostile environment (e.g. TMPDIR pointing at owner
+// state) must fail closed through the same serializer as everything else —
+// exactly one compact ok:false JSON line, the SAME object in the results
+// file, nonzero exit — never a raw FatalError on stderr with empty stdout.
+// Module scope therefore declares only let-bindings assigned by setupIsolation().
+let runRoot = null;
+let isolationEnv = null;
+let MANIFEST_DIR = null;
+let CONFIG_PATH = null;
+
+function setupIsolation() {
+  runRoot = makeRunRoot("action-hub-chaos-");
+  for (const [k, v] of Object.entries(buildIsolatedEnv(runRoot))) {
+    process.env[k] = v; // REPLACE, never forward the caller's value
+  }
+
+  // Sentinel regression (CHAOS_SENTINEL_SELFTEST=1) — now driven by the SHARED
+  // ownerStateDirs: builds a fake home with .claude and .codex-plus children
+  // and asserts the wildcard entries are present in its output — the coverage
+  // the readdir must never silently lose. Runs inside the guarded region too:
+  // it serializes its one JSON line itself and exits before the summary
+  // contract would add a second stdout line.
+  if (process.env.CHAOS_SENTINEL_SELFTEST === "1") {
+    const fakeHome = join(runRoot, "sentinel-selftest-home");
+    mkdirSync(join(fakeHome, ".claude"), { recursive: true });
+    mkdirSync(join(fakeHome, ".codex-history"), { recursive: true });
+    const dirs = ownerStateDirs({}, fakeHome);
+    const ok =
+      dirs.includes(join(fakeHome, ".claude")) &&
+      dirs.includes(join(fakeHome, ".codex-history")) &&
+      dirs.includes(join(fakeHome, ".cache", "action-hub"));
+    console.log(JSON.stringify({ script: "chaos-sentinel-selftest", ok }));
+    rmSync(fakeHome, { recursive: true, force: true }); // no temp litter on either exit
+    rmSync(runRoot, { recursive: true, force: true });
+    process.exit(ok ? 0 : 1);
+  }
+
+  assertIsolated(process.env, runRoot); // validate the initial assignment
+
+  // children inherit the already-isolated process.env
+  isolationEnv = () => ({ ...process.env });
+  MANIFEST_DIR = join(runRoot, "manifests");
+  CONFIG_PATH = process.env.ACTION_HUB_CONFIG; // INSIDE the run root (shared layout)
 }
-const realHome = undefined; // owner dirs come from the shared lib now
 
-// Sentinel regression (CHAOS_SENTINEL_SELFTEST=1) — now driven by the SHARED
-// ownerStateDirs: builds a fake home with .claude and .codex-plus children
-// and asserts the wildcard entries are present in its output — the coverage
-// the readdir must never silently lose.
-if (process.env.CHAOS_SENTINEL_SELFTEST === "1") {
-  const fakeHome = join(runRoot, "sentinel-selftest-home");
-  mkdirSync(join(fakeHome, ".claude"), { recursive: true });
-  mkdirSync(join(fakeHome, ".codex-history"), { recursive: true });
-  const dirs = ownerStateDirs({}, fakeHome);
-  const ok =
-    dirs.includes(join(fakeHome, ".claude")) &&
-    dirs.includes(join(fakeHome, ".codex-history")) &&
-    dirs.includes(join(fakeHome, ".cache", "action-hub"));
-  console.log(JSON.stringify({ script: "chaos-sentinel-selftest", ok }));
-  // The run-root exit cleanup is registered later in the file, so the
-  // sentinel path must clean up itself: no temp litter on either exit.
-  rmSync(fakeHome, { recursive: true, force: true });
-  rmSync(runRoot, { recursive: true, force: true });
-  process.exit(ok ? 0 : 1);
-}
-
-assertIsolated(process.env, runRoot); // validate the initial assignment
-
-// children inherit the already-isolated process.env
-const isolationEnv = () => ({ ...process.env });
-const MANIFEST_DIR = join(runRoot, "manifests");
-const CONFIG_PATH = process.env.ACTION_HUB_CONFIG; // INSIDE the run root (shared layout)
+process.on("exit", () => {
+  try {
+    if (runRoot) rmSync(runRoot, { recursive: true, force: true });
+  } catch {}
+});
 const CLI_ENTRY = join(REPO_ROOT, "packages", "cli", "dist", "index.js");
 
 const SECRET = "CHAOS-SENTINEL-9f3a2b";
@@ -125,13 +144,6 @@ const SLOW_START_MS = 10_000;
 const HUGE_BYTES = 5 * 1024 * 1024;
 const CHAOS_SEED = 7;
 const DOCTOR_TIMEOUT_MS = 180_000;
-
-
-process.on("exit", () => {
-  try {
-    rmSync(runRoot, { recursive: true, force: true });
-  } catch {}
-});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -230,6 +242,10 @@ async function main() {
     console.error(`[chaos] missing ${FAKE_SERVER} (committed by PR 46; run from a checkout of main 55dc286 or later)`);
     refusal(`missing ${FAKE_SERVER}`, "preflight");
   }
+
+  // Isolation MUST be established inside the shared main()'s guarded region
+  // (REWORK-MIG1-1): hostile-env refusals flow through the one serializer.
+  setupIsolation();
 
   const { ActionHub } = await import(resolve(REPO_ROOT, "packages/core/dist/index.js"));
   const { createSdkClientFactory } = await import(resolve(REPO_ROOT, "packages/cli/dist/client-factory.js"));
@@ -496,18 +512,32 @@ async function main() {
       timeoutMs: DOCTOR_TIMEOUT_MS,
     },
   );
+  // Documented fault-injection hook (CHAOS_FAULT=doctor-group-empty): forces
+  // groupEmpty=false after the doctor step to prove the REWORK-MIG1-2 gate —
+  // unverified group cleanup must yield a P1 finding, doctorBounded=false,
+  // ok:false and a nonzero exit. Not part of a normal run.
+  if (process.env.CHAOS_FAULT === "doctor-group-empty") {
+    doctorInfo.groupEmpty = false;
+  }
   const doctorMs = Date.now() - doctorStart;
   const doctorOut = `${doctorInfo.stdout ?? ""}\n${doctorInfo.stderr ?? ""}`;
   scanForSecret(doctorOut);
   summary.doctor = {
     exitCode: doctorInfo.code,
     timedOut: doctorInfo.timedOut === true,
+    groupEmpty: doctorInfo.groupEmpty === true, // false when cleanup could NOT be verified (REWORK-MIG1-2)
     durationMs: doctorMs,
     bounded: doctorInfo.timedOut !== true && doctorMs < DOCTOR_TIMEOUT_MS,
     error: doctorInfo.error,
   };
   if (!summary.doctor.bounded) {
     finding("P1", `doctor exceeded ${DOCTOR_TIMEOUT_MS}ms with ${SERVER_COUNT} servers`, `ACTION_HUB_CONFIG=${CONFIG_PATH} node ${CLI_ENTRY} doctor`);
+  }
+  if (summary.doctor.groupEmpty !== true) {
+    // REWORK-MIG1-2: runStep reports groupEmpty:false exactly when it could
+    // not VERIFY the spawned group is gone. A false green here would let
+    // doctor descendants outlive the harness while the gate stays true.
+    finding("P1", `doctor group cleanup could not be verified (groupEmpty=false, pid ${doctorInfo.pid}) — possible surviving descendants`, `stress/lib/harness.mjs runStep returned groupEmpty:false for the doctor step`);
   }
   // doctor checks live boot health; under chaos the same fleet can
   // legitimately exit 0 (all servers bootable at check time) or 1 (a
@@ -530,7 +560,9 @@ async function main() {
     circuitBreakersOpened: circuit.opened.length === crashIds.length,
     circuitBreakersRecovered: circuit.recovered.length === finiteIds.length,
     hangsBounded: hang.bounded,
-    doctorBounded: summary.doctor.bounded,
+    // REWORK-MIG1-2: bounded time alone is not enough — the doctor process
+    // group must be VERIFIED empty (no surviving descendants).
+    doctorBounded: summary.doctor.bounded && summary.doctor.groupEmpty === true,
     secretsContained: !leaked,
   };
   if (!memoryBounded) {
