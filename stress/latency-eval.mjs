@@ -16,7 +16,7 @@
 import { readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertIsolated, buildIsolatedEnv, makeRunRoot, main } from "./lib/harness.mjs";
+import { assertIsolated, buildIsolatedEnv, FatalError, makeRunRoot, main } from "./lib/harness.mjs";
 import { loadGeneratedCorpus } from "./lib/search-corpus.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -25,8 +25,16 @@ const flag = (name, fallback) => {
   const i = args.indexOf(name);
   return i === -1 ? fallback : args[i + 1];
 };
-const corpusDir = resolve(flag("--corpus", join(repoRoot, "stress", ".generated")));
-const passes = Math.max(1, Number(flag("--passes", 3)));
+// CLI values are resolved INSIDE main()'s guarded callback (SQ2-R4 review):
+// a present-but-valueless --corpus previously threw at module scope, leaving
+// zero stdout lines and a stale artifact. Missing values are rejected
+// explicitly through the finish path.
+const requireFlagValue = (name) => {
+  if (!args.includes(name)) return undefined;
+  const v = flag(name);
+  if (v === undefined) throw new FatalError(`flag ${name} requires a value`);
+  return v;
+};
 const resultsPath = join(repoRoot, "stress", ".generated", "results", "latency-eval.json");
 
 await main(async () => {
@@ -38,6 +46,14 @@ await main(async () => {
   try {
     Object.assign(process.env, buildIsolatedEnv(root));
     assertIsolated(process.env, root);
+    const corpusArg = requireFlagValue("--corpus");
+    const corpusDir = resolve(corpusArg ?? join(repoRoot, "stress", ".generated"));
+    const passesArg = requireFlagValue("--passes");
+    const passesRaw = Number(passesArg ?? 3);
+    if (!Number.isFinite(passesRaw) || passesRaw < 1) {
+      throw new FatalError(`--passes must be a positive number (got "${passesArg ?? "3"}")`);
+    }
+    const passes = Math.floor(passesRaw);
   const { SearchEngine } = await import(join(repoRoot, "packages", "core", "dist", "search", "search.js"));
   const { LocalSemanticIndex } = await import(join(repoRoot, "packages", "core", "dist", "search", "semantic.js"));
   const { Catalog } = await import(join(repoRoot, "packages", "core", "dist", "catalog", "catalog.js"));

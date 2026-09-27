@@ -32,9 +32,15 @@ const flag = (name) => {
   const i = args.indexOf(name);
   return i === -1 ? undefined : args[i + 1];
 };
-const splitPath = resolve(flag("--split") ?? join(repoRoot, "stress", "fixtures", "split-held.json"));
-const corpusDir = resolve(flag("--corpus") ?? join(repoRoot, "stress", ".generated"));
-const withFails = args.includes("--fails");
+// CLI values are resolved INSIDE main()'s guarded callback (SQ2-R4 review):
+// a present-but-valueless flag must flow through the one-JSON/artifact path
+// as ok:false, not throw at module scope and leave a stale artifact.
+const requireFlagValue = (name) => {
+  if (!args.includes(name)) return undefined;
+  const v = flag(name);
+  if (v === undefined) throw new FatalError(`flag ${name} requires a value`);
+  return v;
+};
 const resultsPath = join(repoRoot, "stress", ".generated", "results", "split-eval.json");
 
 await main(async () => {
@@ -46,6 +52,11 @@ await main(async () => {
   try {
     Object.assign(process.env, buildIsolatedEnv(root));
     assertIsolated(process.env, root);
+    const withFails = args.includes("--fails");
+    const splitArg = requireFlagValue("--split");
+    const corpusArg = requireFlagValue("--corpus");
+    const splitPath = resolve(splitArg ?? join(repoRoot, "stress", "fixtures", "split-held.json"));
+    const corpusDir = resolve(corpusArg ?? join(repoRoot, "stress", ".generated"));
   const rows = JSON.parse(readFileSync(splitPath, "utf8"));
   if (!Array.isArray(rows)) throw new FatalError(`split file ${splitPath} is not a JSON array`);
 
@@ -128,7 +139,6 @@ await main(async () => {
     mrr10: +avg(mrr).toFixed(3),
     ...(noMatch.length > 0 ? { noMatchFp: `${fp}/${noMatch.length}` } : {}),
   };
-  return summary;
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
