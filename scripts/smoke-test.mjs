@@ -269,6 +269,41 @@ function checkForeignCacheBase(bin) {
 }
 
 /**
+ * Both cache-base candidates hostile (review-2 round 5 MUST-FIX 1): with the
+ * tmp base AND the user-cache base pre-created loose (0777), the run must
+ * NOT extract anywhere — hashed fallback with ok:false and no import of a
+ * swappable tree.
+ */
+function checkHostileCacheBases(bin) {
+  const tmpRoot = checkDir("sea-hostile-bases");
+  const suffix = cacheBaseSuffix();
+  mkdirSync(join(tmpRoot, `action-hub-cache-${suffix}`), { recursive: true, mode: 0o777 });
+  const fakeCache = join(tmpRoot, "fake-xdg");
+  mkdirSync(join(fakeCache, "action-hub"), { recursive: true, mode: 0o777 });
+  const { stdout } = runBinary(bin, [], {
+    TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
+    XDG_CACHE_HOME: fakeCache,
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`hostile-bases selftest printed no JSON line`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== false) {
+    fail(`both-hostile cache bases must fail closed (no extraction): ${line}`);
+  }
+  // No extraction tree anywhere under either hostile parent.
+  const base = join(tmpRoot, `action-hub-cache-${suffix}`);
+  const planted = readdirSync(base, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (planted.length > 0) fail(`extraction happened under a hostile cache base (${planted.length} trees)`);
+  process.stderr.write(`  ok  both-hostile cache bases fail closed (no extraction, no import)\n`);
+}
+
+/**
  * The CJS bundle (non-SEA distribution) must also serve `licenses` — the
  * texts are inlined at bundle time (review-1 round 5 HIGH 1).
  */
@@ -456,6 +491,7 @@ async function main() {
     checkValidModelOverride(bin);
     checkTamperedCache(bin);
     checkForeignCacheBase(bin);
+    checkHostileCacheBases(bin);
     checkBundleLicenses();
   } finally {
     rmRunRoot(runRoot);

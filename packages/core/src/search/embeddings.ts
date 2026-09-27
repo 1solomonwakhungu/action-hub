@@ -420,7 +420,7 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
     const { createHash } = await import("node:crypto");
     const { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
-    const { join, dirname } = await import("node:path");
+    const { join, dirname, resolve } = await import("node:path");
 
     // Content-addressed cache (review-2/round 4): extract ONCE under a
     // stable per-content key and REUSE across processes. A fresh temp dir per
@@ -472,33 +472,67 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
       }
     };
     const usable = (dir: string): boolean => privateMode(dir);
+    // A base is only acceptable if its WHOLE ANCESTRY up to a trusted root
+    // (the user's home, the sticky system tmp, or a root-owned path) is owned
+    // by the user or root and not group/world-writable — the sticky system
+    // tmp itself is the only allowed world-writable ancestor. Otherwise
+    // another user could SWAP the cache child between verification and
+    // import (review-2 round 5 MUST-FIX 1).
+    const trustedAncestry = (dir: string): boolean => {
+      if (isWin) return true;
+      const uid = typeof process.getuid === "function" ? process.getuid() : null;
+      const systemTmp = resolve(tmpdir());
+      const home = process.env["HOME"] ? resolve(process.env["HOME"]) : null;
+      let cur = resolve(dir);
+      for (;;) {
+        let st;
+        try {
+          st = statSync(cur);
+        } catch {
+          return false;
+        }
+        if (!st.isDirectory()) return false;
+        const worldWritable = (st.mode & 0o002) !== 0;
+        if (worldWritable && !(st.mode & 0o1000)) return false;
+        if (uid !== null && st.uid !== uid && st.uid !== 0) return false;
+        if (cur === systemTmp || cur === "/" || (home !== null && cur === home)) return true;
+        const parent = dirname(cur);
+        if (parent === cur) return true; // filesystem root (root-owned)
+        cur = parent;
+      }
+    };
     const userCache = join(
       process.env["XDG_CACHE_HOME"] || process.env["LOCALAPPDATA"] || join(process.env["HOME"] ?? tmpdir(), ".cache"),
       "action-hub",
     );
-    const privateFallback = (): string => {
+    let base: string | null = null;
+    for (const candidate of [cacheBase, userCache]) {
       try {
-        return mkdtempSync(join(userCache, "cache-"));
+        mkdirSync(candidate, { recursive: true, mode: 0o700 });
       } catch {
-        return mkdtempSync(join(tmpdir(), "action-hub-cache-"));
+        /* not ours — skip */
       }
-    };
-    let base = cacheBase;
-    if (!usable(base)) {
-      try {
-        mkdirSync(cacheBase, { recursive: true, mode: 0o700 });
-      } catch {
-        /* fall through to the user cache dir */
-      }
-      if (!usable(base)) {
-        try {
-          mkdirSync(userCache, { recursive: true, mode: 0o700 });
-        } catch {
-          /* final fallback below */
-        }
-        base = usable(cacheBase) ? cacheBase : usable(userCache) ? userCache : privateFallback();
+      if (usable(candidate) && trustedAncestry(candidate)) {
+        base = candidate;
+        break;
       }
     }
+    if (base === null) {
+      // Final filesystem resort: a fresh private mkdtemp, but ONLY beneath a
+      // parent whose ancestry is proven non-swappable (a hostile parent is
+      // never used — the run falls back to the hashed scorer instead).
+      for (const candidate of [cacheBase, userCache]) {
+        if (usable(candidate) && trustedAncestry(candidate)) {
+          try {
+            base = mkdtempSync(join(candidate, "cache-"));
+            break;
+          } catch {
+            /* try the next candidate */
+          }
+        }
+      }
+    }
+    if (base === null) throw new Error("no safe private embeddings cache base (fail closed)");
     const root = join(base, `vendor-${hash.digest("hex").slice(0, 16)}`);
     const readFileF = (await import("node:fs/promises")).readFile;
     const sha256Bytes = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");

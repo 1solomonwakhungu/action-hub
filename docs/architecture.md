@@ -105,8 +105,14 @@ dependency-free `LocalSemanticIndex` hashed scorer instead; it remains the
 automatic fallback whenever the embedding model cannot be loaded or a rebuild
 fails (the hub warns once and degrades, so retrieval never breaks).
 
-A document embedding is the IDF-weighted sum of two signals, hashed into a
-fixed 256-dimensional space and L2-normalized; scoring is a cosine similarity.
+The hashed scorer below is the FALLBACK, not the default: `LocalSemanticIndex`
+is built only when the embedding model cannot be loaded or a rebuild fails
+(`embeddings: null` opts out entirely). Its design is retained verbatim because
+it is what the hub degrades to.
+
+A hashed document embedding is the IDF-weighted sum of two signals, hashed
+into a fixed 256-dimensional space and L2-normalized; scoring is a cosine
+similarity.
 
 1. **Subword character n-grams** (3-4 chars) over each term. This is what makes
    morphology work — "messaging" and "message" share most of their n-grams
