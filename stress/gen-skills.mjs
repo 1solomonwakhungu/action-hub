@@ -375,6 +375,8 @@ async function selfTestCleanup(baseDir) {
   await mkdir(parent, { recursive: true });
   const targetDir = join(parent, "skills");
   const failures = [];
+  let r2 = { removedPartialSkillsDir: null, cleanupError: null };
+  let child = null;
   // 1. Unit: an rm implementation that rejects must yield removed:false +
   //    cleanupError, with the dir verifiably still present (sentinel intact).
   const sentinel = join(targetDir, "SKILL.md");
@@ -390,14 +392,15 @@ async function selfTestCleanup(baseDir) {
   // 2. End-to-end with a real refusal: read-only parent prevents rm of the
   //    child dir (skipped when running as root — the check is then moot).
   if (process.getuid && process.getuid() !== 0) {
-    const child = join(parent, "ro-child");
+    child = join(parent, "ro-child");
     await mkdir(child, { recursive: true });
     await writeFile(join(child, "SKILL.md"), "sentinel", "utf8");
     chmodSync(parent, 0o555);
     try {
-      const r2 = await cleanupPartialSkillsDir(child);
-      if (r2.removedPartialSkillsDir !== false || !existsSync(child)) {
-        failures.push(`read-only-parent verdict wrong: ${JSON.stringify({ ...r2, childPresent: existsSync(child) })}`);
+      r2 = await cleanupPartialSkillsDir(child);
+      const childSurvived = existsSync(child);
+      if (r2.removedPartialSkillsDir !== false || !childSurvived) {
+        failures.push(`read-only-parent verdict wrong: ${JSON.stringify({ ...r2, childPresent: childSurvived })}`);
       }
     } finally {
       chmodSync(parent, 0o755);
@@ -407,7 +410,10 @@ async function selfTestCleanup(baseDir) {
   if (failures.length > 0) {
     throw new FatalError(`HYG2 cleanup self-test FAILED: ${failures.join(" | ")}`);
   }
-  console.log("HYG2 cleanup self-test: ok (failing-rm verdict=false+cleanupError, sentinel survives; read-only-parent verdict=false, child survives)");
+  return {
+    failingRm: { verdict: r1, sentinelSurvived: existsSync(sentinel) },
+    readOnlyParent: r2 ? { verdict: r2, childSurvived: true, skipped: false } : { verdict: null, skipped: true },
+  };
 }
 
 async function runSkillsInner() {
@@ -1069,17 +1075,28 @@ async function runSkillsInner() {
   return summary;
 }
 
-// HYG2 rework: cleanup-failure regression (Darwin-runnable). Verifies the
-// cleanup verdict can never turn green while the partial tree survives.
-if (args.includes("--self-test-cleanup")) {
-  const dirArg = args[args.indexOf("--self-test-cleanup") + 1];
-  const target = dirArg || mkdtempSync(join(tmpdir(), "hyg2-selftest-"));
-  await selfTestCleanup(target);
-  process.exit(0);
-}
-
 // --- FX17: shared-lib entry point ----------------------------------------------
 // One finish path via stress/lib/harness.mjs main(): stale-result removal,
 // reserved ok/error fields, guarded durable artifact write, exactly one
 // compact JSON summary as the last stdout line, nonzero exit on failure.
-await main(runSkills, { resultsPath: join(RESULTS_DIR, "gen-skills.json") });
+// HYG2 rework: the cleanup self-test runs through the SAME finish path
+// (compact JSON last line, durable artifact, exit derived from ok) — no
+// process.exit() and no human-text last line.
+if (args.includes("--self-test-cleanup")) {
+  const selfTestRun = async () => {
+    let tmpParent = null;
+    try {
+      const dirArg = args[args.indexOf("--self-test-cleanup") + 1];
+      const target = dirArg ?? (tmpParent = mkdtempSync(join(tmpdir(), "hyg2-selftest-")));
+      const checks = await selfTestCleanup(target);
+      return { ok: true, mode: "self-test-cleanup", checks };
+    } finally {
+      if (tmpParent) {
+        try { rmSync(tmpParent, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+    }
+  };
+  await main(selfTestRun, { resultsPath: join(RESULTS_DIR, "gen-skills-selftest.json") });
+} else {
+  await main(runSkills, { resultsPath: join(RESULTS_DIR, "gen-skills.json") });
+}
