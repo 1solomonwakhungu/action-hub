@@ -290,6 +290,31 @@ any harness from any machine with the checkout:
 authenticated local socket. Each connection gets its own MCP session; the
 catalog, connection pool, and auth are shared process-wide.
 
+## Raw MCP clients
+
+If you hand-roll an MCP client instead of using an SDK, three framing
+details matter. Malformed frames are rejected explicitly, not silently:
+HTTP answers `400` with JSON-RPC `-32700` ("Parse error: Invalid JSON-RPC
+message") for payloads that are not valid JSON-RPC requests.
+
+1. **Request payloads live under `params`, not `arguments`.** A tool call
+   is `{ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+   "name": "action_hub", "arguments": { "operation": "search", "query":
+   "deploy" } } }`. A top-level `arguments` key is not a valid JSON-RPC
+   `params` member and the request is rejected as invalid params.
+2. **Send the `initialized` notification before any other request.** After
+   the `initialize` response, send `{ "jsonrpc": "2.0", "method":
+   "notifications/initialized" }` (no `id`), then call tools. The SDK
+   client does this for you; a raw client that skips it will be rejected.
+3. **The daemon socket expects an auth frame first.** The first line on a
+   daemon connection is `{ "token": "<token>", "command": "mcp" }`
+   followed by a newline; the daemon replies `{ "ok": true }` and only then
+   speaks JSON-RPC. Lines are newline-delimited, not content-length framed.
+
+`tools/list` pagination is not used by this server; sending a `cursor`
+(correctly returns `-32602` invalid params per the MCP spec's
+recommendation).
+
 ## Migrating your existing MCP servers and skills
 
 If you already have MCP servers and skills configured in Claude Desktop,
