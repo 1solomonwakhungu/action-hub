@@ -27,6 +27,8 @@
  */
 
 import { mkdir, writeFile, readdir, readFile, rm } from "node:fs/promises";
+import { existsSync, mkdtempSync, chmodSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -330,26 +332,82 @@ const DOMAIN_DETAILS = {
 // deliberate near-duplicates.
 
 // --- FX17: run body wrapped in the shared-lib finish path ---
-// HYG2 (F46): any failure after this run starts writing skills must leave no
-// partial tree behind — mirror the gen-tools catch-cleanup contract. The
-// skills dir under stress/.generated is owned exclusively by this run (it is
-// reconciled/wiped at startup), so removing the whole dir is safe and removes
-// only paths this run created.
+// HYG2 (F46, rework per review): on ANY failure the run-owned skills dir is
+// removed fail-closed (the dir is reconciled/wiped at startup, so a pre-write
+// failure also clears any prior corpus this generator owns). The cleanup
+// verdict is verified, never assumed: removedPartialSkillsDir is true only
+// when rm succeeded AND the dir is verifiably absent; on rm failure the
+// summary reports false + cleanupError and preserves the original error.
+async function cleanupPartialSkillsDir(dir = SKILLS_DIR, rmImpl = rm) {
+  try {
+    await rmImpl(dir, { recursive: true, force: true });
+  } catch (err) {
+    return { removedPartialSkillsDir: false, cleanupError: String(err?.message ?? err) };
+  }
+  if (existsSync(dir)) {
+    return { removedPartialSkillsDir: false, cleanupError: "skills dir still present after rm" };
+  }
+  return { removedPartialSkillsDir: true, cleanupError: null };
+}
+
 async function runSkills() {
   try {
     return await runSkillsInner();
   } catch (err) {
-    try {
-      await rm(SKILLS_DIR, { recursive: true, force: true });
-    } catch {
-      // best effort; the ok:false summary below is the durable failure record
-    }
+    const cleanup = await cleanupPartialSkillsDir();
     return {
       ok: false,
       error: String(err?.message ?? err),
-      cleanup: { removedPartialSkillsDir: true },
+      cleanup,
     };
   }
+}
+
+// HYG2 rework: Darwin-runnable regression for the cleanup failure branch.
+// Fails loudly (exit 1) if the cleanup verdict ever turns green while the
+// partial tree survives. --self-test-cleanup <dir>
+async function selfTestCleanup(baseDir) {
+  // The test owns a private parent dir so the read-only chmod in part 2
+  // never touches a shared tmp root.
+  const parent = baseDir
+    ? join(baseDir, "selftest-" + Date.now())
+    : mkdtempSync(join(tmpdir(), "hyg2-selftest-"));
+  await mkdir(parent, { recursive: true });
+  const targetDir = join(parent, "skills");
+  const failures = [];
+  // 1. Unit: an rm implementation that rejects must yield removed:false +
+  //    cleanupError, with the dir verifiably still present (sentinel intact).
+  const sentinel = join(targetDir, "SKILL.md");
+  await mkdir(targetDir, { recursive: true });
+  await writeFile(sentinel, "sentinel", "utf8");
+  const boom = new Error("forced rm failure");
+  const r1 = await cleanupPartialSkillsDir(targetDir, async () => {
+    throw boom;
+  });
+  if (r1.removedPartialSkillsDir !== false || !r1.cleanupError || !existsSync(sentinel)) {
+    failures.push(`failing-rm verdict wrong: ${JSON.stringify({ ...r1, sentinelPresent: existsSync(sentinel) })}`);
+  }
+  // 2. End-to-end with a real refusal: read-only parent prevents rm of the
+  //    child dir (skipped when running as root — the check is then moot).
+  if (process.getuid && process.getuid() !== 0) {
+    const child = join(parent, "ro-child");
+    await mkdir(child, { recursive: true });
+    await writeFile(join(child, "SKILL.md"), "sentinel", "utf8");
+    chmodSync(parent, 0o555);
+    try {
+      const r2 = await cleanupPartialSkillsDir(child);
+      if (r2.removedPartialSkillsDir !== false || !existsSync(child)) {
+        failures.push(`read-only-parent verdict wrong: ${JSON.stringify({ ...r2, childPresent: existsSync(child) })}`);
+      }
+    } finally {
+      chmodSync(parent, 0o755);
+      rmSync(child, { recursive: true, force: true });
+    }
+  }
+  if (failures.length > 0) {
+    throw new FatalError(`HYG2 cleanup self-test FAILED: ${failures.join(" | ")}`);
+  }
+  console.log("HYG2 cleanup self-test: ok (failing-rm verdict=false+cleanupError, sentinel survives; read-only-parent verdict=false, child survives)");
 }
 
 async function runSkillsInner() {
@@ -1009,6 +1067,15 @@ async function runSkillsInner() {
   console.log(JSON.stringify({ ...descLint, distinctDescriptions }));
   // gen-skills.json is written by the shared finish path (resultsPath).
   return summary;
+}
+
+// HYG2 rework: cleanup-failure regression (Darwin-runnable). Verifies the
+// cleanup verdict can never turn green while the partial tree survives.
+if (args.includes("--self-test-cleanup")) {
+  const dirArg = args[args.indexOf("--self-test-cleanup") + 1];
+  const target = dirArg || mkdtempSync(join(tmpdir(), "hyg2-selftest-"));
+  await selfTestCleanup(target);
+  process.exit(0);
 }
 
 // --- FX17: shared-lib entry point ----------------------------------------------
