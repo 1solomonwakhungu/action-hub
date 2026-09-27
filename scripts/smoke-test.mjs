@@ -124,7 +124,7 @@ function checkLicenses(bin) {
  */
 function checkExtractionCacheReuse(bin) {
   const tmpRoot = checkDir("sea-extraction");
-  const env = { TMPDIR: tmpRoot, TMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
+  const env = { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
   const first = runBinary(bin, [], env);
   const cacheDirs = () => {
     const base = join(tmpRoot, "action-hub");
