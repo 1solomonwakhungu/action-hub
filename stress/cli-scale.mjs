@@ -663,7 +663,9 @@ function emitSummary(totalMs, error = null) {
   }
   console.log("\n--- flags (slow > " + SLOW_MS + "ms, output > " + LARGE_OUTPUT_BYTES + "B) ---");
   console.log(flags.length === 0 ? "(none)" : JSON.stringify(flags, null, 2));
-  console.log(JSON.stringify(summary));
+  // NOTE: no console.log here — harness main() prints the ONE compact JSON
+  // summary (with ...result merged in). Printing here would duplicate the
+  // line and break the one-JSON-last-line contract.
   return summary;
 }
 
@@ -862,9 +864,9 @@ async function runAll() {
     cfg.harnessServersPerConfig + " servers per harness config for import/migrate");
 
   try {
-    phaseCliBenchmarks({ configPath, serverIds });
-    phaseImportMigrate({ perConfig: cfg.harnessServersPerConfig });
-    phaseHarnessInstall();
+    await phaseCliBenchmarks({ configPath, serverIds });
+    await phaseImportMigrate({ perConfig: cfg.harnessServersPerConfig });
+    await phaseHarnessInstall();
   } finally {
     // S8-R6: NO worktree-wide pkill. Every CLI step runs in an anchored
     // process group via lib runStep, which reaps the WHOLE group (including
