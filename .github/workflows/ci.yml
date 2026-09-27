@@ -34,6 +34,28 @@ jobs:
       - name: Test
         run: npm test
 
+  min-node-floor:
+    name: Minimum Node floor (20.11.0)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Setup Node 20.11.0 (declared floor)
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20.11.0
+      - name: Install dependencies
+        run: npm ci
+      - name: Build workspaces
+        run: npm run build
+      - name: Basic CLI commands run on the floor runtime
+        run: |
+          node --version
+          node packages/cli/dist/index.js --version
+          node packages/cli/dist/index.js --help >/dev/null
+          echo '{"servers":[],"skills":[],"bundles":[],"autoDiscover":false}' > /tmp/floor-cfg.json
+          ACTION_HUB_CONFIG=/tmp/floor-cfg.json node packages/cli/dist/index.js list | grep -q "Action Hub Catalog"
+
   binary-smoke:
     name: Binary smoke (${{ matrix.os }})
     needs: verify
