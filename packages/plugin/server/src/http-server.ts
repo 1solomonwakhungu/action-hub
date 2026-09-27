@@ -205,9 +205,7 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
         // can never extend the client-observed response latency even if its
         // work is synchronous. Memoised in the runtime, so repeated
         // stateless requests cannot duplicate it.
-        const trigger = () => setImmediate(() => runtime.startRefresh());
-        if (res.writableFinished) trigger();
-        else res.once("finish", trigger);
+        scheduleRefresh(res);
       } finally {
         await requestTransport.close().catch(() => undefined);
       }
@@ -230,7 +228,39 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   const address = httpServer.address();
   const boundPort = typeof address === "object" && address !== null ? address.port : port;
 
+  // The deferred refresh is scheduled with an untracked setImmediate after a
+  // response flushes; close() must cancel a trigger that has not run yet, or
+  // it would start an authoritative index against an already-closed hub
+  // (rework round 3). A trigger that has already STARTED the refresh is
+  // awaited by runtime.close() (memoised in the runtime).
+  let closing = false;
+  let pendingTrigger: NodeJS.Immediate | undefined;
+  const scheduleRefresh = (res: ServerResponse): void => {
+    if (closing) return;
+    if (res.writableFinished) {
+      pendingTrigger = setImmediate(() => {
+        pendingTrigger = undefined;
+        if (closing) return;
+        void runtime.startRefresh().catch(() => undefined);
+      });
+    } else {
+      res.once("finish", () => {
+        if (closing) return;
+        pendingTrigger = setImmediate(() => {
+          pendingTrigger = undefined;
+          if (closing) return;
+          void runtime.startRefresh().catch(() => undefined);
+        });
+      });
+    }
+  };
+
   async function close(): Promise<void> {
+    closing = true;
+    if (pendingTrigger) {
+      clearImmediate(pendingTrigger);
+      pendingTrigger = undefined;
+    }
     await new Promise<void>((resolve, reject) => {
       httpServer.close((cause) => (cause ? reject(cause) : resolve()));
     });

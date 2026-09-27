@@ -378,3 +378,73 @@ test("F23 rework 2: synchronous refresh work cannot extend client-observed initi
   }
 });
 
+
+test("F23 rework 3: closing cancels the queued refresh trigger (deterministic)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "hub-http-close-"));
+  const configPath = join(tmp, "config.json");
+  await writeFile(configPath, JSON.stringify({ autoDiscover: false }), "utf8");
+  const prevConfig = process.env["ACTION_HUB_CONFIG"];
+  process.env["ACTION_HUB_CONFIG"] = configPath;
+  const realSetImmediate = globalThis.setImmediate;
+  try {
+    const { startHttpServer } = await import("../dist/http-server.js");
+    const seed = await startHttpServer({ port: 0, token: "tok" });
+    await seed.close();
+    const handle = await startHttpServer({ port: 0, token: "tok" });
+    let refreshRan = 0;
+    let refreshPromise: Promise<unknown> | undefined;
+    handle.runtime.startRefresh = () => {
+      refreshRan += 1;
+      refreshPromise ??= Promise.resolve([]);
+      return refreshPromise;
+    };
+    // Capture the queued trigger instead of letting it run: the real window
+    // between res finish and the setImmediate firing is sub-millisecond, so
+    // no external close can land inside it deterministically.
+    const queued: Array<(...args: unknown[]) => void> = [];
+    const handles: unknown[] = [];
+    const realClearImmediate = globalThis.clearImmediate;
+    (globalThis as { setImmediate: unknown }).setImmediate = ((fn: (...args: unknown[]) => void, ...args: unknown[]) => {
+      queued.push(() => fn(...args));
+      const handle = realSetImmediate(() => undefined, 0);
+      handles.push(handle);
+      return handle;
+    }) as typeof setImmediate;
+    const cleared: unknown[] = [];
+    (globalThis as { clearImmediate: unknown }).clearImmediate = ((handle: unknown) => {
+      cleared.push(handle);
+    }) as typeof clearImmediate;
+    const res = await fetch(`http://127.0.0.1:${handle.port}/mcp`, {
+      method: "POST",
+      headers: { authorization: "Bearer tok", "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } }),
+    });
+    await res.arrayBuffer().catch(() => undefined);
+    (globalThis as { setImmediate: unknown }).setImmediate = realSetImmediate;
+    assert.ok(queued.length >= 1, "the finish handler queued at least one deferred trigger");
+    assert.equal(refreshRan, 0, "trigger has not run while queued");
+
+    // Close must cancel the queued trigger (clearImmediate on our handle).
+    await handle.close();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    (globalThis as { clearImmediate: unknown }).clearImmediate = realClearImmediate;
+    const triggerHandles = handles.slice(-queued.length);
+    assert.equal(
+      triggerHandles.some((h) => cleared.includes(h)),
+      true,
+      "close cleared the queued trigger",
+    );
+    assert.equal(refreshRan, 0, "close cancelled the queued trigger");
+
+    // Even if the trigger runs after close (the race the reviewer proved),
+    // the closing guard must keep it from starting an index.
+    for (const run of queued) run();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(refreshRan, 0, "a trigger firing after close must not start the refresh");
+  } finally {
+    (globalThis as { setImmediate: unknown }).setImmediate = realSetImmediate;
+    if (prevConfig === undefined) delete process.env["ACTION_HUB_CONFIG"];
+    else process.env["ACTION_HUB_CONFIG"] = prevConfig;
+  }
+});
