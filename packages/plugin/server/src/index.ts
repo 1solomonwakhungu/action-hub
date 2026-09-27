@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { isJSONRPCErrorResponse, isJSONRPCRequest, isJSONRPCNotification, isJSONRPCResultResponse } from "@modelcontextprotocol/sdk/types.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { pathToFileURL } from "node:url";
@@ -351,14 +353,76 @@ export async function runDaemonServer(): Promise<void> {
 }
 
 /**
+ * F53 (P3): over stdio, the MCP SDK silently drops malformed JSON-RPC frames:
+ * `StdioServerTransport` reports both unparseable lines and parseable-but-
+ * non-JSON-RPC frames (e.g. a top-level `arguments` object) to `onerror`
+ * without replying (shared/protocol.js dispatches unclassifiable frames to
+ * `onerror` and never answers). A client that sent a request with an id then
+ * waits for that id and hangs.
+ *
+ * Fix (packet F53-R2 option A, no stream wrapping): hook the transport error
+ * path via `server.onerror` and classify each reported error:
+ *  - `SyntaxError` (unparseable JSON) -> `-32700 Parse error`, `id: null`
+ *    (the JSON-RPC 2.0 spec requires a null id when the id is undetectable);
+ *  - schema-invalid frames surface as the SDK's ZodError, which does NOT
+ *    expose the parsed frame (verified against the SDK source: union failure
+ *    issues carry no input), so the reply is `-32600 Invalid Request` with
+ *    `id: null` — never a guessed id;
+ *  - the SDK's "Unknown message type" errors embed the parsed frame in the
+ *    message; when its `id` is a string or number it is echoed verbatim.
+ * Every frame is answered at most once (WeakSet guard). Valid frames keep
+ * the SDK's own ReadBuffer path (its 10 MiB bound and UTF-8 handling)
+ * untouched.
+ */
+export function installStdioMalformedFrameReplies(server: McpServer): void {
+  const answered = new WeakSet<object>();
+  // McpServer wraps the raw Protocol (with the connected transport) at
+  // `.server`; error reports and the live transport live there.
+  const protocol = server.server as unknown as {
+    onerror: ((error: unknown) => void) | undefined;
+    transport?: Transport;
+  };
+  protocol.onerror = (error: unknown): void => {
+    if (typeof error !== "object" || error === null || answered.has(error)) return;
+    answered.add(error); // at most one reply per reported frame
+    const isSyntaxError = error instanceof SyntaxError;
+    const isSchemaRejection = !isSyntaxError && (error as { name?: unknown }).name === "ZodError";
+    if (!isSyntaxError && !isSchemaRejection) return; // not a malformed frame; don't guess
+    // JSON-RPC 2.0: unparseable JSON -> -32700; parseable but not a valid
+    // JSON-RPC message -> -32600. The id is echoed only when the SDK error
+    // exposes it (protocol "Unknown message type" errors embed the parsed
+    // frame); ZodError carries no input, so schema-invalid frames are
+    // answered with id null rather than a guessed one.
+    const parseErrorCode = isSyntaxError ? -32700 : -32600;
+    const detail = isSyntaxError
+      ? "Parse error"
+      : "Invalid Request: the frame was not a valid JSON-RPC message";
+    let id: string | number | null = null;
+    const embedded = (error as { message?: unknown }).message;
+    if (typeof embedded === "string" && embedded.startsWith("Unknown message type: ")) {
+      try {
+        const frame: unknown = JSON.parse(embedded.slice("Unknown message type: ".length));
+        const candidate = (frame as { id?: unknown } | null)?.id;
+        if (typeof candidate === "string" || typeof candidate === "number") id = candidate;
+      } catch {
+        id = null;
+      }
+    }
+    void protocol.transport
+      ?.send({ jsonrpc: "2.0", id, error: { code: parseErrorCode, message: detail } } as unknown as JSONRPCMessage)
+      .catch(() => undefined);
+  };
+}
+
+/**
  * Boots the Action Hub meta-MCP server on stdio and resolves on transport
  * close or a termination signal.
  */
 export async function runServer(): Promise<void> {
   const runtime = await createHubRuntime();
   const transport = new StdioServerTransport();
-  await connectMcpClient(runtime, transport);
-
+  const server = await connectMcpClient(runtime, transport);
+  installStdioMalformedFrameReplies(server);
   await new Promise<void>((resolveShutdown) => {
     let closing = false;
     const shutdown = () => {
