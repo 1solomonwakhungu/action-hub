@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -33,12 +34,13 @@ export interface SdkClientFactoryOptions {
   /** Diagnostics sink. stdout is the MCP channel, so this must not use it. */
   onWarning?: (message: string) => void;
   /**
-   * Called with the spawned stdio transport child PID as soon as the child
-   * exists — BEFORE the client connection resolves. Hosts that own anchored
-   * teardown (doctor) use this to hold the parent-known anchor identity;
-   * there is no disk PID metadata (F39 ruling).
+   * Called with the spawned stdio transport child PROCESS HANDLE as soon as
+   * the child exists — BEFORE the client connection resolves. Hosts that own
+   * anchored teardown (doctor) hold the exact ChildProcess issued by the SDK
+   * transport; there is no disk PID metadata and no numeric identity
+   * reconstruction (F39 ruling).
    */
-  onChildSpawn?: (config: ServerConfig, pid: number) => void;
+  onChildSpawn?: (config: ServerConfig, child: ChildProcess) => void;
 }
 
 /**
@@ -68,8 +70,8 @@ export const createSdkClientFactory: (options?: SdkClientFactoryOptions) => McpC
         const originalStart = startFn.bind(stdioTransport) as () => Promise<void>;
         stdioTransport.start = async () => {
           await originalStart();
-          const pid = (stdioTransport as unknown as { _process?: { pid?: number } })._process?.pid;
-          if (typeof pid === "number") onChildSpawn(config, pid);
+          const child = (stdioTransport as unknown as { _process?: ChildProcess })._process;
+          if (child) onChildSpawn(config, child);
         };
       }
     }

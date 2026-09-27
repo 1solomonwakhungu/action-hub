@@ -102,33 +102,47 @@ const signalGroup = (signal) => {
   try { process.kill(-wrapper.pid, signal); } catch {}
   return true;
 };
+// Teardown PROOF protocol: the anchor exits 0 only after VERIFIED cleanup
+// (the wrapper group is proven empty); any other exit code reports failure
+// to the host, which holds this exact ChildProcess and fails closed.
+const EXIT_PROVEN = 0;
+const EXIT_FAILED = 3;
 const startKillSequence = (why) => {
   if (killStarted) return;
   killStarted = true;
   if (isWin) {
     // child.kill is NOT a tree kill on Windows and the wrapper is not a
-    // group leader there: taskkill /T /F the wrapper tree, await it, then
-    // exit. The anchor stays a live tree root until this completes.
+    // group leader there: taskkill /T /F the wrapper tree, await it, verify
+    // the wrapper is gone, then exit with the proof code.
     const tk = spawn("taskkill", ["/pid", String(wrapper.pid), "/T", "/F"], { stdio: "ignore" });
-    const done = () => finalize();
+    const done = () => {
+      if (tk.exitCode === 0 && !wrapperAlive()) finalize(true);
+      else finalize(false);
+    };
     tk.on("exit", done);
-    tk.on("error", () => { try { wrapper.kill("SIGKILL"); } catch {} done(); });
+    tk.on("error", () => { try { wrapper.kill("SIGKILL"); } catch {} finalize(false); });
     return;
   }
   signalGroup("SIGTERM");
   const escalate = setTimeout(() => {
     signalGroup("SIGKILL");
-    finalize();
+    // Verify before claiming success: poll the wrapper until dead (bounded).
+    const verifyDeadline = Date.now() + 2000;
+    const verify = setInterval(() => {
+      if (!wrapperAlive()) {
+        clearInterval(verify);
+        finalize(true);
+      } else if (Date.now() > verifyDeadline) {
+        clearInterval(verify);
+        finalize(false);
+      }
+    }, 50);
   }, 150);
-  // Ref'd on purpose: the anchor must stay alive to escalate and exit.
+  // Ref'd on purpose: the anchor must stay alive to escalate, verify and exit.
   escalate.unref?.();
-  // Absolute fallback in case timers are somehow gone.
-  const deadline = setTimeout(() => finalize(), 5000);
-  deadline.unref?.();
 };
-const finalize = () => {
-  try { if (mode === "daemon") process.exit(serverExitCode ?? 0); } catch {}
-  process.exit(0);
+const finalize = (proven) => {
+  process.exit(proven ? EXIT_PROVEN : EXIT_FAILED);
 };
 const wrapper = spawn(process.execPath, ["-e", ${JSON.stringify(WRAPPER_SRC)}, command, ...serverArgs], {
   detached: !isWin,
@@ -138,12 +152,9 @@ const wrapper = spawn(process.execPath, ["-e", ${JSON.stringify(WRAPPER_SRC)}, c
 });
 wrapper.on("error", () => { startKillSequence("wrapper-error"); });
 wrapper.once("exit", () => {
-  // The wrapper must never exit on its own; if it was killed externally with
-  // descendants still inside, do a single gated attempt (best effort) and
-  // exit. There is no reuse-safe way to signal a dead leader's group, so
-  // this is intentionally a single shot with a liveness check.
-  if (!killStarted) startKillSequence("wrapper-external-exit");
-  else finalize();
+  // The wrapper must never exit on its own. If it dies unexpectedly, the
+  // group state is unverifiable — report failure (the host fails closed).
+  startKillSequence("wrapper-external-exit");
 });
 if (relayStdin) {
   process.stdin.on("data", (chunk) => { try { wrapper.stdin.write(chunk); } catch {} });
@@ -200,6 +211,9 @@ export interface TeardownResult {
 
 const isWindows = platform() === "win32";
 
+/** Anchor exit code meaning "group cleanup verified". */
+export const EXIT_PROVEN = 0;
+
 export const pidAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
@@ -212,43 +226,50 @@ export const pidAlive = (pid: number): boolean => {
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Gated teardown of ONE anchored tree whose anchor PID the host holds
- * directly. The host only ever signals the ANCHOR (single-PID signal, safe
- * unconditionally): a living anchor performs its own group cleanup from
- * inside, where the wrapper PID is known and every group signal is gated on
- * the wrapper being alive. If the anchor cannot be proven dead-and-cleaned,
- * the result is fail-closed — the host NEVER guesses at group PIDs.
+ * Gated teardown of ONE anchored tree whose anchor ChildProcess the host
+ * holds directly. The host only ever signals the ANCHOR it spawned
+ * (single-PID signal, safe unconditionally); the anchor performs its own
+ * group cleanup from inside, where the wrapper PID is known and every group
+ * signal is gated on the wrapper being alive. Proof is the anchor's EXIT
+ * CODE (0 = verified cleanup; anything else = failure). If the anchor cannot
+ * be proven cleaned, the result is fail-closed — the host NEVER guesses at
+ * group PIDs and never reconstructs authority from a number.
  */
 export async function teardownAnchorChild(
-  anchorPid: number,
+  child: ChildProcess,
   timeoutMs = 5_000,
 ): Promise<TeardownResult> {
-  if (!pidAlive(anchorPid)) return { survivors: [], proven: false };
-  try {
-    process.kill(anchorPid, "SIGTERM");
-  } catch {}
-  const deadline = Date.now() + timeoutMs;
-  while (pidAlive(anchorPid) && Date.now() < deadline) await delay(50);
-  if (!pidAlive(anchorPid)) return { survivors: [], proven: true };
-  if (isWindows) {
-    // The anchor is a live tree root: taskkill /T /F covers wrapper + server.
+  if (child.pid === undefined) return { survivors: [], proven: false };
+  const alreadyExited = child.exitCode !== null || child.signalCode !== null;
+  if (!alreadyExited) {
     try {
+      child.kill("SIGTERM");
+    } catch {}
+  }
+  const deadline = Date.now() + timeoutMs;
+  while ((child.exitCode === null && child.signalCode === null) && Date.now() < deadline) {
+    await delay(50);
+  }
+  if (child.exitCode === EXIT_PROVEN) return { survivors: [], proven: true };
+  if (child.exitCode !== null || child.signalCode !== null) {
+    // Exited with a failure proof (or was killed): fail closed.
+    return { survivors: [], proven: false };
+  }
+  // Still alive past the deadline: SIGKILL the anchor (Windows: taskkill the
+  // tree) and fail closed — the group state is unverifiable.
+  try {
+    if (isWindows) {
       await new Promise<void>((resolve) => {
-        const tk = spawn("taskkill", ["/pid", String(anchorPid), "/T", "/F"], { stdio: "ignore" });
+        const tk = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
         tk.on("exit", () => resolve());
         tk.on("error", () => resolve());
       });
-    } catch {}
-    await delay(500);
-    return { survivors: pidAlive(anchorPid) ? [anchorPid] : [], proven: !pidAlive(anchorPid) };
-  }
-  // POSIX: the anchor ignored our TERM long enough to be wedged. SIGKILLing
-  // it cannot be proven to clean the group, so fail closed and report.
-  try {
-    process.kill(anchorPid, "SIGKILL");
+    } else {
+      process.kill(child.pid, "SIGKILL");
+    }
   } catch {}
   await delay(100);
-  return { survivors: pidAlive(anchorPid) ? [anchorPid] : [], proven: false };
+  return { survivors: pidAlive(child.pid) ? [child.pid] : [], proven: false };
 }
 
 /** Bounded spawn of the anchor used by hosts. Returns the child. */
