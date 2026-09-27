@@ -35,12 +35,28 @@ function handleLine(line) {
       send({ op: "spawn-error", error: String(err && err.message) });
       return;
     }
-    workload.on("error", (err) => send({ op: "workload-error", error: String(err && err.message) }));
-    workload.on("exit", (code, signal) => send({ op: "workload-exit", code, signal }));
-    if (wstdio[0] === "pipe" && workload.stdin) process.stdin.pipe(workload.stdin);
-    if (wstdio[1] === "pipe" && workload.stdout) workload.stdout.pipe(process.stdout);
-    if (wstdio[2] === "pipe" && workload.stderr) workload.stderr.pipe(process.stderr);
-    send({ op: "spawned", pid: workload.pid });
+    // CONFIRMATION: 'spawned' is sent only after the child's actual 'spawn'
+    // event — cp.spawn() returning is NOT proof the child exists (an ENOENT
+    // command fires 'error' asynchronously and would otherwise be reported
+    // as a confirmed pid, leaving the anchor alive with no workload and the
+    // parent terminalizing a false green).
+    let confirmed = false;
+    workload.on("spawn", () => {
+      confirmed = true;
+      if (wstdio[0] === "pipe" && workload.stdin) process.stdin.pipe(workload.stdin);
+      if (wstdio[1] === "pipe" && workload.stdout) workload.stdout.pipe(process.stdout);
+      if (wstdio[2] === "pipe" && workload.stderr) workload.stderr.pipe(process.stderr);
+      send({ op: "spawned", pid: workload.pid });
+    });
+    workload.on("error", (err) => {
+      if (!confirmed) send({ op: "spawn-error", error: String(err && err.message) });
+      else send({ op: "workload-error", error: String(err && err.message) });
+    });
+    workload.on("exit", (code, signal) => {
+      // An unconfirmed child (spawn 'error') must not produce a phantom exit
+      // report; the spawn-error already told the parent the truth.
+      if (confirmed) send({ op: "workload-exit", code, signal });
+    });
   } else if (msg.op === "exit") {
     process.exit(0);
   }

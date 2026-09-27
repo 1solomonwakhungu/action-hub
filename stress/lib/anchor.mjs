@@ -177,7 +177,10 @@ export function spawnAnchoredGroup(cmd, args, { env, cwd, stdio = ["ignore", "pi
         }
       });
       ctrl?.on?.("error", () => {});
-      // If the anchor dies without reporting, surface that.
+      // If the anchor dies without reporting, surface that; and an anchor
+      // spawn error (e.g. invalid cwd) must SETTLE the protocol — an
+      // unhandled ChildProcess 'error' event crashes the caller's process.
+      anchor.on("error", (err) => feed({ op: "anchor-exit", code: null, signal: null, error: "anchor spawn error: " + String((err && err.message) || err) }));
       anchor.on("close", (code, signal) => feed({ op: "anchor-exit", code, signal }));
     }
 
@@ -186,7 +189,9 @@ export function spawnAnchoredGroup(cmd, args, { env, cwd, stdio = ["ignore", "pi
       if (!anchor) return { code: null, signal: null, error: issued.error };
       const ready = await nextControl(ANCHOR_READY_MS);
       if (!ready || ready.op !== "ready") {
-        issued.terminal = true;
+        // NOT terminalized here: the anchor may still be live and must be
+        // reaped by the normal ladder (killGroupAndVerify), never blessed
+        // as verified-empty by a failed spawn (reviewer LIB2-R3.1).
         return { code: null, signal: null, error: ready?.error ?? "anchor did not report ready" };
       }
       try {
@@ -197,7 +202,9 @@ export function spawnAnchoredGroup(cmd, args, { env, cwd, stdio = ["ignore", "pi
       }
       const spawned = await nextControl(ANCHOR_SPAWN_CONFIRM_MS);
       if (!spawned || spawned.op !== "spawned") {
-        issued.terminal = true;
+        // NOT terminalized: see the ready-failure note — the anchor may be
+        // alive with no workload; the ladder must reap it for a truthful
+        // verdict (a terminal mark here would be a false green).
         return { code: null, signal: null, error: spawned?.error ?? "workload spawn not confirmed" };
       }
       issued.pid = spawned.pid ?? null;

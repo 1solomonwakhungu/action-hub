@@ -341,7 +341,7 @@ function killTreeWindows(pid) {
  * lastJson, error }. pid/code/signal describe the WORKLOAD; groupEmpty
  * describes the verified state of the whole anchored group.
  */
-export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
+export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd, win32, taskkillRunner, hooks } = {}) {
   if (interruptReceived) {
     return Promise.resolve({
       pid: null, code: null, signal: null, timedOut: false, killed: false,
@@ -354,20 +354,24 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       const handle = adoptAnchorHandle(
         await spawnAnchoredGroup(cmd, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"] }),
       );
+      // The step is registry-visible from the earliest moment the anchor
+      // exists (INCLUDING failed spawns — the anchor may be live with no
+      // workload) so an interrupt arriving during setup sweeps it too.
+      registerGroup(handle);
       if (!handle.pid) {
-        // Spawn/protocol failure: nothing may be signalled (fail closed).
-        markTerminal(handle);
+        // Spawn/protocol failure: NEVER terminalize a possibly-live anchor
+        // (reviewer LIB2-R3.1) — reap through the normal gated ladder and
+        // report its truthful verdict.
+        const verdict = await killGroupAndVerify(handle, { win32, taskkillRunner, hooks });
         resolveP({
-          pid: null, code: null, signal: null, timedOut: false, killed: false,
-          groupEmpty: false, error: handle.error ?? "workload spawn failed",
+          pid: null, pgid: handle.pgid, code: null, signal: null, timedOut: false, killed: false,
+          groupEmpty: verdict.groupEmpty,
+          ...(verdict.error ? { killError: verdict.error } : {}),
+          error: handle.error ?? "workload spawn failed",
           stdout: "", stderr: "", lastJson: null,
         });
         return;
       }
-      // The in-flight step is registry-visible so an interrupt arriving DURING
-      // the step sweeps its group too; the entry drops only after the group is
-      // VERIFIED empty (reviewer LIB2-R2.1).
-      registerGroup(handle);
 
       let stdout = "";
       let stderr = "";
@@ -384,6 +388,7 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
 
       const buildResult = (extraError) => ({
         pid: handle.pid,
+        pgid: handle.pgid,
         code: exitInfo ? exitInfo.code : null,
         signal: exitInfo ? exitInfo.signal : null,
         timedOut,
@@ -405,7 +410,7 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
       // this gate keeps the timeout path and the natural-exit path from even
       // requesting two verdicts with different error framing).
       const settleAfterTeardown = async (extraError) => {
-        const verdict = await killGroupAndVerify(handle);
+        const verdict = await killGroupAndVerify(handle, { win32, taskkillRunner, hooks });
         // The relay pipes close when the anchor dies; give data events one
         // bounded window to flush (the verdict, not the drain, is the truth).
         const deadline = Date.now() + 250;
@@ -444,7 +449,7 @@ export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
             if (!settled) {
               settled = true;
               if (timer) clearTimeout(timer);
-              killGroupAndVerify(handle)
+              killGroupAndVerify(handle, { win32, taskkillRunner, hooks })
                 .then((verdict) => resolveP({
                   ...buildResult(exit.error),
                   groupEmpty: verdict.groupEmpty,
@@ -524,6 +529,18 @@ function unregisterGroup(handleOrPgid) {
   }
 }
 
+/**
+ * The authoritative handle currently registered for `pgid` (or null). Returns
+ * the module's OWN object — a caller can only ever hold a real issued handle
+ * through this, never a fabricated one. Test/cleanup seam: after a
+ * non-terminal verdict (e.g. an injected failed taskkill), the registered
+ * handle lets the caller drive the real gated ladder.
+ */
+export function registeredHandleFor(pgid) {
+  const handle = liveGroups.get(pgid);
+  return handle && !handle.terminal ? handle : null;
+}
+
 /** Mark a handle terminal: verified empty (or dead) — it may NEVER signal again. */
 function markTerminal(handle) {
   if (handle) handle.terminal = true;
@@ -551,7 +568,7 @@ function isAuthoritativeHandle(target) {
     target &&
     typeof target === "object" &&
     issuedHandles.has(target) &&
-    (target.terminal === true || liveGroups.get(target.pgid) === target)
+    (target.terminal === true || target.pgid == null /* ours, group never existed */ || liveGroups.get(target.pgid) === target)
   );
 }
 
@@ -598,13 +615,13 @@ export async function spawnGroup(cmd, args, { env, cwd, stdio = ["ignore", "pipe
     throw new FatalError("interrupt received; refusing to start new group work");
   }
   const handle = adoptAnchorHandle(await spawnAnchoredGroup(cmd, args, { env, cwd, stdio }));
-  if (!handle.pid) {
-    // Spawn/protocol failure: nothing may ever be signalled — mark terminal
-    // (fail closed; the anchor may already be dead and the pgid unprovable).
-    markTerminal(handle);
-    return handle;
-  }
-  registerGroup(handle); // registered as soon as the workload spawn is confirmed
+  // Register whenever a pgid exists — INCLUDING failed spawns: the anchor may
+  // still be live with no workload, and the handle must stay sweep-visible
+  // until the ladder verifies it empty. A failed spawn is NEVER terminalized
+  // here (that would be a false green: reviewer LIB2-R3.1) — the caller's
+  // killGroupAndVerify reaps through the normal gated ladder and the verdict
+  // reports the truth.
+  registerGroup(handle);
   return handle;
 }
 
@@ -645,7 +662,7 @@ export async function spawnGroup(cmd, args, { env, cwd, stdio = ["ignore", "pipe
  * groupEmpty:false + error and the handle stays non-terminal; the runner is
  * injectable (taskkillRunner) for cross-platform regression coverage.
  */
-export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner } = {}) {
+export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner, win32, hooks } = {}) {
   if (!isAuthoritativeHandle(target)) {
     return {
       groupEmpty: false,
@@ -656,12 +673,18 @@ export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS
   if (target.terminal) {
     return { groupEmpty: true, survivors: [] }; // verified gone before; never probe, never signal (F39)
   }
+  if (target.pgid == null) {
+    // Our OWN handle that never got a group (anchor never spawned): nothing
+    // provable, nothing signallable — fail closed with a precise reason
+    // (not the forgery refusal; the identity is fine, the group is absent).
+    return { groupEmpty: false, survivors: [], error: "fail closed: no group was ever created for this handle (anchor never spawned)" };
+  }
   // Single-flight: a handle must never have TWO teardown ladders running —
   // concurrent TERM/KILL sequences from racing callers (timeout path vs
   // natural-exit path) are themselves the unsynchronized-signal hazard this
   // design exists to kill. Concurrent callers share the in-flight verdict.
   if (target.teardownPromise) return target.teardownPromise;
-  target.teardownPromise = teardownAnchoredGroup(target, { termGraceMs, killDeadlineMs, taskkillRunner }).then((verdict) => {
+  target.teardownPromise = teardownAnchoredGroup(target, { termGraceMs, killDeadlineMs, taskkillRunner, win32, hooks }).then((verdict) => {
     // A verified-empty verdict terminalizes (later calls are safe no-ops).
     // A NOT-empty verdict clears the flight lock so a later, changed state
     // (e.g. the workload exited since) can be re-attempted honestly.
@@ -671,17 +694,30 @@ export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS
   return target.teardownPromise;
 }
 
-async function teardownAnchoredGroup(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner } = {}) {
+async function teardownAnchoredGroup(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner, win32: win32Override, hooks } = {}) {
+  // Platform + verdict-mapping seam (reviewer LIB2-R3.3): the win32 branch
+  // (taskkill /T /F against the anchor pid, truthful verdict mapping) is
+  // EXERCISABLE on any host by passing win32:true with an injectable
+  // taskkillRunner; real win32 hosts take the same branch with the real
+  // runner. POSIX default is unchanged.
+  const win32 = win32Override ?? process.platform === "win32";
+  // Before every negative-pgid signal: run the caller's test hook (if any),
+  // then require the exact anchor to be provably ours and alive RIGHT HERE —
+  // the gate is the last thing before the signal fires (reviewer LIB2-R3.2).
+  const signalGate = async (which) => {
+    try { await hooks?.beforeSignal?.(which, target); } catch { /* the gate below decides, not the hook */ }
+    return anchorLive(target.anchor);
+  };
   const failClosed = () => ({
     groupEmpty: false,
     survivors: enumerateGroupPids(target.pgid),
     error: "fail closed: the group's anchor is not provably alive; no negative-pgid signal permitted (the pgid may be recycled)",
   });
 
-  if (process.platform === "win32") {
+  if (win32) {
     // Gate: taskkill walks the tree from the anchor pid; that is only safe
     // while the anchor is still the process we spawned.
-    if (!anchorLive(target.anchor)) return failClosed();
+    if (!(await signalGate("taskkill"))) return failClosed();
     const taskkill = taskkillRunner ?? killTreeWindows;
     const verdict = taskkill(target.anchor.pid);
     if (!verdict.ok) {
@@ -726,7 +762,10 @@ async function teardownAnchoredGroup(target, { termGraceMs = TERM_TO_KILL_MS, ki
 
   // Ladder: TERM (the workload/stragglers die; the anchor ignores TERM),
   // bounded wait, then — gated on the anchor being STILL provably live —
-  // the FINAL KILL, then verify-only.
+  // the FINAL KILL, then verify-only. The TERM gate is checked IMMEDIATELY
+  // before the signal (enumeration/probes happen in between; reviewer
+  // LIB2-R3.2).
+  if (!(await signalGate("TERM"))) return failClosed();
   signalGroup(target.pgid, "SIGTERM");
   const termDeadline = Date.now() + termGraceMs;
   while (Date.now() < termDeadline && !groupEmpty(target.pgid)) await sleep(GROUP_POLL_MS);
@@ -748,7 +787,7 @@ async function teardownAnchoredGroup(target, { termGraceMs = TERM_TO_KILL_MS, ki
       markTerminal(target);
       return { groupEmpty: true, survivors: [] };
     }
-    if (!anchorLive(target.anchor)) return failClosed();
+    if (!(await signalGate("KILL"))) return failClosed();
     signalGroup(target.pgid, "SIGKILL"); // FINAL signal — verify-only after
     const killDeadline = Date.now() + killDeadlineMs;
     while (Date.now() < killDeadline && !groupEmpty(target.pgid)) await sleep(GROUP_POLL_MS);
