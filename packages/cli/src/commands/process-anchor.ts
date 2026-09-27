@@ -116,10 +116,38 @@ export function runWrapperProcess(argvTail: string[]): void {
     killStarted = true;
     try { fs.writeSync(2, `__wrapper-run: anchor lost (${why}); tearing down group\n`); } catch {}
     if (isWin) {
-      // No process groups on Windows: taskkill our own whole tree, then a
-      // bounded backstop exit in case the taskkill misses.
-      try { spawn("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
-      setTimeout(() => process.exit(4), 2000);
+      // No process groups on Windows. The server is our direct child, so
+      // server.kill works even where taskkill cannot; taskkill /T /F on our
+      // own pid is the tree sweep that also takes US down. Every attempt is
+      // VERIFIED: the wrapper must never exit while the server is still
+      // alive — a failed taskkill must not silently orphan the tree.
+      const serverDead = (): boolean => {
+        if (!server) return true;
+        if (server.exitCode !== null || server.signalCode !== null) return true;
+        try { process.kill(server.pid!, 0); return false; } catch { return true; }
+      };
+      let attempts = 0;
+      const attemptTeardown = () => {
+        attempts++;
+        try { server?.kill("SIGKILL"); } catch {}
+        const tk = spawn("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore" });
+        // A taskkill that works kills this wrapper too; the verification
+        // below only runs when it did NOT (launch failure or nonzero exit).
+        tk.on("error", () => {});
+        setTimeout(() => {
+          if (serverDead()) {
+            process.exit(4);
+            return;
+          }
+          if (attempts < 6) { attemptTeardown(); return; }
+          // Every bounded attempt failed: never exit while the server
+          // lives. Keep attempting (and holding the group) instead of
+          // silently orphaning it.
+          const keepTrying = setInterval(attemptTeardown, 2000);
+
+        }, 400);
+      };
+      attemptTeardown();
       return;
     }
     // We are the group leader, so the PGID is ours by construction and
