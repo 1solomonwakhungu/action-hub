@@ -12,6 +12,12 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import {
+  spawnAnchoredGroup,
+  shutdownAnchor,
+  anchorLive,
+  enumerateGroupPids,
+} from "./anchor.mjs";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -300,34 +306,6 @@ function killTreeWindows(pid) {
  * must still settle). Never throws. Grace deadlines are parameterizable
  * (killGroupAndVerify exposes them to callers); defaults match runStep.
  */
-async function reapGroup(pgid, { alreadyTermed = false, termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS } = {}) {
-  if (process.platform === "win32") {
-    // win32 has no process groups; taskkill /T walks the tree by pid.
-    return true; // caller already ran taskkill against the root pid
-  }
-  if (!alreadyTermed) signalGroup(pgid, "SIGTERM");
-  const termDeadline = Date.now() + termGraceMs;
-  while (Date.now() < termDeadline && !groupEmpty(pgid)) {
-    await sleep(GROUP_POLL_MS);
-  }
-  if (!groupEmpty(pgid)) {
-    signalGroup(pgid, "SIGKILL");
-    const killDeadline = Date.now() + killDeadlineMs;
-    while (Date.now() < killDeadline && !groupEmpty(pgid)) {
-      await sleep(GROUP_POLL_MS);
-    }
-  }
-  return groupEmpty(pgid);
-}
-
-/** Bounded wait for in-flight 'exit'/'close' events to flush stdio. */
-async function drainPipes(child, ms = 250) {
-  const deadline = Date.now() + ms;
-  while ((child.exitCode === null && child.signalCode === null) && Date.now() < deadline) {
-    await sleep(10);
-  }
-  await new Promise((r) => setTimeout(r, 25)); // one macrotask for data events
-}
 
 /**
  * Run one step as a detached process group with drained pipes and bounded
@@ -338,119 +316,159 @@ async function drainPipes(child, ms = 250) {
  *
  * Resolves { pid, code, signal, timedOut, killed, groupEmpty, stdout, stderr, lastJson, error }.
  */
+/**
+ * Run one step as an ANCHORED process group (Design C, reviewer ruling
+ * LIB2-R3): a dedicated detached anchor is the group leader for the step's
+ * whole lifetime; the workload is spawned NON-detached inside the anchor's
+ * group and its exit is reported over the control channel. The anchor is the
+ * always-live ownership proof — the group can never become leaderless while
+ * the step is in flight, so every negative-pgid signal the reaper sends is
+ * gated on the exact anchor being provably ours and alive immediately before
+ * it fires (TERM, then the FINAL KILL; verify-only after).
+ *
+ * On EVERY completion path — timeout, error, or nominal success — the whole
+ * group is reaped: stragglers (a successful launcher that spawned+unref'd a
+ * grandchild) get TERM -> bounded wait -> the FINAL KILL while the anchor is
+ * live, then verification. win32 uses `taskkill /T /F` on the ANCHOR pid and
+ * its TRUTHFUL verdict is propagated (reviewer LIB2-R2.3: a failed taskkill
+ * is never a green).
+ *
+ * Interrupt discipline: once an interrupt has been received, runStep REFUSES
+ * to start new steps (the sweep has snapshotted the registry). The step
+ * handle stays registry-visible until the group is VERIFIED empty.
+ *
+ * Resolves { pid, code, signal, timedOut, killed, groupEmpty, stdout, stderr,
+ * lastJson, error }. pid/code/signal describe the WORKLOAD; groupEmpty
+ * describes the verified state of the whole anchored group.
+ */
 export function runStep(cmd, args, { env, timeoutMs = 300_000, cwd } = {}) {
-  // Reviewer LIB2-R2.1: once an interrupt has been received, no NEW work may
-  // start — the sweep has already snapshotted the registry.
   if (interruptReceived) {
-    return Promise.resolve({ pid: null, code: null, signal: null, timedOut: false, killed: false, groupEmpty: true, error: "interrupt received; refusing to start new step work", stdout: "", stderr: "", lastJson: null });
+    return Promise.resolve({
+      pid: null, code: null, signal: null, timedOut: false, killed: false,
+      groupEmpty: false, error: "interrupt received; refusing to start new step work",
+      stdout: "", stderr: "", lastJson: null,
+    });
   }
   return new Promise((resolveP) => {
-    let child;
-    try {
-      child = spawn(cmd, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
-    } catch (err) {
-      resolveP({ pid: null, code: null, signal: null, timedOut: false, killed: false, groupEmpty: true, error: "spawn failed: " + err.message, stdout: "", stderr: "", lastJson: null });
-      return;
-    }
-    const pgid = child.pid; // detached + first member => the group leader
-    // The in-flight step is registry-visible so an interrupt arriving DURING
-    // the step sweeps its group too. Registration is held until the group is
-    // VERIFIED empty (reaping complete) — never dropped at settle time.
-    const stepHandle = issueHandle({ pid: pgid, pgid, owned: true });
-    registerGroup(stepHandle);
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let killed = false;
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (d) => { stdout += d; });
-    child.stderr.on("data", (d) => { stderr += d; });
-
-    let timer = null;
-    let settled = false;
-    let exitInfo = null;
-    let closed = false;
-
-    const buildResult = (extraError) => ({
-      pid: pgid,
-      code: exitInfo ? exitInfo.code : null,
-      signal: exitInfo ? exitInfo.signal : null,
-      timedOut,
-      killed,
-      stdout,
-      stderr,
-      lastJson: lastJsonLine(stdout),
-      ...(extraError ? { error: extraError } : {}),
-    });
-
-    const settle = (result) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      resolveP(result);
-    };
-
-    timer = setTimeout(() => {
-      timedOut = true;
-      killed = true;
-      // The escalation must NOT depend on child exit/close: a group leader
-      // that ignores SIGTERM never exits, so 'finish' would never run and
-      // nothing would ever escalate to SIGKILL. Drive the ladder here.
-      (async () => {
-        if (process.platform === "win32") {
-          killTreeWindows(pgid);
-          await drainPipes(child);
-          settle({ ...buildResult(), groupEmpty: true, error: `timeout after ${timeoutMs}ms` });
-          return;
-        }
-        signalGroup(pgid, "SIGTERM");
-        const empty = await reapGroup(pgid, { alreadyTermed: true });
-        await drainPipes(child);
-        settle({
-          ...buildResult(),
-          groupEmpty: empty === true,
-          error: `timeout after ${timeoutMs}ms`,
-        });
-      })().catch(() => settle({ ...buildResult(), groupEmpty: false, error: `timeout after ${timeoutMs}ms; escalation error` }));
-    }, timeoutMs);
-
-    const finish = async () => {
-      if (settled || exitInfo === null || !closed) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      // Reap the WHOLE group on every path: TERM -> bounded wait -> KILL ->
-      // poll until empty. A successful launcher that spawned+unref'd a
-      // grandchild leaves it in this group; it must not survive the step.
-      // Registration is dropped only AFTER the reaping verdict (reviewer
-      // LIB2-R2.1: the step must stay registry-visible until verified empty).
-      if (pgid) {
-        if (process.platform === "win32" && !timedOut) {
-          killTreeWindows(pgid);
-        }
-        const empty = await reapGroup(pgid, { alreadyTermed: timedOut });
-        if (empty) markTerminal(stepHandle);
+    (async () => {
+      const handle = adoptAnchorHandle(
+        await spawnAnchoredGroup(cmd, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"] }),
+      );
+      if (!handle.pid) {
+        // Spawn/protocol failure: nothing may be signalled (fail closed).
+        markTerminal(handle);
         resolveP({
-          ...buildResult(timedOut ? `timeout after ${timeoutMs}ms` : killed ? "terminated by runner" : undefined),
-          groupEmpty: empty === true,
+          pid: null, code: null, signal: null, timedOut: false, killed: false,
+          groupEmpty: false, error: handle.error ?? "workload spawn failed",
+          stdout: "", stderr: "", lastJson: null,
         });
         return;
       }
-      markTerminal(stepHandle);
-      resolveP({
-        ...buildResult(timedOut ? `timeout after ${timeoutMs}ms` : undefined),
-        groupEmpty: true,
+      // The in-flight step is registry-visible so an interrupt arriving DURING
+      // the step sweeps its group too; the entry drops only after the group is
+      // VERIFIED empty (reviewer LIB2-R2.1).
+      registerGroup(handle);
+
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let killed = false;
+      let settled = false;
+      let timer = null;
+      let exitInfo = null;
+
+      handle.stdout?.setEncoding?.("utf8");
+      handle.stderr?.setEncoding?.("utf8");
+      handle.stdout?.on?.("data", (d) => { stdout += d; });
+      handle.stderr?.on?.("data", (d) => { stderr += d; });
+
+      const buildResult = (extraError) => ({
+        pid: handle.pid,
+        code: exitInfo ? exitInfo.code : null,
+        signal: exitInfo ? exitInfo.signal : null,
+        timedOut,
+        killed,
+        stdout,
+        stderr,
+        lastJson: lastJsonLine(stdout),
+        ...(extraError ? { error: extraError } : {}),
       });
-    };
-    child.on("exit", (code, signal) => { exitInfo = { code, signal }; finish(); });
-    child.on("close", () => { closed = true; finish(); });
-    child.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      markTerminal(stepHandle); // spawn error: never signal this handle again
-      resolveP({ pid: pgid, code: null, signal: null, timedOut, killed, groupEmpty: false, error: "spawn error: " + err.message, stdout, stderr, lastJson: null });
-    });
+
+      const settle = (result) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolveP(result);
+      };
+
+      // ONE teardown drive (killGroupAndVerify is single-flight per handle;
+      // this gate keeps the timeout path and the natural-exit path from even
+      // requesting two verdicts with different error framing).
+      const settleAfterTeardown = async (extraError) => {
+        const verdict = await killGroupAndVerify(handle);
+        // The relay pipes close when the anchor dies; give data events one
+        // bounded window to flush (the verdict, not the drain, is the truth).
+        const deadline = Date.now() + 250;
+        while (Date.now() < deadline) await sleep(10);
+        settle({
+          ...buildResult(extraError),
+          groupEmpty: verdict.groupEmpty,
+          ...(verdict.error ? { killError: verdict.error } : {}),
+        });
+      };
+
+      timer = setTimeout(() => {
+        timedOut = true;
+        killed = true;
+        // The escalation must NOT depend on workload exit: a workload that
+        // ignores SIGTERM never exits, so the timeout path drives the whole
+        // anchor-gated ladder itself.
+        settleAfterTeardown(`timeout after ${timeoutMs}ms`).catch(() => settle({ ...buildResult(`timeout after ${timeoutMs}ms; escalation error`), groupEmpty: false }));
+      }, timeoutMs);
+
+      handle.exited.then(
+        (exit) => {
+          if (exit?.anchorDied) {
+            // The ANCHOR died without reporting a workload exit (crashed or
+            // externally killed). Do NOT adopt its death as the workload's
+            // signal; the teardown's fail-closed verdict is the honest result.
+            if (!settled) {
+              settleAfterTeardown("anchor died before reporting workload exit").catch(() => settle({ ...buildResult("anchor died before reporting workload exit"), groupEmpty: false }));
+            }
+            return;
+          }
+          exitInfo = { code: exit?.code ?? null, signal: exit?.signal ?? null };
+          if (exit?.error && exitInfo.code === null && exitInfo.signal === null) {
+            // Workload spawn/exec error reported by the anchor: honest error,
+            // still reap the (possibly never-started) group.
+            if (!settled) {
+              settled = true;
+              if (timer) clearTimeout(timer);
+              killGroupAndVerify(handle)
+                .then((verdict) => resolveP({
+                  ...buildResult(exit.error),
+                  groupEmpty: verdict.groupEmpty,
+                  ...(verdict.error ? { killError: verdict.error } : {}),
+                }))
+                .catch(() => resolveP({ ...buildResult(exit.error), groupEmpty: false }));
+            }
+            return;
+          }
+          if (!settled) settleAfterTeardown(timedOut ? `timeout after ${timeoutMs}ms` : undefined).catch(() => {});
+        },
+        (err) => {
+          if (!settled) {
+            settled = true;
+            if (timer) clearTimeout(timer);
+            resolveP({ ...buildResult(String((err && err.message) || err)), groupEmpty: false });
+          }
+        },
+      );
+    })().catch((err) => resolveP({
+      pid: null, code: null, signal: null, timedOut: false, killed: false,
+      groupEmpty: false, error: "step setup failed: " + String((err && err.message) || err),
+      stdout: "", stderr: "", lastJson: null,
+    }));
   });
 }
 
@@ -477,6 +495,18 @@ let interruptReceived = false;
 
 function issueHandle(shape) {
   const handle = { ...shape, terminal: false };
+  issuedHandles.add(handle);
+  return handle;
+}
+
+/**
+ * Adopt a handle produced by the anchor core (spawnAnchoredGroup) into this
+ * module's unforgeable identity set. The anchor core issues the object; the
+ * harness owns the object-identity contract (killGroupAndVerify refuses any
+ * handle outside issuedHandles), so adoption happens exactly once per
+ * spawned group, at the harness API boundary.
+ */
+function adoptAnchorHandle(handle) {
   issuedHandles.add(handle);
   return handle;
 }
@@ -525,118 +555,95 @@ function isAuthoritativeHandle(target) {
   );
 }
 
-/**
- * Best-effort enumeration of the pids currently inside a process group
- * (POSIX `ps -eo pid,pgid` filtering). [] when enumeration is impossible
- * (win32, ps failure, timeout) — groupEmpty stays the authoritative verdict.
- */
-function enumerateGroupPids(pgid) {
-  if (process.platform === "win32") return [];
-  try {
-    const out = spawnSync("ps", ["-eo", "pid,pgid"], { encoding: "utf8", timeout: 2_000 });
-    if (out.status !== 0 || typeof out.stdout !== "string") return [];
-    const members = [];
-    for (const line of out.stdout.split("\n")) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length === 2 && Number(parts[1]) === pgid) members.push(Number(parts[0]));
-    }
-    return members;
-  } catch {
-    return [];
-  }
-}
 
 /**
- * Spawn a LONG-LIVED child (hub/daemon under chaos) as its own detached
- * process group — the same group shape runStep uses, but without a timeout:
- * the caller decides when the group dies.
+ * Spawn a LONG-LIVED child (hub/daemon under chaos) in an ANCHORED process
+ * group (Design C, reviewer ruling LIB2-R3): a dedicated detached ANCHOR is
+ * spawned first and is the group leader (pgid) for the handle's entire
+ * lifetime; the workload is spawned NON-detached inside the anchor's group
+ * and reports its exit over the anchor's control channel. The group can
+ * never become leaderless while the handle lives — the anchor stays alive
+ * through workload exit (even when the workload spawned+unref'd
+ * grandchildren), ignores SIGTERM, and exits only when the parent tells it
+ * to AFTER cleanup verification.
  *
- * Returns a handle:
- *   { pid, pgid, child, stdout, stderr, exited, owned, terminal }
- *   - pid/pgid: the group leader (pgid === pid by construction: the child is
- *     detached, so it leads a FRESH group).
- *   - stdout/stderr: the child's pipe streams.
- *   - exited: promise resolving { code, signal } (or { error }) — never rejects.
+ * Returns a PROMISE of a handle (breaking change vs the pre-Design-C sync
+ * spawn: the handle exists only once the workload spawn is CONFIRMED over
+ * the control channel):
+ *   { pid, pgid, anchor, stdin, stdout, stderr, exited, owned, terminal }
+ *   - pid: the WORKLOAD pid; pgid: the ANCHOR pid (the group leader). The
+ *     anchor ChildProcess object is the ownership proof: killGroupAndVerify
+ *     gates every negative-pgid signal on THAT EXACT anchor being provably
+ *     ours and alive immediately before it fires (kernel check; no disk
+ *     metadata).
+ *   - stdin/stdout/stderr: the parent ends of the ANCHOR's relays — "pipe"
+ *     entries are transparently relayed to/from the workload (stdio
+ *     passthrough, default ["ignore","pipe","pipe"], preserved for the
+ *     bench-load stdio MCP hub).
+ *   - exited: promise resolving { code, signal } for the WORKLOAD (never
+ *     rejects; { error } when the workload failed to exec or the anchor died
+ *     before reporting).
  *   - owned: informational marker; ownership is enforced by OBJECT IDENTITY
- *     against this module's registry, not by this flag (a copied handle shape
- *     proves nothing).
- *   - terminal: set true once the group is VERIFIED empty (or the spawn
- *     failed) — a terminal handle refuses to signal FOREVER, even if the old
- *     pgid is later reused by an unrelated process (F39, reviewer LIB2-R2.2).
+ *     against this module's registry + the exact anchor ChildProcess.
+ *   - terminal: set once the group is VERIFIED empty (or the spawn failed) —
+ *     a terminal handle refuses to signal FOREVER (F39).
  *
  * The handle auto-registers in the live-group registry (swept by main()'s
- * interrupt handler) and unregisters when the group is verified empty.
+ * interrupt handler); the entry drops when the group is verified empty.
  * After an interrupt has been received, spawnGroup REFUSES (FatalError):
  * main() has promised to stop starting work.
  */
-export function spawnGroup(cmd, args, { env, cwd, stdio = ["ignore", "pipe", "pipe"] } = {}) {
+export async function spawnGroup(cmd, args, { env, cwd, stdio = ["ignore", "pipe", "pipe"] } = {}) {
   if (interruptReceived) {
     throw new FatalError("interrupt received; refusing to start new group work");
   }
-  let child;
-  try {
-    child = spawn(cmd, args, { env, cwd, stdio, detached: true });
-  } catch (err) {
-    const failed = issueHandle({
-      pid: null,
-      pgid: null,
-      child: null,
-      stdout: null,
-      stderr: null,
-      owned: true,
-      terminal: true, // nothing was spawned; nothing may ever be signalled
-      exited: Promise.resolve({ code: null, signal: null, error: "spawn failed: " + err.message }),
-    });
-    return failed;
+  const handle = adoptAnchorHandle(await spawnAnchoredGroup(cmd, args, { env, cwd, stdio }));
+  if (!handle.pid) {
+    // Spawn/protocol failure: nothing may ever be signalled — mark terminal
+    // (fail closed; the anchor may already be dead and the pgid unprovable).
+    markTerminal(handle);
+    return handle;
   }
-  const handle = issueHandle({
-    pid: child.pid ?? null,
-    pgid: child.pid ?? null,
-    child,
-    stdout: child.stdout,
-    stderr: child.stderr,
-    owned: true,
-    exited: null,
-  });
-  handle.exited = new Promise((resolveP) => {
-    child.on("error", (err) => {
-      markTerminal(handle); // spawn error: never signal this handle again
-      resolveP({ code: null, signal: null, error: "spawn error: " + err.message });
-    });
-    child.on("exit", (code, signal) => {
-      // Natural death: mark terminal ONLY when nothing remains in the group
-      // — a leader that spawned+unref'd grandchildren must stay live in the
-      // registry so the interrupt sweep can still reap the survivors.
-      if (groupEmpty(child.pid)) markTerminal(handle);
-      resolveP({ code, signal });
-    });
-  });
-  if (child.pid != null) registerGroup(handle); // registered as soon as the pid exists
+  registerGroup(handle); // registered as soon as the workload spawn is confirmed
   return handle;
 }
 
 /**
- * Kill a spawned process group with the SAME ladder as runStep's reaper —
- * TERM -> termGraceMs bounded wait -> SIGKILL -> killDeadlineMs bounded wait
- * -> poll kill(-pgid, 0) until ESRCH — and report what happened:
+ * Kill a spawned process group and report a TRUTHFUL verdict:
  *   { groupEmpty, survivors, error? }
  *
- * Ownership (reviewer LIB2-R2.2): `target` must be a handle OBJECT this
- * module ISSUED (object identity via the module-private WeakSet) AND still
- * authoritative in the registry (liveGroups maps its pgid to this exact
- * handle). Copies, plain {pgid, owned:true} shapes, and bare pgid numbers
- * are all REFUSED without signalling — possession of a copied handle proves
- * nothing, and a recycled pgid could name a group this process never created.
+ * Design C teardown (reviewer ruling LIB2-R3), shared by runStep, spawnGroup
+ * callers, and main()'s interrupt sweep:
  *
- * Terminal: once a handle is verified empty (or its spawn failed) it is
- * marked terminal and REFUSES forever — a stale terminal handle can never
- * signal a reused pgid (F39). Terminal state lives on the handle itself, so
- * it remains authoritative after unregistration.
+ * Ownership (defense in depth, kept from LIB2-R2.2): `target` must be a
+ * handle OBJECT this module ISSUED (object identity via the module-private
+ * WeakSet) AND still authoritative in the registry (or terminal). Copies,
+ * plain {pgid, owned:true} shapes, and bare pgid numbers are all REFUSED
+ * without signalling.
  *
- * F39: a group verified empty is NEVER signalled — the probe runs first and
- * the ladder is skipped entirely. groupEmpty:false means the ladder ran to
- * its SIGKILL deadline and members may remain; survivors[] (best-effort,
- * POSIX ps enumeration) names them.
+ * Live-anchor gate: every negative-pgid signal requires the exact anchor
+ * ChildProcess recorded in the handle to be provably ours and alive
+ * IMMEDIATELY before the signal (kernel probe). The ladder is TERM -> bounded
+ * wait -> FINAL KILL -> verify-only — after the final signal, no further
+ * signal ever fires. The anchor ignores TERM, so the group stays owned
+ * through the whole ladder.
+ *
+ * Fail closed: if the anchor is unexpectedly dead (crashed, externally
+ * killed, never confirmed), NO group signal is sent — the verdict is
+ * groupEmpty:false with a best-effort survivors enumeration. An anchor-less
+ * group may be a recycled pgid; no leak prevention justifies killing an
+ * unrelated group. If only the anchor remains (workload exited, no
+ * stragglers), the group dissolves via the anchor's control channel — the
+ * anchor exits 0 after cleanup — so a healthy teardown needs NO signal at
+ * all.
+ *
+ * Terminal: a verified-empty handle refuses forever (F39): never probed,
+ * never signalled, even if the old pgid is later reused.
+ *
+ * win32: `taskkill /T /F` runs against the ANCHOR pid and its TRUTHFUL
+ * verdict is propagated (reviewer LIB2-R2.3): a failed taskkill is
+ * groupEmpty:false + error and the handle stays non-terminal; the runner is
+ * injectable (taskkillRunner) for cross-platform regression coverage.
  */
 export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner } = {}) {
   if (!isAuthoritativeHandle(target)) {
@@ -649,27 +656,110 @@ export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS
   if (target.terminal) {
     return { groupEmpty: true, survivors: [] }; // verified gone before; never probe, never signal (F39)
   }
-  const pgid = target.pgid;
+  // Single-flight: a handle must never have TWO teardown ladders running —
+  // concurrent TERM/KILL sequences from racing callers (timeout path vs
+  // natural-exit path) are themselves the unsynchronized-signal hazard this
+  // design exists to kill. Concurrent callers share the in-flight verdict.
+  if (target.teardownPromise) return target.teardownPromise;
+  target.teardownPromise = teardownAnchoredGroup(target, { termGraceMs, killDeadlineMs, taskkillRunner }).then((verdict) => {
+    // A verified-empty verdict terminalizes (later calls are safe no-ops).
+    // A NOT-empty verdict clears the flight lock so a later, changed state
+    // (e.g. the workload exited since) can be re-attempted honestly.
+    if (!verdict.groupEmpty) target.teardownPromise = null;
+    return verdict;
+  });
+  return target.teardownPromise;
+}
+
+async function teardownAnchoredGroup(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner } = {}) {
+  const failClosed = () => ({
+    groupEmpty: false,
+    survivors: enumerateGroupPids(target.pgid),
+    error: "fail closed: the group's anchor is not provably alive; no negative-pgid signal permitted (the pgid may be recycled)",
+  });
+
   if (process.platform === "win32") {
+    // Gate: taskkill walks the tree from the anchor pid; that is only safe
+    // while the anchor is still the process we spawned.
+    if (!anchorLive(target.anchor)) return failClosed();
     const taskkill = taskkillRunner ?? killTreeWindows;
-    const verdict = taskkill(pgid);
+    const verdict = taskkill(target.anchor.pid);
     if (!verdict.ok) {
       // A failed taskkill is NOT a green: report it truthfully so callers
       // (and the interrupt summary) surface the possible orphan tree.
       return { groupEmpty: false, survivors: [], error: `taskkill failed (status ${verdict.status ?? "?"}): ${verdict.error ?? "unknown"}` };
     }
     markTerminal(target);
-    return { groupEmpty: true, survivors: [] }; // win32 has no probeable groups
+    return { groupEmpty: true, survivors: [] }; // the tree was killed by pid, no probeable group
   }
-  // F39: verified-empty groups are never signalled.
-  if (groupEmpty(pgid)) {
+
+  // POSIX. The anchor must be provably ours and alive before ANY signal.
+  if (!anchorLive(target.anchor)) return failClosed();
+
+  // Fast path: the workload already exited and no non-anchor member remains
+  // — dissolve the group through the anchor's control channel. A healthy
+  // teardown needs no negative-pgid signal at all.
+  const members = enumerateGroupPids(target.pgid);
+  const nonAnchor = members.filter((p) => p !== target.anchor.pid);
+  if (groupEmpty(target.pgid)) {
+    // Verified empty (the anchor is the group leader — if the probe is ESRCH
+    // the anchor itself is gone; nothing left to signal).
     markTerminal(target);
     return { groupEmpty: true, survivors: [] };
   }
-  const empty = await reapGroup(pgid, { termGraceMs, killDeadlineMs });
-  const survivors = empty ? [] : enumerateGroupPids(pgid);
-  if (empty) markTerminal(target);
-  return empty ? { groupEmpty: true, survivors: [] } : { groupEmpty: false, survivors };
+  if (nonAnchor.length === 0) {
+    await shutdownAnchor(target);
+    const deadline = Date.now() + killDeadlineMs;
+    while (Date.now() < deadline && !groupEmpty(target.pgid)) await sleep(GROUP_POLL_MS);
+    if (!groupEmpty(target.pgid)) {
+      // Members remain after the anchor exited: leaderless state — fail
+      // closed rather than signal an unprovably-owned group.
+      return {
+        groupEmpty: false,
+        survivors: enumerateGroupPids(target.pgid),
+        error: "group still non-empty after anchor shutdown (leaderless; no signal permitted)",
+      };
+    }
+    markTerminal(target);
+    return { groupEmpty: true, survivors: [] };
+  }
+
+  // Ladder: TERM (the workload/stragglers die; the anchor ignores TERM),
+  // bounded wait, then — gated on the anchor being STILL provably live —
+  // the FINAL KILL, then verify-only.
+  signalGroup(target.pgid, "SIGTERM");
+  const termDeadline = Date.now() + termGraceMs;
+  while (Date.now() < termDeadline && !groupEmpty(target.pgid)) await sleep(GROUP_POLL_MS);
+  if (!groupEmpty(target.pgid)) {
+    const nowMembers = enumerateGroupPids(target.pgid);
+    if (nowMembers.length > 0 && nowMembers.every((p) => p === target.anchor.pid)) {
+      // Only the ownership proof remains (the workload died of TERM): skip
+      // the KILL, dissolve via the control channel.
+      await shutdownAnchor(target);
+      const d2 = Date.now() + killDeadlineMs;
+      while (Date.now() < d2 && !groupEmpty(target.pgid)) await sleep(GROUP_POLL_MS);
+      if (!groupEmpty(target.pgid)) {
+        return {
+          groupEmpty: false,
+          survivors: enumerateGroupPids(target.pgid),
+          error: "group still non-empty after anchor shutdown (leaderless; no signal permitted)",
+        };
+      }
+      markTerminal(target);
+      return { groupEmpty: true, survivors: [] };
+    }
+    if (!anchorLive(target.anchor)) return failClosed();
+    signalGroup(target.pgid, "SIGKILL"); // FINAL signal — verify-only after
+    const killDeadline = Date.now() + killDeadlineMs;
+    while (Date.now() < killDeadline && !groupEmpty(target.pgid)) await sleep(GROUP_POLL_MS);
+  }
+  if (!groupEmpty(target.pgid)) {
+    return { groupEmpty: false, survivors: enumerateGroupPids(target.pgid), error: "group still non-empty after final KILL" };
+  }
+  // Verified empty. The anchor died with the final KILL (it is a group
+  // member) — nothing left to shut down.
+  markTerminal(target);
+  return { groupEmpty: true, survivors: [] };
 }
 
 // ---------------------------------------------------------------------------
