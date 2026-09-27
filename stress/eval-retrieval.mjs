@@ -330,10 +330,14 @@ function loadGenerated() {
     const arr = Array.isArray(parsed) ? parsed : parsed.queries;
     return arr.filter((q) => q && typeof q.query === "string");
   };
+  // Tool queries and skill queries are SEPARATE universes: tools are
+  // retrieved against the tool catalog (contract mix + gates), skills against
+  // the skill catalog (regression section). Merging them mislabels both.
   return {
     manifests,
     skills,
-    queries: [...loadJson(tq), ...loadJson(sqp)],
+    toolQueries: loadJson(tq),
+    skillQueries: loadJson(sqp),
     idMismatches,
   };
 }
@@ -605,13 +609,19 @@ function goldsOf(q) {
  * Fail-closed corpus validation (reviewer-2 blocker 5): a partial or
  * malformed fixture set must never silently pass as "full-generated".
  */
-function validateGeneratedCorpus({ manifests, skills, queries, idMismatches }) {
+function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idMismatches }) {
   const errors = [];
   const toolCount = manifests.reduce((s, m) => s + m.tools.length, 0);
   if (manifests.length !== 44) errors.push(`expected 44 server manifests, got ${manifests.length}`);
   if (toolCount !== 10000) errors.push(`expected 10,000 tools, got ${toolCount}`);
   if (skills.length !== 5000) errors.push(`expected 5,000 skills, got ${skills.length}`);
-  if (queries.length !== 1500) errors.push(`expected 1,500 queries, got ${queries.length}`);
+  if (queries.length !== 1500) errors.push(`expected 1,500 tool queries, got ${queries.length}`);
+  if (skillQueries?.length !== 500) errors.push(`expected 500 skill queries, got ${skillQueries?.length ?? 0}`);
+  const mix = countBy(queries, (q) => q.subtype);
+  const CONTRACT_MIX = { exact: 300, paraphrase: 300, "goal-only": 300, "near-duplicate": 375, multi: 150, "no-match": 75 };
+  for (const [st, want] of Object.entries(CONTRACT_MIX)) {
+    if ((mix[st] ?? 0) !== want) errors.push(`tool query mix ${st}: expected ${want}, got ${mix[st] ?? 0}`);
+  }
   if ((idMismatches ?? 0) !== 0) errors.push(`${idMismatches} skill id mismatches vs parseSkillContent`);
   for (const q of queries) {
     if (typeof q.query !== "string" || q.query.trim() === "") { errors.push(`invalid query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
@@ -630,16 +640,17 @@ function validateGeneratedCorpus({ manifests, skills, queries, idMismatches }) {
 async function runEval() {
 
   // --- corpus ------------------------------------------------------------------
-  let manifests, skills, queries, mode = "self-fixtures";
+  let manifests, skills, queries, skillQueries = null, mode = "self-fixtures";
   const generated = loadGenerated();
   const idMismatches = generated?.idMismatches ?? 0;
   if (generated) {
     manifests = generated.manifests;
     skills = generated.skills;
-    queries = generated.queries;
+    skillQueries = generated.skillQueries;
+    queries = generated.toolQueries;
     mode = "full-generated";
     // Fail closed on malformed/partial full fixtures (reviewer-2 blocker 5).
-    validateGeneratedCorpus({ manifests, skills, queries, idMismatches: generated.idMismatches ?? 0 });
+    validateGeneratedCorpus({ manifests, skills, queries, skillQueries: generated.skillQueries, idMismatches: generated.idMismatches ?? 0 });
     console.error(`[eval-retrieval] using generated corpus: ${manifests.length} servers, ${skills.length} skills, ${queries.length} queries`);
   } else {
     ({ tools } = syntheticCatalog(QUICK ? 2 : DOMAINS.length));
@@ -770,6 +781,23 @@ async function runEval() {
     console.error(`[eval-retrieval] realistic: blend r@5=${realisticReport.engines.blend.recallAt5?.toFixed(3)} mrr@10=${realisticReport.engines.blend.mrrAt10?.toFixed(3)}`);
   }
 
+  // --- skills regression section (skill queries vs the skill catalog) -------------
+  let skillsReport = null;
+  if (skillQueries && skillQueries.length > 0) {
+    skillsReport = { queryCount: skillQueries.length, mix: countBy(skillQueries, (q) => q.subtype), engines: {} };
+    for (const name of SWEEP_ENGINES) {
+      const { hub } = await buildEngine(name, [], skills);
+      const { rows, latencies } = await warmAndTime(hub, skillQueries);
+      const scored = scoreEngine(rows, latencies);
+      skillsReport.engines[name] = {
+        recallAt5: scored.recallAt5, recallAt10: scored.recallAt10, mrrAt10: scored.mrrAt10,
+        ndcgAt10: scored.ndcgAt10, noMatch: scored.noMatch, latency: scored.latency,
+      };
+      await hub.close?.();
+    }
+    console.error(`[eval-retrieval] skills: blend r@5=${skillsReport.engines.blend.recallAt5?.toFixed(3)} mrr@10=${skillsReport.engines.blend.mrrAt10?.toFixed(3)}`);
+  }
+
   // --- prefix sweep ---------------------------------------------------------------
   const sweep = [];
   // ONE fixed latency sample for every prefix (reviewer-2 blocker 3). Recall
@@ -871,6 +899,7 @@ async function runEval() {
     sweep,
     gates: { definitions: GATES, checks: gateChecks, tokenSavings: { allDefinitionTokens: allDefTokens, meanReturnedDefinitionsTokens: Math.round(meanResponseTokens), searchToolDefTokens: tokens(SEARCH_TOOL_DEF), savings: Number(savings.toFixed(4)), formula: "1 - (search tool def + mean returned definitions per response) / (one eager definition payload of the full catalog); load() schema cost excluded" } },
     worstFailures: { engine: "blend", querySet: "full", items: worst },
+    skillsRegression: skillsReport,
     realistic: realisticReport
       ? {
           note: "HEADLINE product numbers (hand-written realistic fixture, intake FX13-R2); contract gates below remain on the generated corpus",
