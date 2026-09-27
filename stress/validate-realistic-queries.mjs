@@ -95,13 +95,31 @@ try {
   }
 
   const problems = [];
-  const MIX = { paraphrase: 40, "goal-only": 30, "near-duplicate": 20, multi: 15, "no-match": 15 };
+  // 121 rows: intake 00:16Z split the 6-member get_invoice multi row into
+  // two scope-clued rows (v2 expectedAll max 4), so multi is 16.
+  const MIX = { paraphrase: 40, "goal-only": 30, "near-duplicate": 20, multi: 16, "no-match": 15 };
+  const DIFFICULTY = { paraphrase: "paraphrase", "goal-only": "hard", "near-duplicate": "hard", multi: "hard", "no-match": "hard" };
   const counts = {};
   const seen = new Set();
   for (const row of rows) {
     counts[row.subtype] = (counts[row.subtype] ?? 0) + 1;
     if (seen.has(row.query)) problems.push(`duplicate query: ${row.query}`);
     seen.add(row.query);
+    // Full v2 shape rules: types, expectedAll size 2-4 on multi only,
+    // difficulty consistent with subtype.
+    if (typeof row.query !== "string" || row.query.length < 5) {
+      problems.push(`bad query field: ${JSON.stringify(row.query)}`);
+    }
+    if (!MIX.hasOwnProperty(row.subtype)) problems.push(`unknown subtype: ${row.subtype}`);
+    if (row.difficulty !== DIFFICULTY[row.subtype]) {
+      problems.push(`difficulty ${row.difficulty} != ${DIFFICULTY[row.subtype]} for subtype ${row.subtype}: ${row.query}`);
+    }
+    if (row.expected !== null && typeof row.expected !== "string") {
+      problems.push(`expected must be a string id or null: ${row.query}`);
+    }
+    if (row.expectedAll !== undefined && (!Array.isArray(row.expectedAll) || row.expectedAll.some((x) => typeof x !== "string"))) {
+      problems.push(`expectedAll must be an array of id strings: ${row.query}`);
+    }
     const check = (id) => {
       if (!corpus.has(id)) problems.push(`unknown gold id: ${id} (query: ${row.query})`);
     };
@@ -109,14 +127,17 @@ try {
     for (const id of row.expectedAll ?? []) check(id);
 
     if (row.subtype === "no-match") {
+      if (row.expected !== null || row.expectedAll !== undefined) {
+        problems.push(`no-match must have expected null and no expectedAll: ${row.query}`);
+      }
       const hits = contentTokens(row.query).filter((t) => vocab.has(t));
       if (hits.length > 0) problems.push(`no-match overlaps corpus vocabulary [${hits}]: ${row.query}`);
       continue;
     }
     if (row.subtype === "multi") {
-      if (row.expected != null) problems.push(`multi row must have expected null: ${row.query}`);
-      if (!Array.isArray(row.expectedAll) || row.expectedAll.length < 2) {
-        problems.push(`multi row needs expectedAll >= 2: ${row.query}`);
+      if (row.expected !== null) problems.push(`multi row must have expected null: ${row.query}`);
+      if (!Array.isArray(row.expectedAll) || row.expectedAll.length < 2 || row.expectedAll.length > 4) {
+        problems.push(`multi row needs expectedAll of 2-4 ids (v2), got ${row.expectedAll?.length}: ${row.query}`);
       }
       continue;
     }
@@ -149,7 +170,7 @@ try {
   for (const [sub, want] of Object.entries(MIX)) {
     if ((counts[sub] ?? 0) !== want) problems.push(`mix ${sub}: got ${counts[sub] ?? 0}, want ${want}`);
   }
-  if (rows.length !== 120) problems.push(`row count: got ${rows.length}, want 120`);
+  if (rows.length !== 121) problems.push(`row count: got ${rows.length}, want 121`);
 
   const summary = {
     ok: problems.length === 0,
