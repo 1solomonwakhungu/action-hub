@@ -188,12 +188,15 @@ test("CALLER-LEVEL: conformance VALID evidence + poisoned cleanup is red (real e
   assert.equal(evaluated.ok, false, "valid evidence + failed cleanup must NOT be green");
   assert.ok(Array.isArray(evaluated.cleanupFailures) && evaluated.cleanupFailures.length > 0);
   assert.match(evaluated.cleanupFailures[0].problems[0], /groupEmpty !== true/);
-  // Sanity: the same evaluator with a GREEN cleanup stays green (a FRESH
-  // row — the poisoned fold left cleanupFailures/ok on the first one).
+  // Sanity: the same evaluator with a GREEN cleanup goes green — using
+  // MAIN'S ROW SHAPE (ok seeded false as a placeholder; reviewer-1/intake
+  // F64 false-negative: the derivation must come from cleanupFailures, not
+  // the placeholder).
   const cleanRun = {
     label: "http-server-suite", exitCode: 0, timedOut: false, spawnError: null,
     scenarios: 2,
+    ok: false, // main's placeholder seed
     stepVerdict: { code: 0, timedOut: false, spawnError: null, groupEmpty: true, survivors: [], killError: null, pgid: null },
   };
-  assert.equal(evaluateConformanceRun(cleanRun, evidence).ok, true);
+  assert.equal(evaluateConformanceRun(cleanRun, evidence).ok, true, "a healthy run with main's placeholder ok:false must still evaluate green");
 });

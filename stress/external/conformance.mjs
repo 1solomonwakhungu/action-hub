@@ -187,7 +187,11 @@ export function evaluateConformanceRun(run, evidence) {
     !run.spawnError &&
     evidence.ok === true;
   foldCleanupVerdict(run, run.stepVerdict, "conformance suite");
-  run.ok = workloadOk && run.ok !== false;
+  // Derive from the FOLD'S OWN evidence, never from a prior run.ok value
+  // (reviewer-1 non-blocking false-negative: main constructs the row with a
+  // placeholder ok:false; a healthy cleanup must be able to become green).
+  const cleanupGreen = !(Array.isArray(run.cleanupFailures) && run.cleanupFailures.length > 0);
+  run.ok = workloadOk && cleanupGreen;
   if (!run.ok && evidence.reason && !evaluatedCleanup(run)) run.evidenceReason = evidence.reason;
   return run;
 }
@@ -207,4 +211,3 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   await finish(summary);
   });
 }
-
