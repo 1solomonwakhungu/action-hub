@@ -148,6 +148,8 @@ async function main() {
     }
   }
 
+  // MIG2-R1 (ordering): fold every run row BEFORE summary.ok snapshots.
+  for (const r of fuzzRuns) foldCleanupVerdict(r, r.stepVerdict, `fuzz ${r.label}`);
   const summary = {
     script: "fuzz.mjs",
     tool: "mcp-fuzzer",
@@ -160,8 +162,6 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
-  // MIG2-R1: every fuzz run's cleanup verdict is load-bearing.
-  for (const r of fuzzRuns) foldCleanupVerdict(r, r.stepVerdict, `fuzz ${r.label}`);
   foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }

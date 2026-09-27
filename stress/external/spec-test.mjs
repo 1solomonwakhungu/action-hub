@@ -106,6 +106,8 @@ async function main() {
     serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
+  // MIG2-R1 (ordering): fold every run row BEFORE summary.ok snapshots.
+  for (const r of runs) foldCleanupVerdict(r, r.stepVerdict, `spec ${r.label}`);
   const summary = {
     script: "spec-test.mjs",
     tool: "@hasmcp/mcp-spec-test",
@@ -119,8 +121,6 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
-  // MIG2-R1: every spec run's cleanup verdict is load-bearing.
-  for (const r of runs) foldCleanupVerdict(r, r.stepVerdict, `spec ${r.label}`);
   foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }

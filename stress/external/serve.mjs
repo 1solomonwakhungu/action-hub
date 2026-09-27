@@ -231,6 +231,28 @@ export function isInside(root, candidate) {
  * cannot leak descendants.
  */
 export function runTool(cmd, args, { env, timeoutMs = 30 * 60_000, win32, taskkillRunner } = {}) {
+  // BEHAVIORAL FAULT SEAM (intake, MIG2-R1.3): when STRESS_RUNTOOL_FAULT is
+  // set, EVERY step resolves with a poisoned verdict — green workload
+  // evidence (code 0, a parseable ok:true child summary) but a FAILED
+  // cleanup (groupEmpty:false + killError). Only the fold can make a runner
+  // red under this seam; no step may pass. Default: unset, zero effect.
+  if (process.env["STRESS_RUNTOOL_FAULT"]) {
+    return {
+      exitP: Promise.resolve({
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdoutTail: '{"ok":true,"note":"poisoned by STRESS_RUNTOOL_FAULT"}\n',
+        stderrTail: "",
+        durationMs: 0,
+        spawnError: null,
+        groupEmpty: false,
+        survivors: [],
+        killError: "injected cleanup failure (STRESS_RUNTOOL_FAULT)",
+        pgid: null,
+      }),
+    };
+  }
   // MIG2: one anchored, drained, bounded step through the lib. The group is
   // reaped on EVERY completion path (timeout -> TERM -> FINAL KILL ->
   // verify; successful-launcher stragglers reaped too). Keep this

@@ -181,6 +181,11 @@ async function main() {
       stderr: smokeRes.stderrTail.slice(-2000),
     });
 
+    // MIG2-R1: the smoke step's cleanup verdict is LOAD-BEARING and folded
+    // IMMEDIATELY after its row — inside no conditional branch, so the
+    // default run folds it too (reviewer-1 ordering item).
+    foldCleanupVerdict(runs[runs.length - 1], smokeRes, "inspector-smoke");
+
     // 3b. k6 load (async, detached, group-killed on timeout).
     if (hasFlag("--k6")) {
       const profile = hasFlag("--k6-full") ? "full" : "quick";
@@ -195,9 +200,6 @@ async function main() {
       const k6 = runTool(K6_BIN, ["run", "--summary-export", summaryOut, join(here, "k6-mcp.js")], {
         env: k6Env, timeoutMs: 20 * 60_000,
       });
-      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
-      // workload with a failed teardown fails this row.
-      foldCleanupVerdict(runs[runs.length - 1], smokeRes, "inspector-smoke");
       const k6Res = await k6.exitP;
       let k6Summary = null;
       try {
