@@ -60,7 +60,11 @@ export class SearchEngine {
     this.#invalidateIfChanged();
     const limit = options.limit ?? DEFAULT_LIMIT;
     const candidates = this.#catalog.filter(options);
-    const terms = tokenize(query);
+    // Query-side stopword filtering: common function words carry no retrieval
+    // signal for BM25 and only dilute the query. Document tokens are NOT
+    // filtered — a record whose summary legitimately contains one of these
+    // words should still match the content words around it.
+    const terms = tokenize(query).filter((term) => !QUERY_STOPWORDS.has(term));
 
     if (candidates.length === 0) return [];
 
@@ -89,9 +93,22 @@ export class SearchEngine {
       }));
     }
 
-    return ranked
+    const sorted = ranked
       .filter((entry) => entry.score > 0)
-      .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id))
+      .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id));
+
+    // Optional relative cutoff: drop hits far below the best score so a weak
+    // partial match cannot pad the result page. Off by default; ships only if
+    // the S5 retrieval eval shows fewer no-match false positives with no
+    // recall regression.
+    const ratio = options.minScoreRatio;
+    const cutoff =
+      typeof ratio === "number" && Number.isFinite(ratio) && ratio > 0 && ratio <= 1
+        ? (sorted[0]?.score ?? 0) * ratio
+        : 0;
+
+    return sorted
+      .filter((entry) => entry.score >= cutoff)
       .slice(0, limit)
       .map((entry) => toHit(entry.record, entry.score, options.includeSchema ?? false));
   }
@@ -255,6 +272,39 @@ interface CorpusStats {
   lengths: Map<string, number>;
 }
 
+/**
+ * Function words filtered from QUERIES before lexical scoring.
+ *
+ * Deliberately excludes every term used as a DEFAULT_CONCEPTS anchor
+ * (me, my, i, you, current, on, off, up, down, back, set, open, line, cut,
+ * file, work, new, show, get, list, search, …) — those carry paraphrase
+ * signal in the semantic scorer and must never be dropped.
+ *
+ * Also deliberately excludes PREPOSITIONS (to, from, into, with, by, at, in,
+ * about, via, over, under, on, …): in action catalogs they carry targeting
+ * signal ("send to channel", "merge into branch", "assigned to you"), and a
+ * measured regression on the semantic paraphrase suite showed that stripping
+ * "to" flips a true paraphrase match. Articles, copulas, auxiliaries,
+ * demonstratives, pronouns, and pure conjunctions are the conservative core.
+ * A unit test asserts the intersection with the concept lexicon stays empty.
+ *
+ * INTENT-BEARING QUANTIFIERS ARE DELIBERATELY ABSENT (all, any, only, same,
+ * some, ...): they are real name tokens ("delete_all_users",
+ * "show_only_active_users", "find_any_open_ticket", "compare_same_branch"),
+ * and filtering them lets a keyword-collision near-duplicate outrank the
+ * exact-name match — breaking the ranking invariant that an exact name wins
+ * its own query. A regression test pins the four repro pairs.
+ */
+export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
+  "a", "an", "the", "and", "or", "of", "that", "this", "these", "those",
+  "it", "its", "is", "are", "was", "were", "be", "been", "being", "am",
+  "has", "have", "had", "do", "does", "did", "but", "when", "while",
+  "which", "who", "whom", "their", "them", "they", "can",
+  "could", "should", "would", "will", "shall", "may", "might", "must",
+  "if", "then", "than", "so", "too", "very", "just", "also",
+  "such",
+]);
+
 const K1 = 1.2;
 const B = 0.75;
 
@@ -292,15 +342,32 @@ function documentTokens(record: ActionRecord): string[] {
     ...tokenize(record.summary),
     ...tokenize(record.description ?? ""),
     ...(record.tags ?? []).flatMap((tag) => tokenize(tag)),
-  ];
+  ].slice(0, MAX_DOCUMENT_TOKENS);
 }
 
-/** Splits on non-alphanumerics and camelCase boundaries, then lowercases. */
+/**
+ * Per-record token cap. A hostile or accidentally huge description (the S10
+ * adversarial fixtures carry 100 KB descriptions) must not dominate the
+ * average-document-length term of BM25 or blow up indexing cost.
+ */
+export const MAX_DOCUMENT_TOKENS = 2048;
+
+/**
+ * Unicode-aware tokenizer: splits on camelCase boundaries and on everything
+ * that is not a letter, a number, or an emoji, then lowercases.
+ *
+ * Format and control characters (zero-width spaces, bidi marks, NULs) are
+ * stripped BEFORE splitting so they cannot glue tokens together or create
+ * phantom tokens. Emoji (Extended_Pictographic, general category So) are kept
+ * as tokens so an emoji-named tool like `deploy_🚀_rocket` is findable by the
+ * emoji itself.
+ */
 export function tokenize(text: string): string[] {
   if (!text) return [];
   return text
+    .replace(/[\p{Cf}\p{Cc}\p{Zs}\p{Zl}\p{Zp}]/gu, " ")
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .split(/[^a-zA-Z0-9]+/)
+    .split(/[^\p{L}\p{N}\p{Extended_Pictographic}]+/u)
     .filter((token) => token.length > 0)
     .map((token) => token.toLowerCase());
 }
