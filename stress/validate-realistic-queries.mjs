@@ -1,0 +1,231 @@
+#!/usr/bin/env node
+/**
+ * stress/validate-realistic-queries.mjs — FX13-R2 gate for the hand-written
+ * realistic query fixture (stress/fixtures/realistic-queries.json).
+ *
+ * Validates every row against the seeded generated corpus
+ * (stress/.generated/tools/*.json; regenerates it via gen-tools.mjs if
+ * missing) so gold labels can never reference a tool that does not exist.
+ *
+ * Checks (full v2 rules):
+ *  (1) mix: 40 paraphrase, 30 goal-only, 20 near-duplicate, 16 multi,
+ *      15 no-match (121 rows — intake 00:16Z split the 6-gold get_invoice
+ *      multi row into two scope-clued rows); every query unique; v2 types
+ *      (expected string id or null; expectedAll array of ids); difficulty
+ *      consistent with subtype.
+ *  (2) existence: every expected / expectedAll id "<serverId>:<name>"
+ *      exists in the corpus.
+ *  (3) multi rows: expected null, expectedAll 2-4 ids (v2 bound).
+ *  (4) goal-only: the query shares NO token with the gold tool's VERB
+ *      (entity wording is allowed — that is what makes it goal-only).
+ *  (5) near-duplicate: the gold name is a clone (>= 2 servers) and the
+ *      query carries a domain clue (a token of the gold serverId).
+ *  (6) no-match: after stopword removal the query shares ZERO tokens with
+ *      the corpus vocabulary; expected null, no expectedAll.
+ *
+ * Output contract: one compact JSON summary as the last stdout line with
+ * ok:true/false; writes stress/.generated/results/validate-realistic-queries.json;
+ * exits nonzero iff ok is false. `--samples N` prints N random queries.
+ * `--self-test` feeds deliberately invalid rows (6-gold multi, expectedAll
+ * on a non-multi row, wrong difficulty) through the same row checker and
+ * exits 0 only if every violation is caught.
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const FIXTURE = path.join(HERE, "fixtures", "realistic-queries.json");
+const TOOLS_DIR = path.join(HERE, ".generated", "tools");
+const RESULTS_PATH = path.join(HERE, ".generated", "results", "validate-realistic-queries.json");
+
+const STOPWORDS = new Set(
+  `a about access across after again against all also am an and any are as at back be because been before
+   being best between bit but by call came can cannot come could did do does doing done down due during each
+   either else even every few for from further get gets getting give given go goes going got had has have
+   having he her here hers him his how i if in into is it its itself just keep kind last let like long look
+   looking make makes making may me mine more most much must my myself need needs neither never new no nor
+   not now of off on once one only onto or other others our ours out over own per please put puts ran rather
+   really right run running same see sees seem seems set several she should show side since so some someone
+   something still such take taken than that the their theirs them then there these they thing things this
+   those though through to too took two under until up upon us use used using very was way we well went were
+   what when where which while who whom whose why will with within without would yet you your yours`
+    .split(/\s+/)
+    .filter(Boolean),
+);
+
+function tokens(text) {
+  return String(text).toLowerCase().match(/[a-z]+/g) ?? [];
+}
+function contentTokens(text) {
+  return tokens(text).filter((t) => t.length >= 2 && !STOPWORDS.has(t));
+}
+
+// 121 rows: intake 00:16Z split the 6-member get_invoice multi row into
+// two scope-clued rows (v2 expectedAll max 4), so multi is 16.
+const MIX = { paraphrase: 40, "goal-only": 30, "near-duplicate": 20, multi: 16, "no-match": 15 };
+const DIFFICULTY = { paraphrase: "paraphrase", "goal-only": "hard", "near-duplicate": "hard", multi: "hard", "no-match": "hard" };
+const TOTAL_ROWS = 121;
+
+function finish(summary) {
+  try {
+    fs.mkdirSync(path.dirname(RESULTS_PATH), { recursive: true });
+    fs.writeFileSync(RESULTS_PATH, JSON.stringify(summary) + "\n");
+  } catch (err) {
+    summary.ok = false;
+    summary.artifactError = String(err?.message ?? err);
+  }
+  console.log(JSON.stringify(summary));
+  process.exitCode = summary.ok ? 0 : 1;
+}
+
+function loadCorpus() {
+  const corpus = new Map(); // id -> tool
+  const vocab = new Set();
+  const byName = new Map(); // name -> Set(serverId)
+  for (const f of fs.readdirSync(TOOLS_DIR).filter((f) => f.endsWith(".json"))) {
+    const m = JSON.parse(fs.readFileSync(path.join(TOOLS_DIR, f), "utf8"));
+    for (const t of m.tools) {
+      const id = `${m.serverId}:${t.name}`;
+      corpus.set(id, t);
+      if (!byName.has(t.name)) byName.set(t.name, new Set());
+      byName.get(t.name).add(m.serverId);
+      for (const tok of tokens(t.name)) vocab.add(tok);
+      for (const tok of contentTokens(`${t.summary ?? ""} ${t.description ?? ""}`)) vocab.add(tok);
+    }
+    for (const tok of tokens(m.serverId)) vocab.add(tok);
+    for (const tok of contentTokens(m.serverDescription ?? "")) vocab.add(tok);
+  }
+  return { corpus, vocab, byName };
+}
+
+function checkRows(rows, { corpus, vocab, byName }) {
+  const problems = [];
+  const counts = {};
+  const seen = new Set();
+  for (const row of rows) {
+    counts[row.subtype] = (counts[row.subtype] ?? 0) + 1;
+    if (seen.has(row.query)) problems.push(`duplicate query: ${row.query}`);
+    seen.add(row.query);
+    // Full v2 shape rules: types, expectedAll size 2-4 on multi only,
+    // difficulty consistent with subtype.
+    if (typeof row.query !== "string" || row.query.length < 5) {
+      problems.push(`bad query field: ${JSON.stringify(row.query)}`);
+    }
+    if (!MIX.hasOwnProperty(row.subtype)) problems.push(`unknown subtype: ${row.subtype}`);
+    if (row.difficulty !== DIFFICULTY[row.subtype]) {
+      problems.push(`difficulty ${row.difficulty} != ${DIFFICULTY[row.subtype]} for subtype ${row.subtype}: ${row.query}`);
+    }
+    if (row.expected !== null && typeof row.expected !== "string") {
+      problems.push(`expected must be a string id or null: ${row.query}`);
+    }
+    if (row.expectedAll !== undefined && (!Array.isArray(row.expectedAll) || row.expectedAll.some((x) => typeof x !== "string"))) {
+      problems.push(`expectedAll must be an array of id strings: ${row.query}`);
+    }
+    const check = (id) => {
+      if (!corpus.has(id)) problems.push(`unknown gold id: ${id} (query: ${row.query})`);
+    };
+    if (row.expected != null) check(row.expected);
+    for (const id of row.expectedAll ?? []) check(id);
+
+    if (row.subtype === "no-match") {
+      if (row.expected !== null || row.expectedAll !== undefined) {
+        problems.push(`no-match must have expected null and no expectedAll: ${row.query}`);
+      }
+      const hits = contentTokens(row.query).filter((t) => vocab.has(t));
+      if (hits.length > 0) problems.push(`no-match overlaps corpus vocabulary [${hits}]: ${row.query}`);
+      continue;
+    }
+    if (row.subtype === "multi") {
+      if (row.expected !== null) problems.push(`multi row must have expected null: ${row.query}`);
+      if (!Array.isArray(row.expectedAll) || row.expectedAll.length < 2 || row.expectedAll.length > 4) {
+        problems.push(`multi row needs expectedAll of 2-4 ids (v2), got ${row.expectedAll?.length}: ${row.query}`);
+      }
+      continue;
+    }
+    if (row.expectedAll) problems.push(`non-multi row has expectedAll: ${row.query}`);
+    if (!row.expected) { problems.push(`row without expected: ${row.query}`); continue; }
+    const tool = corpus.get(row.expected);
+    if (!tool) continue;
+
+    if (row.subtype === "goal-only") {
+      // Intent without the gold tool's VERB; entity wording is allowed to
+      // appear (that is what makes it goal-only rather than a paraphrase).
+      const verb = tokens(tool.name)[0];
+      if (contentTokens(row.query).includes(verb)) {
+        problems.push(`goal-only shares the gold VERB token "${verb}" with gold name: ${row.query}`);
+      }
+    }
+    if (row.subtype === "near-duplicate") {
+      const servers = byName.get(tool.name) ?? new Set();
+      if (servers.size < 2) problems.push(`near-dup gold is not cloned (${servers.size} servers): ${row.query}`);
+      const clue = tokens(row.expected.split(":")[0]).filter((t) => contentTokens(row.query).includes(t));
+      if (clue.length === 0) {
+        problems.push(`near-dup query missing domain clue (gold serverId token): ${row.query}`);
+      }
+    }
+  }
+  for (const [sub, want] of Object.entries(MIX)) {
+    if ((counts[sub] ?? 0) !== want) problems.push(`mix ${sub}: got ${counts[sub] ?? 0}, want ${want}`);
+  }
+  if (rows.length !== TOTAL_ROWS) problems.push(`row count: got ${rows.length}, want ${TOTAL_ROWS}`);
+  return problems;
+}
+
+try {
+  const rows = JSON.parse(fs.readFileSync(FIXTURE, "utf8"));
+  if (!fs.existsSync(TOOLS_DIR) || fs.readdirSync(TOOLS_DIR).filter((f) => f.endsWith(".json")).length === 0) {
+    const r = spawnSync("node", [path.join(HERE, "gen-tools.mjs")], { stdio: "inherit" });
+    if (r.status !== 0) throw new Error("corpus manifests missing and gen-tools.mjs failed to regenerate them");
+  }
+  const ctx = loadCorpus();
+
+  if (process.argv.includes("--self-test")) {
+    // Negative regression: the same checker must catch the concrete defects
+    // that reached review — a 6-gold multi row (the original get_invoice row),
+    // expectedAll on a non-multi row, and a wrong difficulty.
+    const bad = [
+      { query: "find every tool that can get an invoice", expected: null, expectedAll: ["acme-corp-analytics:get_invoice", "acme-corp-legal:get_invoice", "acme-corp-payments:get_invoice", "globex-cloud-infra:get_invoice", "globex-search:get_invoice", "initech-billing:get_invoice"], subtype: "multi", difficulty: "hard" },
+      { query: "lock the budget so nobody edits it", expected: "acme-corp-cloud-infra:lock_budget", expectedAll: ["acme-corp-cloud-infra:lock_budget"], subtype: "paraphrase", difficulty: "paraphrase" },
+      { query: "the batch needs a tidy up", expected: "acme-corp-hr:prune_batch", subtype: "goal-only", difficulty: "paraphrase" },
+    ];
+    const caught = checkRows(bad, ctx);
+    const need = [
+      caught.some((p) => p.includes("2-4 ids")),
+      caught.some((p) => p.includes("non-multi row has expectedAll")),
+      caught.some((p) => p.includes("difficulty")),
+    ];
+    const ok = need.every(Boolean);
+    finish({ ok, selfTest: "v2-row-checker", caughtCount: caught.length, need });
+    process.exit(process.exitCode ?? 0);
+  }
+
+  const problems = checkRows(rows, ctx);
+  const summary = {
+    ok: problems.length === 0,
+    rows: rows.length,
+    counts: Object.fromEntries(Object.keys(MIX).map((k) => [k, rows.filter((r) => r.subtype === k).length])),
+    corpusTools: ctx.corpus.size,
+    problems: problems.slice(0, 40),
+    problemCount: problems.length,
+  };
+
+  const sampleArg = process.argv.indexOf("--samples");
+  if (sampleArg > 0) {
+    const n = Number(process.argv[sampleArg + 1] ?? 20);
+    for (let i = rows.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [rows[i], rows[j]] = [rows[j], rows[i]];
+    }
+    summary.samples = rows.slice(0, n).map((r) => ({
+      query: r.query,
+      expected: r.expected ?? null,
+      expectedAll: r.expectedAll ? r.expectedAll.length : undefined,
+      subtype: r.subtype,
+    }));
+  }
+  finish(summary);
+} catch (err) {
+  finish({ ok: false, error: String(err?.message ?? err) });
+}
