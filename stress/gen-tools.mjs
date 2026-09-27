@@ -44,10 +44,22 @@
 //  (6) near-duplicate queries only target genuinely confusable tools: the gold
 //      must have >= 1 distractor that is a sibling-server clone (same tool name
 //      on another server) or shares its verb token (same verb, different object)
-import { mkdirSync, writeFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
+import fs, { mkdirSync, writeFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 const ARGS = process.argv.slice(2);
+function gateError(message) {
+  const err = new Error(message);
+  err.summary = { script: 'gen-tools.mjs', generatorVersion: 3, ok: false, error: message };
+  return err;
+}
+// Generated-output paths written by THIS run; unlinked on failure so no
+// partial corpus/query data survives a failed generation.
+const WRITTEN = [];
+function writeOut(filePath, data) {
+  WRITTEN.push(filePath);
+  writeFileSync(filePath, data);
+}
 function argValue(name) {
   const i = ARGS.indexOf(name);
   return i >= 0 && i + 1 < ARGS.length ? ARGS[i + 1] : undefined;
@@ -276,6 +288,11 @@ const FRAGMENT_RATE = 0.05;  // share of exact queries that are fragments
 
 function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
 function titleFromName(name) { return name.split('_').map(cap).join(' '); }
+function hash32(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
 
 function injectTypo(word) {
   if (word.length < 4) return word;
@@ -308,7 +325,7 @@ function makeSchema(name, opts = {}) {
   const used = new Set();
   if (rnd() < 0.8) {
     const n = pick(ID_NAMES);
-    props[n] = { type: 'string', description: `Unique ${titleFromName(n)} for this ${name}.` };
+    props[n] = { type: 'string', description: `Unique ${titleFromName(n)} for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
     used.add(n);
   }
   let guard = 0;
@@ -317,7 +334,7 @@ function makeSchema(name, opts = {}) {
     if (used.has(n)) continue; // no numeric serials: resample instead of suffixing
     used.add(n);
     const t = rnd() < 0.55 ? 'string' : pick(SCALAR_TYPES);
-    const p = { type: t, description: `${titleFromName(n)} of the ${name.replace(/_/g, ' ')}.` };
+    const p = { type: t, description: `${titleFromName(n)} of the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
     if (t === 'string' && rnd() < 0.4) p.format = pick(STRING_FORMATS);
     if (t === 'string' && rnd() < 0.15) { p.enum = pick(ENUM_SETS); p.description += ` One of: ${p.enum.join(', ')}.`; }
     if ((t === 'number' || t === 'integer') && rnd() < 0.5) { p.minimum = int(0, 100); p.maximum = p.minimum + int(1, 10000); }
@@ -329,21 +346,21 @@ function makeSchema(name, opts = {}) {
     const depth = opts.deep ? int(2, 3) : 1;
     for (let d = 0; d < int(1, 3); d++) {
       const n = pick(NESTED_NAMES);
-      const root = { type: 'object', properties: {}, additionalProperties: false, description: `Structured ${titleFromName(n)} for this request.` };
+      const root = { type: 'object', properties: {}, additionalProperties: false, description: `Structured ${titleFromName(n)} for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')} request.` };
       let cur = root;
       for (let level = 0; level < depth; level++) {
         const childName = level === depth - 1 ? 'details' : 'inner';
         const child = { type: 'object', properties: {}, additionalProperties: false };
         for (let k = 0; k < int(2, 5); k++) {
           const pn = pick(ENTITY_WORDS) + '_l' + level;
-          child.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} at nesting level ${level}.` };
+          child.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} of the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}, nesting level ${level}.` };
         }
         cur.properties[childName] = child;
         cur = child;
       }
       for (let k = 0; k < int(2, 6); k++) {
         const pn = pick(ENTITY_WORDS);
-        cur.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} for ${titleFromName(n)}.` };
+        cur.properties[pn] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(pn)} for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
       }
       props[n] = root;
     }
@@ -353,13 +370,70 @@ function makeSchema(name, opts = {}) {
     while (Object.keys(props).length < 22 && g2++ < 200) {
       const n = pick(ENTITY_WORDS) + '_x' + Object.keys(props).length;
       if (n in props) continue;
-      props[n] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(n)} extension field.` };
+      props[n] = { type: rnd() < 0.6 ? 'string' : pick(SCALAR_TYPES), description: `${titleFromName(n)} extension for the ${name.replace(/_/g, ' ').split(' ').slice(1).join(' ')}.` };
     }
   }
   const schema = { type: 'object', properties: props, additionalProperties: false };
   if (req.length) schema.required = req;
   return schema;
 }
+
+// ---------- FX16: verb-consistent realistic descriptions ----------
+// Leading phrase is keyed by the tool-name verb: the description's action
+// can never contradict the name. Entities appear in plain words.
+const DESC_LEAD = {
+  list: 'Lists', get: 'Returns', search: 'Searches',
+  create: 'Creates a new', update: 'Updates the', delete: 'Permanently deletes the',
+  revoke: 'Revokes the', purge: 'Permanently purges the', cancel: 'Cancels the',
+  void: 'Voids the', retry: 'Retries the', resend: 'Resends the',
+  approve: 'Approves the', reject: 'Rejects the', close: 'Closes the',
+  reopen: 'Reopens the', archive: 'Archives the', restore: 'Restores the',
+  assign: 'Assigns the', move: 'Moves the', merge: 'Merges the',
+  export: 'Exports the', validate: 'Validates the', preview: 'Previews the',
+  publish: 'Publishes the', clone: 'Duplicates the', diff: 'Compares the',
+  sync: 'Synchronizes the', rotate: 'Rotates the', send: 'Sends the',
+  schedule: 'Schedules the', acknowledge: 'Acknowledges the', escalate: 'Escalates the',
+  count: 'Counts the', summarize: 'Summarizes the', compare: 'Compares the',
+  enable: 'Enables the', disable: 'Disables the', pause: 'Pauses the',
+  resume: 'Resumes the', transfer: 'Transfers the', attach: 'Attaches the',
+  detach: 'Detaches the', link: 'Links the', unlink: 'Unlinks the',
+  resolve: 'Resolves the', split: 'Splits the', rollback: 'Rolls back the',
+  promote: 'Promotes the', invite: 'Invites the', verify: 'Verifies the',
+  share: 'Shares the', lock: 'Locks the', unlock: 'Unlocks the',
+  freeze: 'Freezes the', unfreeze: 'Unfreezes the', finalize: 'Finalizes the',
+  reindex: 'Reindexes the', rebuild: 'Rebuilds the', recalculate: 'Recalculates the',
+  amend: 'Amends the', snapshot: 'Snapshots the', prune: 'Prunes the',
+  migrate: 'Migrates the', backfill: 'Backfills the', replay: 'Replays the',
+  redact: 'Redacts the',
+  add: 'Adds the', resize: 'Resizes the', run: 'Runs the',
+  trigger: 'Triggers the', upload: 'Uploads the',
+};
+
+// 1-2 domain-specific details per domain, woven into the description's
+// second half so schema/description text carries retrieval signal beyond
+// the tool name.
+const DOMAIN_DETAILS = {
+  crm: ['with account, contact, and deal-stage references', 'with pipeline activity and next-step notes', 'against CRM records with owner assignment'],
+  billing: ['with billing ledger and invoice line-item references', 'including due dates and proration rules', 'against customer accounts and payment methods'],
+  ticketing: ['with queue, SLA clock, and assignee references', 'with the customer conversation thread attached', 'against the support desk backlog and priorities'],
+  'git-hosting': ['with repository, branch, and commit references', 'with pull request checks and release tags', 'against CI hook and pipeline status'],
+  'cloud-infra': ['with region, instance size, and tag references', 'against the network and storage inventory', 'with IAM scope and change-window references'],
+  analytics: ['with event, funnel, and cohort references', 'with dashboard widget and metric references', 'against product usage segments'],
+  email: ['with campaign, template, and delivery-stat references', 'with bounce and send-window details', 'against recipient lists and suppression rules'],
+  calendar: ['with room booking and attendee availability references', 'with scheduling window and recurrence rules', 'against calendar invitations and responses'],
+  hr: ['with employee record and time-off balance references', 'with payroll run and review-cycle details', 'against people-ops headcount and role data'],
+  docs: ['with knowledge base space, section, and editor references', 'with comment thread and permission scope', 'against document version history'],
+  observability: ['with alert threshold and on-call routing references', 'with metric series and dashboard links', 'against log and trace retention windows'],
+  iam: ['with role binding and policy version references', 'with session scope and identity references', 'against access review and audit trails'],
+  'data-warehouse': ['with warehouse table and materialized view references', 'with query credits and refresh schedule', 'against export formats and row-level filters'],
+  search: ['with index entry and ranking hint references', 'with content source and embedding metadata', 'against search relevance and recall metrics'],
+  chat: ['with channel membership and pinned message references', 'with thread history and notification rules', 'against workspace conversation archives'],
+  shipping: ['with carrier, tracking, and delivery window references', 'with warehouse pickup and customs paperwork', 'against shipment manifests and rates'],
+  inventory: ['with warehouse bin, count, and reorder point references', 'with supplier lead times', 'against stock movement and cycle counts'],
+  payments: ['with capture status and settlement batch references', 'with refund and chargeback references', 'against payment method and currency records'],
+  marketing: ['with campaign source and conversion metric references', 'with audience filters and AB test arms', 'against segment membership and attribution data'],
+  legal: ['with matter number and counsel-of-record references', 'with retention class and privilege review notes', 'against redaction and legal-hold records'],
+};
 
 // ---------- Manifest / tool generation ----------
 function makeTool(serverId, domainName, orgName, forced) {
@@ -376,7 +450,49 @@ function makeTool(serverId, domainName, orgName, forced) {
   const bigResponse = rnd() < 0.04;
   const errorRate = rnd() < 0.03 ? +(rnd() * 0.15).toFixed(3) : 0;
   const latencyMs = int(0, 50);
-  const desc = `${isRead ? 'Retrieves' : kind === 'danger' ? 'Permanently removes or revokes' : 'Creates, updates, or manages'} ${titleFromName(name).toLowerCase()} in the ${orgName} ${domainName} service. ${bigResponse ? 'Returns a large paginated payload with full embedded records, audit history, and related entities.' : `Supports ${isRead ? 'filtering and pagination' : 'partial updates and idempotency keys'}${rnd() < 0.5 ? ' for automation workflows' : ''}.`}`;
+  // FX16: 1-2 sentences, verb-consistent lead (DESC_LEAD keyed by the
+  // tool-name verb, so the description's action can never contradict the
+  // name), entity in plain words, 1-2 details drawn from the server's
+  // domain. Detail selection is keyed by a hash of the tool name, NOT the
+  // global rnd stream, and the original rnd() consumption shape is kept
+  // exactly (one call when !bigResponse) — otherwise every subsequent tool
+  // name/id would shift and invalidate the realistic fixture's gold labels.
+  const parts = name.split('_');
+  // Qualifier reads as an adjective before the entity ("the escalated
+  // user") — but only when the last segment IS a qualifier: multi-word
+  // entities (burn_rate, golden_signal, credit_note) keep their order.
+  const qualifier = parts.length > 2 && QUALIFIERS.includes(parts[parts.length - 1]) ? parts[parts.length - 1] : '';
+  const entityHead = parts[1];
+  const entityPhrase = qualifier ? `${qualifier} ${parts.slice(1, -1).join(' ')}` : parts.slice(1).join(' ');
+  const lead = DESC_LEAD[parts[0]];
+  // Every tool carries 1-2 REAL domain-specific details (FX16 rework:
+  // 100% coverage, no generic fallback). Fragments are written to be
+  // object-agnostic but anchored on the domain's nouns, so any tool object
+  // reads coherently. An entity-matching fragment is preferred when one
+  // exists. Selection is hash-keyed — no rnd consumption.
+  const details = DOMAIN_DETAILS[domainName] ?? [];
+  if (details.length === 0) throw new Error(`FX16: no DOMAIN_DETAILS pool for domain "${domainName}"`);
+  const matched = details.filter((d) => d.includes(entityHead));
+  const h = hash32(name);
+  const d1 = matched.length ? matched[h % matched.length] : details[h % details.length];
+  const d2pool = details.filter((d) => d !== d1);
+  const d2 = d2pool.length && h % 3 === 0 ? d2pool[(h >> 3) % d2pool.length] : '';
+  const automation = !bigResponse && rnd() < 0.5;
+  const suffix = automation ? ' for automation workflows' : '';
+  // Tail/annotations follow the NAME's semantics, not the random kind — a
+  // description must never contradict the tool name (FX16 hard rule).
+  const semanticRead = /^(list|get|search|preview|diff|compare|count|summarize|validate|verify)_/.test(name);
+  const semanticDanger = /^(delete|revoke|purge|void)_/.test(name);
+  const tail = bigResponse
+    ? ' Results are paginated with full embedded records and audit history.'
+    : semanticDanger
+      ? ' This action is irreversible and is recorded in the audit log.'
+      : semanticRead
+        ? ` Supports filtering and pagination${suffix}.`
+        : ` Supports partial updates with idempotency keys${suffix}.`;
+  const desc = lead
+    ? `${lead} ${entityPhrase} in the ${orgName} ${domainName.replace(/-/g, ' ')} workspace${d1 ? `, ${d1}` : ''}${d2 ? `; also ${d2}` : ''}.${tail}`
+    : '';
   const input = makeSchema(name, {
     nested: rnd() < 0.3,
     deep: rnd() < 0.12,
@@ -385,8 +501,8 @@ function makeTool(serverId, domainName, orgName, forced) {
     maxProps: 26,
   });
   const tool = { name, description: desc, inputSchema: input, annotations: {} };
-  if (isRead) tool.annotations.readOnlyHint = true;
-  if (kind === 'danger') tool.annotations.destructiveHint = true;
+  if (semanticRead) tool.annotations.readOnlyHint = true;
+  if (semanticDanger) tool.annotations.destructiveHint = true;
   const behavior = { latencyMs };
   if (errorRate > 0) behavior.errorRate = errorRate;
   if (bigResponse) behavior.responseBytes = int(600_000, 1_000_000);
@@ -807,6 +923,14 @@ function validate(manifests, queries, serverDescs, staleRemoved, finalFiles) {
 
 // ---------- Main ----------
 function main() {
+  // Validate numeric args before any side effect (FX16 rework: setup
+  // failures must be reported through the finish path, not crash silently).
+  const numericArgs = { '--small-servers': SMALL_SERVERS, '--small-tools': SMALL_TOOLS, '--big-servers': BIG_SERVERS, '--big-tools': BIG_TOOLS, '--queries': QUERY_TOTAL };
+  for (const [flag, value] of Object.entries(numericArgs)) {
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+      throw new Error(`invalid ${flag}: must be a non-negative integer, got ${JSON.stringify(argValue(flag))}`);
+    }
+  }
   mkdirSync(OUT_DIR, { recursive: true });
   mkdirSync(RESULTS_DIR, { recursive: true });
 
@@ -837,12 +961,12 @@ function main() {
   const queries = buildQueries(manifests, serverDescs);
 
   for (const m of manifests) {
-    writeFileSync(join(OUT_DIR, `${m.serverId}.json`), JSON.stringify(m, null, 2));
+    writeOut(join(OUT_DIR, `${m.serverId}.json`), JSON.stringify(m, null, 2));
   }
   // Contract: queries are a direct array at stress/.generated/tools-queries.json
   // (same shape as skills-queries.json). Never inside the manifest directory —
   // make-config scans tools/*.json as fake-server manifests.
-  writeFileSync(resolve('stress/.generated/tools-queries.json'), JSON.stringify(queries, null, 2));
+  writeOut(resolve('stress/.generated/tools-queries.json'), JSON.stringify(queries, null, 2));
 
   const finalFiles = readdirSync(OUT_DIR).filter((f) => f.endsWith('.json'));
   const { violations, minDistractors } = validate(manifests, queries, serverDescs, staleRemoved, finalFiles);
@@ -881,6 +1005,45 @@ function main() {
       unknownSamples.push(...unknown.slice(0, 5));
     }
   }
+  // FX16 verb-agreement lint: the description's leading action phrase must
+  // come from DESC_LEAD for the tool-name verb, and the entity phrase (with
+  // qualifier reordered as an adjective) must appear verbatim. Any mismatch
+  // or missing verb fails generation.
+  const descLint = { descVerb: 0, descEntity: 0 };
+  const descBadSamples = [];
+  for (const m of manifests) {
+    for (const t of m.tools) {
+      const parts = t.name.split('_');
+      const lead = DESC_LEAD[parts[0]];
+      const qualifier = parts.length > 2 && QUALIFIERS.includes(parts[parts.length - 1]) ? parts[parts.length - 1] : '';
+      const entityPhrase = qualifier ? `${qualifier} ${parts.slice(1, -1).join(' ')}` : parts.slice(1).join(' ');
+      if (!lead || !t.description.startsWith(lead + ' ')) {
+        descLint.descVerb += 1;
+        if (descBadSamples.length < 10) descBadSamples.push(`${m.serverId}:${t.name} -> ${t.description.slice(0, 80)}`);
+        continue;
+      }
+      if (!t.description.includes(entityPhrase)) descLint.descEntity += 1;
+    }
+  }
+  // FX16 rework: domain-detail coverage — every tool's description must
+  // contain at least one actual DOMAIN_DETAILS fragment of its own domain.
+  const genericFallback = 'standard audit and access controls';
+  // Reverse-lookup each serverId against DOMAINS (org prefix lengths vary:
+  // acme-corp has two segments, globex/initech one).
+  const domainOfServer = new Map(DOMAINS.map((dd) => [`${dd.org}-${dd.name}`, dd.name]));
+  const coverage = { covered: 0, total: 0, generic: 0 };
+  for (const m of manifests) {
+    const domainName = domainOfServer.get(m.serverId);
+    const pool = DOMAIN_DETAILS[domainName] ?? [];
+    for (const t of m.tools) {
+      coverage.total += 1;
+      if (pool.some((f) => t.description.includes(f))) coverage.covered += 1;
+      if (t.description.includes(genericFallback)) coverage.generic += 1;
+    }
+  }
+  descLint.domainCoverage = coverage;
+  const descLintTotal = descLint.descVerb + descLint.descEntity + (coverage.covered < coverage.total ? 1 : 0);
+
   // Ambiguity count for the record: the validator inside buildQueries already
   // fails hard on ambiguous paraphrases; this recomputes the same predicate
   // over the emitted rows so the results file carries the number.
@@ -904,9 +1067,29 @@ function main() {
   console.log('--- FX13 tool lint counts (clean text, gate = all zero) ---');
   console.log(JSON.stringify(toolLint));
   if (toolLintTotal > 0) {
-    throw new Error(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
+    throw gateError(`FX13 lint gate failed for tools: ${JSON.stringify(toolLint)} unknown-tokens: ${[...new Set(unknownSamples)].slice(0, 30).join(',')}`);
   }
-  writeFileSync(
+  if (descLintTotal > 0) {
+    const covMsg = descLint.domainCoverage && descLint.domainCoverage.covered < descLint.domainCoverage.total
+      ? ` coverage ${descLint.domainCoverage.covered}/${descLint.domainCoverage.total} (generic fallback used ${descLint.domainCoverage.generic}x)`
+      : '';
+    throw gateError(`FX16 description lint failed: ${JSON.stringify(descLint)}${covMsg} samples: ${descBadSamples.slice(0, 10).join(' | ')}`);
+  }
+  const descSamples = manifests.flatMap((m) => m.tools).filter((_, i) => i % Math.max(1, Math.floor(10000 / 30)) === 0).slice(0, 30)
+    .map((t) => `${t.name}: ${t.description}`);
+  console.log('--- FX16 description samples (30) ---');
+  for (const sample of descSamples) console.log('  ' + sample);
+  console.log('--- FX16 previously-contradictory cases, fixed ---');
+  for (const m of manifests) {
+    for (const t of m.tools) {
+      if (['compare_dispute', 'delete_team', 'replay_node', 'count_transfer'].includes(t.name)) {
+        console.log(`  ${m.serverId}:${t.name}: ${t.description}`);
+      }
+    }
+  }
+  console.log('--- FX16 description lint (gate = all zero) ---');
+  console.log(JSON.stringify(descLint));
+  writeOut(
     join(RESULTS_DIR, 'query-quality-tools.json'),
     JSON.stringify({ generatorVersion: 3, lint: toolLint, samples: paraphraseSamples }, null, 2),
   );
@@ -917,6 +1100,8 @@ function main() {
     bySubtype[q.subtype] = (bySubtype[q.subtype] || 0) + 1;
     byDifficulty[q.difficulty] = (byDifficulty[q.difficulty] || 0) + 1;
   }
+  const uniqueQueryStrings = new Set(queries.map((q) => q.query)).size === queries.length;
+  const unresolvedExpected = queries.filter((q) => q.expected !== null && !idExists(manifests, q.expected)).length;
   const summary = {
     script: 'gen-tools.mjs',
     generatorVersion: 3,
@@ -926,11 +1111,12 @@ function main() {
     bigManifests: BIG_MANIFEST_COUNT,
     queryTotal: queries.length,
     queryQuality: { generatorVersion: 3, lint: toolLint, lintHits: toolLintTotal, sampleCount: paraphraseSamples.length },
+    descriptionQuality: { lint: descLint, lintHits: descLintTotal, sampleCount: descSamples.length },
     bySubtype,
     byDifficulty,
     checks: {
-      uniqueQueryStrings: new Set(queries.map((q) => q.query)).size === queries.length,
-      unresolvedExpected: queries.filter((q) => q.expected !== null && !idExists(manifests, q.expected)).length,
+      uniqueQueryStrings,
+      unresolvedExpected,
       paraphraseCeiling: 0.3,
       noMatchRule: 'zero content-token overlap with the whole indexed corpus (tool name words, description, serverId, server description) after removing the documented stopword list: ' + [...STOPWORDS].join(','),
       staleRemoved,
@@ -938,15 +1124,16 @@ function main() {
       violations: violations.slice(0, 20),
       violationCount: violations.length,
     },
-    ok: violations.length === 0,
+    ok:
+      violations.length === 0 &&
+      toolLintTotal === 0 &&
+      descLintTotal === 0 &&
+      uniqueQueryStrings &&
+      unresolvedExpected === 0,
   };
-  writeFileSync(join(RESULTS_DIR, 'gen-tools.json'), JSON.stringify(summary, null, 2));
-  // Contract: last stdout line is a single-line machine-readable JSON summary.
-  const summaryLine = JSON.stringify(summary);
-  console.log(summaryLine);
-  if (!summary.ok) process.exit(1);
-  // Smoke assertion: the last stdout line parses as JSON.
-  JSON.parse(summaryLine.trim());
+  // Contract: the finish path writes the artifact and prints the last
+  // stdout line — main() just returns the summary.
+  return summary;
 }
 function idExists(manifests, id) {
   const i = id.indexOf(':');
@@ -954,4 +1141,33 @@ function idExists(manifests, id) {
   const m = manifests.find((x) => x.serverId === sid);
   return !!m && m.tools.some((t) => t.name === tn);
 }
-main();
+function finish(summary) {
+  try {
+    fs.mkdirSync(RESULTS_DIR, { recursive: true });
+    // Always overwrite the results artifact — a failure must never leave a
+    // stale ok:true summary behind (FX16 rework: failure contract).
+    writeFileSync(join(RESULTS_DIR, 'gen-tools.json'), JSON.stringify(summary, null, 2));
+  } catch (err) {
+    summary.ok = false;
+    summary.artifactError = String(err?.message ?? err);
+  }
+  // Contract: exactly one compact machine-readable JSON line on stdout.
+  console.log(JSON.stringify(summary));
+  process.exitCode = summary.ok ? 0 : 1;
+}
+
+try {
+  const summary = main();
+  finish(summary);
+} catch (err) {
+  // Remove artifacts this run wrote so consumers cannot read partial data.
+  for (const p of WRITTEN) {
+    try { fs.rmSync(p); } catch { /* best effort */ }
+  }
+  finish(err?.summary ?? {
+    script: 'gen-tools.mjs',
+    generatorVersion: 3,
+    ok: false,
+    error: String(err?.message ?? err),
+  });
+}
