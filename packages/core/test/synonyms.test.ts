@@ -97,6 +97,22 @@ test("verb paraphrase reaches the canonical tool: hold -> pause_project", async 
   assert.equal(hits[0].id, "acme:pause_project");
 });
 
+test("stopword-bearing exact name beats a high-IDF synonym distractor (SQ2-R4 item 1)", async () => {
+  const catalog = new Catalog();
+  catalog.add(record("acme:delete_the_user", "Deletes the user account and revokes sessions."));
+  catalog.add(record("other:remove_account", "Removes the user account permanently."));
+  const engine = new SearchEngine(catalog);
+  // The reviewer repro: the exact action name carries a stopword ("the").
+  // With the old asymmetric filter the short-circuit was missed and the
+  // high-IDF synonym "remove" (delete<->remove in VERB_SYNONYMS) let the
+  // distractor win. With the symmetric filter the short-circuit fires and
+  // the exact name stays rank 1.
+  const words = await engine.search("delete the user");
+  assert.equal(words[0].id, "acme:delete_the_user");
+  const snake = await engine.search("delete_the_user");
+  assert.equal(snake[0].id, "acme:delete_the_user");
+});
+
 test("exact-name lookup is never demoted by synonym noise", async () => {
   const catalog = new Catalog();
   catalog.add(record("acme:disable_user", "Disables the user account and revokes sessions."));
