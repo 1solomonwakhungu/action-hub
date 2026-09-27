@@ -746,7 +746,13 @@ async function runEval() {
   // gates stay on the generated corpus (binding until the contract changes).
   const REALISTIC_PATH = join(STRESS_DIR, "fixtures", "realistic-queries.json");
   let realistic = null;
-  if (existsSync(REALISTIC_PATH)) {
+  // The realistic fixture's gold ids exist only in the generated corpus; in
+  // self-fixtures mode (clean-clone --quick smoke) they are absent by
+  // construction, so the headline set is skipped with an explicit note
+  // instead of failing closed on a known-good fixture (F52 ledger item 2).
+  if (mode !== "full-generated") {
+    console.error(`[eval-retrieval] realistic fixture skipped: self-fixtures mode has none of the realistic gold ids (full-generated corpus required)`);
+  } else if (existsSync(REALISTIC_PATH)) {
     const raw = JSON.parse(readFileSync(REALISTIC_PATH, "utf8"));
     const list = Array.isArray(raw) ? raw : raw.queries;
     // Fail closed with the FULL v2 schema on the realistic fixture as well
