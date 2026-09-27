@@ -16,6 +16,7 @@ import { dirname, join, resolve } from "node:path";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { connectMcpClient, createHubRuntime, type HubRuntime } from "./index.js";
+import { createDeferredTrigger } from "./deferred-trigger.js";
 
 const AUTH_TIMEOUT_MS = 5_000;
 const MAX_AUTH_BYTES = 8 * 1024;
@@ -52,6 +53,7 @@ export function defaultDaemonDir(): string {
   return resolve(tmpdir(), `action-hub-${uid}`);
 }
 
+
 export async function runDaemon(): Promise<void> {
   const paths = daemonPaths(defaultDaemonDir());
   await secureDirectory(paths.dir);
@@ -61,6 +63,7 @@ export async function runDaemon(): Promise<void> {
   let listener: NetServer | undefined;
   const clients = new Map<Socket, McpServer>();
   let stopping = false;
+  const deferredRefresh = createDeferredTrigger(() => stopping);
   let resolveStopped!: () => void;
   let rejectStopped!: (cause: unknown) => void;
   const stopped = new Promise<void>((resolve, reject) => {
@@ -69,6 +72,7 @@ export async function runDaemon(): Promise<void> {
   });
 
   const cleanup = async (): Promise<void> => {
+    deferredRefresh.cancel();
     const closeListener =
       listener?.listening
         ? new Promise<void>((done) => listener!.close(() => done()))
@@ -154,6 +158,19 @@ export async function runDaemon(): Promise<void> {
       endpoint,
     };
     await writePrivateJson(paths.state, state);
+
+    // FX12-R5: unlike stdio/HTTP, a warm-started daemon may never see a
+    // client, so the deferred refresh must start on its own — deferred by
+    // one turn so the listener-up path (socket published, state written)
+    // completes first. The settle flags above depend on the refresh
+    // settling; daemon clients connecting mid-refresh are served from the
+    // warm cache (startRefresh is memoised, so their handshake trigger is a
+    // no-op).
+    // FX12-R5: a warm-started daemon may never see a client, so the
+    // deferred refresh starts one turn after the listener is up. Mid-refresh
+    // clients are served from the warm cache; their handshake trigger hits
+    // the memoised startRefresh and is a no-op.
+    deferredRefresh.schedule(() => void runtime!.startRefresh().catch(() => undefined));
 
     // The hub answers from the warm cache immediately; the authoritative
     // re-index runs behind it. Publish its settlement so hosts and the CLI can
