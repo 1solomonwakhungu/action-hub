@@ -428,7 +428,53 @@ const tokens = (s) => Math.ceil(String(s ?? "").length / 4);
 function percentileOf(values, p) {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))];
+  // Nearest-rank definition: the smallest value covering >= p% of the sample,
+  // i.e. sorted[ceil(p/100 * N) - 1] (reviewer-1 must-fix #2). Documented and
+  // pinned by percentileSelfTest().
+  const idx = Math.max(0, Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1));
+  return sorted[idx];
+}
+
+/**
+ * Macro per-query recall@k (reviewer-1 must-fix #1): for each matched query,
+ * |retrieved@k ∩ golds| / |golds|, then mean across queries. This is the
+ * BINDING gate metric; micro recall (gold-id-weighted) is reported separately.
+ */
+function macroRecallAt(matchedRows, k) {
+  return mean(matchedRows.map((r) => {
+    const golds = r.expectedAll?.length > 1 ? r.expectedAll : [r.expected];
+    const hit = golds.filter((_, i) => r.goldRanks[i] !== null && r.goldRanks[i] <= k).length;
+    return safeDiv(hit, golds.length);
+  }));
+}
+
+function microRecallAt(matchedRows, k) {
+  let found = 0, total = 0;
+  for (const r of matchedRows) {
+    const golds = r.expectedAll?.length > 1 ? r.expectedAll : [r.expected];
+    for (let i = 0; i < golds.length; i++) {
+      total += 1;
+      const p = r.goldRanks[i];
+      if (p !== null && p <= k) found += 1;
+    }
+  }
+  return safeDiv(found, total);
+}
+
+function percentileSelfTest() {
+  const eq = (a, b, m) => { if (a !== b) throw new Error(`self-test failed: ${m} (${a} !== ${b})`); };
+  const base = Array.from({ length: 100 }, (_, i) => i + 1);
+  eq(percentileOf(base, 50), 50, "p50 nearest-rank of 1..100");
+  eq(percentileOf(base, 95), 95, "p95 nearest-rank of 1..100");
+  eq(percentileOf([1, 2, 3, 4], 95), 4, "p95 of 4 items");
+  eq(percentileOf([5], 50), 5, "p50 of single value");
+  eq(percentileOf([], 95), 0, "empty");
+  const fakeRows = [
+    { expected: "a", expectedAll: null, goldRanks: [1] },
+    { expected: null, expectedAll: ["b", "c", "d", "e"], goldRanks: [1, null, null, null] },
+  ];
+  eq(Number(macroRecallAt(fakeRows, 5).toFixed(4)), 0.625, "macro recall@5 per-query mean");
+  eq(Number(microRecallAt(fakeRows, 5).toFixed(4)), 0.4, "micro recall@5 gold-weighted");
 }
 
 function scoreEngine(rows, latencies, fpThreshold) {
@@ -459,25 +505,19 @@ function scoreEngine(rows, latencies, fpThreshold) {
     noMatchTop1Mean = mean(noMatch.map((r) => r.top1Score));
   }
 
+  // Binding metric = macro per-query recall; micro (gold-id weighted) kept
+  // separately as microRecallAt{k} (reviewer-1 must-fix #1).
   const recalls = {};
-  for (const k of [1, 3, 5, 10, 20]) {
-    let found = 0, total = 0;
-    for (const r of matched) {
-      const golds = r.expectedAll?.length > 1 ? r.expectedAll : [r.expected];
-      for (const g of golds) {
-        const idx = golds.indexOf(g);
-        const pos = r.goldRanks[idx];
-        total += 1;
-        if (pos !== null && pos <= k) found += 1;
-      }
-    }
-    recalls[`recallAt${k}`] = safeDiv(found, total);
-  }
+  for (const k of [1, 3, 5, 10, 20]) recalls[`recallAt${k}`] = macroRecallAt(matched, k);
+  const microRecalls = {};
+  for (const k of [1, 3, 5, 10, 20]) microRecalls[`microRecallAt${k}`] = microRecallAt(matched, k);
 
   const lat = [...latencies].sort((a, b) => a - b);
   return {
     queryCount: rows.length,
     matchedCount: matched.length,
+    recallDefinition: "macro: per-query |retrieved@k ∩ golds| / |golds|, mean across matched queries",
+    ...microRecalls,
     ...recalls,
     mrrAt10: mean(matched.map((r) => (r.firstGoldRank !== Infinity && r.firstGoldRank <= 10 ? 1 / r.firstGoldRank : 0))),
     ndcgAt10: mean(matched.map((r) => {
@@ -520,18 +560,8 @@ function coreMetrics(rows) {
   const matched = rows.filter((r) => r.expected !== null || (r.expectedAll?.length ?? 0) > 0);
   const multi = matched.filter((r) => (r.expectedAll?.length ?? 0) > 1);
   const out = { queryCount: rows.length };
-  for (const k of [1, 3, 5, 10, 20]) {
-    let found = 0, total = 0;
-    for (const r of matched) {
-      const golds = r.expectedAll?.length > 1 ? r.expectedAll : [r.expected];
-      for (let i = 0; i < golds.length; i++) {
-        total += 1;
-        const p = r.goldRanks[i];
-        if (p !== null && p <= k) found += 1;
-      }
-    }
-    out[`recallAt${k}`] = safeDiv(found, total);
-  }
+  for (const k of [1, 3, 5, 10, 20]) out[`recallAt${k}`] = macroRecallAt(matched, k);
+  for (const k of [1, 3, 5, 10, 20]) out[`microRecallAt${k}`] = microRecallAt(matched, k);
   out.mrrAt10 = mean(matched.map((r) => (r.firstGoldRank !== Infinity && r.firstGoldRank <= 10 ? 1 / r.firstGoldRank : 0)));
   out.ndcgAt10 = mean(matched.map((r) => {
     const golds = r.expectedAll?.length > 1 ? r.expectedAll : [r.expected];
@@ -649,12 +679,32 @@ async function runEval() {
   if (existsSync(REALISTIC_PATH)) {
     const raw = JSON.parse(readFileSync(REALISTIC_PATH, "utf8"));
     const list = Array.isArray(raw) ? raw : raw.queries;
-    // Fail closed on a malformed realistic fixture as well.
+    // Fail closed with the FULL v2 schema on the realistic fixture as well
+    // (reviewer-1 must-fix #3): row shape, expectedAll 2-4 bounds/types,
+    // subtype whitelist, mix counts, unique queries.
     const rErrors = [];
-    if (list.length !== 120) rErrors.push(`expected 120 realistic rows, got ${list.length}`);
+    if (list.length !== 121) rErrors.push(`expected 121 realistic rows, got ${list.length}`);
+    const SUBTYPES = ["paraphrase", "goal-only", "near-duplicate", "multi", "no-match"];
+    const EXPECTED_MIX = { paraphrase: 40, "goal-only": 30, "near-duplicate": 20, multi: 16, "no-match": 15 };
+    const seenMix = {};
     for (const q of list) {
-      if (typeof q.query !== "string" || q.query.trim() === "" || !("expected" in q)) { rErrors.push(`invalid realistic row: ${JSON.stringify(q).slice(0, 80)}`); break; }
+      if (typeof q.query !== "string" || q.query.trim() === "") { rErrors.push(`invalid realistic query text: ${JSON.stringify(q).slice(0, 80)}`); break; }
+      if (!SUBTYPES.includes(q.subtype)) { rErrors.push(`unknown realistic subtype: ${q.subtype}`); break; }
+      if (!q.difficulty) { rErrors.push(`missing difficulty on realistic row: ${q.query.slice(0, 60)}`); break; }
+      const hasExpected = typeof q.expected === "string" || q.expected === null;
+      const hasExpectedAll = Array.isArray(q.expectedAll);
+      if (!hasExpected && !hasExpectedAll) { rErrors.push(`realistic row without expected/expectedAll: ${q.query.slice(0, 60)}`); break; }
+      if (hasExpectedAll && (q.expectedAll.length < 2 || q.expectedAll.length > 4 || q.expectedAll.some((g) => typeof g !== "string"))) {
+        rErrors.push(`realistic expectedAll out of 2-4 string bounds: ${q.query.slice(0, 60)}`); break;
+      }
+      if (q.subtype === "no-match" && q.expected !== null) { rErrors.push(`no-match realistic row must have expected=null: ${q.query.slice(0, 60)}`); break; }
+      seenMix[q.subtype] = (seenMix[q.subtype] ?? 0) + 1;
     }
+    for (const [st, want] of Object.entries(EXPECTED_MIX)) {
+      if ((seenMix[st] ?? 0) !== want) rErrors.push(`realistic mix ${st}: expected ${want}, got ${seenMix[st] ?? 0}`);
+    }
+    const rUnique = new Set(list.map((q) => q.query));
+    if (rUnique.size !== list.length) rErrors.push(`duplicate realistic queries: ${list.length - rUnique.size}`);
     if (rErrors.length > 0) throw new Error(`realistic fixture failed validation:\n- ${rErrors.join("\n- ")}`);
     realistic = list;
     console.error(`[eval-retrieval] realistic fixture loaded: ${list.length} rows`);
@@ -870,6 +920,8 @@ function countBy(arr, keyFn) {
 // Shared-harness failure envelope (PR 64): isolation, summary contract and
 // exit code all come from stress/lib/harness.mjs. setupIsolation, the local
 // withTimeout-guarded runner and the local write/exit logic are gone.
+percentileSelfTest();
+
 harnessMain(async () => {
   // Isolate THIS process first: every checklist env var is replaced under one
   // fresh run root before any hub construction.
