@@ -26,6 +26,12 @@ interface DaemonState {
   version: number;
   pid: number;
   startedAt: string;
+  /**
+   * F63 launch identity: daemonStartCommand passes ACTION_HUB_LAUNCH_TOKEN
+   * via env; echoing it into the state makes every ready answer
+   * self-identifying (probe-carried token, no relay/event timing race).
+   */
+  launchToken?: string;
   configPath?: string;
   /** True while the authoritative post-startup re-index is still running. */
   indexing: boolean;
@@ -152,6 +158,7 @@ export async function runDaemon(): Promise<void> {
       version: STATE_VERSION,
       pid: process.pid,
       startedAt: new Date().toISOString(),
+      launchToken: process.env["ACTION_HUB_LAUNCH_TOKEN"],
       configPath: runtime.configPath,
       indexing: true,
       indexingSettledAt: null,

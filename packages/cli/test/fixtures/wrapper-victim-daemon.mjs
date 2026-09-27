@@ -15,6 +15,9 @@ if (!daemonDir) throw new Error("ACTION_HUB_DAEMON_DIR is required");
 const wrapperPid = process.ppid;
 if (process.env["TREE_PIDS_FILE"]) {
   appendFileSync(process.env["TREE_PIDS_FILE"], `SERVER:${process.pid}\nPPID:${wrapperPid}\n`);
+  // ACK-based readiness for the test's wait (never a fixed wall under load):
+  // the ack file exists only after the pid record is durably written.
+  writeFileSync(`${process.env["TREE_PIDS_FILE"]}.ack`, "");
 }
 process.stdin.resume();
 setInterval(() => {}, 1000); // survive stdin EOF; death must be signal-attributable
@@ -44,6 +47,7 @@ const orphanPoll = setInterval(() => {
     const state = {
       version: 1,
       pid: process.pid,
+      launchToken: process.env["ACTION_HUB_LAUNCH_TOKEN"],
       startedAt: new Date().toISOString(),
       endpoint: { kind: "tcp", host: "127.0.0.1", port },
     };
