@@ -25,6 +25,7 @@ export class SearchEngine {
   readonly #catalog: Catalog;
   #semanticScorer?: SemanticScorer;
   #semanticWeight = DEFAULT_SEMANTIC_WEIGHT;
+  #fusion: "blend" | "rrf" = "blend";
 
   // Memoized corpus work, keyed by the catalog generation. The dominant F18
   // cost was re-tokenizing the entire corpus on every query; this cache makes
@@ -63,6 +64,18 @@ export class SearchEngine {
 
   get semanticWeight(): number {
     return this.#semanticWeight;
+  }
+
+  /**
+   * Selects how the semantic signal is fused with the lexical ranking:
+   * - "blend" (default): weighted interpolation of the two normalized
+   *   scores. Fine-grained but sensitive to score-scale mismatches.
+   * - "rrf": reciprocal-rank fusion over the two orderings. Scale-free;
+   *   measured best for real sentence embeddings (SQ4), which live on a
+   *   different scale than BM25's saturation curve.
+   */
+  setFusion(mode: "blend" | "rrf"): void {
+    this.#fusion = mode;
   }
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchHit[]> {
@@ -125,10 +138,13 @@ export class SearchEngine {
     // contradicting the down-weight contract.
     const semantic = await this.#semanticScores(literalTokens.join(" "), candidates);
     if (semantic) {
-      ranked = lexical.map((entry, i) => ({
-        record: entry.record,
-        score: blend(entry.score, semantic[i] ?? 0, this.#semanticWeight),
-      }));
+      ranked =
+        this.#fusion === "rrf"
+          ? rrfFuse(lexical, semantic, this.#semanticWeight)
+          : lexical.map((entry, i) => ({
+              record: entry.record,
+              score: blend(entry.score, semantic[i] ?? 0, this.#semanticWeight),
+            }));
     }
 
     const sorted = ranked
@@ -291,6 +307,41 @@ export type SemanticScorer = (
  * recall@1 43.8% → 50.0%, ambiguous recall@1 75.0% → 91.7%, MRR .804 → .863.
  */
 export const DEFAULT_SEMANTIC_WEIGHT = 0.2;
+
+/**
+ * Reciprocal-rank fusion of the lexical ranking with the semantic ranking.
+ *
+ * The semantic list only contains candidates the scorer actually scored
+ * above zero; everything else keeps its lexical rank contribution alone.
+ * Scores are small (two 1/(k+r) terms at most) but strictly ordered, which
+ * is all the ranker needs.
+ */
+function rrfFuse(
+  lexical: { record: ActionRecord; score: number }[],
+  semantic: number[],
+  weight: number,
+): { record: ActionRecord; score: number }[] {
+  const k = 60;
+  // Ranks come from SCORE order, not array order (candidates arrive in
+  // catalog order): sort each signal descending and rank by position.
+  const lexOrder = lexical
+    .map((entry, index) => ({ index, score: entry.score }))
+    .sort((a, b) => b.score - a.score || lexical[a.index]!.record.id.localeCompare(lexical[b.index]!.record.id));
+  const lexRank = new Map<number, number>();
+  lexOrder.forEach((entry, position) => lexRank.set(entry.index, position + 1));
+  const semOrder: { index: number; score: number }[] = [];
+  for (let i = 0; i < semantic.length; i += 1) {
+    if ((semantic[i] ?? 0) > 0) semOrder.push({ index: i, score: semantic[i]! });
+  }
+  semOrder.sort((a, b) => b.score - a.score);
+  const semRank = new Map<number, number>();
+  semOrder.forEach((entry, position) => semRank.set(entry.index, position + 1));
+  return lexical.map((entry, i) => {
+    let score = weight * (1 / (k + (semRank.get(i) ?? k)));
+    score += 1 / (k + (lexRank.get(i) ?? k));
+    return { record: entry.record, score };
+  });
+}
 
 function blend(lexicalScore: number, semanticScore: number, weight: number): number {
   // Lexical scores are unbounded, so squash before blending to keep the two

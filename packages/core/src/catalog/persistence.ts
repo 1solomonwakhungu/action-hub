@@ -11,6 +11,7 @@ import type {
   TrustTier,
 } from "../types.js";
 import { TRUST_TIERS } from "../types.js";
+import type { PersistedEmbeddings } from "../search/embeddings.js";
 
 /**
  * Bumped whenever the on-disk shape changes. A mismatch discards the entry
@@ -37,6 +38,11 @@ export interface PersistedCatalog {
   skills: number;
   context: { actions: number; eagerTokensEstimate: number; hubTokensEstimate: number };
   history: InvocationRecord[];
+  /**
+   * SQ4: quantized document vectors keyed by action id. Optional and
+   * additive; absent when embeddings are disabled or the model never loaded.
+   */
+  embeddings?: PersistedEmbeddings;
 }
 
 /**
