@@ -722,7 +722,12 @@ export class ActionHub {
           // A successful downstream call proves the transport is alive: reset
           // the execute-failure streak so isolated connection failures between
           // healthy calls cannot accumulate into an open circuit.
-          this.#connections.recordSuccess(record.serverId, durationMs);
+          // A successful downstream call proves the transport is alive: reset
+          // the execute-failure streak AND the execute-timeout streak (F26)
+          // so isolated connection failures between healthy calls cannot
+          // accumulate into an open circuit. Heartbeat/listTools successes
+          // deliberately do NOT reset the timeout streak (recordSuccess).
+          this.#connections.recordExecuteSuccess(record.serverId, durationMs);
           if (approved) {
             span.setAttribute(ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS, "approved");
           }
@@ -749,7 +754,11 @@ export class ActionHub {
         } catch (cause) {
           const durationMs = Date.now() - start;
           const message = cause instanceof Error ? cause.message : String(cause);
-          const isTimeout = message.includes("timed out after");
+          // Positive classification (F26 rework): only callWithTimeout's own
+          // rejection is an execution timeout. A live server's ToolError or
+          // isError text saying "timed out after..." is a TOOL error and
+          // must not feed the timeout streak.
+          const isTimeout = cause instanceof ExecutionTimeoutError;
           const isCircuit = message.includes("Circuit breaker open");
 
           // Feed transport/connection failures back into the circuit breaker.
@@ -757,7 +766,14 @@ export class ActionHub {
           // boundary as transport-level (see isTransportFailure): JSON-RPC
           // error responses and isError results from a live server are ignored,
           // and the breaker's recovery (drop + restart) never blocks on close.
-          if (!isTimeout && !isCircuit) {
+          if (isCircuit) {
+            // Already tripped; nothing to feed back.
+          } else if (isTimeout) {
+            // F26: consecutive execute timeouts isolate a server that hangs
+            // every tools/call (a slow handler is not a transport failure,
+            // so the breaker's transport path ignores these by design).
+            this.#connections.recordExecuteTimeout(record.serverId, message);
+          } else {
             await this.#connections.reportExecuteFailure(record.serverId, cause, message);
           }
 
@@ -947,10 +963,23 @@ export class ActionHubError extends Error {
 
 const SUMMARY_MAX = 160;
 
+/**
+ * Positively typed Action Hub execution timeout (F26 rework): a tool error
+ * or isError response whose text merely CONTAINS "timed out after" must
+ * never be classified as an execution timeout — only callWithTimeout's own
+ * rejection carries this type.
+ */
+class ExecutionTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExecutionTimeoutError";
+  }
+}
+
 async function callWithTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+    timer = setTimeout(() => reject(new ExecutionTimeoutError(timeoutMessage)), timeoutMs);
   });
 
   try {

@@ -46,6 +46,9 @@ export interface ConnectionManagerHooks {
 }
 
 export interface ConnectionManagerOptions extends CircuitBreakerOptions, ConnectionManagerHooks {
+  /** Default threshold for consecutive execute timeouts per server (F26).
+   * Per-server config.executeTimeoutThreshold overrides. 0 disables. Default 5. */
+  executeTimeoutThreshold?: number;
   heartbeat?: HeartbeatConfig;
   restartBackoff?: RestartBackoffConfig;
   maxOldSpaceSizeMb?: number;
@@ -76,6 +79,12 @@ interface Entry {
   toolCount: number;
   lastActivatedAt?: string;
   consecutiveFailures: number;
+  /** Consecutive execute-timeout streak (F26): only a successful execute
+   * resets it; tool errors and transport failures never do. */
+  consecutiveTimeouts: number;
+  /** Why the circuit was tripped, when it was NOT plain transport failures
+   * (F26): surfaced in doctor/list/states and the activate() error. */
+  circuitOpenReason?: string;
   lastFailureTime?: number;
   lastLatencyMs?: number;
   circuitState: CircuitState;
@@ -102,6 +111,7 @@ function isShutdownAbort(signal: AbortSignal): boolean {
 }
 
 const DEFAULT_FAILURE_THRESHOLD = 3;
+const DEFAULT_EXECUTE_TIMEOUT_THRESHOLD = 5;
 const DEFAULT_COOLDOWN_MS = 10_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_ACTIVATION_TIMEOUT_MS = 10_000;
@@ -142,6 +152,7 @@ export class ConnectionManager {
   readonly #entries = new Map<string, Entry>();
   readonly #factory: McpClientFactory;
   readonly #failureThreshold: number;
+  readonly #executeTimeoutThreshold: number;
   readonly #cooldownMs: number;
   readonly #heartbeat: HeartbeatConfig;
   readonly #restartBackoff: RestartBackoffConfig;
@@ -160,6 +171,7 @@ export class ConnectionManager {
   ) {
     this.#factory = factory;
     this.#failureThreshold = options.failureThreshold ?? DEFAULT_FAILURE_THRESHOLD;
+    this.#executeTimeoutThreshold = options.executeTimeoutThreshold ?? DEFAULT_EXECUTE_TIMEOUT_THRESHOLD;
     this.#cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
     this.#heartbeat = options.heartbeat ?? {};
     this.#restartBackoff = options.restartBackoff ?? {};
@@ -256,6 +268,7 @@ export class ConnectionManager {
     const entry = this.#entries.get(serverId);
     if (!entry || entry.manualShutdown) return;
     entry.consecutiveFailures = 0;
+    entry.circuitOpenReason = undefined;
     entry.lastFailureTime = undefined;
     entry.error = undefined;
     entry.circuitState = "closed";
@@ -267,6 +280,20 @@ export class ConnectionManager {
     if (entry.status !== "disabled" && entry.client) {
       entry.status = "ready";
     }
+  }
+
+  /**
+   * A successful EXECUTE (F26): like recordSuccess, but additionally resets
+   * the consecutive execute-timeout streak. Deliberately separate: health
+   * checks and heartbeats report success from listTools — a server that
+   * answers pings while every tools/call hangs would otherwise keep wiping
+   * the streak and never be isolated.
+   */
+  recordExecuteSuccess(serverId: string, latencyMs?: number): void {
+    const entry = this.#entries.get(serverId);
+    if (!entry || entry.manualShutdown) return;
+    entry.consecutiveTimeouts = 0;
+    this.recordSuccess(serverId, latencyMs);
   }
 
   recordFailure(serverId: string, error?: string): void {
@@ -321,10 +348,60 @@ export class ConnectionManager {
     }
   }
 
+  /**
+   * Reports an EXECUTE timeout observed while running a tool (F26). Tool
+   * timeouts deliberately never counted as transport failures (a slow
+   * handler is not a dead transport), but a server that answers heartbeat
+   * pings while every tools/call hangs would otherwise never be isolated:
+   * every caller waits the full execution timeout forever. A streak of
+   * consecutive timeouts trips the circuit with a distinct reason and the
+   * same cooldown/half-open recovery as transport failures. Only a
+   * successful execute resets the streak; tool errors never count, and
+   * transport failures keep their existing path.
+   */
+  recordExecuteTimeout(serverId: string, message?: string): void {
+    const entry = this.#entries.get(serverId);
+    if (!entry || entry.manualShutdown || entry.config.enabled === false) return;
+    entry.consecutiveTimeouts += 1;
+    const threshold = this.#timeoutThreshold(entry);
+    if (threshold <= 0) return; // 0 disables the policy
+    if (entry.consecutiveTimeouts < threshold) return;
+    // Trip: distinct reason, same cooldown/half-open machinery. Advancing
+    // consecutiveFailures to the transport threshold drives #circuitState
+    // (open -> half-open after cooldown) without double-counting timeouts
+    // as transport failures.
+    entry.circuitOpenReason = `repeated execute timeouts (${entry.consecutiveTimeouts} in a row)`;
+    entry.error = entry.circuitOpenReason;
+    entry.consecutiveFailures = this.#threshold(entry);
+    entry.lastFailureTime = this.#now();
+    entry.halfOpen = false;
+    entry.circuitState = "open";
+    entry.status = "unreachable";
+    // Same recovery as a tripped transport breaker: stop probing a server
+    // that hangs, release its client (bounded close), and schedule a
+    // restart after the cooldown. No NEW restart behavior: a timeout trip
+    // recovers exactly like any other open circuit. (activate() normally
+    // sets autoRestart; a timeout can trip before the first activate.)
+    entry.autoRestart = true;
+    this.#stopHeartbeat(entry);
+    const client = entry.client;
+    entry.client = undefined;
+    if (client) {
+      void this.#withTimeout(client.close(), 2_000, "close timed out").catch(() => {});
+    }
+    this.#scheduleRestart(entry);
+  }
+
+  #timeoutThreshold(entry: Entry): number {
+    return entry.config.executeTimeoutThreshold ?? this.#executeTimeoutThreshold;
+  }
+
   resetCircuit(serverId: string): void {
     const entry = this.#entries.get(serverId);
     if (!entry) return;
     entry.consecutiveFailures = 0;
+    entry.consecutiveTimeouts = 0;
+    entry.circuitOpenReason = undefined;
     entry.lastFailureTime = undefined;
     entry.error = undefined;
     entry.circuitState = "closed";
@@ -356,8 +433,9 @@ export class ConnectionManager {
 
     const state = this.#circuitState(entry);
     if (state === "open") {
+      const reason = entry.circuitOpenReason ? ` — ${entry.circuitOpenReason}` : "";
       throw new Error(
-        `Circuit breaker open for server "${serverId}": too many consecutive failures. Cooling down.`,
+        `Circuit breaker open for server "${serverId}": too many consecutive failures${reason}. Cooling down.`,
       );
     }
 
@@ -602,6 +680,7 @@ export class ConnectionManager {
         circuitOpen: circuitState === "open",
         circuitState,
         consecutiveFailures: entry.consecutiveFailures,
+        executeTimeoutStreak: entry.consecutiveTimeouts,
         restartAttempt: entry.restartAttempt,
         nextRestartAt: entry.nextRestartAt !== undefined ? new Date(entry.nextRestartAt).toISOString() : undefined,
         lastHeartbeatAt:
@@ -617,6 +696,7 @@ export class ConnectionManager {
       status: config.enabled === false ? "disabled" : "inactive",
       toolCount: 0,
       consecutiveFailures: 0,
+      consecutiveTimeouts: 0,
       circuitState: "closed",
       halfOpen: false,
       generation: 0,

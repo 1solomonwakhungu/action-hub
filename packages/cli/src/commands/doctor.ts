@@ -481,7 +481,7 @@ export async function doctorCommand(options: DoctorOptions = {}): Promise<number
       const memory = state.memoryLimitMb ? `${state.memoryLimitMb} MB` : "unset";
       const restart = state.nextRestartAt ? `; next restart ${state.nextRestartAt}` : "";
       console.log(
-        `  [${state.id}] circuit=${state.circuitState ?? "closed"} failures=${state.consecutiveFailures ?? 0} memory=${memory}${restart}`,
+        `  [${state.id}] circuit=${state.circuitState ?? "closed"} failures=${state.consecutiveFailures ?? 0}${state.executeTimeoutStreak ? ` timeouts=${state.executeTimeoutStreak}` : ""} memory=${memory}${restart}`,
       );
     }
 
