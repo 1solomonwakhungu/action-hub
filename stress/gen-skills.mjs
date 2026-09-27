@@ -375,7 +375,8 @@ async function selfTestCleanup(baseDir) {
   await mkdir(parent, { recursive: true });
   const targetDir = join(parent, "skills");
   const failures = [];
-  let r2 = { removedPartialSkillsDir: null, cleanupError: null };
+  let r2 = null; // set only if the E2E probe actually ran — no claimed
+  let childSurvived = null; // evidence from a skipped probe
   let child = null;
   // 1. Unit: an rm implementation that rejects must yield removed:false +
   //    cleanupError, with the dir verifiably still present (sentinel intact).
@@ -390,15 +391,18 @@ async function selfTestCleanup(baseDir) {
     failures.push(`failing-rm verdict wrong: ${JSON.stringify({ ...r1, sentinelPresent: existsSync(sentinel) })}`);
   }
   // 2. End-to-end with a real refusal: read-only parent prevents rm of the
-  //    child dir (skipped when running as root — the check is then moot).
-  if (process.getuid && process.getuid() !== 0) {
+  //    child dir. Skipped when the platform has no getuid (Windows) or the
+  //    process runs as root (chmod is moot) — the summary must then say
+  //    skipped:true and claim NO survival evidence.
+  const probeRan = e2eProbeEnabled();
+  if (probeRan) {
     child = join(parent, "ro-child");
     await mkdir(child, { recursive: true });
     await writeFile(join(child, "SKILL.md"), "sentinel", "utf8");
     chmodSync(parent, 0o555);
     try {
       r2 = await cleanupPartialSkillsDir(child);
-      const childSurvived = existsSync(child);
+      childSurvived = existsSync(child);
       if (r2.removedPartialSkillsDir !== false || !childSurvived) {
         failures.push(`read-only-parent verdict wrong: ${JSON.stringify({ ...r2, childPresent: childSurvived })}`);
       }
@@ -407,13 +411,41 @@ async function selfTestCleanup(baseDir) {
       rmSync(child, { recursive: true, force: true });
     }
   }
+  // 3. Regression for the skip branch itself (HYG2 rework 3): with no
+  //    getuid (Windows-style) or a root-style uid 0, the probe decision must
+  //    be "skip" — this check runs even when the probe above was skipped, so
+  //    the branch is exercised through the same finish path on every platform.
+  const savedGetuid = process.getuid;
+  let noGetuidSkipped = false;
+  let rootStyleSkipped = false;
+  try {
+    delete process.getuid;
+    noGetuidSkipped = !e2eProbeEnabled();
+    process.getuid = () => 0;
+    rootStyleSkipped = !e2eProbeEnabled();
+  } finally {
+    if (savedGetuid === undefined) delete process.getuid;
+    else process.getuid = savedGetuid;
+  }
+  if (!noGetuidSkipped) failures.push("no-getuid branch did not decide skip");
+  if (!rootStyleSkipped) failures.push("root-style uid=0 branch did not decide skip");
   if (failures.length > 0) {
     throw new FatalError(`HYG2 cleanup self-test FAILED: ${failures.join(" | ")}`);
   }
   return {
     failingRm: { verdict: r1, sentinelSurvived: existsSync(sentinel) },
-    readOnlyParent: r2 ? { verdict: r2, childSurvived: true, skipped: false } : { verdict: null, skipped: true },
+    readOnlyParent: probeRan
+      ? { verdict: r2, childSurvived, skipped: false }
+      : { verdict: null, childSurvived: null, skipped: true },
+    skipBranchRegression: { noGetuidSkipped, rootStyleSkipped },
   };
+}
+
+// Whether the read-only-parent E2E probe can produce meaningful evidence on
+// this platform: needs a getuid (not Windows) and a non-root uid (chmod 555
+// is moot for root, who bypasses permission checks).
+function e2eProbeEnabled() {
+  return typeof process.getuid === "function" && process.getuid() !== 0;
 }
 
 async function runSkillsInner() {
