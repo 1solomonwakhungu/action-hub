@@ -16,7 +16,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
 import { specEvidence } from "./parsers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -92,6 +92,7 @@ async function main() {
     root,
     repoRoot,
   });
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     runs.push(
       await runSpec(isolatedEnv, [
@@ -102,9 +103,11 @@ async function main() {
       ], "http"),
     );
   } finally {
-    await killTree(serve.child, serve.exitP);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
+  // MIG2-R1 (ordering): fold every run row BEFORE summary.ok snapshots.
+  for (const r of runs) foldCleanupVerdict(r, r.stepVerdict, `spec ${r.label}`);
   const summary = {
     script: "spec-test.mjs",
     tool: "@hasmcp/mcp-spec-test",
@@ -118,6 +121,7 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }
 
@@ -139,6 +143,8 @@ async function runSpec(env, args, label) {
     reportDir: outDir,
     durationMs: res.durationMs,
     stdoutTail: res.stdoutTail.slice(-2000),
+    // MIG2-R1: the step verdict rides on the run row and is folded below.
+    stepVerdict: res,
     stderr: res.stderrTail.slice(-3000),
     spawnError: res.spawnError,
   };

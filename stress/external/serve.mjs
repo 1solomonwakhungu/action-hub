@@ -9,8 +9,8 @@
  *  - early-exit monitoring, spawn error handlers;
  *  - process-group termination with bounded wait and SIGKILL escalation.
  */
-import { spawn } from "node:child_process";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { spawnGroup, killGroupAndVerify, runStep, pathContains } from "../lib/harness.mjs";
 
 const here = new URL(".", import.meta.url).pathname;
 
@@ -61,20 +61,23 @@ export async function startServe({
     env = { ...env, ACTION_HUB_HTTP_TOKEN: env["ACTION_HUB_HTTP_TOKEN"] ?? token, ...extraEnv };
   }
   const binary = process.env["ACTION_HUB_SERVE_BIN"] ?? join(repoRoot ?? resolve(here, "..", ".."), "packages", "cli", "dist", "index.js");
-  const child = spawn(process.execPath, [binary, "serve", "--config", configPath, "--port", "0"], {
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true, // own process group so cleanup can kill the whole tree
-  });
-
+  // MIG2: the serve child runs as a NON-detached workload inside a dedicated
+  // detached anchor's process group (Design C). The anchor is the
+  // always-live ownership proof; the lib's kill ladder gates every
+  // negative-pgid signal on that proof, so a wedged serve can never leave a
+  // leaderless group behind.
+  const handle = await spawnGroup(
+    process.execPath,
+    [binary, "serve", "--config", configPath, "--port", "0"],
+    { env, cwd: process.cwd() },
+  );
   let spawnError = null;
-  child.on("error", (cause) => { spawnError = cause; });
   let tail = "";
   let sawPort = null;
   let sawTokenLine = false;
   const portWaiters = [];
   const notifyPort = () => { while (portWaiters.length) portWaiters.shift()(sawPort); };
-  for (const stream of [child.stdout, child.stderr]) {
+  for (const stream of [handle.stdout, handle.stderr]) {
     stream?.on("data", (chunk) => {
       tail = (tail + String(chunk)).slice(-20_000);
       const parsed = parseServePort(tail);
@@ -86,11 +89,9 @@ export async function startServe({
     });
   }
   let exitInfo = null;
-  const exitP = new Promise((resolveExit) => {
-    child.on("close", (code, signal) => {
-      exitInfo = { code, signal };
-      resolveExit(exitInfo);
-    });
+  const exitP = handle.exited.then((e) => {
+    exitInfo = { code: e?.code ?? null, signal: e?.signal ?? null, anchorDied: e?.anchorDied === true, error: e?.error ?? null };
+    return exitInfo;
   });
 
   // Every failure after spawn must clean up the child we own.
@@ -116,7 +117,9 @@ export async function startServe({
     // Prove the /health endpoint belongs to THIS child: the port was parsed
     // from this child's own stdout, the child is still alive, and the banner
     // confirms it authenticated with this run's token.
-    if (child.exitCode !== null || child.signalCode !== null) {
+    try {
+      process.kill(handle.pid, 0); // liveness probe on the WORKLOAD pid
+    } catch {
       throw new Error(`serve exited before health check; tail=${tail.slice(-400)}`);
     }
     if (!sawTokenLine) {
@@ -159,51 +162,66 @@ export async function startServe({
       throw new Error(`serve on port ${port} (from its own stdout) never answered an authenticated initialize; tail=${tail.slice(-400)}`);
     }
     return {
-      child,
+      /** The lib group handle: {pid, pgid, anchor, exited, ...}. Kills go
+       * through THIS (object identity is the ownership proof). */
+      handle,
+      /** Workload pid (shape-compat: old callers read serve.child.pid). */
+      pid: handle.pid,
+      child: { pid: handle.pid },
       port,
       env,
       root,
-      /** Resolves with {code, signal} when the child closes. */
+      /** Resolves with {code, signal, anchorDied, error} when the workload
+       * closes (anchor death is surfaced as anchorDied, never adopted as the
+       * workload's result). */
       exitP,
       /** Tail of the child's stdout+stderr for evidence. */
       tail: () => tail,
     };
   } catch (cause) {
-    await killTree(child, exitP);
+    await killGroupAndVerify(handle);
     throw cause;
   }
 }
 
 /**
- * Terminates a detached child's whole process group: SIGTERM, bounded wait,
- * then SIGKILL escalation. Resolves when the group is gone.
+ * Fail-closed fold of a cleanup verdict into a runner summary (reviewer
+ * MIG2-R1): groupEmpty !== true, a killError, or ANY survivor evidence makes
+ * the summary NOT ok — a successful workload with failed cleanup can never
+ * pass. Returns the mutated summary; evidence lands in summary.cleanupFailures.
  */
-export async function killTree(child, exitP, graceMs = 5_000) {
-  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return null;
-  const sig = (s) => {
-    try { process.kill(-child.pid, s); } catch { /* already gone */ }
-    try { child.kill(s); } catch { /* already gone */ }
-  };
-  sig("SIGTERM");
-  const result = await Promise.race([
-    exitP ?? new Promise(() => undefined),
-    new Promise((resolveKill) => setTimeout(() => {
-      sig("SIGKILL");
-      resolveKill({ code: null, signal: "SIGKILL" });
-    }, graceMs)),
-  ]);
-  // Give the KILL a moment to reap.
-  await Promise.race([
-    exitP ?? Promise.resolve(null),
-    new Promise((r) => setTimeout(r, 1_000)),
-  ]);
-  return result ?? null;
+export function foldCleanupVerdict(summary, verdict, label = "cleanup") {
+  if (!verdict) return summary;
+  const problems = [];
+  if (verdict.groupEmpty !== true) problems.push(`groupEmpty !== true (${JSON.stringify(verdict.groupEmpty)})`);
+  if (verdict.error) problems.push(`error: ${String(verdict.error).slice(0, 300)}`);
+  if (verdict.killError) problems.push(`killError: ${String(verdict.killError).slice(0, 300)}`);
+  const survivors = Array.isArray(verdict.survivors) ? verdict.survivors : [];
+  if (survivors.length > 0) problems.push(`survivors: ${JSON.stringify(survivors).slice(0, 300)}`);
+  if (problems.length > 0) {
+    summary.ok = false;
+    summary.cleanupFailures = [...(summary.cleanupFailures ?? []), { label, problems }];
+  }
+  return summary;
+}
+
+/**
+ * Terminates a served group via the lib's gated ladder (MIG2): TERM ->
+ * bounded wait -> FINAL KILL -> verify, every negative-pgid signal gated on
+ * the exact anchor being provably ours and alive immediately before it
+ * fires. Resolves {groupEmpty, survivors, error?} — a FALSE green is
+ * impossible: a failed verification is reported as such, never folded into
+ * success.
+ */
+export async function killTree(target) {
+  if (!target) return null;
+  return killGroupAndVerify(target);
 }
 
 /** Separator-safe containment check (path.relative, no string prefixes). */
 export function isInside(root, candidate) {
-  const rel = relative(resolve(root), resolve(String(candidate)));
-  return rel === "" || (!isAbsolute(rel) && !rel.split(/[\\/]/).includes(".."));
+  // Delegated to the lib (MIG2): path.relative-based, separator-safe.
+  return pathContains(root, candidate);
 }
 
 /**
@@ -212,36 +230,51 @@ export function isInside(root, candidate) {
  * stderrTail, durationMs}. Use this instead of spawnSync so timed-out runs
  * cannot leak descendants.
  */
-export function runTool(cmd, args, { env, timeoutMs = 30 * 60_000, killOnTimeout = true } = {}) {
+export function runTool(cmd, args, { env, timeoutMs = 30 * 60_000, win32, taskkillRunner } = {}) {
+  // BEHAVIORAL FAULT SEAM (intake, MIG2-R1.3): when STRESS_RUNTOOL_FAULT is
+  // set, EVERY step resolves with a poisoned verdict — green workload
+  // evidence (code 0, a parseable ok:true child summary) but a FAILED
+  // cleanup (groupEmpty:false + killError). Only the fold can make a runner
+  // red under this seam; no step may pass. Default: unset, zero effect.
+  if (process.env["STRESS_RUNTOOL_FAULT"]) {
+    return {
+      exitP: Promise.resolve({
+        code: 0,
+        signal: null,
+        timedOut: false,
+        stdoutTail: '{"ok":true,"note":"poisoned by STRESS_RUNTOOL_FAULT"}\n',
+        stderrTail: "",
+        durationMs: 0,
+        spawnError: null,
+        groupEmpty: false,
+        survivors: [],
+        killError: "injected cleanup failure (STRESS_RUNTOOL_FAULT)",
+        pgid: null,
+      }),
+    };
+  }
+  // MIG2: one anchored, drained, bounded step through the lib. The group is
+  // reaped on EVERY completion path (timeout -> TERM -> FINAL KILL ->
+  // verify; successful-launcher stragglers reaped too). Keep this
+  // SYNCHRONOUS — runners do `const t = runTool(...); await t.exitP`.
   const started = Date.now();
-  const child = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
-  let spawnError = null;
-  child.on("error", (cause) => { spawnError = cause; });
-  let stdout = "";
-  let stderr = "";
-  child.stdout?.on("data", (chunk) => { stdout = (stdout + chunk).slice(-200_000); });
-  child.stderr?.on("data", (chunk) => { stderr = (stderr + chunk).slice(-200_000); });
-  let timedOut = false;
-  const exitP = new Promise((resolveExit) => {
-    const timer = setTimeout(() => {
-      timedOut = true;
-      if (killOnTimeout) void killTree(child, new Promise((res) => child.on("close", (c, s) => res({ code: c, signal: s }))), 5_000);
-    }, timeoutMs);
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      resolveExit({ code, signal, timedOut });
-    });
-  });
+  const stepP = runStep(cmd, args, { env, timeoutMs, win32, taskkillRunner });
   return {
-    exitP: exitP.then((r) => ({
-      code: spawnError ? -1 : (r?.code ?? null),
-      signal: r?.signal ?? null,
-      timedOut: r?.timedOut ?? timedOut,
-      stdoutTail: stdout.slice(-20_000),
-      stderrTail: stderr.slice(-20_000),
+    exitP: stepP.then((r) => ({
+      code: r.pid === null && r.error ? -1 : r.code,
+      signal: r.signal ?? null,
+      timedOut: r.timedOut === true,
+      stdoutTail: String(r.stdout ?? "").slice(-20_000),
+      stderrTail: String(r.stderr ?? "").slice(-20_000),
       durationMs: Date.now() - started,
-      spawnError: spawnError ? String(spawnError) : null,
+      spawnError: r.error ?? null,
+      // Truthful teardown evidence from the lib (never folded away):
+      groupEmpty: r.groupEmpty,
+      survivors: r.survivors ?? [],
+      killError: r.killError ?? null,
+      // The anchored pgid for follow-up cleanup through the authoritative
+      // handle (registeredHandleFor) when a verdict is non-green.
+      pgid: r.pgid ?? null,
     })),
-    child,
   };
 }

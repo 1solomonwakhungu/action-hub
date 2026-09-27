@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { userInfo } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { buildIsolatedEnv, assertFinalEnv, SANDBOX_KEYS } from "../isolation.mjs";
 
 // Independent literal checklist (R7): NOT derived from SANDBOX_KEYS, so a key
@@ -18,8 +18,14 @@ const LITERAL_CHECKLIST = [
 test("literal isolation checklist: every var replaced and inside the run root", () => {
   const previous = { ...process.env };
   try {
-    // Hostile inherited values everywhere; none may survive.
-    for (const key of LITERAL_CHECKLIST) process.env[key] = previous["HOME"];
+    // Hostile inherited values everywhere; none may survive. The temp-base
+    // trio is excluded: a hostile temp base inside owner state is refused
+    // PRE-WRITE by the shared lib (stricter than the pre-MIG2 module, which
+    // allowed a whole-home base) — that refusal is test 4's subject.
+    for (const key of LITERAL_CHECKLIST) {
+      if (key === "TMPDIR" || key === "TMP" || key === "TEMP") continue;
+      process.env[key] = previous["HOME"];
+    }
     const { env, root } = buildIsolatedEnv({ ACTION_HUB_HTTP_TOKEN: "tok" });
     for (const key of LITERAL_CHECKLIST) {
       assert.ok(typeof env[key] === "string" && env[key].length > 0, `${key} must be replaced`);
@@ -67,7 +73,12 @@ test("hostile temp base is refused BEFORE any write", () => {
   try {
     assert.throws(() => buildIsolatedEnv({}), /owner app state/);
     // Pre-write guarantee: the refused base must not gain a sandbox dir.
-    assert.ok(!existsSync(`${hostileTmp}/ah-stress-iso-`), "no sandbox dir may be created inside the hostile temp base");
+    // F36 fix: a literal existsSync("<base>/ah-stress-iso-") misses the
+    // mkdtemp-SUFFIXED directory names — scan the base for the prefix.
+    if (existsSync(hostileTmp)) {
+      const litter = readdirSync(hostileTmp).filter((name) => name.startsWith("ah-stress-iso-"));
+      assert.deepEqual(litter, [], "no sandbox dir (prefixed or suffixed) may be created inside the hostile temp base");
+    }
   } finally {
     if (previous === undefined) delete process.env["TMPDIR"];
     else process.env["TMPDIR"] = previous;

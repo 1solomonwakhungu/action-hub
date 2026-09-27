@@ -20,9 +20,9 @@
 import { mkdir, readdir, writeFile, copyFile, symlink, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
 import { conformanceEvidence } from "./parsers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -86,6 +86,7 @@ async function main() {
   });
 
   let run;
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     const res = await runTool(
       "npx",
@@ -118,9 +119,11 @@ async function main() {
       stderr: res.stderrTail.slice(-3000),
       stdoutTail: res.stdoutTail.slice(-2000),
       spawnError: res.spawnError,
+      // MIG2-R1: the step verdict rides on the run row and is folded below.
+      stepVerdict: res,
     };
   } finally {
-    await killTree(serve.child, serve.exitP);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
   // Parse per-scenario result files: the suite writes one directory per
@@ -146,14 +149,10 @@ async function main() {
   run.scenarioCount = scenarios.length;
   run.scenarios = scenarios.length;
   const evidence = conformanceEvidence(scenarios);
-  run.counts = { success: evidence.success, failure: evidence.failure, warning: evidence.warning, scenarios: scenarios.length };
-  run.evidence = { ok: evidence.ok, reason: evidence.reason };
-  run.ok =
-    run.exitCode === 0 &&
-    !run.timedOut &&
-    !run.spawnError &&
-    evidence.ok === true;
-  if (!run.ok && evidence.reason) run.evidenceReason = evidence.reason;
+  // MIG2-R1 (ordering): the step-verdict fold happens INSIDE the evaluator,
+  // BEFORE run.ok is derived — valid evidence with a failed cleanup can
+  // never be green (reviewer-1's exact remaining case).
+  evaluateConformanceRun(run, evidence);
 
   const summary = {
     script: "conformance.mjs",
@@ -166,10 +165,39 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }
 
-main().catch(async (cause) => {
+/**
+ * Pure evaluator (reviewer-1 MIG2-R1.5): derives the run row's verdict from
+ * workload evidence AND the folded step verdict — the fold happens BEFORE
+ * ok is computed, so valid evidence + a failed teardown is red. Exported
+ * for the discriminating caller-level regression.
+ */
+export function evaluateConformanceRun(run, evidence) {
+  run.counts = { success: evidence.success, failure: evidence.failure, warning: evidence.warning, scenarios: run.scenarios };
+  run.evidence = { ok: evidence.ok, reason: evidence.reason };
+  // Workload evidence first, THEN the fold (which sets run.ok=false and
+  // attaches cleanupFailures on any cleanup problem), then ok is the CONJUNCTION —
+  // the fold's false must survive the evidence derivation.
+  const workloadOk =
+    run.exitCode === 0 &&
+    !run.timedOut &&
+    !run.spawnError &&
+    evidence.ok === true;
+  foldCleanupVerdict(run, run.stepVerdict, "conformance suite");
+  run.ok = workloadOk && run.ok !== false;
+  if (!run.ok && evidence.reason && !evaluatedCleanup(run)) run.evidenceReason = evidence.reason;
+  return run;
+}
+
+function evaluatedCleanup(run) {
+  return Array.isArray(run.cleanupFailures) && run.cleanupFailures.length > 0;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch(async (cause) => {
   const summary = {
     script: "conformance.mjs",
     ok: false,
@@ -177,4 +205,6 @@ main().catch(async (cause) => {
     at: new Date().toISOString(),
   };
   await finish(summary);
-});
+  });
+}
+
