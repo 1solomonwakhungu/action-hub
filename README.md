@@ -264,15 +264,15 @@ Running the stress suite **requires a fully isolated environment**
 config or cache.
 
 **Load profile** (k6 JSON-RPC mix, full profile on main `f53adbc`, which
-includes #63 and #68): **263.6 RPS** served at the top of the 100→500-VU ramp
-with **1.73% HTTP failures** and **98.3% checks** (the 99% checks bar
-narrowly fails only at that extreme), overall p99 **2.9 s**, `initialize`
-p99 **12.9 s**, peak RSS **765 MB**. In the sustained 10–40 RPS steps:
-**0 failures**, search p95 **747 ms**; the throughput knee sits near
-**~110 RPS**. For history: the pre-#63/#68 run (#47 evidence, `205aaf6`)
-measured 85 RPS served / 13.7% failures at the extreme ramp and ~0.8% in the
-10–40 RPS band. Treat the ramp numbers as worst-case saturation, not
-steady-state SLAs.
+includes #63 and #68; metrics aggregate the 100→500-VU ramp **and** the
+5-minute soak): **263.6 RPS** served with **1.73% HTTP failures** and
+**98.3% checks** (the 99% checks bar narrowly misses across the full
+profile), overall p99 **2.9 s**, `initialize` p99 **12.9 s**, peak RSS
+**765 MB**. In the sustained 10–40 RPS steps: **0 failures**, search p95
+**747 ms**; the throughput knee sits near **~110 RPS**. For history: the
+pre-#63/#68 run (#47 evidence, `205aaf6`) measured 85 RPS served / 13.7%
+failures at the extreme ramp and ~0.8% in the 10–40 RPS band. Treat the
+ramp numbers as worst-case saturation, not steady-state SLAs.
 
 Reliability behaviors shipped in the current release:
 
@@ -300,12 +300,14 @@ Reliability behaviors shipped in the current release:
   with `cached: true`.
 - **Progress-aware daemon start** (#70): overall cap **120 s** (override via
   `--start-timeout` or `ACTION_HUB_DAEMON_START_TIMEOUT_MS`), with a **15 s
-  no-progress window** that any sign of life (log growth, state-file write,
-  live pid) resets. A daemon that dies during startup fails immediately.
+  no-progress window** that log growth or a successful readiness probe
+  resets. A daemon that dies during startup fails immediately.
 - **`doctor` is deterministic under flapping servers** (#61): one retry after
-  a 250 ms settle delay, probes run serially inside a total deadline, and the
-  exit code is explainable — `1` iff any enabled server is still down at
-  check time after the retry.
+  a 250 ms settle delay, probes run serially inside a total deadline. For the
+  downstream connectivity checks, the exit code is `1` iff any enabled server
+  is still down at check time after the retry; an incompatible Node runtime
+  also counts as a critical failure, and teardown errors can fail the
+  command.
 - **The daemon stays responsive during reindex** (#63): index embedding runs
   cooperatively so the event loop keeps serving; `daemon.json` exposes
   `indexing: boolean` and `indexingSettledAt: string | null` so callers can
