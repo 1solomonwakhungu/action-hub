@@ -1,0 +1,37 @@
+name: spike-sea-embeddings
+# THROWAWAY spike branch (never merged to main): verifies that a Node SEA
+# with @huggingface/transformers + vendored int8 MiniLM-L6 builds and runs
+# fully offline on all three OSes. workflow_dispatch only.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sea-embeddings:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: spike
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"  # exact version: blob and binary MUST match
+      - name: Install deps
+        run: npm install @huggingface/transformers esbuild postject --no-save
+      - name: Build SEA + run one offline query
+        run: node spike-build.mjs
+      - name: Upload spike result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-sea-${{ matrix.os }}
+          path: spike/sea-config.json
+          if-no-files-found: ignore

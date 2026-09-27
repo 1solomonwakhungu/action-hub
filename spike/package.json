@@ -1,0 +1,7 @@
+{
+  "name": "sq4-sea-spike",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Throwaway spike: Node SEA with offline WASM MiniLM-L6 embeddings. Never merged to main."
+}
