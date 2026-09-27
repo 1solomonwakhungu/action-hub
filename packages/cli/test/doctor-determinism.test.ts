@@ -186,7 +186,12 @@ test("44-server fleet with failures and hangs finishes within a wall-time ceilin
     assert.equal(code, 1, "fleet with dead and hung servers must exit 1");
     // Ceiling: 44 servers, serial, bounded per attempt — far below the
     // unbounded 44 x 2 x (30s index + 5s health) the old code allowed.
-    assert.ok(wallMs < 45_000, `fleet run took ${wallMs}ms, expected < 45s`);
+    // Raised from 45s when the anchor/wrapper moved in-binary (PR 77 round 8):
+    // every attempt now pays two CLI module-graph loads (~70ms each) instead of
+    // bare `node -e` spawns, ~+6-12s wall across the fleet under parallel test
+    // contention. The ceiling still guards the same property: bounded serial
+    // probing and teardown must terminate well under any unbounded hang.
+    assert.ok(wallMs < 60_000, `fleet run took ${wallMs}ms, expected < 60s`);
 
     // No hung survivors, evidenced by the exact PIDs the fixtures recorded:
     // every hang server wrote its own PID; each must be dead after the
