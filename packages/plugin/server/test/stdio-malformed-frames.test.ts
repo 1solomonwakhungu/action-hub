@@ -38,6 +38,8 @@ test("stdio server replies to malformed JSON-RPC frames (F53)", async () => {
       stdio: ["pipe", "pipe", "pipe"],
     },
   );
+  // Captured BEFORE the try block so a child that exits early still races.
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
   try {
     const replies: Array<Record<string, unknown>> = [];
     let buffer = "";
@@ -81,8 +83,15 @@ test("stdio server replies to malformed JSON-RPC frames (F53)", async () => {
     const listed = await waitFor((m) => m.id === 3 && m.result);
     assert.ok(listed, "tools/list still answered after malformed frames");
   } finally {
+    // F56a (HYG3): SIGKILL + a blind delay(250) races process reaping.
+    // Instead: race the child's 'exit' event against a bounded timeout,
+    // assert termination, and only then remove the scratch dir.
     child.kill("SIGKILL");
-    await delay(250); // bounded awaited exit; SIGKILL needs no graceful wait
+    const terminated = await Promise.race([
+      exited.then(() => true),
+      delay(5_000, undefined, { ref: false }).then(() => false),
+    ]);
+    assert.ok(terminated, "stdio child must terminate after SIGKILL within the bounded wait");
     rmSync(root, { recursive: true, force: true });
   }
 });

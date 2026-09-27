@@ -368,8 +368,6 @@ export async function runDaemonServer(): Promise<void> {
  *    expose the parsed frame (verified against the SDK source: union failure
  *    issues carry no input), so the reply is `-32600 Invalid Request` with
  *    `id: null` — never a guessed id;
- *  - the SDK's "Unknown message type" errors embed the parsed frame in the
- *    message; when its `id` is a string or number it is echoed verbatim.
  * Every frame is answered at most once (WeakSet guard). Valid frames keep
  * the SDK's own ReadBuffer path (its 10 MiB bound and UTF-8 handling)
  * untouched.
@@ -389,25 +387,18 @@ export function installStdioMalformedFrameReplies(server: McpServer): void {
     const isSchemaRejection = !isSyntaxError && (error as { name?: unknown }).name === "ZodError";
     if (!isSyntaxError && !isSchemaRejection) return; // not a malformed frame; don't guess
     // JSON-RPC 2.0: unparseable JSON -> -32700; parseable but not a valid
-    // JSON-RPC message -> -32600. The id is echoed only when the SDK error
-    // exposes it (protocol "Unknown message type" errors embed the parsed
-    // frame); ZodError carries no input, so schema-invalid frames are
-    // answered with id null rather than a guessed one.
+    // JSON-RPC message -> -32600. Both classifier paths (SyntaxError,
+    // ZodError) expose neither the frame nor its id, so the reply id is
+    // always null (JSON-RPC 2.0 requires null when the id is undetectable).
+    // F56b (HYG3): an earlier draft echoed the id out of the SDK's "Unknown
+    // message type" error message, but that error class is neither a
+    // SyntaxError nor a ZodError, so it is rejected by the classifier above
+    // and never reaches this code — the branch was unreachable and is gone.
     const parseErrorCode = isSyntaxError ? -32700 : -32600;
     const detail = isSyntaxError
       ? "Parse error"
       : "Invalid Request: the frame was not a valid JSON-RPC message";
-    let id: string | number | null = null;
-    const embedded = (error as { message?: unknown }).message;
-    if (typeof embedded === "string" && embedded.startsWith("Unknown message type: ")) {
-      try {
-        const frame: unknown = JSON.parse(embedded.slice("Unknown message type: ".length));
-        const candidate = (frame as { id?: unknown } | null)?.id;
-        if (typeof candidate === "string" || typeof candidate === "number") id = candidate;
-      } catch {
-        id = null;
-      }
-    }
+    const id: string | number | null = null;
     void protocol.transport
       ?.send({ jsonrpc: "2.0", id, error: { code: parseErrorCode, message: detail } } as unknown as JSONRPCMessage)
       .catch(() => undefined);

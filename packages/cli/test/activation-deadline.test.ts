@@ -53,11 +53,15 @@ function sleep(ms: number): Promise<void> {
 // finally block still runs cleanup; the timer is unref'd so it cannot keep
 // the process alive after the test ends.
 function hangGuard<T>(p: Promise<T>, label: string, ms = 60_000): Promise<T> {
+  // HYG3: clear the timer when the GUARDED promise wins, so the closure does
+  // not linger for the full window after a fast result (reviewer-2 note on
+  // PR 87; unref already meant this was cosmetic, not a leak).
+  let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
-    p,
+    p.finally(() => clearTimeout(timer)),
     new Promise<never>((_, reject) => {
-      const g = setTimeout(() => reject(new Error(`${label}: exceeded the ${ms}ms hang guard`)), ms);
-      g.unref?.();
+      timer = setTimeout(() => reject(new Error(`${label}: exceeded the ${ms}ms hang guard`)), ms);
+      timer.unref?.();
     }),
   ]);
 }
