@@ -9,15 +9,17 @@
 
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
+import { spawn } from "node:child_process";
 import { dirname } from "node:path";
 
 import {
   ISOLATION_VARS, FatalError, ownerHome, ownerStateDirs, pathContains,
   refusedInsideOwnerState, makeRunRoot, buildIsolatedEnv, assertIsolated,
   createSandbox, runStep, lastJsonLine, main,
+  spawnGroup, killGroupAndVerify, registeredGroups, registeredHandleFor,
 } from "./harness.mjs";
 
 const LIB_DIR = dirname(fileURLToPath(import.meta.url));
@@ -41,6 +43,8 @@ await main(async () => {
   const checks = [];
 
   // --- 0. env-table single source of truth (drift check) -------------------
+  console.error("[progress]", "\"0. env-table single source of truth (drift check)\"".replace(/---/g, "").trim());
+
   {
     // harness.mjs already put test-isolation.mjs in library mode.
     const { ISOLATION_CHECKLIST } = await import("../../test-isolation.mjs");
@@ -56,6 +60,8 @@ await main(async () => {
   }
 
   // --- 1. hostile run-root location is refused with nothing created ---------
+  console.error("[progress]", "\"1. hostile run-root location is refused with nothing created\"".replace(/---/g, "").trim());
+
   {
     const hostile = join(ownerHome(), ".cache", "action-hub", "harness-check-hostile");
     const conflict = refusedInsideOwnerState(hostile);
@@ -83,6 +89,8 @@ await main(async () => {
   }
 
   // --- 2. isolated env: complete, sandboxed, hostile base replaced ----------
+  console.error("[progress]", "\"2. isolated env: complete, sandboxed, hostile base replaced\"".replace(/---/g, "").trim());
+
   {
     const { root, env } = createSandbox({ prefix: "harness-check-env-" });
     try {
@@ -106,6 +114,8 @@ await main(async () => {
   }
 
   // --- 3. assertIsolated refuses leaks (FatalError) --------------------------
+  console.error("[progress]", "\"3. assertIsolated refuses leaks (FatalError)\"".replace(/---/g, "").trim());
+
   {
     const { root, env } = createSandbox({ prefix: "harness-check-leak-" });
     try {
@@ -118,6 +128,8 @@ await main(async () => {
   }
 
   // --- 4. timed-out step: group killed, ZERO survivors -----------------------
+  console.error("[progress]", "\"4. timed-out step: group killed, ZERO survivors\"".replace(/---/g, "").trim());
+
   {
     const { root, env } = createSandbox({ prefix: "harness-check-timeout-" });
     try {
@@ -162,6 +174,8 @@ await main(async () => {
   }
 
   // --- 5b. adversarial: grandchild that IGNORES TERM survives a timeout -----
+  console.error("[progress]", "\"5b. adversarial: grandchild that IGNORES TERM survives a timeout\"".replace(/---/g, "").trim());
+
   {
     const { root, env } = createSandbox({ prefix: "harness-check-term-ignorer-" });
     try {
@@ -208,6 +222,8 @@ await main(async () => {
   }
 
   // --- 5c. adversarial: successful launcher leaves an unref'd grandchild ----
+  console.error("[progress]", "\"5c. adversarial: successful launcher leaves an unref\"d grandchild\"".replace(/---/g, "").trim());
+
   {
     const { root, env } = createSandbox({ prefix: "harness-check-unref-" });
     try {
@@ -239,6 +255,8 @@ await main(async () => {
   }
 
   // --- 6. ownerStateDirs includes dynamic wildcard entries -------------------
+  console.error("[progress]", "\"6. ownerStateDirs includes dynamic wildcard entries\"".replace(/---/g, "").trim());
+
   {
     const ownerRoot = makeRunRoot("harness-check-owner-");
     const fakeHome = join(ownerRoot, "fake-owner-home");
@@ -263,6 +281,8 @@ await main(async () => {
   }
 
   // --- 7. main(): stale results removed, failure contract exactly-once ------
+  console.error("[progress]", "\"7. main(): stale results removed, failure contract exactly-once\"".replace(/---/g, "").trim());
+
   {
     const mainRoot = makeRunRoot("harness-check-main-");
     const nestedResults = join(mainRoot, "results.json");
@@ -324,6 +344,525 @@ await main(async () => {
 
     process.exitCode = exitBefore === undefined ? null : exitBefore;
     rmSync(mainRoot, { recursive: true, force: true });
+  }
+
+  // --- 8. spawnGroup: long-lived child, killGroupAndVerify ladder -----------
+  console.error("[progress]", "\"8. spawnGroup: long-lived child, killGroupAndVerify ladder\"".replace(/---/g, "").trim());
+
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-group-" });
+    try {
+      assert.deepEqual(registeredGroups(), [], "registry starts empty");
+      // Long-lived child that writes its pid, then ignores TERM forever.
+      const marker = join(root, "group-child-pid");
+      const childCode =
+        `require('node:fs').writeFileSync(process.env.MARKER, String(process.pid));` +
+        `process.on('SIGTERM', () => {}); setInterval(() => {}, 500);`;
+      const handle = await spawnGroup(process.execPath, ["-e", childCode], { env: { ...env, MARKER: marker }, cwd: root });
+      // Design C: pgid is the ANCHOR pid (the dedicated detached group leader
+      // and the always-live ownership proof); pid is the WORKLOAD pid.
+      assert.equal(handle.pgid, handle.anchor.pid, "pgid must be the anchor pid (the group leader / ownership proof)");
+      assert.notEqual(handle.pgid, handle.pid, "workload pid and anchor pgid must be distinct processes");
+      assert.ok(registeredGroups().includes(handle.pgid), "spawnGroup must auto-register (keyed by the anchor's pgid)");
+      const deadline = performance.now() + 10_000;
+      while (!existsSync(marker) && performance.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(existsSync(marker), "long-lived child must have started (marker written)");
+      const childPid = Number(readFileSync(marker, "utf8").trim());
+      assert.equal(childPid, handle.pid, "the leader pid must be the spawned child");
+
+      // Ownership refusal: a BARE pgid (no owned handle) must NEVER be signalled.
+      const refused = await killGroupAndVerify(handle.pgid);
+      assert.equal(refused.groupEmpty, false);
+      assert.match(refused.error, /refused/);
+      assert.ok(aliveByProbe(childPid), "refused kill must not signal the group");
+
+      // The real ladder: owned handle, TERM-ignoring child -> SIGKILL -> empty.
+      const killed = await killGroupAndVerify(handle, { termGraceMs: 1_000, killDeadlineMs: 3_000 });
+      assert.equal(killed.groupEmpty, true, "TERM-ignoring long-lived child must be reaped to an EMPTY group");
+      assert.deepEqual(killed.survivors, []);
+      assert.ok(!aliveByProbe(childPid), "the child must be dead after killGroupAndVerify");
+      assert.ok(!registeredGroups().includes(handle.pgid), "verified-empty groups must unregister");
+      assert.equal(handle.terminal, true, "verified-empty handles must be marked terminal");
+
+      // F39 + reviewer LIB2-R2.2: a TERMINAL handle refuses forever — even if
+      // its old pgid were reused, no probe/signal may fire from the stale handle.
+      const gone = await killGroupAndVerify(handle);
+      assert.equal(gone.groupEmpty, true, "a terminal handle reports verified-empty WITHOUT probing or signalling");
+      assert.deepEqual(gone.survivors, []);
+      assert.equal(gone.error, undefined, "terminal refusal is a clean verdict, not an error");
+      checks.push({ check: "spawnGroup-killGroupAndVerify-ladder", ok: true, childPid });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8b. spawnGroup natural exit with an unref'd grandchild ----------------
+  console.error("[progress]", "\"8b. spawnGroup natural exit with an unref\"d grandchild\"".replace(/---/g, "").trim());
+
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-group-adopt-" });
+    try {
+      const marker = join(root, "grandchild-pid");
+      const launcherCode =
+        `const { spawn } = require("node:child_process");` +
+        `const g = spawn(process.execPath, ["-e", "require('node:fs').writeFileSync(process.env.MARKER, String(process.pid)); setInterval(() => {}, 500)"], { env: process.env, stdio: "ignore" });` +
+        `g.unref();` +
+        `const w = Date.now(); while (!require('node:fs').existsSync(process.env.MARKER) && Date.now() - w < 10000) {}`;
+      const handle = await spawnGroup(process.execPath, ["-e", launcherCode], { env: { ...env, MARKER: marker }, cwd: root });
+      await handle.exited; // leader exits naturally after the grandchild starts
+      const deadline = performance.now() + 10_000;
+      while (!existsSync(marker) && performance.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(existsSync(marker), "grandchild must have started");
+      const grandchildPid = Number(readFileSync(marker, "utf8").trim());
+      // The leader is gone but the group is NOT empty: the handle must STAY
+      // registered so the interrupt sweep can reap the survivor.
+      assert.ok(registeredGroups().includes(handle.pgid), "leader's natural exit must NOT unregister while the group still has members");
+      const killed = await killGroupAndVerify(handle, { termGraceMs: 1_000, killDeadlineMs: 3_000 });
+      assert.equal(killed.groupEmpty, true, "the surviving grandchild must be reaped by the owned kill");
+      assert.ok(!aliveByProbe(grandchildPid), "the orphaned grandchild must be dead");
+      checks.push({ check: "spawnGroup-leader-exit-keeps-registry-until-group-empty", ok: true, grandchildPid });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8c. main() SIGTERM: ONE interrupted JSON, groups dead, exit 143 -------
+  console.error("[progress]", "\"8c. main() SIGTERM: ONE interrupted JSON, groups dead, exit 143\"".replace(/---/g, "").trim());
+
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-sigterm-" });
+    const resultsPath = join(root, "interrupted.json");
+    try {
+      // The script under test: registers a TERM-ignoring long-lived group via
+      // spawnGroup, then idles until signalled. It must serialize exactly one
+      // interrupted summary and die with exit code 143.
+      const scriptPath = join(root, "sigterm-target.mjs");
+      const targetResults = join(root, "target-results.json");
+      writeFileSync(scriptPath, `
+import { spawnGroup, main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+await main(async () => {
+  const handle = await spawnGroup(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 500)"], { env: process.env, cwd: process.cwd() });
+  require('node:fs').writeFileSync(process.env.TARGET_PID_FILE, String(handle.pid));
+  await new Promise(() => {}); // idle forever; SIGTERM is the only way out
+}, { resultsPath: ${JSON.stringify(targetResults)} });
+`);
+      // NOTE: writeFileSync of an ESM script using require() would fail at
+      // runtime; use an fs import instead.
+      writeFileSync(scriptPath, `
+import { spawnGroup, main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+import { writeFileSync } from "node:fs";
+await main(async () => {
+  const handle = await spawnGroup(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 500)"], { env: process.env, cwd: process.cwd() });
+  writeFileSync(process.env.TARGET_PID_FILE, String(handle.pid));
+  await new Promise(() => {}); // idle forever; SIGTERM is the only way out
+}, { resultsPath: ${JSON.stringify(targetResults)} });
+`);
+      const targetEnv = { ...env, TARGET_PID_FILE: join(root, "target-pid") };
+      const proc = spawn(process.execPath, [scriptPath], { env: targetEnv, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+      let procStdout = "";
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (d) => { procStdout += d; });
+      const pidDeadline = performance.now() + 10_000;
+      while (!existsSync(targetEnv.TARGET_PID_FILE) && performance.now() < pidDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(existsSync(targetEnv.TARGET_PID_FILE), "target must have registered its group");
+      const groupLeaderPid = Number(readFileSync(targetEnv.TARGET_PID_FILE, "utf8").trim());
+      assert.ok(aliveByProbe(groupLeaderPid), "the long-lived group must be alive before the signal");
+
+      proc.kill("SIGTERM");
+      const exitCode = await new Promise((resolveP) => {
+        const t0 = performance.now();
+        proc.on("exit", (code2, signal2) => resolveP({ code: code2, signal: signal2, waited: performance.now() - t0 }));
+      });
+      assert.equal(exitCode.code, 143, `SIGTERM must produce exit 143, got ${JSON.stringify(exitCode)}`);
+      assert.ok(exitCode.waited < 15_000, `interrupt cleanup must be bounded (took ${exitCode.waited}ms)`);
+      const lines = procStdout.split("\n").filter((l) => l.trim() !== "");
+      assert.equal(lines.length, 1, `exactly ONE stdout JSON line, got: ${JSON.stringify(lines)}`);
+      const summary = JSON.parse(lines[0]);
+      assert.equal(summary.ok, false);
+      assert.equal(summary.interrupted, "SIGTERM");
+      assert.ok(summary.groupsKilled >= 1, "the registered group must have been swept");
+      assert.equal("survivors" in summary, false, "no survivors may remain");
+      const disk = JSON.parse(readFileSync(targetResults, "utf8"));
+      assert.deepEqual(disk, summary, "interrupt summary: file must carry the SAME final object");
+      // The registered group leader must be DEAD.
+      await new Promise((r) => setTimeout(r, TERM_LADDER_GRACE_MS));
+      assert.ok(!aliveByProbe(groupLeaderPid), "the registered long-lived group must be dead after the interrupt");
+      checks.push({ check: "main-sigterm-one-json-groups-dead-exit-143", ok: true, groupLeaderPid, groupsKilled: summary.groupsKilled });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8d. reviewer LIB2-R2.1: SIGTERM during an IN-FLIGHT runStep ----------
+  console.error("[progress]", "\"8d. reviewer LIB2-R2.1: SIGTERM during an IN-FLIGHT runStep\"".replace(/---/g, "").trim());
+
+  // The exact repro: a main() script whose fn() is awaiting a long runStep
+  // when SIGTERM lands. The interrupt sweep must be the ONLY final summary:
+  // exactly ONE ok:false JSON line (never a preceding ok:true from the
+  // step settling), exit 143, step group dead.
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-sigterm-step-" });
+    try {
+      const scriptPath = join(root, "sigterm-step-target.mjs");
+      const targetResults = join(root, "target-results.json");
+      writeFileSync(scriptPath, `
+import { runStep, main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+import { writeFileSync } from "node:fs";
+await main(async () => {
+  // Long child that ignores TERM and writes its pid, so the sweep has a
+  // registered group to kill while fn() is still awaiting the step.
+  const step = runStep(process.execPath, ["-e",
+    "const fs = require('node:fs'); if (process.env.STEP_PID_FILE) fs.writeFileSync(process.env.STEP_PID_FILE, String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 500)"],
+    { env: process.env, cwd: process.cwd(), timeoutMs: 120_000 });
+  writeFileSync(process.env.STEP_STARTED, "1");
+  const res = await step;
+  return { step: { code: res.code, signal: res.signal } }; // would emit ok:true pre-fix
+}, { resultsPath: ${JSON.stringify(targetResults)} });
+`);
+      const targetEnv = { ...env, STEP_PID_FILE: join(root, "step-pid"), STEP_STARTED: join(root, "step-started") };
+      const proc = spawn(process.execPath, [scriptPath], { env: targetEnv, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+      let procStdout = "";
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (d) => { procStdout += d; });
+      const startedDeadline = performance.now() + 10_000;
+      while (!existsSync(targetEnv.STEP_STARTED) && performance.now() < startedDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      const pidDeadline = performance.now() + 10_000;
+      while (!existsSync(targetEnv.STEP_PID_FILE) && performance.now() < pidDeadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(existsSync(targetEnv.STEP_PID_FILE), "the in-flight step must have started (pid written)");
+      const stepPid = Number(readFileSync(targetEnv.STEP_PID_FILE, "utf8").trim());
+      assert.ok(aliveByProbe(stepPid), "the step child must be alive before the signal");
+
+      proc.kill("SIGTERM"); // land while runStep is in flight
+      const exit = await new Promise((resolveP) => proc.on("exit", (code2, signal2) => resolveP({ code: code2, signal: signal2 })));
+      assert.equal(exit.code, 143, `interrupted in-flight runStep must exit 143, got ${JSON.stringify(exit)}`);
+      const lines = procStdout.split("\n").filter((l) => l.trim() !== "");
+      assert.equal(lines.length, 1, `exactly ONE stdout JSON line (no ok:true from the settled step), got: ${JSON.stringify(lines)}`);
+      const summary = JSON.parse(lines[0]);
+      assert.equal(summary.ok, false, "the only summary must be the interrupt summary");
+      assert.equal(summary.interrupted, "SIGTERM");
+      assert.equal("step" in summary, false, "the fn() result must NOT leak into the final summary");
+      await new Promise((r) => setTimeout(r, TERM_LADDER_GRACE_MS));
+      assert.ok(!aliveByProbe(stepPid), "the in-flight step's group must be dead");
+      checks.push({ check: "main-sigterm-inflight-runstep-one-json-exit-143", ok: true, stepPid });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8e. reviewer LIB2-R2.2: forged / stale / terminal handles -------------
+  console.error("[progress]", "\"8e. reviewer LIB2-R2.2: forged / stale / terminal handles\"".replace(/---/g, "").trim());
+
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-forge-" });
+    try {
+      // (a) A copied handle shape ({pgid, owned:true}) must be REFUSED.
+      const { execPath } = process;
+      const child = spawn(execPath, ["-e", "setInterval(()=>{},500)"], { env, cwd: root, detached: true, stdio: "ignore" });
+      const realPgid = child.pid; // live group that is NOT ours by handle
+      await new Promise((r) => setTimeout(r, 200));
+      const forged = await killGroupAndVerify({ pgid: realPgid, owned: true });
+      assert.equal(forged.groupEmpty, false, "forged handle must be refused");
+      assert.match(forged.error, /refused/);
+      assert.ok(aliveByProbe(realPgid), "forged handle must not have signalled the live group");
+      // (b) A bare pgid number must still be refused.
+      const bare = await killGroupAndVerify(realPgid);
+      assert.equal(bare.groupEmpty, false);
+      assert.match(bare.error, /refused/);
+      assert.ok(aliveByProbe(realPgid), "bare pgid must not have signalled the live group");
+      // (c) Terminal handles: verify-empty, then re-issue the SAME pgid via a
+      // second spawn, and prove the STALE terminal handle cannot signal the
+      // new group (the reviewer's pgid-reuse F39 case).
+      const marker = join(root, "reuse-pid");
+      const h1 = await spawnGroup(execPath, ["-e", "setInterval(()=>{},500)"], { env: { ...env, MARKER: marker }, cwd: root });
+      await new Promise((r) => setTimeout(r, 300));
+      const k1 = await killGroupAndVerify(h1, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
+      assert.equal(k1.groupEmpty, true);
+      assert.equal(h1.terminal, true, "handle must be terminal after verified-empty");
+      // Spin until the OS reuses h1.pgid for a NEW live child (bounded;
+      // usually immediate on macOS/Linux with the old group freshly dead).
+      let reused = null;
+      const reuseDeadline = performance.now() + 5_000;
+      while (reused === null && performance.now() < reuseDeadline) {
+        const probe = spawn(execPath, ["-e", "setInterval(()=>{},500)"], { env, cwd: root, detached: true, stdio: "ignore" });
+        await new Promise((r) => setTimeout(r, 150));
+        if (probe.pid === h1.pgid && aliveByProbe(probe.pid)) reused = probe;
+        else probe.kill("SIGKILL");
+      }
+      if (reused) {
+        try {
+          const stale = await killGroupAndVerify(h1); // terminal: must refuse
+          assert.equal(stale.groupEmpty, true, "stale terminal handle must be a clean no-op");
+          assert.equal(stale.error, undefined);
+          assert.ok(aliveByProbe(reused.pid), "the REUSED pgid's live group must be UNTOUCHED by the stale handle");
+        } finally {
+          try { process.kill(-reused.pid, "SIGKILL"); } catch { /* reaping our own probe */ }
+        }
+        checks.push({ check: "terminal-handle-cannot-signal-reused-pgid", ok: true, reusedPgid: reused.pid });
+      } else {
+        // pgid reuse not observed within the window (OS-dependent); the
+        // terminal no-op path is still proven above (b/c).
+        checks.push({ check: "terminal-handle-cannot-signal-reused-pgid", ok: true, reusedPgid: null, note: "pgid reuse not observed in window; terminal no-op verified" });
+      }
+      // Cleanup of the (a)/(b) probe group.
+      try { process.kill(-realPgid, "SIGKILL"); } catch { /* already gone */ }
+      await new Promise((r) => setTimeout(r, 200));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8f. reviewer LIB2-R3.3: win32 verdict mapping, EXERCISABLE anywhere --
+  // The win32 branch (taskkill /T /F against the anchor pid, truthful verdict
+  // mapping) is now behind an injectable seam: win32:true + taskkillRunner
+  // run the EXACT branch code on any host. These checks drive FAILED and
+  // successful verdicts through killGroupAndVerify AND BOTH runStep cleanup
+  // paths (timeout + nominal) on THIS host. On a real win32 host the same
+  // branch runs with the real taskkill (the platform default), so the
+  // win32-host assertion is retained.
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-taskkill-" });
+    try {
+      const failStub = () => ({ ok: false, status: 1, error: "stubbed taskkill failure" });
+
+      // (a) killGroupAndVerify seam: failed taskkill is NOT a green.
+      const h = await spawnGroup(process.execPath, ["-e", "setInterval(()=>{},500)"], { env, cwd: root });
+      const failedKill = await killGroupAndVerify(h, { win32: true, taskkillRunner: failStub });
+      assert.equal(failedKill.groupEmpty, false, "a failed taskkill must NOT report groupEmpty:true");
+      assert.match(failedKill.error, /taskkill failed/);
+      assert.equal(h.terminal, false, "a failed taskkill must NOT mark the handle terminal");
+      // Real cleanup through the normal (POSIX) ladder — the handle is still
+      // authoritative and registered.
+      const realDown = await killGroupAndVerify(h, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
+      assert.equal(realDown.groupEmpty, true);
+      assert.equal(h.terminal, true);
+
+      // (b) runStep TIMEOUT path propagates the failure verdict.
+      const resTimeout = await runStep(process.execPath, ["-e", 'process.on("SIGTERM",()=>{});setInterval(()=>{},500)'], {
+        env, cwd: root, timeoutMs: 800, win32: true, taskkillRunner: failStub,
+      });
+      assert.equal(resTimeout.timedOut, true);
+      assert.equal(resTimeout.groupEmpty, false, "runStep timeout: a failed taskkill must surface as groupEmpty:false");
+      assert.match(resTimeout.killError ?? "", /taskkill failed/);
+      assert.ok(resTimeout.pgid, "the result must expose the anchored pgid for cleanup");
+      // Real cleanup via the authoritative handle.
+      const handleT = registeredHandleFor(resTimeout.pgid);
+      assert.ok(handleT, "the failed-verdict handle must still be registered (non-terminal)");
+      assert.equal((await killGroupAndVerify(handleT, { termGraceMs: 1_000, killDeadlineMs: 2_000 })).groupEmpty, true);
+
+      // (c) runStep NOMINAL path propagates the failure verdict.
+      const resNominal = await runStep(process.execPath, ["-e", "process.exit(0)"], {
+        env, cwd: root, win32: true, taskkillRunner: failStub,
+      });
+      assert.equal(resNominal.code, 0);
+      assert.equal(resNominal.groupEmpty, false, "runStep nominal: a failed taskkill must surface as groupEmpty:false");
+      assert.match(resNominal.killError ?? "", /taskkill failed/);
+      const handleN = registeredHandleFor(resNominal.pgid);
+      assert.ok(handleN);
+      assert.equal((await killGroupAndVerify(handleN, { termGraceMs: 1_000, killDeadlineMs: 2_000 })).groupEmpty, true);
+
+      // (d) A SUCCESSFUL stubbed verdict maps to groupEmpty:true + terminal —
+      // and the stub makes that green TRUE: it kills the exact owned group
+      // (the check owns this handle; the kill is a deliberate verification
+      // kill) so the mapping's green is never asserted against a live group.
+      const h2 = await spawnGroup(process.execPath, ["-e", "setInterval(()=>{},500)"], { env, cwd: root });
+      const okStubKill = await killGroupAndVerify(h2, {
+        win32: true,
+        taskkillRunner: (pid) => {
+          try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+          return { ok: true, status: 0 };
+        },
+      });
+      assert.equal(okStubKill.groupEmpty, true);
+      assert.equal(h2.terminal, true);
+      // The green must be REAL: anchor and workload are actually dead.
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(h2.anchor.pid), "the anchor must be dead after a TRUE successful verdict");
+      assert.ok(!aliveByProbe(h2.pid), "the workload must be dead after a TRUE successful verdict");
+      assert.deepEqual(registeredGroups(), [], "no leak from the success-mapping check");
+
+      if (process.platform === "win32") {
+        // Real win32 host: the default (non-seam) path with the REAL taskkill.
+        const h3 = await spawnGroup(process.execPath, ["-e", "setInterval(()=>{},500)"], { env, cwd: root });
+        const realWin = await killGroupAndVerify(h3);
+        assert.equal(realWin.groupEmpty, true, "real win32 taskkill must verify empty");
+        assert.equal(h3.terminal, true);
+        checks.push({ check: "win32-taskkill-real-host", ok: true });
+      }
+      checks.push({ check: "win32-taskkill-failure-not-a-green", ok: true, note: "verdict mapping exercised on this host via the win32 seam (failed + successful stubs, runStep timeout + nominal paths); real win32 branch retained for win32 hosts" });
+      checks.push({ check: "win32-taskkill-failure-not-a-green-contract", ok: true });
+      assert.deepEqual(registeredGroups(), [], "all seam-driven handles must be reaped");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8i. Design C: anchor survives workload exit; dies only via cleanup ---
+  console.error("[progress]", "\"8i. Design C: anchor survives workload exit; dies only via cleanup\"".replace(/---/g, "").trim());
+
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-anchor-life-" });
+    try {
+      const h = await spawnGroup(process.execPath, ["-e", "console.log('bye')"], { env, cwd: root });
+      const exit = await h.exited; // the WORKLOAD exits naturally
+      assert.equal(exit.code, 0);
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(aliveByProbe(h.anchor.pid), "the anchor must STILL be alive after the workload exits (the group is never leaderless while the handle lives)");
+      assert.ok(registeredGroups().includes(h.pgid), "the handle must stay registered through workload exit");
+      const killed = await killGroupAndVerify(h, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
+      assert.equal(killed.groupEmpty, true, "post-exit teardown must dissolve the group via the anchor's control channel");
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(h.anchor.pid), "the anchor must die only via the cleanup path");
+      assert.equal(h.terminal, true);
+      assert.deepEqual(registeredGroups(), []);
+      checks.push({ check: "anchor-survives-workload-exit-dies-via-cleanup", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8j. reviewer LIB2-R3.1: spawn failures are reaped, never blessed ----
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-spawn-fail-" });
+    try {
+      // (a) Invalid COMMAND (ENOENT): the anchor program must NOT confirm a
+      // phantom pid; the handle stays non-terminal; the ladder reaps the live
+      // anchor and reports the truth. No orphan, no false green.
+      const hBad = await spawnGroup("/definitely/missing/binary-xyz", ["--flag"], { env, cwd: root });
+      assert.equal(hBad.pid, null, "an ENOENT workload must not produce a pid");
+      assert.equal(hBad.terminal, false, "a failed spawn must NOT be terminalized while its anchor may be live");
+      assert.ok(hBad.pgid, "the anchor pgid exists");
+      const downBad = await killGroupAndVerify(hBad, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
+      assert.equal(downBad.groupEmpty, true, "the failed spawn's group must be reaped through the normal ladder");
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(hBad.pgid), "no anchor may survive a failed-spawn cleanup");
+      assert.ok(!registeredGroups().includes(hBad.pgid));
+
+      // (b) Invalid CWD: the ANCHOR fails to spawn — the caller's process
+      // must NOT crash on an unhandled ChildProcess 'error' event, and the
+      // verdict must be fail-closed truth (nothing provable, nothing signalled).
+      const resBadCwd = await runStep(process.execPath, ["-e", "console.log(1)"], { env, cwd: "/definitely/missing/dir-xyz", timeoutMs: 10_000 });
+      assert.equal(resBadCwd.code, null);
+      assert.ok(resBadCwd.error, "an invalid-cwd step must surface an error, not crash");
+      assert.equal(resBadCwd.groupEmpty, false, "an unprovable group must never be reported empty");
+      assert.match(String(resBadCwd.killError ?? resBadCwd.error ?? ""), /fail closed|anchor/i);
+      assert.deepEqual(registeredGroups(), [], "no spawn-failure handle may leak in the registry");
+      checks.push({ check: "spawn-failure-reaped-never-blessed", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8l. reviewer LIB2-R5.1: sync control-serialization failure is reaped -
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-ctrl-ser-" });
+    try {
+      // BigInt args make JSON.stringify throw SYNCHRONOUSLY in ctrlWrite —
+      // before any byte reaches the anchor. The anchor stays live with no
+      // workload; the handle must remain non-terminal and authoritative, and
+      // the gated ladder must reap it (never a terminal false green).
+      const bad = await spawnGroup(process.execPath, [1n], { env, cwd: root });
+      assert.equal(bad.pid, null, "a serialization failure must not produce a workload pid");
+      assert.equal(bad.terminal, false, "a serialization failure must NOT terminalize the live anchor's handle");
+      assert.ok(bad.pgid, "the anchor pgid exists (the anchor is live, unconfirmed)");
+      const down = await killGroupAndVerify(bad, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
+      assert.equal(down.groupEmpty, true, "the serialization-failure group must be reaped through the normal ladder");
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(bad.pgid), "no anchor may survive a serialization-failure cleanup");
+      assert.ok(!registeredGroups().includes(bad.pgid), "the reaped handle must unregister");
+      checks.push({ check: "ctrl-serialization-failure-reaped-never-blessed", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8k. reviewer LIB2-R3.2: TERM is gated immediately before the signal --
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-term-gate-" });
+    try {
+      const h = await spawnGroup(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},500)"], { env, cwd: root });
+      // Spy: every negative-pgid SIGNAL (TERM/KILL) this process attempts.
+      const realKill = process.kill.bind(process);
+      const groupSignals = [];
+      process.kill = (pid, sig) => {
+        if (typeof pid === "number" && pid < 0 && (sig === "SIGTERM" || sig === "SIGKILL")) {
+          groupSignals.push({ pgid: -pid, sig });
+        }
+        return realKill(pid, sig);
+      };
+      try {
+        // The seam: between enumeration/probes and the TERM, kill the anchor.
+        const verdict = await killGroupAndVerify(h, {
+          termGraceMs: 1_000, killDeadlineMs: 1_000,
+          hooks: { beforeSignal: async () => { h.anchor.kill("SIGKILL"); await new Promise((r2) => setTimeout(r2, 150)); } },
+        });
+        assert.equal(verdict.groupEmpty, false, "an anchor that died before the TERM must yield a fail-closed verdict");
+        assert.match(verdict.error, /fail closed/);
+        assert.equal(groupSignals.length, 0, `ZERO negative-pgid signals may fire once the anchor is dead (got ${JSON.stringify(groupSignals)})`);
+      } finally {
+        process.kill = realKill;
+      }
+      // Check hygiene: the workload is our own descendant via the handle pid.
+      try { realKill(h.pid, "SIGKILL"); } catch { /* gone */ }
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(h.pid), "the check's own workload must be dead after hygiene (no leak)");
+      assert.ok(!aliveByProbe(h.anchor.pid), "the check's own anchor must be dead after hygiene (no leak)");
+      checks.push({ check: "term-gated-on-live-anchor-zero-signals", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8h. Design C: unexpected anchor death -> fail closed, zero signals --
+  console.error("[progress]", "\"8h. Design C: unexpected anchor death -> fail closed, zero signals\"".replace(/---/g, "").trim());
+
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-anchor-death-" });
+    try {
+      const h = await spawnGroup(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},500)"], { env, cwd: root });
+      // Spy: count every negative-pgid SIGNAL (TERM/KILL; sig-0 probes are
+      // probes, not signals, and are permitted).
+      const realKill = process.kill.bind(process);
+      const groupSignals = [];
+      process.kill = (pid, sig) => {
+        if (typeof pid === "number" && pid < 0 && (sig === "SIGTERM" || sig === "SIGKILL")) {
+          groupSignals.push({ pgid: -pid, sig });
+        }
+        return realKill(pid, sig);
+      };
+      try {
+        // Kill the anchor directly (single pid — provably ours via the exact
+        // ChildProcess on the handle; never a negative-pgid signal).
+        h.anchor.kill("SIGKILL");
+        await new Promise((r) => setTimeout(r, 400));
+        assert.ok(aliveByProbe(h.pid), "the workload must still be alive after its anchor died (it is not the anchor's business to kill it)");
+        const verdict = await killGroupAndVerify(h, { termGraceMs: 500, killDeadlineMs: 1_000 });
+        assert.equal(verdict.groupEmpty, false, "an unexpected anchor death must NOT be reported as a green");
+        assert.match(verdict.error, /fail closed/, "the verdict must name the fail-closed refusal");
+        assert.equal(h.terminal, false, "a fail-closed handle stays non-terminal (the state is unresolved)");
+      } finally {
+        process.kill = realKill;
+      }
+      assert.equal(groupSignals.length, 0, `no negative-pgid signal may fire once the anchor is dead (got ${JSON.stringify(groupSignals)})`);
+      // Check hygiene: the workload is our own descendant (handle.pid — a
+      // single pid we spawned); clean it up with a direct pid kill.
+      try { realKill(h.pid, "SIGKILL"); } catch { /* already gone */ }
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(h.pid), "the check's own workload must be dead after hygiene (no leak)");
+      assert.ok(!aliveByProbe(h.anchor.pid), "the check's own anchor must be dead after hygiene (no leak)");
+      checks.push({ check: "anchor-death-fail-closed-zero-signals", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 
   return { checks, suite: "harness.check" };
