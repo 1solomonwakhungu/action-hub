@@ -16,6 +16,7 @@ import {
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { createSdkClientFactory } from "./sdk-client.js";
 import { warn, writeSnapshot, SnapshotDebouncer } from "./snapshot.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import {
   LOAD_DESCRIPTION_MAX_BYTES,
   LOAD_SCHEMA_MAX_BYTES,
@@ -265,6 +266,52 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
       }
     },
   );
+
+  // FX19 (F6/F7): MCP-conformance guards around the SDK's registered
+  // handlers. Tool-level input errors are normally CallToolResult errors
+  // (isError), but two violations are protocol-level per the MCP spec and
+  // must surface as JSON-RPC -32602: a missing/empty query for `search`
+  // (and missing action_id for load/execute, same validation class), and an
+  // unrecognized `tools/list` cursor (we never issue cursors, so any cursor
+  // is unknown). The SDK converts McpErrors thrown inside the tool callback
+  // into tool results, so these guards wrap the registered handlers
+  // themselves. The private _requestHandlers map is pinned to the bundled
+  // SDK version; if it ever moves, the guards degrade to the previous
+  // behavior (no conformance error) rather than breaking the server.
+  const protocol = server.server as unknown as {
+    _requestHandlers?: Map<string, (request: unknown, extra: unknown) => Promise<unknown>>;
+  };
+  const requestHandlers = protocol._requestHandlers;
+  if (requestHandlers) {
+    const originalCallTool = requestHandlers.get("tools/call");
+    if (originalCallTool) {
+      requestHandlers.set("tools/call", async (request, extra) => {
+        const params = (request as { params?: { arguments?: Record<string, unknown> } }).params ?? {};
+        const input = (params.arguments ?? {}) as ToolInput;
+        if (input.operation === "search" && (typeof input.query !== "string" || input.query.trim() === "")) {
+          throw new McpError(ErrorCode.InvalidParams, "query is required");
+        }
+        if ((input.operation === "load" || input.operation === "execute") && !input.action_id) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `"action_id" is required for operation "${input.operation}"`,
+          );
+        }
+        return originalCallTool(request, extra);
+      });
+    }
+    const originalListTools = requestHandlers.get("tools/list");
+    if (originalListTools) {
+      requestHandlers.set("tools/list", async (request, extra) => {
+        const cursor = (request as { params?: { cursor?: string } }).params?.cursor;
+        if (typeof cursor === "string" && cursor !== "") {
+          // The hub issues no pagination cursors, so any cursor is unknown.
+          throw new McpError(ErrorCode.InvalidParams, "Unknown pagination cursor");
+        }
+        return originalListTools(request, extra);
+      });
+    }
+  }
 
   return server;
 }
