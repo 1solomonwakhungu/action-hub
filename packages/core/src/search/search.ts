@@ -161,10 +161,17 @@ export class SearchEngine {
         ? (sorted[0]?.score ?? 0) * ratio
         : 0;
 
+    // Raw semantic score per hit (SQ3/SQ4): confidence consumers (e.g. the
+    // abstention gate) key on this scale, not the fused score.
+    const semanticById = semantic
+      ? new Map(candidates.map((record, i) => [record.id, semantic[i] ?? 0]))
+      : undefined;
     return sorted
       .filter((entry) => entry.score >= cutoff)
       .slice(0, limit)
-      .map((entry) => toHit(entry.record, entry.score, options.includeSchema ?? false));
+      .map((entry) =>
+        toHit(entry.record, entry.score, options.includeSchema ?? false, semanticById?.get(entry.record.id)),
+      );
   }
 
   /**
@@ -350,7 +357,7 @@ function blend(lexicalScore: number, semanticScore: number, weight: number): num
   return (1 - weight) * squashed + weight * semanticScore;
 }
 
-function toHit(record: ActionRecord, score: number, includeSchema = false): SearchHit {
+function toHit(record: ActionRecord, score: number, includeSchema = false, semantic?: number): SearchHit {
   return {
     id: record.id,
     kind: record.kind,
@@ -358,6 +365,7 @@ function toHit(record: ActionRecord, score: number, includeSchema = false): Sear
     name: record.name,
     summary: record.summary,
     score: Number(score.toFixed(6)),
+    ...(semantic !== undefined ? { semantic: Number(semantic.toFixed(4)) } : {}),
     ...(includeSchema && record.inputSchema ? { inputSchema: record.inputSchema } : {}),
   };
 }

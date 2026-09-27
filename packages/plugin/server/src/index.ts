@@ -473,7 +473,15 @@ async function dispatch(
       // total — a thin calibration base.
       const matchingBundles = hub.searchBundles(input.query ?? "");
       if (abstention.enabled && matchingBundles.length === 0) {
-        const topScore = hits[0]?.score ?? 0;
+        // Confidence keys on the RAW semantic score when the channel is
+        // active (SQ4): under RRF fusion the fused `score` is rank-scale
+        // (≈1/(60+rank)) and has no absolute meaning, so thresholds
+        // calibrated on semantic cosines (SQ1/SQ3) would refuse every
+        // match. The hashed scorer leaves `semantic` undefined and the
+        // fused score keeps its calibrated blend scale — both scales are
+        // cosine-ish, so one threshold serves both with the documented
+        // per-catalog recalibration caveat.
+        const topScore = hits[0]?.semantic ?? hits[0]?.score ?? 0;
         if (hits.length === 0 || topScore < abstention.threshold) {
           return {
             ok: true,
@@ -483,7 +491,10 @@ async function dispatch(
             reason: "no_confident_match",
             threshold: abstention.threshold,
             closestMatch: hits[0]
-              ? { id: hits[0].id, score: Math.round((hits[0].score ?? 0) * 1000) / 1000 }
+              ? {
+                  id: hits[0].id,
+                  score: Math.round((hits[0].semantic ?? hits[0].score ?? 0) * 1000) / 1000,
+                }
               : null,
             hint: "No action scored above the confidence threshold and no bundle matched. Rephrase with the exact tool or domain name, or ask the user how to proceed.",
           };
