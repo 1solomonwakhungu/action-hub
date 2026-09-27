@@ -862,6 +862,27 @@ export async function main(fn, { resultsPath, extraInterruptCleanup, extraCleanu
   if (!resultsPath) {
     throw new TypeError("main() requires { resultsPath } — the final summary must have a durable home");
   }
+  // F61: refuse an owner-state resultsPath BEFORE ANY filesystem operation —
+  // the guarded region below starts with rmSync(resultsPath) and later
+  // writes the durable summary; both must never touch owner app state.
+  // The refusal still honors main()'s ONE-summary contract (reviewer
+  // F61-R2): exactly one ok:false JSON line on stdout + exit 1, with ZERO
+  // fs mutations — the artifact is not written because the path itself is
+  // refused, and the summary says so.
+  const ownerDir = refusedInsideOwnerState(resultsPath);
+  if (ownerDir) {
+    const final = {
+      ok: false,
+      error:
+        `resultsPath ${resolve(resultsPath)} lies inside owner app state ${ownerDir}; ` +
+        "refused BEFORE any filesystem operation (F61); no results artifact written",
+      artifactWritten: false,
+      totalMs: 0,
+    };
+    console.log(JSON.stringify(final));
+    process.exitCode = 1;
+    return final;
+  }
   const started = performance.now();
   let ok = true;
   let error = null;
