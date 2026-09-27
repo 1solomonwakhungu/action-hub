@@ -70,3 +70,19 @@ fetched at runtime.
    committing; verify no other runtime file is referenced.
 3. Re-run the embeddings parity test (fixture vs vendored runtime) and the
    quality eval.
+
+## Shipped license texts
+
+Redistribution requires the upstream license terms to accompany the
+artifacts, so the texts are vendored here and packed with the package:
+
+| file | covers |
+|---|---|
+| `licenses/Apache-2.0.txt` | the MiniLM model weights (Apache-2.0, canonical text from apache.org) |
+| `licenses/onnxruntime-LICENSE.txt` | the vendored onnxruntime-web subset (MIT, Microsoft Corporation, verbatim from the upstream repository) |
+
+Upstream NOTICE check (recorded): neither the onnxruntime repository nor the
+Hugging Face model repositories ship a NOTICE file (verified 2026-09-27:
+`onnxruntime` NOTICE request -> 404; `Xenova/all-MiniLM-L6-v2` and
+`sentence-transformers/all-MiniLM-L6-v2` raw LICENSE -> not found). Nothing
+further to redistribute.

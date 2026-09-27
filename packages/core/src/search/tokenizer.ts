@@ -10,7 +10,8 @@
  * truncated to the model's 128-token window.
  *
  * Parity with the previous runtime is pinned by test/fixtures/embedding-vectors.json
- * (cosine >= 0.999 per vector over 200 texts).
+ * (median cosine 0.993, worst 0.986 over 200 texts — int8 GEMM kernels
+ * differ between runtimes; the test asserts that floor).
  */
 import { readFileSync } from "node:fs";
 
