@@ -84,16 +84,22 @@ and re-run before/after any optimization.
    this band as advisory — a full-scale rerun can flag while staying green.
 3. **`action_hub` execute response still drops `ExecuteResult.cached`** —
    the bench measures cache effect indirectly via repeat-vs-distinct latency.
-   Small scale: repeats ~1.2-2.2× faster than distinct. Full scale: HTTP
-   ~1.37×, stdio noisy (0.73-1.27× — a repeat can measure slower than a
-   distinct call at scale); treat small-scale numbers as the clean signal.
-4. **Daemon `start` does not become ready at fleet scale**: its 15s
-   readiness window (`START_TIMEOUT_MS` in packages/cli/src/commands/daemon.ts)
-   is smaller than a 44-server boot (6-19s observed, more under load), and
-   `daemon.log` contains only child stderr with no hub progress markers.
-   Concurrent-connect behavior is packet D1 (builder-1). (PR 58 rerun:
-   the daemon contract passes at full scale — 20/20 clients connect and
-   complete searches, 0 errors.)
+   Corrected methodology (PR 101 rework): the distinct baseline now uses 100
+   PROVABLY unique schema-valid arg sets (cardinality asserted and reported
+   as `distinctArgSets` in the summary); the first rework iteration silently
+   measured only 2 unique sets (a boolean-only schema) and its ratios were
+   invalid. Corrected full-scale result: speedup http ~0.75, stdio ~1.6 —
+   the cache's full-scale benefit is marginal and noisy in both directions;
+   small scale (~1.2-2.2×) remains the cleaner signal. Do not cite the
+   pre-PR-101 full-scale cache ratios.
+4. **Daemon `start` passes at fleet scale** (PR 58 rerun: the daemon
+   contract passes at full scale — 20/20 clients connect and complete
+   searches, 0 errors). Current behavior: `daemon.ts` caps start at an
+   overall 120s limit plus a 15s no-progress window (`START_TIMEOUT_MS` is
+   the daemon-stop wait, not a start window). Historical: the original run
+   failed with a fixed 15s start window smaller than a 44-server boot —
+   superseded by the current cap-and-progress design; the old fixed-window
+   failure is kept here only as history.
 5. **Hub memory at full scale**: hub process peak RSS ~0.5GB (cold boot)
    and ~1.0GB steady-state under the HTTP or stdio scenarios; the 20-client
    daemon hub holds ~346MB. Children add ~30MB each × 44 fake servers.
