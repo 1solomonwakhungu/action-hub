@@ -287,32 +287,6 @@ const DOMAINS = [
   },
 ];
 
-const INSTRUCTION_VERBS = [
-  "Confirm",
-  "Capture",
-  "Verify",
-  "Stage",
-  "Record",
-  "Cross-check",
-  "Escalate",
-  "Schedule",
-];
-const INSTRUCTION_CONDITIONS = [
-  "before the next handoff",
-  "when the threshold is crossed",
-  "at the start of the shift",
-  "after every change window",
-  "before the weekly review",
-  "once the queue is drained",
-];
-const INSTRUCTION_ACTIONS = [
-  "Update the tracking sheet and tag the owner",
-  "Announce the status in the shared channel",
-  "Log the outcome against the current cycle",
-  "Attach the evidence to the running doc",
-  "Summarize the deltas for the next reviewer",
-  "Archive the artifacts under the dated folder",
-];
 const QUALIFIERS = ["Blue-Green", "Canary", "Rolling", "Shadow", "Warm", "Cold"];
 
 // --- Slug derivation (must match core parseSkillContent exactly) ---------------
@@ -356,7 +330,29 @@ const DOMAIN_DETAILS = {
 // deliberate near-duplicates.
 
 // --- FX17: run body wrapped in the shared-lib finish path ---
+// HYG2 (F46): any failure after this run starts writing skills must leave no
+// partial tree behind — mirror the gen-tools catch-cleanup contract. The
+// skills dir under stress/.generated is owned exclusively by this run (it is
+// reconciled/wiped at startup), so removing the whole dir is safe and removes
+// only paths this run created.
 async function runSkills() {
+  try {
+    return await runSkillsInner();
+  } catch (err) {
+    try {
+      await rm(SKILLS_DIR, { recursive: true, force: true });
+    } catch {
+      // best effort; the ok:false summary below is the durable failure record
+    }
+    return {
+      ok: false,
+      error: String(err?.message ?? err),
+      cleanup: { removedPartialSkillsDir: true },
+    };
+  }
+}
+
+async function runSkillsInner() {
   const PER_DOMAIN = Math.ceil(COUNT / DOMAINS.length);
   const skills = [];
   const usedNames = new Set();
