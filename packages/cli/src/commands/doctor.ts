@@ -9,7 +9,7 @@ import {
   type ServerConfig,
 } from "@action-hub/core";
 import { loadCliConfig } from "../config-loader.js";
-import { ANCHOR_SRC, EXIT_PROVEN, teardownAnchorChild, type TeardownResult } from "./process-anchor.js";
+import { anchorSpawnArgs, EXIT_PROVEN, teardownAnchorChild, type TeardownResult } from "./process-anchor.js";
 import type { ChildProcess } from "node:child_process";
 import { createSdkClientFactory } from "../client-factory.js";
 
@@ -71,7 +71,7 @@ function supervisedServers(servers: readonly ServerConfig[]): ServerConfig[] {
       transport: {
         type: "stdio",
         command: process.execPath,
-        args: ["-e", ANCHOR_SRC, "doctor", transport.command, ...(transport.args ?? [])],
+        args: anchorSpawnArgs("doctor", transport.command, transport.args ?? []),
         env,
         ...(transport.cwd ? { cwd: transport.cwd } : {}),
       },

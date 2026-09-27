@@ -1,23 +1,12 @@
 #!/usr/bin/env node
 
-import { doctorCommand } from "./commands/doctor.js";
-import { authCommand } from "./commands/auth.js";
-import type { AuthAction } from "./commands/auth.js";
-import { importCommand } from "./commands/import.js";
-import { migrateCommand } from "./commands/migrate.js";
-import { testSearchCommand } from "./commands/test-search.js";
-import { listCommand } from "./commands/list.js";
-import { bundlesCommand } from "./commands/bundles.js";
-import { startCommand } from "./commands/start.js";
- import { harnessCommand } from "./commands/harness.js";
-import { serveCommand } from "./commands/serve.js";
-import {
-  connectCommand,
-  daemonStartCommand,
-  daemonStatusCommand,
-  daemonStopCommand,
-  runDaemonProcess,
-} from "./commands/daemon.js";
+// Command modules are loaded LAZILY (await import) inside their dispatch
+// cases: the anchored process tree re-invokes this CLI for hidden internal
+// modes (__anchor-run/__wrapper-run), and every CLI load in that chain pays
+// the module graph. Lazy imports keep anchor/wrapper invocations — and
+// ordinary startup — from loading every command module.
+import { ANCHOR_MODE, WRAPPER_MODE, runAnchorProcess, runWrapperProcess } from "./commands/process-anchor.js";
+const loadDaemon = (): Promise<typeof import("./commands/daemon.js")> => import("./commands/daemon.js");
 import { VERSION } from "./version.js";
 import { IMPORT_SOURCE_FILTERS, type ImportSourceFilter } from "./commands/import.js";
 import { MIGRATE_SOURCE_FILTERS, type MigrateSourceFilter } from "./commands/migrate.js";
@@ -107,11 +96,24 @@ EXAMPLES:
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
+  // Hidden internal anchor/wrapper modes (process-anchor.ts): the anchored
+  // process tree re-invokes THIS CLI instead of requiring an external
+  // interpreter, so the standalone SEA binary stays zero-dependency. Must be
+  // handled before any ordinary command parsing.
+  if (args[0] === ANCHOR_MODE) {
+    runAnchorProcess(args.slice(1));
+    return;
+  }
+  if (args[0] === WRAPPER_MODE) {
+    runWrapperProcess(args.slice(1));
+    return;
+  }
+
   // `harness --help` (or bare `harness`) shows the harness-specific help,
   // not the global help text.
   if (args[0] === "harness" &&
       (args.includes("--help") || args.includes("-h") || args.length === 1)) {
-    await harnessCommand("help", {});
+    await (await import("./commands/harness.js")).harnessCommand("help", {});
     return;
   }
 
@@ -157,7 +159,7 @@ async function main(): Promise<void> {
     let exitCode = 0;
     switch (command) {
       case "doctor": {
-        exitCode = await doctorCommand({
+        exitCode = await (await import("./commands/doctor.js")).doctorCommand({
           configPath,
           checkConnectivity: parsedArgs["no-check"] ? false : true,
         });
@@ -175,7 +177,7 @@ async function main(): Promise<void> {
           typeof parsedArgs["timeout"] === "string"
             ? Number.parseInt(parsedArgs["timeout"], 10)
             : undefined;
-        exitCode = await authCommand(action as AuthAction, positional[1], {
+        exitCode = await (await import("./commands/auth.js")).authCommand(action as import("./commands/auth.js").AuthAction, positional[1], {
           configPath,
           noBrowser: Boolean(parsedArgs["no-browser"]),
           timeoutSeconds: Number.isFinite(timeoutVal) ? timeoutVal : undefined,
@@ -199,7 +201,7 @@ async function main(): Promise<void> {
           exitCode = 1;
           break;
         }
-        exitCode = await migrateCommand({
+        exitCode = await (await import("./commands/migrate.js")).migrateCommand({
           configPath,
           type: typeVal as any,
           source: sourceFilter,
@@ -225,7 +227,7 @@ async function main(): Promise<void> {
           exitCode = 1;
           break;
         }
-        exitCode = await importCommand({
+        exitCode = await (await import("./commands/import.js")).importCommand({
           configPath,
           source: sourceFilter,
           write: Boolean(parsedArgs["write"]),
@@ -239,7 +241,7 @@ async function main(): Promise<void> {
         const thresholdVal = typeof parsedArgs["threshold"] === "string" ? parseFloat(parsedArgs["threshold"]) : undefined;
         const serverVal = typeof parsedArgs["server"] === "string" ? parsedArgs["server"] : undefined;
 
-        exitCode = await testSearchCommand(query, {
+        exitCode = await (await import("./commands/test-search.js")).testSearchCommand(query, {
           configPath,
           limit: limitVal,
           threshold: thresholdVal,
@@ -252,7 +254,7 @@ async function main(): Promise<void> {
         const serverVal = typeof parsedArgs["server"] === "string" ? parsedArgs["server"] : undefined;
         const kindVal = typeof parsedArgs["kind"] === "string" ? (parsedArgs["kind"] as any) : undefined;
 
-        exitCode = await listCommand({
+        exitCode = await (await import("./commands/list.js")).listCommand({
           configPath,
           server: serverVal,
           kind: kindVal,
@@ -270,7 +272,7 @@ async function main(): Promise<void> {
           break;
         }
         const exportVal = typeof parsedArgs["export"] === "string" ? parsedArgs["export"] : undefined;
-        exitCode = await bundlesCommand({
+        exitCode = await (await import("./commands/bundles.js")).bundlesCommand({
           configPath,
           load: loadVal,
           exportId: exportVal,
@@ -279,7 +281,7 @@ async function main(): Promise<void> {
       }
 
       case "start": {
-        exitCode = await startCommand({
+        exitCode = await (await import("./commands/start.js")).startCommand({
           configPath,
         });
         break;
@@ -301,7 +303,7 @@ async function main(): Promise<void> {
           exitCode = 1;
           break;
         }
-        exitCode = await harnessCommand(target, {
+        exitCode = await (await import("./commands/harness.js")).harnessCommand(target, {
           mode: modeArg,
           write: Boolean(parsedArgs["write"]),
           json: Boolean(parsedArgs["json"]),
@@ -313,7 +315,7 @@ async function main(): Promise<void> {
 
       case "serve": {
         const portVal = typeof parsedArgs["port"] === "string" ? Number.parseInt(parsedArgs["port"], 10) : undefined;
-        exitCode = await serveCommand({
+        exitCode = await (await import("./commands/serve.js")).serveCommand({
           configPath,
           port: Number.isFinite(portVal) ? portVal : undefined,
         });
@@ -322,7 +324,7 @@ async function main(): Promise<void> {
 
       case "connect": {
         const daemonDirVal = typeof parsedArgs["daemon-dir"] === "string" ? parsedArgs["daemon-dir"] : undefined;
-        exitCode = await connectCommand({
+        exitCode = await (await loadDaemon()).connectCommand({
           configPath,
           daemonDir: daemonDirVal,
         });
@@ -336,14 +338,14 @@ async function main(): Promise<void> {
             typeof parsedArgs["start-timeout"] === "string"
               ? Number.parseInt(parsedArgs["start-timeout"], 10)
               : undefined;
-          exitCode = await daemonStartCommand({
+          exitCode = await (await loadDaemon()).daemonStartCommand({
             configPath,
             ...(Number.isFinite(startTimeoutVal) ? { startTimeoutMs: startTimeoutVal } : {}),
           });
         } else if (subcommand === "status") {
-          exitCode = await daemonStatusCommand({ configPath });
+          exitCode = await (await loadDaemon()).daemonStatusCommand({ configPath });
         } else if (subcommand === "stop") {
-          exitCode = await daemonStopCommand({ configPath });
+          exitCode = await (await loadDaemon()).daemonStopCommand({ configPath });
         } else {
           console.error("Usage: action-hub daemon <start|status|stop>");
           exitCode = 1;
@@ -352,7 +354,7 @@ async function main(): Promise<void> {
       }
 
       case "__daemon-run": {
-        await runDaemonProcess();
+        await (await loadDaemon()).runDaemonProcess();
         // Same lifecycle as `start`: the daemon resolves after its shutdown
         // handlers run, but without a forced exit the process could linger on
         // open handles (this child has no CLI caller to terminate it).
