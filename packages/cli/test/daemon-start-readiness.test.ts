@@ -516,6 +516,7 @@ test("win32 exhausted teardown: single guarded retry chain, warn once, never exi
   let exits: number[] = [];
   const loop = winSelfTeardownLoop({
     serverDead: () => false, // the always-failing / unkillable-server fault
+    taskkillExit: () => -1, // taskkill always fails
     attempt: () => { attempts++; },
     exit: (code) => { exits.push(code); },
     writeErr: () => { warns++; },
@@ -545,6 +546,7 @@ test("win32 exhausted teardown: exits 4 exactly once once the server is verified
   let exits: number[] = [];
   const loop = winSelfTeardownLoop({
     serverDead: () => attempts >= 4, // server verified dead after 4 attempts
+    taskkillExit: () => 0, // the tree sweep reported success
     attempt: () => { attempts++; },
     exit: (code) => { exits.push(code); },
     writeErr: () => {},
@@ -555,4 +557,54 @@ test("win32 exhausted teardown: exits 4 exactly once once the server is verified
   await new Promise((r) => setTimeout(r, 400));
   loop.stop();
   assert.deepEqual(exits, [4], `must exit 4 exactly once, got ${JSON.stringify(exits)}`);
+});
+
+// PR 77 rework round 14 (reviewer-1 MUST-FIX): a direct-child PID is NOT
+// tree-death proof. Fault: the direct server dies EARLY but a grandchild
+// survives (unobservable to the wrapper) and every taskkill fails. The
+// wrapper must NOT exit(4) on the direct child's death — the guarded
+// taskkill chain must keep running — and may only exit after a SUCCESSFUL
+// tree sweep. Scenario A: server dead from attempt 2, taskkill always
+// fails -> no exit ever, chain keeps attempting.
+test("win32 parent loss: direct server death without a proven tree sweep never exits", async () => {
+  const { winSelfTeardownLoop } = await import("../dist/commands/process-anchor.js");
+  let attempts = 0;
+  let exits: number[] = [];
+  const loop = winSelfTeardownLoop({
+    serverDead: () => attempts >= 2, // direct server dies early...
+    taskkillExit: () => -1,          // ...but every taskkill FAILS (grandchild alive, unobservable)
+    attempt: () => { attempts++; },
+    exit: (code) => { exits.push(code); },
+    writeErr: () => {},
+    verifyDelayMs: 5,
+    maxBoundedAttempts: 3,
+    retryIntervalMs: 20,
+  });
+  await new Promise((r) => setTimeout(r, 300));
+  const before = attempts;
+  await new Promise((r) => setTimeout(r, 200));
+  loop.stop();
+  assert.equal(exits.length, 0, `must NOT exit on direct-child death without tree proof, got exits=${JSON.stringify(exits)}`);
+  assert.ok(attempts > before, "guarded chain must keep attempting while the tree is unproven");
+});
+
+// Scenario B: same fault shape, but the tree sweep eventually SUCCEEDS
+// (taskkill exit 0) -> exit(4) fires exactly once and the chain stops.
+test("win32 parent loss: exits 4 only after a successful tree sweep", async () => {
+  const { winSelfTeardownLoop } = await import("../dist/commands/process-anchor.js");
+  let attempts = 0;
+  let exits: number[] = [];
+  const loop = winSelfTeardownLoop({
+    serverDead: () => attempts >= 2,
+    taskkillExit: () => (attempts >= 6 ? 0 : -1), // sweep succeeds only on a later attempt
+    attempt: () => { attempts++; },
+    exit: (code) => { exits.push(code); },
+    writeErr: () => {},
+    verifyDelayMs: 5,
+    maxBoundedAttempts: 3,
+    retryIntervalMs: 20,
+  });
+  await new Promise((r) => setTimeout(r, 400));
+  loop.stop();
+  assert.deepEqual(exits, [4], `must exit 4 exactly once after the tree sweep succeeds, got ${JSON.stringify(exits)}`);
 });

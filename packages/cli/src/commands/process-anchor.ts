@@ -126,16 +126,18 @@ export function runWrapperProcess(argvTail: string[]): void {
         if (server.exitCode !== null || server.signalCode !== null) return true;
         try { process.kill(server.pid!, 0); return false; } catch { return true; }
       };
+      // Last observed taskkill /T /F exit code: the tree-sweep proof the
+      // loop requires before any voluntary exit (round 14).
+      let taskkillExit: number | null = null;
       winSelfTeardownLoop({
         serverDead,
         attempt: () => {
           try { server?.kill("SIGKILL"); } catch {}
           const tk = spawn("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore" });
-          // A taskkill that works kills this wrapper too; the loop's
-          // verification only matters when it did NOT (launch failure or
-          // nonzero exit).
-          tk.on("error", () => {});
+          tk.on("error", () => { taskkillExit = -1; });
+          tk.on("exit", (code) => { taskkillExit = code; });
         },
+        taskkillExit: () => taskkillExit,
         exit: (code) => process.exit(code),
         writeErr: (message) => { try { fs.writeSync(2, message); } catch {} },
       });
@@ -394,16 +396,23 @@ export function startGuardedRetryLoop(options: {
 }
 
 /**
- * The REAL Windows exhausted-teardown loop (review rounds 12-13): bounded
+ * The REAL Windows exhausted-teardown loop (review rounds 12-15): bounded
  * attempts (default 6, verified 400ms apart) end in ONE guarded retry chain
- * — never a multiplying fanout — with the warning fired exactly once, and
- * the caller never exits while the server is still alive. Production wires
- * runWrapperProcess's win32 selfTeardown here; the injected regression
- * drives THIS SAME function with stubbed kill/verify hooks, so the test
- * exercises the production retry callback by construction.
+ * — never a multiplying fanout — with the warning fired exactly once.
+ * FAIL-CLOSED tree proof (review round 14): the wrapper voluntarily exits 4
+ * ONLY when the direct server is dead AND the taskkill /T /F sweep reported
+ * success (exit 0) — a direct-child PID alone is NOT tree-death proof, so a
+ * surviving grandchild keeps the guarded chain alive (attempting taskkill
+ * every interval) until the taskkill succeeds and kills this wrapper too.
+ * Production wires runWrapperProcess's win32 selfTeardown here; the
+ * injected regression drives THIS SAME function with stubbed kill/verify
+ * hooks, so the test exercises the production retry callback by
+ * construction.
  */
 export function winSelfTeardownLoop(hooks: {
   serverDead: () => boolean;
+  /** Last observed taskkill /T /F exit code (null = not observed yet; -1 = spawn error). */
+  taskkillExit: () => number | null;
   attempt: () => void;
   exit: (code: number) => void;
   writeErr: (message: string) => void;
@@ -420,7 +429,9 @@ export function winSelfTeardownLoop(hooks: {
     hooks.attempt();
     setTimeout(() => {
       if (exited) return;
-      if (hooks.serverDead()) {
+      // Whole-tree proof only: direct-child death + a SUCCESSFUL taskkill
+      // tree sweep. Anything less keeps the chain alive (round 14).
+      if (hooks.serverDead() && hooks.taskkillExit() === 0) {
         exited = true;
         guard.stop();
         hooks.exit(4);
