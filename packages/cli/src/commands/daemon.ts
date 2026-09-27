@@ -251,9 +251,12 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   }
 
   console.error(`Action Hub daemon did not become ready. See ${paths.log}`);
-  if (await waitForAnotherDaemon(paths)) return 0;
+  // Teardown FIRST and consult the proof (same as the childExited path): the
+  // orphaned server of THIS failed start must never satisfy the sibling
+  // winner probe.
   const res = await killAndReapSpawned(child);
   if (!res.proven || res.survivors.length > 0) return 1;
+  if (await waitForAnotherDaemon(paths)) return 0;
   return 1;
 }
 
