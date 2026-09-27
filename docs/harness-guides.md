@@ -290,6 +290,46 @@ any harness from any machine with the checkout:
 authenticated local socket. Each connection gets its own MCP session; the
 catalog, connection pool, and auth are shared process-wide.
 
+## No-confident-match abstention (search)
+
+By default `action_hub` search always returns its hits, even when nothing in
+the catalog is a good match (the scorer is "confidently" ranking distractors).
+An optional flag makes the search say so instead:
+
+```json
+{
+  "search": {
+    "abstention": {
+      "enabled": false,
+      "threshold": 0.8
+    }
+  }
+}
+```
+
+- `enabled` (default **false**): when true, a search whose top hit scores
+  below `threshold` returns an abstention response instead of hits:
+  `{ ok, count: 0, results: [], abstained: true, reason: "no_confident_match",
+  threshold, closestMatch: { id, score } | null, hint }` (the query itself
+  is deliberately not echoed — every echoed field carries an output budget).
+- `threshold` (default 0.8, clamped to [0, 1]): calibrated offline on
+  disjoint rows — at 0.8 no real match was refused and 5 of the 7 held-out
+  no-match queries (71%) abstained. The calibration base is thin (12
+  negative rows in total), and scores scale with catalog size and IDF, so
+  recalibrate the threshold for your catalog before enabling the flag. A
+  query that matches a bundle never abstains: bundle discovery runs first
+  and its matches are returned as usual.
+
+The response shape is additive: clients that only read `count`/`results`
+see an ordinary empty result.
+
+**How an agent should react to `abstained: true`:** do not call a tool on a
+guess. First try one rephrased search using an exact tool or domain name
+(the `closestMatch.id` is a good starting point); if that also abstains, ask
+the user how to proceed instead of picking a near-miss action. When the flag
+is off, treat a search whose top hits share only loose words with the query
+the same way — the response gives you no confidence signal by itself.
+
 ## Raw MCP clients
 
 If you hand-roll an MCP client instead of using an SDK, three framing

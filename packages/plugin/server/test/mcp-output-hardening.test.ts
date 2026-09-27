@@ -67,6 +67,7 @@ async function buildRuntime() {
     configHash: "test",
     configPath: "/tmp/nonexistent-action-hub-config.json",
     refreshed: Promise.resolve([]),
+    searchAbstention: { enabled: false, threshold: 0.8 },
     close: async () => {},
   };
 }
