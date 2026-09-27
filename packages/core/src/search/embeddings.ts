@@ -50,6 +50,13 @@ const SEA_ASSETS = [
   "vendor/ort/ort-wasm-simd-threaded.mjs",
   `vendor/ort/${ORT_WASM}`,
 ];
+/** Provenance + third-party license texts, written NEXT TO the extraction
+ * tree so a downloaded standalone binary still carries the upstream terms. */
+const SEA_LICENSE_ASSETS = [
+  "vendor/VENDOR.md",
+  "vendor/licenses/Apache-2.0.txt",
+  "vendor/licenses/onnxruntime-LICENSE.txt",
+];
 let seaVendor: { modelRoot: string; ortDir: string } | null | undefined;
 
 export interface EmbeddingIndexOptions {
@@ -140,10 +147,14 @@ export class EmbeddingSemanticIndex {
     if (this.#session) return true;
     if (this.#loadFailed) return false;
     try {
-      const modelRoot =
-        this.#options.modelPath ||
-        (await seaVendorRoot())?.modelRoot ||
-        defaultVendorPath();
+      // Precedence (review-1 round 4): an EXPLICIT caller/modelPath or env
+      // override wins over the embedded SEA assets — a caller pointing at a
+      // different (or deliberately invalid) model must get exactly what they
+      // asked for, and no 35MB extraction happens needlessly. The embedded
+      // extraction is used only when nothing else is configured.
+      const explicitModel = this.#options.modelPath || process.env["ACTION_HUB_EMBEDDINGS_MODEL"] || "";
+      const sea = explicitModel ? null : await seaVendorRoot();
+      const modelRoot = explicitModel || sea?.modelRoot || defaultVendorPath();
       if (!modelRoot) {
         throw new Error(
           "no model path: set ACTION_HUB_EMBEDDINGS_MODEL (bundled binary hosts extract the vendored model and point this at it)",
@@ -152,7 +163,7 @@ export class EmbeddingSemanticIndex {
       const modelDir = `${modelRoot}/${this.#options.modelId}`;
       this.#tokenizer = loadTokenizer(`${modelDir}/tokenizer.json`);
       const ortDir =
-        process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] || (await seaVendorRoot())?.ortDir || "";
+        process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] || (explicitModel ? "" : sea?.ortDir) || "";
       const ortUrl = ortDir
         ? pathToFileURL(`${ortDir}/${ORT_MODULE}`)
         : new URL(`../../vendor/ort/${ORT_MODULE}`, import.meta.url);
@@ -404,17 +415,50 @@ async function seaVendorRoot(): Promise<{ modelRoot: string; ortDir: string } | 
       getRawAsset?: (key: string) => ArrayBuffer;
     };
     if (!sea.isSea?.() || !sea.getRawAsset) return null;
-    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { createHash } = await import("node:crypto");
+    const { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join, dirname } = await import("node:path");
-    const root = mkdtempSync(join(tmpdir(), "action-hub-vendor-"));
-    for (const key of SEA_ASSETS) {
-      const bytes = sea.getRawAsset(key);
-      if (!bytes) throw new Error(`SEA asset missing: ${key}`);
-      const target = join(root, key);
-      mkdirSync(dirname(target), { recursive: true });
-      writeFileSync(target, Buffer.from(bytes));
+
+    // Content-addressed cache (review-2/round 4): extract ONCE under a
+    // stable per-content key and REUSE across processes. A fresh temp dir per
+    // invocation leaked ~35MB per embedding-enabled process; a shared,
+    // content-addressed tree is bounded (one tree per shipped model/ORT
+    // version) and survives repeated invocations.
+    const modelBytes = Buffer.from(sea.getRawAsset(SEA_ASSETS[0]!) ?? new ArrayBuffer(0));
+    const wasmBytes = Buffer.from(sea.getRawAsset(`vendor/ort/${ORT_WASM}`) ?? new ArrayBuffer(0));
+    if (modelBytes.length === 0 || wasmBytes.length === 0) throw new Error("SEA assets missing");
+    const key = `${createHash("sha256").update(wasmBytes).digest("hex").slice(0, 12)}-${createHash("sha256").update(modelBytes).digest("hex").slice(0, 12)}`;
+    const root = join(tmpdir(), "action-hub", `vendor-${key}`);
+    const mark = (paths: string[]): boolean => paths.every((p) => existsSync(p));
+    const needed = [...SEA_ASSETS, ...SEA_LICENSE_ASSETS].map((assetKey) => join(root, assetKey));
+    if (!mark(needed)) {
+      // Extract into a sibling temp dir and atomically rename; if another
+      // process won the race, drop the temp tree and reuse the winner's.
+      const staging = `${root}.staging-${process.pid}`;
+      rmSync(staging, { recursive: true, force: true });
+      try {
+        for (const assetKey of [...SEA_ASSETS, ...SEA_LICENSE_ASSETS]) {
+          const bytes = sea.getRawAsset(assetKey);
+          if (!bytes) throw new Error(`SEA asset missing: ${assetKey}`);
+          const target = join(staging, assetKey);
+          mkdirSync(dirname(target), { recursive: true });
+          writeFileSync(target, Buffer.from(bytes));
+        }
+        mkdirSync(dirname(root), { recursive: true });
+        try {
+          renameSync(staging, root);
+        } catch {
+          if (!mark(needed)) throw new Error("extraction cache rename race and incomplete winner");
+          rmSync(staging, { recursive: true, force: true });
+        }
+      } catch (cause) {
+        // Partial-failure cleanup: never leave a half-written cache tree.
+        rmSync(staging, { recursive: true, force: true });
+        throw cause;
+      }
     }
+
     // Process-global handoff (NOT module state): a bundled binary can contain
     // more than one copy of this module (package entry + deep imports), and
     // each copy has its own cache. Writing the env vars once (first copy
@@ -425,7 +469,6 @@ async function seaVendorRoot(): Promise<{ modelRoot: string; ortDir: string } | 
       modelRoot: join(root, "vendor/models"),
       ortDir: join(root, "vendor/ort"),
     };
-
   } catch {
     /* fall back to normal resolution */
   }

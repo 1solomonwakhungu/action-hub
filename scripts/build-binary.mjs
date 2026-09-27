@@ -68,12 +68,19 @@ async function main() {
     "ort/ort.wasm.mjs",
     "ort/ort-wasm-simd-threaded.mjs",
     "ort/ort-wasm-simd-threaded.wasm",
+    // Provenance + third-party license texts ride IN the binary (review-1/2
+    // round 4: a standalone-binary recipient gets the upstream terms via
+    // `action-hub licenses`, and the extraction tree writes them next to the
+    // vendored assets).
+    "VENDOR.md",
+    "licenses/Apache-2.0.txt",
+    "licenses/onnxruntime-LICENSE.txt",
   ];
   const assets = {};
   for (const key of assetKeys) {
     const path = resolve(assetRoot, key);
     if (!(await exists(path))) {
-      throw new Error(`Missing vendored embedding asset packages/core/vendor/${key}; run npm ci first.`);
+      throw new Error(`Missing vendored asset packages/core/vendor/${key}; run npm ci first.`);
     }
     // Node's SEA config takes a map of asset KEY -> file PATH (strings);
     // getRawAsset(key) then returns the bytes at runtime.

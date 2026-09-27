@@ -36,6 +36,7 @@ USAGE:
 
 COMMANDS:
   doctor              Run system diagnostics, config validation, and server connectivity checks
+  licenses            Print vendored third-party provenance and license texts
   auth <action>       Manage OAuth 2.0 credentials for remote servers (login, status, logout)
   migrate             Migrate external MCP servers, agent skills, and plugins into Action Hub
   import              Discover and import MCP server configurations from Claude, Cursor, VS Code, Codex, Windsurf, Cline, and Roo Code
@@ -192,6 +193,13 @@ async function main(): Promise<void> {
   try {
     let exitCode = 0;
     switch (command) {
+      case "licenses": {
+        // Third-party provenance + license texts (SQ4 packaging round 4):
+        // SEA recipients get the upstream terms from the embedded assets.
+        exitCode = await (await import("./commands/licenses.js")).licensesCommand();
+        break;
+      }
+
       case "doctor": {
         exitCode = await (await import("./commands/doctor.js")).doctorCommand({
           configPath,

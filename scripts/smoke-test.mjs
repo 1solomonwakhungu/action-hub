@@ -3,7 +3,7 @@
 // `npm run smoke:binary`. Pass the binary path as the first argument, or let it
 // default to the host-target binary under dist-bin/.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, accessSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
@@ -99,6 +99,74 @@ function checkEmbeddingSelftest(bin) {
   }
   if (selftest.nativeAddons !== 0) fail(`embedding selftest loaded ${selftest.nativeAddons} native addons`);
   process.stderr.write(`  ok  embedding selftest (load ${selftest.loadMs}ms, norm ${selftest.norm})\n`);
+}
+
+/**
+ * The standalone binary must carry the third-party terms internally
+ * (review-1/2 round 4 MUST-FIX 3): `action-hub licenses` prints the
+ * vendored provenance notice plus both license texts from the SEA assets.
+ */
+function checkLicenses(bin) {
+  const { status, stdout } = runBinary(bin, ["licenses"]);
+  if (status !== 0) fail(`licenses exited ${status}`);
+  const out = stdout ?? "";
+  for (const needle of ["Vendored third-party provenance", "Apache License", "MIT License", "onnxruntime"]) {
+    if (!out.includes(needle)) fail(`licenses output missing "${needle}"`);
+  }
+  process.stderr.write(`  ok  licenses prints VENDOR.md + Apache-2.0 + MIT texts\n`);
+}
+
+/**
+ * SEA extraction must not leak a fresh 35MB tree per process
+ * (review-1/2 round 4 MUST-FIX 2): the extraction is content-addressed, so
+ * the first selftest creates exactly one cache tree and a second run REUSES
+ * it — no growth.
+ */
+function checkExtractionCacheReuse(bin) {
+  const tmpRoot = checkDir("sea-extraction");
+  const env = { TMPDIR: tmpRoot, TMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
+  const first = runBinary(bin, [], env);
+  const cacheDirs = () => {
+    const base = join(tmpRoot, "action-hub");
+    try {
+      return readdirSync(base).filter((n) => n.startsWith("vendor-"));
+    } catch {
+      return [];
+    }
+  };
+  const trees = cacheDirs();
+  if (trees.length !== 1) fail(`expected exactly 1 SEA extraction cache tree, found ${trees.length}`);
+  const second = runBinary(bin, [], env);
+  if (cacheDirs().length !== 1) fail(`second run created new extraction trees (leak); got ${cacheDirs().length}`);
+  for (const r of [first, second]) {
+    const line = (r.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+    const parsed = JSON.parse(line ?? "{}");
+    if (parsed?.embeddingSelftest?.ok !== true) fail(`SEA selftest not ok in cache-reuse check: ${line}`);
+  }
+  process.stderr.write(`  ok  SEA extraction is content-addressed and reused (1 tree, no growth)\n`);
+}
+
+/**
+ * Explicit ACTION_HUB_EMBEDDINGS_MODEL precedence (review-1 round 4 HIGH):
+ * an INVALID explicit override must fail clearly — no silent fallback to the
+ * embedded model.
+ */
+function checkInvalidModelOverride(bin) {
+  const { status, stdout } = runBinary(bin, [], {
+    ACTION_HUB_EMBEDDINGS_MODEL: "/nonexistent/model/root",
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`invalid-override selftest printed no JSON line (status ${status})`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== false) {
+    fail(`invalid explicit model override must fail, got ${line}`);
+  }
+  process.stderr.write(`  ok  invalid explicit model override fails clearly (no silent embedded fallback)\n`);
 }
 
 function checkVersion(bin, version) {
@@ -263,6 +331,9 @@ async function main() {
     checkDaemonLifecycle(bin);
     await checkMcpHandshake(bin);
     checkEmbeddingSelftest(bin);
+    checkLicenses(bin);
+    checkExtractionCacheReuse(bin);
+    checkInvalidModelOverride(bin);
   } finally {
     rmRunRoot(runRoot);
   }

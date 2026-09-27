@@ -336,21 +336,33 @@ test("vectors survive a real disk cache round-trip: cold write -> fresh cache lo
     const cache = new CatalogCache({ path: cachePath });
     await cache.write(hub.toPersisted(configHash));
 
-    // Fresh hub + fresh cache over the SAME file (simulated restart).
+    // Fresh hub + fresh cache over the SAME file (simulated restart): hub2
+    // must actually SERVE search from the restored vectors, not merely
+    // hydrate them (review-2 round 4: the previous assertion was
+    // tautological and never proved hub2 used restored vectors).
     const cache2 = new CatalogCache({ path: cachePath });
     const entry = await cache2.load(configHash);
     assert.ok(entry?.embeddings, "persisted entry on disk must carry the embeddings block");
     const hub2 = new ActionHub({ servers: [...servers], clientFactory: factory });
-    hub2.restoreCatalog(entry);
-    const freshIndex = new EmbeddingSemanticIndex();
-    const hydrated = freshIndex.hydrate(entry.embeddings);
-    assert.ok(hydrated >= 3, `expected >=3 hydrated vectors, got ${hydrated}`);
-    const records = [...hub2.catalog.all()];
-    const fresh = new EmbeddingSemanticIndex();
-    assert.equal(await fresh.load(), true);
-    assert.equal(await fresh.hydrate ? hydrated : 0, hydrated);
+    const restored = hub2.restoreCatalog(entry);
+    assert.ok(restored >= 3, `expected >=3 restored records, got ${restored}`);
+    // REAL search on the restored hub, WITHOUT any indexing: the semantic
+    // channel must come from the hydrated vectors (a MiniLM cosine for the
+    // exact summary is high; an empty index would score 0).
+    await hub2.semanticReady();
+    const hits = await hub2.search("pause the project until further notice");
+    assert.ok(hits.length > 0, "restored hub must return hits");
+    const top = hits.find((h) => h.id === "acme:pause_project");
+    assert.ok(top, "expected the pause_project hit");
+    assert.ok(
+      (top.semantic ?? 0) > 0.5,
+      `restored hub must serve hydrated-vector semantics, got ${top.semantic}`,
+    );
     // Warm start: unchanged catalog re-embeds nothing (fingerprint match).
-    assert.equal(await freshIndex.index(records), 0, "warm start must not re-embed hydrated docs");
+    const hub2Index = new EmbeddingSemanticIndex();
+    assert.equal(await hub2Index.load(), true);
+    hub2Index.hydrate(entry.embeddings);
+    assert.equal(await hub2Index.index([...hub2.catalog.all()]), 0, "warm start must not re-embed hydrated docs");
     await hub.close();
     await hub2.close();
   } finally {
@@ -358,7 +370,7 @@ test("vectors survive a real disk cache round-trip: cold write -> fresh cache lo
   }
 });
 
-test("close() cancels the fire-and-forget embedding rebuild (bounded shutdown)", async () => {
+test("close() cancels the fire-and-forget embedding rebuild: prompt, unref'd, NOT a failure", async () => {
   // 300 tools x chunk 8 => many chunks; close() must land at the first
   // boundary and settle promptly (review-2 round 3 MUST-FIX 3).
   const { factory } = makeFactory({
@@ -376,18 +388,60 @@ test("close() cancels the fire-and-forget embedding rebuild (bounded shutdown)",
     indexing: { chunkSize: 8 },
   });
   void hub.indexAll();
-  await hub.semanticReady === undefined ? null : null;
   // Give the rebuild a tick to start, then close and time the settlement.
   await new Promise((r) => setTimeout(r, 50));
+  // Capture stderr: a normal close() cancellation must NOT print the
+  // "rebuild failed" warning (review-2 round 4: cancellation != failure).
+  const warnings: string[] = [];
+  const origWrite = process.stderr.write.bind(process.stderr);
+  (process.stderr as unknown as { write: (chunk: unknown) => boolean }).write = (chunk: unknown) => {
+    const text = typeof chunk === "string" ? chunk : String(chunk);
+    if (text.includes("rebuild failed")) warnings.push(text);
+    return origWrite(chunk);
+  };
   const started = Date.now();
   await hub.close();
   const elapsed = Date.now() - started;
-  assert.ok(elapsed < 5000, `close() took ${elapsed}ms; rebuild must settle bounded (<=2s)`);
+  (process.stderr as unknown as { write: (chunk: unknown) => boolean }).write = origWrite;
+  assert.ok(elapsed < 1500, `close() took ${elapsed}ms; rebuild must settle bounded`);
+  assert.equal(warnings.length, 0, `close() must not warn: ${warnings.join("|")}`);
   // The process must not linger: after close() the rebuild is cancelled and
-  // hub.embeddedDocs stops growing.
+  // hub.embeddedDocs stops growing (hub exposes the count for tests).
   const after = hub.embeddedDocs;
   await new Promise((r) => setTimeout(r, 300));
   assert.equal(hub.embeddedDocs, after, "embedding work must stop after close()");
+});
+
+test("production rebuild yields real macrotask ticks (no starvation, no custom yieldFn)", async () => {
+  // review-2 round 4 MUST-FIX 1: `await undefined` in the default yield
+  // wrapper is a microtask — a 300-doc rebuild used to starve the event loop
+  // (zero 10ms timer ticks fired). The production path must service timers
+  // between chunks so signals/close()/requests stay alive.
+  const { factory } = makeFactory({
+    acme: new EmbeddingFakeClient(
+      Array.from({ length: 300 }, (_, i) => ({
+        name: `tool_${i}`,
+        description: `Synthetic tool number ${i} for the heartbeat regression.`,
+        inputSchema: { type: "object" },
+      })),
+    ),
+  });
+  // Small chunks => many chunk boundaries => the macrotask yield between
+  // chunks has many chances to service the 10ms heartbeat.
+  const hub = new ActionHub({ servers: [...servers], clientFactory: factory, indexing: { chunkSize: 8 } }); // NO indexing.yieldFn
+  let ticks = 0;
+  const heartbeat = setInterval(() => {
+    ticks += 1;
+  }, 10);
+  try {
+    await hub.indexAll();
+    await hub.semanticReady();
+  } finally {
+    clearInterval(heartbeat);
+  }
+  assert.ok(hub.embeddedDocs >= 300, `expected 300 embedded, got ${hub.embeddedDocs}`);
+  assert.ok(ticks >= 10, `expected the event loop serviced during the rebuild (got ${ticks} 10ms ticks)`);
+  await hub.close();
 });
 
 test("rebuild failure falls back gracefully: warn once, discard partials, hashed scorer, settled semanticReady", async () => {

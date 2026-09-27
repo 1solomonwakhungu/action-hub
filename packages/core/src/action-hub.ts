@@ -271,6 +271,12 @@ export class ActionHub {
     await this.#embedRebuild;
   }
 
+  /** Number of document vectors currently held by the embedding index
+   * (diagnostics/test observability; 0 when embeddings are disabled). */
+  get embeddedDocs(): number {
+    return this.#embedIndex?.embeddedDocs ?? 0;
+  }
+
   async indexServer(serverId: string): Promise<IndexResult> {
     const result = await this.#indexServer(serverId);
     this.#kickEmbeddingRebuild();
@@ -310,28 +316,54 @@ export class ActionHub {
             // #embedCancelled and the next chunk boundary throws, ending the
             // rebuild instead of holding shutdown open for minutes.
             const baseYield = this.#indexYieldFn;
-            await this.#embedIndex!.index(this.#catalog.all(), {
-              chunkSize: this.#indexChunkSize ?? 64,
-              yieldFn: async () => {
-                if (this.#embedCancelled) throw new Error("embedding rebuild cancelled by close()");
-                await baseYield?.();
-              },
-            });
+
+                // Production (no test override) MUST yield a real macrotask
+                // tick between chunks (review-2 round 4): `await undefined`
+                // is a microtask that never services timers/signals, so the
+                // event loop starves for the whole embed and close()
+                // cancellation could never run.
+                //
+                // The default is a SINGLE-BOUNDARY timer yield: measured with
+                // a 10ms heartbeat over a 300-doc rebuild, `await undefined`
+                // gives 0 ticks and promise forms that chain within one loop
+                // pass give ~2 ticks; exactly this form (timer awaited once,
+                // directly from the yield function) services the loop every
+                // chunk (~40 ticks). An extra async boundary around the
+                // promise silently reverts to starvation, so keep this exact
+                // shape.
+                const yieldImpl =
+                  baseYield ??
+                  (async () => {
+                    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                  });
+                await this.#embedIndex!.index(this.#catalog.all(), {
+                  chunkSize: this.#indexChunkSize ?? 64,
+                  yieldFn: async () => {
+                    if (this.#embedCancelled) throw new Error("embedding rebuild cancelled by close()");
+                    await yieldImpl();
+                  },
+                });
             this.#embedIndex!.prune(new Set(this.#catalog.all().map((record) => record.id)));
             if (this.#embedCancelled) break;
             if (this.#catalog.generation === generation) break;
           }
         } catch (cause) {
-          // Graceful fallback on ANY rebuild failure (review-2 round 3): the
-          // documented contract is "finished or permanently fallen back".
-          // A PARTIAL embedding map must never serve as the semantic channel
-          // (mixed coverage distorts rankings), so discard it, warn once,
-          // and degrade to the hashed/blend scorer.
-          this.#embedFailed = true;
-          this.#embedIndex!.discardVectors();
-          this.#warnOnce(
-            `embedding rebuild failed; falling back to the built-in semantic scorer (${String(cause).slice(0, 200)})`,
-          );
+          if (this.#embedCancelled) {
+            // Normal shutdown cancellation (review-2 round 4): NOT a failure.
+            // No warn, no fallback, no discard — the partial in-memory state
+            // is simply left as-is while the hub closes.
+          } else {
+            // Graceful fallback on ANY real rebuild failure (review-2 round 3):
+            // the documented contract is "finished or permanently fallen
+            // back". A PARTIAL embedding map must never serve as the semantic
+            // channel (mixed coverage distorts rankings), so discard it, warn
+            // once, and degrade to the hashed/blend scorer.
+            this.#embedFailed = true;
+            this.#embedIndex!.discardVectors();
+            this.#warnOnce(
+              `embedding rebuild failed; falling back to the built-in semantic scorer (${String(cause).slice(0, 200)})`,
+            );
+          }
         } finally {
           this.#embedRebuild = undefined;
           // Restore RRF fusion unless embeddings permanently failed (the
@@ -1089,7 +1121,16 @@ export class ActionHub {
     this.#embedCancelled = true;
     const rebuild = this.#embedRebuild;
     if (rebuild) {
-      await Promise.race([rebuild.catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
+      // Bounded settlement. The deadline timer is unref'd (it must never
+      // hold the process open) and cleared once the race settles (review-2
+      // round 4: an uncleared ref'd timer delayed process exit ~2s).
+      let deadline: NodeJS.Timeout | undefined;
+      const timedOut = new Promise<void>((resolve) => {
+        deadline = setTimeout(resolve, 2000);
+        deadline.unref?.();
+      });
+      await Promise.race([rebuild.catch(() => {}), timedOut]);
+      if (deadline) clearTimeout(deadline);
     }
     await this.#connections.closeAll();
   }
