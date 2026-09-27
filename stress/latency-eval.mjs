@@ -9,9 +9,25 @@
  * Usage: node stress/latency-eval.mjs [--corpus DIR] [--passes 3]
  * Prints one JSON line: { n, passes, p50, p95, p99 (ms) }.
  */
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+
+/** Single exit path (CONTRACT hard rule): compact JSON last line + artifact. */
+function finish(summary = {}) {
+  const payload = { script: "latency-eval.mjs", ok: true, ...summary };
+  try {
+    const dir = join(repoRoot, "stress", ".generated", "results");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "latency-eval.json"), JSON.stringify(payload, null, 1));
+  } catch {
+    payload.ok = false;
+    payload.artifactError = "failed to write stress/.generated/results/latency-eval.json";
+  }
+  console.log(JSON.stringify(payload));
+  process.exit(payload.ok ? 0 : 1);
+}
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const args = process.argv.slice(2);
@@ -29,14 +45,17 @@ const { Catalog } = await import(join(repoRoot, "packages", "core", "dist", "cat
 const catalog = new Catalog();
 const toolsDir = join(corpusDir, "tools");
 if (!statSync(toolsDir, { throwIfNoEntry: false })) {
-  console.error(`corpus not found: ${toolsDir} (run node stress/gen-tools.mjs first)`);
-  process.exit(2);
+  finish({ ok: false, error: `corpus not found: ${toolsDir} (run node stress/gen-tools.mjs first)` });
 }
+let toolCount = 0;
+let manifestCount = 0;
 for (const f of readdirSync(toolsDir)) {
   if (!f.endsWith(".json")) continue;
+  manifestCount += 1;
   const data = JSON.parse(readFileSync(join(toolsDir, f), "utf8"));
   const serverId = data.serverId ?? basename(f, ".json");
   for (const tool of data.tools ?? []) {
+    toolCount += 1;
     const description = tool.description ?? "";
     const firstPara = description.split(/\n\n|\r\n\r\n/)[0] ?? "";
     catalog.add({
@@ -52,9 +71,11 @@ for (const f of readdirSync(toolsDir)) {
   }
 }
 const skillsDir = join(corpusDir, "skills");
+let skillCount = 0;
 for (const entry of readdirSync(skillsDir)) {
   const p = join(skillsDir, entry);
   if (!statSync(p).isDirectory()) continue;
+  skillCount += 1;
   const md = readFileSync(join(p, "SKILL.md"), "utf8");
   const name = md.match(/^name:\s*(.+)$/m)?.[1]?.trim() ?? entry;
   const desc = md.match(/^description:\s*(.+)$/m)?.[1]?.trim() ?? "";
@@ -83,4 +104,20 @@ const q = (x) => {
   const i = Math.min(samples.length - 1, Math.ceil((x / 100) * samples.length) - 1);
   return +samples[i].toFixed(1);
 };
-console.log(JSON.stringify({ corpusDocs: catalog.all().length, n: queries.length, passes, p50: q(50), p95: q(95), p99: q(99) }));
+const summary = {
+  corpus: { tools: toolCount, skills: skillCount, docs: toolCount + skillCount, manifests: manifestCount },
+  n: queries.length,
+  passes,
+  p50: q(50),
+  p95: q(95),
+  p99: q(99),
+};
+// Fail closed on the binding corpus, same rule as split-eval.
+if (!flag("--corpus")) {
+  const binding = toolCount === 10_000 && skillCount === 5_000 && manifestCount === 44;
+  if (!binding) {
+    summary.ok = false;
+    summary.error = `binding corpus mismatch: expected 10000 tools / 5000 skills / 44 manifests, got ${toolCount}/${skillCount}/${manifestCount}`;
+  }
+}
+finish(summary);

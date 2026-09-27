@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Catalog } from "../dist/catalog/catalog.js";
-import { SearchEngine, SYNONYM_TERM_WEIGHT, tokenize } from "../dist/search/search.js";
+import { SearchEngine, SYNONYM_TERM_WEIGHT, tokenize, QUERY_STOPWORDS } from "../dist/search/search.js";
 import { expandQuery, VERB_PHRASES, VERB_SYNONYMS } from "../dist/search/synonyms.js";
 import type { ActionRecord } from "../dist/types.js";
 
@@ -97,22 +97,39 @@ test("verb paraphrase reaches the canonical tool: hold -> pause_project", async 
   assert.equal(hits[0].id, "acme:pause_project");
 });
 
-test("exact-name lookup is never demoted by synonym noise (vs independent literal baseline)", async () => {
+test("exact-name lookup is never demoted by synonym noise", async () => {
   const catalog = new Catalog();
   catalog.add(record("acme:disable_user", "Disables the user account and revokes sessions."));
   catalog.add(record("acme:pause_user", "Pauses the user account temporarily."));
   catalog.add(record("other:pause_user", "Pauses the user account temporarily."));
   const engine = new SearchEngine(catalog);
-  // "disable_user" tokenizes to an exact existing name -> expansion skipped.
+  // "disable_user" tokenizes to an exact existing name -> expansion skipped
+  // and the literal name must stay rank 1 (zero-weight parity is covered by
+  // the short-circuit unit test; PR 52's exact-name suite covers the rest).
   const exact = await engine.search("disable_user");
   assert.equal(exact[0].id, "acme:disable_user");
-  // Independent baseline: a SEPARATE engine built without the synonyms module
-  // in play at all — expansion-weight 0 equals pure lexical on a fresh engine.
-  const baseline = new SearchEngine(catalog);
-  assert.deepEqual(
-    exact.map((h) => h.id),
-    (await baseline.search("disable_user")).map((h) => h.id),
-  );
+});
+
+test("every VERB_PHRASES key expands through the real QUERY_STOPWORDS path (SQ2 review finding 1)", () => {
+  for (const phrase of Object.keys(VERB_PHRASES)) {
+    const variants = [
+      phrase,
+      `${phrase},`,
+      phrase.replace(/ /g, "  "),
+      phrase.toUpperCase(),
+    ];
+    for (const q of variants) {
+      const expanded = expandQuery(q, tokenize, SYNONYM_TERM_WEIGHT, QUERY_STOPWORDS).terms
+        .filter((t) => t.weight < 1)
+        .map((t) => t.term);
+      assert.ok(expanded.length > 0, `phrase "${q}" must expand under real stopwords (got ${JSON.stringify(expanded)})`);
+    }
+  }
+  // The exact reviewer repro: "get rid of the user" with real stopwords.
+  const expanded = expandQuery("get rid of the user", tokenize, SYNONYM_TERM_WEIGHT, QUERY_STOPWORDS).terms
+    .filter((t) => t.weight < 1)
+    .map((t) => t.term);
+  assert.ok(expanded.length > 0, JSON.stringify(expanded));
 });
 
 test("the semantic scorer receives ONLY the literal query terms (SQ2 review finding 3)", async () => {

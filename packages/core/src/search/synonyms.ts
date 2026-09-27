@@ -210,12 +210,13 @@ export function expandQuery(
   };
 
   // 1. Multi-word phrases, matched as token subsequences of the SAME
-  //    tokenization. This is inherently punctuation-safe: tokenization has
-  //    already stripped terminal/interior punctuation and normalized
-  //    whitespace.
+  //    tokenization AND the same stopword filter as the query (so a phrase
+  //    containing "of" still matches a stopword-filtered query stream).
+  //    Punctuation-safe by construction: tokenization has already stripped
+  //    terminal/interior punctuation and normalized whitespace.
   const tokens = literal;
   for (const [phrase, syns] of Object.entries(VERB_PHRASES)) {
-    const phraseTokens = tokenize(phrase);
+    const phraseTokens = tokenize(phrase).filter((term) => !stopwords.has(term));
     if (phraseTokens.length === 0) continue;
     outer: for (let i = 0; i + phraseTokens.length <= tokens.length; i += 1) {
       for (let j = 0; j < phraseTokens.length; j += 1) {
