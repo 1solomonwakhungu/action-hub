@@ -204,6 +204,30 @@ Edit `~/.codeium/windsurf/mcp_config.json` and add:
 
 Restart Windsurf or reload the window, then check the MCP servers panel.
 
+## MCP startup budgets (verified)
+
+MCP hosts and adapters bound the server handshake with a startup budget.
+Budgets verified against real harnesses at fleet scale
+(44 servers / 10,000 tools / 5,000 skills):
+
+| Harness | MCP startup budget | Source |
+| --- | --- | --- |
+| pi (pi-mcp-adapter) | **30 s** adapter wait budget (`INIT_WAIT_TIMEOUT_MS`, an `awaitWithTimeout` around initialization — it returns `init_timeout` while initialization keeps running; it is **not** a spawn kill) | [pi-mcp-adapter on npm](https://www.npmjs.com/package/pi-mcp-adapter) (`index.ts:30`) |
+| Codex | **30 s** spawn-kill deadline (`DEFAULT_STARTUP_TIMEOUT`) | [openai/codex `rust-v0.154.0`](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/codex-mcp/src/rmcp_client.rs#L102) (`codex-rs/codex-mcp/src/rmcp_client.rs:102`); the 1.1 s constant is `DEFAULT_OPTIONAL_MCP_STARTUP_GRACE`, not a spawn kill |
+
+Startup measurements at 15K actions:
+
+- **Current (with #68's deferred refresh):** a warm hub serves `initialize`
+  immediately and re-indexes afterwards — PR #68 measured warm initialize at
+  **1.5 s**, down from **4.1 s**.
+- **Historical (pre-deferred-refresh, PR 62 stress measurements):** cold
+  `createHubRuntime` ≈ **20 s**, warm cache ≈ **13 s**. These describe the
+  pre-#68 behavior and are kept only as context for hosts on older builds.
+
+Hosts whose effective budget is tighter than the cold-start cost should point
+their config at the shared daemon (see below) or raise their MCP
+`startup_timeout_ms`.
+
 ## Verifying the setup
 
 From the checkout, run:

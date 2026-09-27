@@ -253,6 +253,69 @@ action-hub auth logout github-oauth
 
 Tokens are then refreshed automatically ahead of expiry and rotated in place, so no re-entry is needed. Servers using a static `Authorization` header keep working unchanged.
 
+## Scale & reliability
+
+Tested at fleet scale: **44 MCP servers / 10,000 tools / 5,000 skills**.
+The stress suite that produced these numbers lives in [`stress/`](stress/) —
+see [`stress/external/README.md`](stress/external/README.md) for the k6/load
+harness and [`stress/lib/`](stress/lib/) for the shared isolation runner.
+Running the stress suite **requires a fully isolated environment**
+(temp `HOME`/`XDG_*`/`TMPDIR`/`ACTION_HUB_*`); never point it at your real
+config or cache.
+
+**Load profile** (k6 JSON-RPC mix, full profile on main `f53adbc`, which
+includes #63 and #68; metrics aggregate the 100→500-VU ramp **and** the
+5-minute soak): **263.6 RPS** served with **1.73% HTTP failures** and
+**98.3% checks** (the 99% checks bar narrowly misses across the full
+profile), overall p99 **2.9 s**, `initialize` p99 **12.9 s**, peak RSS
+**765 MB**. In the sustained 10–40 RPS steps: **0 failures**, search p95
+**747 ms**; the throughput knee sits near **~110 RPS**. For history: the
+pre-#63/#68 run (#47 evidence, `205aaf6`) measured 85 RPS served / 13.7%
+failures at the extreme ramp and ~0.8% in the 10–40 RPS band. Treat the
+ramp numbers as worst-case saturation, not steady-state SLAs.
+
+Reliability behaviors shipped in the current release:
+
+- **Large piped output is never truncated** (#53): the CLI flushes pending
+  stdout before exiting, because `process.exit()` silently drops writes beyond
+  ~64 KiB when stdout is a pipe. Long-running commands (`start`, `serve`) exit
+  cleanly on `SIGTERM` after runtime teardown. `list --kind skill` never
+  contacts MCP servers (zero spawns, config + directory skills only);
+  `list --server X` indexes exactly that one server (unknown ids exit 1).
+- **Execute-time connection failures trip the circuit breaker** (#59):
+  per-server breaker with a failure threshold of **3** transport failures
+  (`EPIPE`, `ECONNRESET`, `ECONNREFUSED`, `ENOTFOUND`, …) and a **10 s
+  cooldown**, after which one **half-open** probe decides recovery. Tool
+  errors (`isError` responses, `ToolError`) never count as transport
+  failures.
+- **Per-server activation deadline** (#65): a server's `timeoutMs` (default
+  10 s) now bounds **spawn + initialize**, not just tool calls. A server that
+  misses the deadline is aborted, killed, and retried with restart backoff;
+  a server that has answered initialize is never deadline-killed.
+- **Warm start** (#67 + #68): the persisted catalog cache serves `initialize`
+  immediately; a deferred refresh re-indexes afterwards (stdio, HTTP, and
+  daemon transports). Search-side corpus statistics are memoized per catalog
+  version (#67). Catalog snapshot writes are debounced into at most one
+  write after a burst of executes, and repeated idempotent reads are reported
+  with `cached: true`.
+- **Progress-aware daemon start** (#70): overall cap **120 s** (override via
+  `--start-timeout` or `ACTION_HUB_DAEMON_START_TIMEOUT_MS`), with a **15 s
+  no-progress window** that log growth or a successful readiness probe
+  resets. A daemon that dies during startup fails immediately.
+- **`doctor` is deterministic under flapping servers** (#61): one retry after
+  a 250 ms settle delay, probes run serially inside a total deadline. For the
+  downstream connectivity checks, the exit code is `1` iff any enabled server
+  is still down at check time after the retry; an incompatible Node runtime
+  also counts as a critical failure, and teardown errors can fail the
+  command.
+- **The daemon stays responsive during reindex** (#63): index embedding runs
+  cooperatively so the event loop keeps serving; `daemon.json` exposes
+  `indexing: boolean` and `indexingSettledAt: string | null` so callers can
+  wait for a settled index instead of guessing.
+
+See [`docs/harness-guides.md`](docs/harness-guides.md) for the MCP startup
+timeouts verified against real harnesses.
+
 ## Status
 
 Early development. The interfaces described above are the target design; see [`docs/roadmap.md`](docs/roadmap.md) for what is implemented versus planned.
