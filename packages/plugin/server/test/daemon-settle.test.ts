@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
+import { performance } from "node:perf_hooks";
 import { after, before, test } from "node:test";
 
 /**
@@ -149,4 +150,101 @@ test("warm daemon start transitions indexing true -> false with indexingSettledA
     second.kill("SIGTERM");
     await sleep(200);
   }
+});
+
+test("FX12-R5/FX18: a daemon client connecting mid-refresh is served from the warm cache", async () => {
+  // Warm start with the slow server: the authoritative re-index stays in
+  // flight (700 ms handshake + 100 ms list). A REAL client connects through
+  // `action-hub connect` (stdio proxy) mid-refresh and must be served from
+  // the warm cache immediately.
+  rmSync(join(daemonDir, "daemon.json"), { force: true });
+  const daemon = spawn(process.execPath, [DIST_INDEX, "--daemon"], {
+    env: daemonEnv(),
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  try {
+    const statePath = join(daemonDir, "daemon.json");
+    let midRefresh = false;
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      await sleep(20);
+      if (!existsSync(statePath)) continue;
+      try {
+        if ((JSON.parse(readFileSync(statePath, "utf8") as string) as Record<string, unknown>)["indexing"] === true) {
+          midRefresh = true;
+          break;
+        }
+      } catch { /* state file mid-write */ }
+    }
+    assert.ok(midRefresh, "daemon did not publish indexing: true (was the cache warm?)");
+
+    const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [DIST_INDEX, "connect"],
+      env: daemonEnv(),
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "mid-refresh-probe", version: "0" });
+    const connected = performance.now();
+    await client.connect(transport);
+    // Search DURING the reindex window: answered from the warm cache.
+    const start = performance.now();
+    const result = await client.callTool({
+      name: "action_hub",
+      arguments: { operation: "search", query: "slow tool" },
+    });
+    const latency = performance.now() - start;
+    const payload = JSON.parse((result.content as Array<{ text: string }>)[0]!.text) as {
+      ok?: boolean;
+      count?: number;
+      results?: Array<{ id?: string }>;
+    };
+    assert.equal(payload.ok, true, "search must succeed mid-refresh");
+    assert.ok(
+      payload.results && payload.results.length > 0,
+      `warm-cache hits expected (slow_tool was indexed in the cold phase); got ${JSON.stringify(payload).slice(0, 160)}`,
+    );
+    assert.ok(
+      latency < 2000,
+      `mid-refresh search took ${Math.round(latency)}ms — must be served from cache, not blocked on the reindex`,
+    );
+    void connected;
+    await client.close();
+  } finally {
+    daemon.kill("SIGTERM");
+    await sleep(200);
+  }
+});
+
+test("FX12-R5 rework: the deferred refresh trigger is cancelled by cleanup and guarded after it", async () => {
+  const { createDeferredRefreshTrigger } = await import("../dist/daemon.js");
+  let started = 0;
+  let stopped = false;
+  const trigger = createDeferredRefreshTrigger(
+    () => {
+      started += 1;
+      return Promise.resolve([]);
+    },
+    () => stopped,
+  );
+  // Normal path: one turn later the refresh starts exactly once.
+  trigger.schedule();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started, 1);
+  // Re-scheduling while the callback is pending would be a bug; after it ran, a second schedule starts a second refresh — not our concern here.
+
+  // Shutdown wins the race: schedule, cancel (cleanup), then the captured
+  // callback fires anyway — nothing may start.
+  stopped = false;
+  trigger.schedule();
+  trigger.cancel();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started, 1, "cancelled trigger must not start the refresh");
+  // Even if the queued callback runs after cleanup (the reviewer's race):
+  stopped = true;
+  trigger.schedule();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(started, 1, "a callback firing after shutdown must not start the refresh");
 });
