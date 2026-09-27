@@ -865,6 +865,124 @@ await main(async () => {
     }
   }
 
+  // --- 9. extraInterruptCleanup hook (reviewer LIB2-hook bar) ---------------
+  console.error("[progress] 9. hook checks start");
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-hook-" });
+
+    /** Runs a main() target with a given hook body; returns {code, lines, summary, disk}. */
+    const runHookTarget = async (hookBody, hookTimeoutExpr) => {
+      const scriptPath = join(root, `hook-target-${Math.random().toString(36).slice(2)}.mjs`);
+      const targetResults = join(root, `hook-results-${Math.random().toString(36).slice(2)}.json`);
+      writeFileSync(scriptPath, `
+import { main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+await main(async () => {
+  // A DETACHED, non-registry child: no handle exists (and none may be
+  // fabricated). It records its pid for the hook to kill+verify.
+  const child = spawn(process.execPath, ["-e", "const fs = require('node:fs'); fs.writeFileSync(process.env.DETACHED_PID, String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 500)"], { env: process.env, cwd: process.cwd(), detached: true, stdio: "ignore" });
+  child.unref();
+  writeFileSync(process.env.STARTED, "1");
+  // Hold the event loop: the detached child is unref'd by design, so
+  // without a ref'd timer node would drain the loop and exit with
+  // "unsettled top-level await" BEFORE the SIGTERM ever lands.
+  setInterval(() => {}, 3_600_000);
+  await new Promise(() => {}); // SIGTERM is the only way out
+}, { resultsPath: ${JSON.stringify(targetResults)}, extraCleanupTimeoutMs: ${hookTimeoutExpr}, extraInterruptCleanup: async (signal) => {
+${hookBody}
+} });
+`);
+      const pidFile = join(root, `detached-${Math.random().toString(36).slice(2)}`);
+      const started = join(root, `started-${Math.random().toString(36).slice(2)}`);
+      const proc = spawn(process.execPath, [scriptPath], { env: { ...env, DETACHED_PID: pidFile, STARTED: started }, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+      let stdoutText = "";
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (d) => { stdoutText += d; });
+      const deadline = performance.now() + 10_000;
+      while (!existsSync(started) && performance.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      assert.ok(existsSync(started), "target must have spawned its detached child");
+      await new Promise((r) => setTimeout(r, 150));
+      // Signal the target: its fn awaits forever; SIGTERM drives its
+      // interrupt path (hook + ONE summary + exit 143).
+      proc.kill("SIGTERM");
+      const exit = await new Promise((resolveP) => proc.on("exit", (code2) => resolveP(code2)));
+      // Hygiene: the target's DETACHED child has no handle — kill it by the
+      // recorded pid (the check owns it) unless the hook already did.
+      try {
+        const pid = Number(readFileSync(pidFile, "utf8").trim());
+        try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
+      } catch { /* pid file unreadable: hook case (a) already verified death */ }
+      const lines = stdoutText.split("\n").filter((l) => l.trim() !== "");
+      let summary = null;
+      try { summary = JSON.parse(lines[lines.length - 1]); } catch { summary = null; }
+      return { exit, lines, summary, pidFile, targetResults };
+    };
+
+    try {
+      // (a) Hook kills+verifies the exact recorded pid: one JSON, exit 143,
+      // child dead, artifact parity.
+      console.error("[progress] 9a begin");
+      const a = await runHookTarget(`
+  const fs = await import("node:fs");
+  const pid = Number(fs.readFileSync(process.env.DETACHED_PID, "utf8").trim());
+  const survivors = [];
+  try { process.kill(pid, 0); } catch { /* already gone */ }
+  try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+  await new Promise((r) => setTimeout(r, 200));
+  try { process.kill(pid, 0); survivors.push(pid); } catch { /* dead: verified */ }
+  return { survivors };
+`, "10_000");
+      assert.equal(a.exit, 143, `hook kill+verify must exit 143, got ${a.exit}`);
+      assert.equal(a.lines.length, 1, `exactly ONE stdout JSON line, got ${JSON.stringify(a.lines)}`);
+      assert.equal(a.summary?.ok, false);
+      assert.equal(a.summary?.interrupted, "SIGTERM");
+      assert.equal("survivors" in a.summary, false, "a verified hook kill must leave no survivors in the summary");
+      const detachedPid = Number(readFileSync(a.pidFile, "utf8").trim());
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(detachedPid), "the detached non-registry child must be dead");
+      assert.deepEqual(JSON.parse(readFileSync(a.targetResults, "utf8")), a.summary, "artifact parity: disk summary equals stdout summary");
+      checks.push({ check: "interrupt-hook-kills-detached-child-one-json-exit-143", ok: true });
+
+      // (b) Hook REPORTS a survivor without killing: honest survivor evidence.
+      console.error("[progress] 9b begin");
+      const b = await runHookTarget(`
+  const fs = await import("node:fs");
+  const pid = Number(fs.readFileSync(process.env.DETACHED_PID, "utf8").trim());
+  return { survivors: [pid] };
+`, "10_000");
+      assert.equal(b.exit, 143);
+      assert.equal(b.lines.length, 1);
+      const detachedB = Number(readFileSync(b.pidFile, "utf8").trim());
+      assert.deepEqual(b.summary?.survivors, [detachedB], "hook-reported survivors must merge into the summary");
+      // Hygiene: the reported survivor is this check's own child.
+      try { process.kill(detachedB, "SIGKILL"); } catch { /* gone */ }
+      checks.push({ check: "interrupt-hook-reports-survivor-merged", ok: true });
+
+      // (c) Hook THROWS: one summary with honest cleanup error, still exit 143.
+      console.error("[progress] 9c begin");
+      const c = await runHookTarget(`
+  throw new Error("hook boom (test)");
+`, "10_000");
+      assert.equal(c.exit, 143);
+      assert.equal(c.lines.length, 1, "a hook throw must not produce a second JSON");
+      assert.match(String(c.summary?.cleanupError ?? ""), /hook boom \(test\)/, "the hook failure must be represented in the ONE summary");
+      checks.push({ check: "interrupt-hook-throw-one-summary", ok: true });
+
+      // (d) Hook HANGS: bounded; the summary still emits with the timeout error.
+      console.error("[progress] 9d begin");
+      const d = await runHookTarget(`
+  await new Promise(() => {});
+`, "1_000");
+      assert.equal(d.exit, 143);
+      assert.equal(d.lines.length, 1, "a hung hook must not suppress the summary");
+      assert.match(String(d.summary?.cleanupError ?? ""), /timed out after 1000ms/);
+      checks.push({ check: "interrupt-hook-timeout-bounded-one-summary", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
   return { checks, suite: "harness.check" };
 }, { resultsPath: RESULTS_PATH });
 
