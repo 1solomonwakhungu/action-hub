@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Catalog } from "../dist/catalog/catalog.js";
-import { SearchEngine, SYNONYM_TERM_WEIGHT, tokenize, QUERY_STOPWORDS } from "../dist/search/search.js";
+import { QUERY_STOPWORDS, SearchEngine, SYNONYM_TERM_WEIGHT, tokenize } from "../dist/search/search.js";
 import { expandQuery, VERB_PHRASES, VERB_SYNONYMS } from "../dist/search/synonyms.js";
 import type { ActionRecord } from "../dist/types.js";
 
@@ -103,33 +103,11 @@ test("exact-name lookup is never demoted by synonym noise", async () => {
   catalog.add(record("acme:pause_user", "Pauses the user account temporarily."));
   catalog.add(record("other:pause_user", "Pauses the user account temporarily."));
   const engine = new SearchEngine(catalog);
-  // "disable_user" tokenizes to an exact existing name -> expansion skipped
-  // and the literal name must stay rank 1 (zero-weight parity is covered by
-  // the short-circuit unit test; PR 52's exact-name suite covers the rest).
+  // "disable_user" tokenizes to an exact existing name -> expansion skipped,
+  // so the exact name ranks first over the pause_user near-duplicates.
   const exact = await engine.search("disable_user");
   assert.equal(exact[0].id, "acme:disable_user");
-});
-
-test("every VERB_PHRASES key expands through the real QUERY_STOPWORDS path (SQ2 review finding 1)", () => {
-  for (const phrase of Object.keys(VERB_PHRASES)) {
-    const variants = [
-      phrase,
-      `${phrase},`,
-      phrase.replace(/ /g, "  "),
-      phrase.toUpperCase(),
-    ];
-    for (const q of variants) {
-      const expanded = expandQuery(q, tokenize, SYNONYM_TERM_WEIGHT, QUERY_STOPWORDS).terms
-        .filter((t) => t.weight < 1)
-        .map((t) => t.term);
-      assert.ok(expanded.length > 0, `phrase "${q}" must expand under real stopwords (got ${JSON.stringify(expanded)})`);
-    }
-  }
-  // The exact reviewer repro: "get rid of the user" with real stopwords.
-  const expanded = expandQuery("get rid of the user", tokenize, SYNONYM_TERM_WEIGHT, QUERY_STOPWORDS).terms
-    .filter((t) => t.weight < 1)
-    .map((t) => t.term);
-  assert.ok(expanded.length > 0, JSON.stringify(expanded));
+  assert.notEqual(exact[1]?.id, exact[0].id);
 });
 
 test("the semantic scorer receives ONLY the literal query terms (SQ2 review finding 3)", async () => {
@@ -159,4 +137,36 @@ test("paraphrased query beats same-noun distractors", async () => {
   const engine = new SearchEngine(catalog);
   const hits = await engine.search("turn the user account off");
   assert.equal(hits[0].id, "a:disable_user");
+});
+
+
+test("EVERY verb phrase expands through the real QUERY_STOPWORDS path (SQ2-R3 must-fix)", () => {
+  // The phrase matcher filters BOTH the query stream and the phrase tokens
+  // through the same stopword set. A phrase whose only carrier word is a
+  // stopword would otherwise become empty and never match. For every table
+  // key — incl. punctuation / repeated-whitespace / case variants (b10) —
+  // expandQuery with the REAL QUERY_STOPWORDS must fire ALL of its synonyms
+  // (tightened per reviewer-2: a single-token synonym could otherwise mask
+  // a phrase that collapsed to zero tokens).
+  for (const [phrase, syns] of Object.entries(VERB_PHRASES)) {
+    const variants = [phrase, `${phrase},`, phrase.replace(/ /g, "  "), phrase.toUpperCase()];
+    for (const q of variants) {
+      const expanded = expandQuery(q, tokenize, SYNONYM_TERM_WEIGHT, QUERY_STOPWORDS).terms
+        .filter((t) => t.weight < 1)
+        .map((t) => t.term);
+      for (const syn of syns) {
+        assert.ok(expanded.includes(syn), `phrase "${q}" must fire synonym "${syn}" (got ${JSON.stringify(expanded)})`);
+      }
+    }
+  }
+});
+
+test("a stopword-carrying phrase matches a stopword-filtered query (get rid of)", () => {
+  // "get rid of" -> tokens [get, rid]; "get" is not a stopword so the
+  // phrase still fires; a query whose tokens match the FILTERED phrase
+  // must expand to the phrase's synonyms.
+  const { terms } = expandQuery("get rid of the old keys", tokenize, SYNONYM_TERM_WEIGHT, QUERY_STOPWORDS);
+  for (const syn of VERB_PHRASES["get rid of"]) {
+    assert.ok(terms.some((t) => t.term === syn), `"get rid of" query must expand "${syn}"`);
+  }
 });
