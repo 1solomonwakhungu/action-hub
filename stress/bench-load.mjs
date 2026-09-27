@@ -23,14 +23,91 @@ import { promisify } from "node:util";
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createSandbox, assertIsolated, main as harnessMain, spawnGroup, killGroupAndVerify, FatalError } from "./lib/harness.mjs";
 
-// ISOLATION.md "Benchmark window rule" (intake, 04:08Z): heavy measurements
-// take an EXCLUSIVE lock so concurrent runs cannot make numbers
-// incomparable. mkdir is the atomic acquisition; the lock file records
-// owner/purpose; released in finally. A stale lock (holder pid provably
-// dead) may be stolen with the theft recorded in the summary.
+// ISOLATION.md "Benchmark window rule" (intake, 04:08Z; reviewer-1 rework,
+// 15:35Z): heavy measurements take an EXCLUSIVE lock so concurrent runs cannot make numbers incomparable. mkdir is the atomic acquisition; the lock
+// file records session/pid/purpose/UTC startedAt; released in finally. The
+// lock is NEVER stolen automatically: an existing lock fails acquisition with
+// the holder's identity. A stale lock (holder pid provably dead) is likewise
+// refused — removal requires manual coordination with intake. Unreadable or
+// malformed holder files fail closed and block acquisition like a live one.
 const BENCH_LOCK_DIR = process.env.BENCH_LOCK_DIR_OVERRIDE ?? "/tmp/action-hub-stress/BENCH.lock";
-const benchLock = { held: false, stolen: false, contender: null };
+const benchLock = { held: false };
 
+// Holder identity comes from the environment, never a hard-coded seat name:
+// the actual OpenRig session when present, else an explicit benchmark-session
+// value, so runs by any operator are attributed correctly.
+function benchLockSession() {
+  return process.env.OPENRIG_SESSION_NAME || "unknown";
+}
+
+// Returns the parsed holder, or null when holder.json is unreadable or
+// malformed. Null always means "fail closed" at the call sites.
+function readBenchHolder() {
+  let raw;
+  try {
+    raw = readFileSync(join(BENCH_LOCK_DIR, "holder.json"), "utf8");
+  } catch {
+    return null;
+  }
+  let holder;
+  try {
+    holder = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    typeof holder?.pid !== "number" || holder.pid <= 0 ||
+    typeof holder?.session !== "string" || holder.session === "" ||
+    typeof holder?.purpose !== "string" || holder.purpose === "" ||
+    typeof holder?.startedAt !== "string" || Number.isNaN(Date.parse(holder.startedAt))
+  ) return null;
+  return holder;
+}
+
+function acquireBenchLock() {
+  mkdirSync(dirname(BENCH_LOCK_DIR), { recursive: true });
+  try {
+    mkdirSync(BENCH_LOCK_DIR, { recursive: false });
+  } catch (cause) {
+    if (cause.code !== "EEXIST") throw cause;
+    // Held by someone else. Never stolen automatically — not even when the
+    // holder pid is provably dead: the stale lock is refused, and removal
+    // requires manual coordination with intake. Unreadable/malformed holder
+    // files fail closed exactly like a live holder.
+    const holder = readBenchHolder();
+    let alive = null;
+    if (holder) {
+      try { process.kill(holder.pid, 0); alive = true; } catch (e) { alive = e.code !== "ESRCH"; }
+    }
+    throw new FatalError(
+      `bench lock held: ${BENCH_LOCK_DIR}\n` +
+      `holder: ${holder ? JSON.stringify(holder) : "unreadable or malformed holder.json (fail-closed)"}\n` +
+      (alive === false
+        ? "holder pid is DEAD — this lock is stale. Do not remove it silently: notify intake, coordinate removal manually, then retry.\n"
+        : "heavy measurements require the exclusive window — retry later or coordinate with the holder session.\n"),
+    );
+  }
+  writeFileSync(join(BENCH_LOCK_DIR, "holder.json"), JSON.stringify({
+    session: benchLockSession(),
+    pid: process.pid,
+    purpose: "PR 58 bench-load (in-process/stdio/daemon measurements)",
+    startedAt: new Date().toISOString(), // UTC
+  }));
+  benchLock.held = true;
+}
+
+function releaseBenchLock() {
+  if (!benchLock.held) return;
+  benchLock.held = false;
+  // Release only our own lock: the holder on disk must still name this
+  // session and pid. A replaced or foreign holder is never deleted here.
+  let holder = null;
+  try { holder = readBenchHolder(); } catch { /* fail closed */ }
+  if (!holder || holder.pid !== process.pid || holder.session !== benchLockSession()) return;
+  try {
+    rmSync(BENCH_LOCK_DIR, { recursive: true, force: true });
+  } catch { /* best effort */ }
+}
 // "What else was running": snapshot other live stress work on this box
 // (scoped to stress workloads, never a broad sweep) at window start.
 async function detectCoRunners() {
@@ -45,47 +122,6 @@ async function detectCoRunners() {
   }
 }
 
-function acquireBenchLock() {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      mkdirSync(dirname(BENCH_LOCK_DIR), { recursive: true });
-      mkdirSync(BENCH_LOCK_DIR, { recursive: false });
-      writeFileSync(join(BENCH_LOCK_DIR, "holder.json"), JSON.stringify({
-        owner: "build-builder-5@action-hub",
-        purpose: "PR 58 bench-load (in-process/stdio/daemon measurements)",
-        pid: process.pid,
-        startedAt: new Date().toISOString(),
-      }));
-      benchLock.held = true;
-      return;
-    } catch (cause) {
-      if (cause.code !== "EEXIST") throw cause;
-      // Held by someone else: is the holder alive? A dead holder's lock is
-      // stale and may be stolen (theft recorded, never silent).
-      let holder = null;
-      try { holder = JSON.parse(readFileSync(join(BENCH_LOCK_DIR, "holder.json"), "utf8")); } catch { /* unreadable */ }
-      if (holder?.pid) {
-        let alive = false;
-        try { process.kill(holder.pid, 0); alive = true; } catch (e) { alive = e.code !== "ESRCH"; }
-        if (!alive) {
-          benchLock.stolen = true;
-          benchLock.contender = holder;
-          rmSync(BENCH_LOCK_DIR, { recursive: true, force: true });
-          continue; // retry acquisition once
-        }
-      }
-      throw new FatalError(`bench lock held: ${BENCH_LOCK_DIR} (holder=${JSON.stringify(holder)}). Heavy measurements require the exclusive window — retry later or coordinate.`);
-    }
-  }
-}
-
-function releaseBenchLock() {
-  if (!benchLock.held) return;
-  try {
-    rmSync(BENCH_LOCK_DIR, { recursive: true, force: true });
-  } catch { /* best effort */ }
-  benchLock.held = false;
-}
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -1191,7 +1227,6 @@ async function runBench() {
   summary.lockHeld = benchLock.held ? "yes" : "no";
   summary.lock = {
     held: benchLock.held ? "yes" : "no",
-    ...(benchLock.stolen ? { stolenFrom: benchLock.contender } : {}),
     ...(coRunners.length > 0 ? { coRunners } : { coRunners: [] }),
   };
   summary.ok =
