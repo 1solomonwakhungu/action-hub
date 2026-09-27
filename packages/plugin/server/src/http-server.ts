@@ -194,7 +194,16 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
       // Fresh server + transport per request; stateless mode keeps no session
       // state, so nothing needs to outlive the response.
       const requestServer = createMcpServer(runtime);
-      const requestTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      // F47: answer POSTs with plain JSON, not a per-request SSE stream.
+      // Stateless mode never uses server-initiated SSE (GET /mcp is 405 and
+      // no notifications are sent), so the stream is pure overhead — under
+      // an initialize storm it roughly doubles client-observed p50 latency
+      // (measured 200-conc storm: ~300ms SSE vs ~135ms JSON median) while
+      // the server CPU sits ~99% idle.
+      const requestTransport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      });
       requestTransport.onclose = () => void requestServer.close().catch(() => undefined);
       await requestServer.connect(requestTransport);
       try {
