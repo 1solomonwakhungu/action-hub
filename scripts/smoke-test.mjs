@@ -129,7 +129,13 @@ function checkDaemonLifecycle(bin) {
   const cfg = join(dir, "servers.json");
   const runtime = join(dir, "runtime");
   writeFileSync(cfg, JSON.stringify({ servers: [], skills: [], bundles: [], autoDiscover: false }));
-  const env = { ACTION_HUB_CONFIG: cfg, ACTION_HUB_DAEMON_DIR: runtime };
+  // Standalone contract (docs/releasing.md): the binary must not need a system
+  // node. PATH is stripped of every node-capable interpreter for the daemon
+  // lifecycle so all three OS jobs prove the anchored tree spawns in-binary.
+  const nodeLessPath = process.platform === "win32"
+    ? "C:\\Windows\\System32"
+    : "/usr/bin:/bin";
+  const env = { ACTION_HUB_CONFIG: cfg, ACTION_HUB_DAEMON_DIR: runtime, PATH: nodeLessPath };
 
   try {
     const start = runBinary(bin, ["daemon", "start"], env);
