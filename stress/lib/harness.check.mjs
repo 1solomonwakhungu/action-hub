@@ -27,6 +27,8 @@ const RESULTS_PATH = join(LIB_DIR, "..", ".generated", "results", "harness-check
 
 const TERM_LADDER_GRACE_MS = 1_000;
 
+
+
 function aliveByProbe(pid) {
   if (!pid) return false;
   try {
@@ -1078,20 +1080,37 @@ ${hookBody}
   // --- 10. F61: owner-state resultsPath refused BEFORE any fs op -------------
   console.error("[progress] 10. F61 owner-state resultsPath refusal");
   {
-    const target = join(ownerHome(), ".cache", "action-hub", "harness-check-f61", "results.json");
-    const ownerDir = refusedInsideOwnerState(target);
-    assert.ok(ownerDir, "precondition: the target must sit inside owner app state");
-    let threw = null;
-    try {
-      await main(async () => ({}), { resultsPath: target });
-    } catch (err) {
-      threw = err;
-    }
-    assert.ok(threw, "main() must refuse an owner-state resultsPath");
-    assert.ok(threw instanceof FatalError, "the refusal must be a FatalError");
-    assert.match(String(threw?.message ?? ""), /BEFORE any filesystem operation/, "the refusal must name the no-fs-op guarantee (F61)");
-    assert.equal(existsSync(target), false, "refusal must leave NOTHING behind (no rm, no write)");
-    assert.equal(existsSync(dirname(target)), false, "refusal must not create directories either");
+    // SPAWNED regression (no surrounding catch): the shipped contract is
+    // what a top-level stress script sees — exactly ONE ok:false stdout
+    // JSON + exit 1 + ZERO fs mutations (no file, no directory created).
+    const { root: f61Root } = createSandbox({ prefix: "harness-check-f61-" });
+    const fakeOwner = join(f61Root, "fake-owner");
+    const target = join(fakeOwner, "xdg", "action-hub", "results.json");
+    const script = `
+import { main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+await main(async () => ({ ok: true }), { resultsPath: ${JSON.stringify(target)} });
+`;
+    const scriptPath = join(f61Root, "f61-target.mjs");
+    writeFileSync(scriptPath, script);
+    const proc = spawn(process.execPath, [scriptPath], {
+      env: { ...process.env, XDG_CACHE_HOME: join(fakeOwner, "xdg") },
+      cwd: f61Root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdoutText = "";
+    proc.stdout.setEncoding("utf8");
+    proc.stdout.on("data", (d) => { stdoutText += d; });
+    const exit = await new Promise((resolveP) => proc.on("exit", (code2) => resolveP(code2)));
+    const lines = stdoutText.split("\n").filter((l) => l.trim() !== "");
+    let summary = null;
+    try { summary = JSON.parse(lines[lines.length - 1]); } catch { summary = null; }
+    assert.equal(exit, 1, `must exit 1 (got ${exit}); stdout=${stdoutText.slice(-200)}`);
+    assert.equal(lines.length, 1, "exactly ONE stdout JSON line");
+    assert.equal(summary?.ok, false, "the summary must be ok:false");
+    assert.equal(summary?.artifactWritten, false, "no artifact is written — the path itself is refused");
+    assert.match(String(summary?.error ?? ""), /BEFORE any filesystem operation/, "the summary must name the no-fs-op guarantee (F61)");
+    assert.equal(existsSync(target), false, "no file created");
+    assert.equal(existsSync(dirname(target)), false, "no directory created");
     // Control: the same main() accepts a resultsPath inside a temp root.
     const { root: okRoot } = createSandbox({ prefix: "harness-check-f61-ok-" });
     const okPath = join(okRoot, "results", "results.json");
@@ -1099,6 +1118,7 @@ ${hookBody}
     assert.equal(ctrl.ok, true, "a temp-root resultsPath must work normally");
     assert.equal(existsSync(okPath), true, "the durable summary must be written in the temp root");
     rmSync(okRoot, { recursive: true, force: true });
+    rmSync(f61Root, { recursive: true, force: true });
     checks.push({ check: "f61-owner-state-resultspath-refused-before-any-fs-op", ok: true });
   }
 
