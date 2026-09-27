@@ -501,31 +501,58 @@ test("__wrapper-run refuses direct (unauthenticated) invocation", () => {
   assert.match(String(result.stderr), /cannot be invoked directly/);
 });
 
-// PR 77 rework round 12: the exhausted Windows teardown retry chain must be
-// a SINGLE guarded interval — repeated activation (which the old code did on
-// every verification tick) must not fan out into a timer storm. Injected
-// regression: activate the guard many times, then prove the attempt rate
-// stays at one chain and the warning fires exactly once.
-test("exhausted-teardown retry loop keeps a single retry chain (no fanout)", async () => {
+// PR 77 rework round 13 (reviewer-1/intake): the injected regression drives
+// the REAL production retry loop — winSelfTeardownLoop, the exact function
+// runWrapperProcess's win32 selfTeardown calls — with an always-failing
+// kill attempt and a never-dying server. It proves: bounded attempts end in
+// ONE guarded retry chain (rate stays single-chain even under repeated
+// exhaust() activation), the warning fires exactly once, and the wrapper
+// NEVER exits while the server is alive. A second scenario flips the server
+// dead and asserts exit(4) fires exactly once.
+test("win32 exhausted teardown: single guarded retry chain, warn once, never exits while server alive", async () => {
+  const { winSelfTeardownLoop } = await import("../dist/commands/process-anchor.js");
   let attempts = 0;
   let warns = 0;
-  const loop = startGuardedRetryLoop({
-    intervalMs: 20,
+  let exits: number[] = [];
+  const loop = winSelfTeardownLoop({
+    serverDead: () => false, // the always-failing / unkillable-server fault
     attempt: () => { attempts++; },
-    onExhausted: () => { warns++; },
+    exit: (code) => { exits.push(code); },
+    writeErr: () => { warns++; },
+    verifyDelayMs: 5,
+    maxBoundedAttempts: 3,
+    retryIntervalMs: 20,
   });
-  loop.exhaust();
-  loop.exhaust();
-  loop.exhaust();
-  await new Promise((r) => setTimeout(r, 120));
+  await new Promise((r) => setTimeout(r, 110));
   const firstWindow = attempts;
-  loop.exhaust(); // repeated activation must be a no-op
-  await new Promise((r) => setTimeout(r, 120));
+  // Repeated activation must be a no-op (the old fanout created a NEW
+  // interval on every verifier tick reaching the exhausted branch).
+  for (let i = 0; i < 10; i++) loop.exhaust();
+  await new Promise((r) => setTimeout(r, 110));
   const secondWindow = attempts - firstWindow;
   loop.stop();
   assert.equal(warns, 1, `warning must fire exactly once, got ${warns}`);
-  assert.ok(firstWindow >= 4, `retry chain must run (first window ${firstWindow})`);
-  // 120ms at 20ms interval = ~6 attempts from ONE chain; a fanout (new
-  // interval per activation/tick) would double or worse.
+  assert.equal(exits.length, 0, "wrapper must never exit while the server is alive");
+  assert.ok(firstWindow >= 4, `bounded chain + retry must run (first window ${firstWindow})`);
+  // 110ms at 20ms interval = ~5-6 attempts from ONE chain; the old fanout
+  // (new interval per exhausted verifier) would multiply the rate.
   assert.ok(secondWindow <= 8, `single retry chain: ${secondWindow} attempts in the second window (fanout would exceed)`);
+});
+
+test("win32 exhausted teardown: exits 4 exactly once once the server is verified dead", async () => {
+  const { winSelfTeardownLoop } = await import("../dist/commands/process-anchor.js");
+  let attempts = 0;
+  let exits: number[] = [];
+  const loop = winSelfTeardownLoop({
+    serverDead: () => attempts >= 4, // server verified dead after 4 attempts
+    attempt: () => { attempts++; },
+    exit: (code) => { exits.push(code); },
+    writeErr: () => {},
+    verifyDelayMs: 5,
+    maxBoundedAttempts: 3,
+    retryIntervalMs: 20,
+  });
+  await new Promise((r) => setTimeout(r, 400));
+  loop.stop();
+  assert.deepEqual(exits, [4], `must exit 4 exactly once, got ${JSON.stringify(exits)}`);
 });

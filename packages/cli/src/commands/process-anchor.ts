@@ -126,29 +126,19 @@ export function runWrapperProcess(argvTail: string[]): void {
         if (server.exitCode !== null || server.signalCode !== null) return true;
         try { process.kill(server.pid!, 0); return false; } catch { return true; }
       };
-      let attempts = 0;
-      const attemptTeardown = () => {
-        attempts++;
-        try { server?.kill("SIGKILL"); } catch {}
-        const tk = spawn("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore" });
-        // A taskkill that works kills this wrapper too; the verification
-        // below only runs when it did NOT (launch failure or nonzero exit).
-        tk.on("error", () => {});
-        setTimeout(() => {
-          if (serverDead()) {
-            process.exit(4);
-            return;
-          }
-          if (attempts < 6) { attemptTeardown(); return; }
-          // Every bounded attempt failed: report it LOUDLY, then never
-          // exit while the server lives — keep attempting (and holding the
-          // group open) instead of silently orphaning it.
-          try { fs.writeSync(2, "__wrapper-run: WARNING teardown attempts exhausted; server still alive; continuing attempts\n"); } catch {}
-          const keepTrying = setInterval(attemptTeardown, 2000);
-
-        }, 400);
-      };
-      attemptTeardown();
+      winSelfTeardownLoop({
+        serverDead,
+        attempt: () => {
+          try { server?.kill("SIGKILL"); } catch {}
+          const tk = spawn("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore" });
+          // A taskkill that works kills this wrapper too; the loop's
+          // verification only matters when it did NOT (launch failure or
+          // nonzero exit).
+          tk.on("error", () => {});
+        },
+        exit: (code) => process.exit(code),
+        writeErr: (message) => { try { fs.writeSync(2, message); } catch {} },
+      });
       return;
     }
     // We are the group leader, so the PGID is ours by construction and
@@ -401,6 +391,54 @@ export function startGuardedRetryLoop(options: {
     if (timer) { clearInterval(timer); timer = null; }
   };
   return { exhaust, stop };
+}
+
+/**
+ * The REAL Windows exhausted-teardown loop (review rounds 12-13): bounded
+ * attempts (default 6, verified 400ms apart) end in ONE guarded retry chain
+ * — never a multiplying fanout — with the warning fired exactly once, and
+ * the caller never exits while the server is still alive. Production wires
+ * runWrapperProcess's win32 selfTeardown here; the injected regression
+ * drives THIS SAME function with stubbed kill/verify hooks, so the test
+ * exercises the production retry callback by construction.
+ */
+export function winSelfTeardownLoop(hooks: {
+  serverDead: () => boolean;
+  attempt: () => void;
+  exit: (code: number) => void;
+  writeErr: (message: string) => void;
+  verifyDelayMs?: number;
+  maxBoundedAttempts?: number;
+  retryIntervalMs?: number;
+}): { exhaust: () => void; stop: () => void } {
+  let attempts = 0;
+  let exited = false;
+  const maxBounded = hooks.maxBoundedAttempts ?? 6;
+  const verifyDelayMs = hooks.verifyDelayMs ?? 400;
+  const attemptTeardown = () => {
+    attempts++;
+    hooks.attempt();
+    setTimeout(() => {
+      if (exited) return;
+      if (hooks.serverDead()) {
+        exited = true;
+        guard.stop();
+        hooks.exit(4);
+        return;
+      }
+      if (attempts < maxBounded) attemptTeardown();
+      else guard.exhaust();
+    }, verifyDelayMs);
+  };
+  const guard = startGuardedRetryLoop({
+    intervalMs: hooks.retryIntervalMs ?? 2000,
+    attempt: attemptTeardown,
+    onExhausted: () => {
+      hooks.writeErr("__wrapper-run: WARNING teardown attempts exhausted; server still alive; continuing attempts\n");
+    },
+  });
+  attemptTeardown();
+  return guard;
 }
 
 export interface TeardownResult {
