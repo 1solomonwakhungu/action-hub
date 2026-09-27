@@ -155,6 +155,16 @@ export async function runDaemon(): Promise<void> {
     };
     await writePrivateJson(paths.state, state);
 
+    // FX12-R5: unlike stdio/HTTP, a warm-started daemon may never see a
+    // client, so the deferred refresh must start on its own — deferred by
+    // one turn so the listener-up path (socket published, state written)
+    // completes first. The settle flags above depend on the refresh
+    // settling; daemon clients connecting mid-refresh are served from the
+    // warm cache (startRefresh is memoised, so their handshake trigger is a
+    // no-op).
+    const settled = runtime;
+    setImmediate(() => void settled.startRefresh().catch(() => undefined));
+
     // The hub answers from the warm cache immediately; the authoritative
     // re-index runs behind it. Publish its settlement so hosts and the CLI can
     // distinguish "connectable" from "index settled" without a new probe.
