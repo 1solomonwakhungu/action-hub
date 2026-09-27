@@ -12,8 +12,8 @@
  * Correctness check (no benchmark) — does not take BENCH.lock.
  */
 import { spawnSync } from "node:child_process";
-import { writeFileSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { FatalError, main } from "./lib/harness.mjs";
 
@@ -30,7 +30,10 @@ await main(async () => {
   const checks = [];
   const failures = [];
   for (const c of cases) {
-    // Pre-seed a STALE artifact: the failure run must overwrite it.
+    // Pre-seed a STALE artifact: the failure run must overwrite it. On a
+    // clean archive the results directory does not exist yet (F59) — create
+    // it before seeding so the selftest itself never bypasses the contract.
+    mkdirSync(dirname(c.artifact), { recursive: true });
     writeFileSync(c.artifact, JSON.stringify({ stale: true }), "utf8");
     const r = spawnSync(process.execPath, [join(repoRoot, c.script), c.flag], { encoding: "utf8", timeout: 60000 });
     const lines = (r.stdout || "").split("\n").filter((l) => l.trim().length > 0);
