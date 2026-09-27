@@ -79,6 +79,17 @@ function daemonStartCapMs(explicit?: number): number {
   return DEFAULT_START_TIMEOUT_MS;
 }
 
+/**
+ * F63: the anchor's 'exit' event is loop-scheduled and can lag behind a
+ * ready-probe success under CPU load. A dead-but-unreported anchor means
+ * THIS attempt failed closed — and a ready answer may be OUR OWN orphaned
+ * server (the wrapper's group died externally while the server survived),
+ * not a concurrent winner. Before declaring success on the winner path, the
+ * loop gives the exit event a bounded grace and then decides on the
+ * freshest ground truth (event flag OR synchronous exitCode/signalCode).
+ */
+const WINNER_EXIT_GRACE_MS = 300;
+
 function noProgressWindowMs(): number {
   const envRaw = process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"];
   if (envRaw) {
@@ -217,7 +228,19 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     }
 
     const ready = await daemonReady(paths);
-    if (childExited) continue; // an exited child must take the proof-checked path below
+    // F63 winner-path grace: if the anchor is alive at probe-success, give
+    // its exit event a bounded window to land before adopting the answer —
+    // a dead anchor means this attempt failed closed and the ready answer
+    // may be our own orphaned server.
+    if (ready?.ok && !childExited && child.exitCode === null && child.signalCode === null) {
+      await Promise.race([
+        new Promise<void>((resolve) => child.once("exit", () => resolve())),
+        new Promise<void>((resolve) => setTimeout(resolve, WINNER_EXIT_GRACE_MS)),
+      ]);
+    }
+    if (childExited || child.exitCode !== null || child.signalCode !== null) {
+      continue; // an exited child must take the proof-checked path below
+    }
     if (ready?.ok) {
       console.log(`Action Hub daemon started (pid ${ready.pid}).`);
       return 0;
