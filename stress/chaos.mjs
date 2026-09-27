@@ -30,17 +30,24 @@
 // Output: JSON summary as the last stdout line, also written to
 // stress/.generated/results/chaos.json. Requires `npm run build` first.
 
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir, userInfo as osUserInfo } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  FatalError,
+  assertIsolated,
+  buildIsolatedEnv,
+  makeRunRoot,
+  ownerStateDirs,
+  runStep,
+  main as harnessMain,
+} from "./lib/harness.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, "..");
 const FAKE_SERVER = join(HERE, "fake-mcp-server.mjs");
 const GEN_DIR = join(REPO_ROOT, "stress", ".generated", "chaos");
-// findings + failureSummary are declared FIRST so every refusal —
+// findings are declared FIRST so every refusal —
 // including the isolation sentinel — can emit the compact-JSON last line.
 const findings = [];
 function finding(severity, summary, repro) {
@@ -50,158 +57,79 @@ function finding(severity, summary, repro) {
 const RESULTS_DIR = join(REPO_ROOT, "stress", ".generated", "results");
 const RESULTS_FILE = join(RESULTS_DIR, "chaos.json");
 
-// CONTRACT.md + ISOLATION.md output contract: a COMPACT JSON summary is the
-// LAST stdout line on EVERY path; the results file always carries the SAME
-// final object; exit nonzero whenever ok is false. stdout is flushed (with
-// a fallback timer) before exiting — the process.exit-before-flush failure
-// class is not acceptable here either.
-let summaryEmitted = false;
-class FatalSummary extends Error {
-  constructor(summary, code) {
-    super(summary.reason ?? "fatal");
-    this.summary = summary;
-    this.code = code;
-  }
+// CONTRACT.md + ISOLATION.md output contract, implemented by the shared
+// stress/lib/harness.mjs main(): a COMPACT JSON summary is the LAST stdout
+// line on EVERY path; the results file always carries the SAME final object;
+// exit nonzero (1) whenever ok is false — including the preflight path
+// (previously exit 2; now 1, per the shared main() contract).
+// Chaos-typed refusals keep the chaos summary shape by being caught inside
+// the task (below) and returned as {ok:false, reason, phase} objects.
+function refusal(reason, phase) {
+  const err = new FatalError(reason);
+  err.phase = phase;
+  throw err;
 }
-function emitSummary(summary, code) {
-  if (summaryEmitted) return; // EXACTLY ONE final summary per run
-  summaryEmitted = true;
-  const compact = JSON.stringify(summary);
-  const pretty = JSON.stringify(summary, null, 2);
+
+// Isolation per ISOLATION.md, implemented by the shared stress/lib/harness.mjs:
+// ONE fresh run root, every checklist var REPLACED (never forwarded) and
+// applied to the ENTIRE process before factory/hub construction — the
+// in-process hub and all 44 spawned children (which inherit process.env)
+// can never touch owner state. The shared ownerStateDirs enumerates the real
+// owner app-state/harness directories (os.userInfo()-derived home, dynamic
+// .claude*/.codex* families) and assertIsolated validates the FINAL env with
+// separator-safe containment after every assignment.
+//
+// All sandbox setup happens INSIDE the shared main()'s guarded region
+// (REWORK-MIG1-1): a hostile environment (e.g. TMPDIR pointing at owner
+// state) must fail closed through the same serializer as everything else —
+// exactly one compact ok:false JSON line, the SAME object in the results
+// file, nonzero exit — never a raw FatalError on stderr with empty stdout.
+// Module scope therefore declares only let-bindings assigned by setupIsolation().
+let runRoot = null;
+let isolationEnv = null;
+let MANIFEST_DIR = null;
+let CONFIG_PATH = null;
+
+function setupIsolation() {
+  runRoot = makeRunRoot("action-hub-chaos-");
+  for (const [k, v] of Object.entries(buildIsolatedEnv(runRoot))) {
+    process.env[k] = v; // REPLACE, never forward the caller's value
+  }
+
+  // Sentinel regression (CHAOS_SENTINEL_SELFTEST=1) — now driven by the SHARED
+  // ownerStateDirs: builds a fake home with .claude and .codex-plus children
+  // and asserts the wildcard entries are present in its output — the coverage
+  // the readdir must never silently lose. Runs inside the guarded region too:
+  // it serializes its one JSON line itself and exits before the summary
+  // contract would add a second stdout line.
+  if (process.env.CHAOS_SENTINEL_SELFTEST === "1") {
+    const fakeHome = join(runRoot, "sentinel-selftest-home");
+    mkdirSync(join(fakeHome, ".claude"), { recursive: true });
+    mkdirSync(join(fakeHome, ".codex-history"), { recursive: true });
+    const dirs = ownerStateDirs({}, fakeHome);
+    const ok =
+      dirs.includes(join(fakeHome, ".claude")) &&
+      dirs.includes(join(fakeHome, ".codex-history")) &&
+      dirs.includes(join(fakeHome, ".cache", "action-hub"));
+    console.log(JSON.stringify({ script: "chaos-sentinel-selftest", ok }));
+    rmSync(fakeHome, { recursive: true, force: true }); // no temp litter on either exit
+    rmSync(runRoot, { recursive: true, force: true });
+    process.exit(ok ? 0 : 1);
+  }
+
+  assertIsolated(process.env, runRoot); // validate the initial assignment
+
+  // children inherit the already-isolated process.env
+  isolationEnv = () => ({ ...process.env });
+  MANIFEST_DIR = join(runRoot, "manifests");
+  CONFIG_PATH = process.env.ACTION_HUB_CONFIG; // INSIDE the run root (shared layout)
+}
+
+process.on("exit", () => {
   try {
-    mkdirSync(RESULTS_DIR, { recursive: true });
-    writeFileSync(RESULTS_FILE, pretty + "\n");
+    if (runRoot) rmSync(runRoot, { recursive: true, force: true });
   } catch {}
-  process.stdout.write(compact + "\n", () => {
-    process.exit(code);
-  });
-  // hard fallback if the write callback never fires (rare pipe edge cases)
-  setTimeout(() => process.exit(code), 1_000).unref();
-}
-function failureSummary(reason, extra = {}, code = 2) {
-  // Terminate control flow SYNCHRONOUSLY: throw a typed fatal that the
-  // single top-level catch serializes once. No caller continues past a
-  // refusal (proven: preflight failure no longer runs later phases).
-  throw new FatalSummary({ script: "chaos", ok: false, reason, findings, elapsedMs: 0, ...extra }, code);
-}
-
-// CONTRACT.md hard rule 2 + intake ISOLATION.md checklist (revised
-// 21:27Z): every var is REPLACED (never forwarded) under ONE fresh temp
-// root, applied to the ENTIRE process before factory/hub construction —
-// the in-process hub and all 44 spawned children (which inherit
-// process.env) can never touch owner state. The sentinel refuses the
-// ENUMERATED real owner app-state/harness directories (resolved via
-// os.userInfo().homedir, independent of $HOME), using separator-safe
-// path.relative/isAbsolute containment; os.tmpdir() under USERPROFILE is
-// allowed. Containment of the run root itself uses relative() too and is
-// validated against the FINAL process.env values, so a later env
-// reassignment cannot escape undetected. The script exits after the run,
-// so the process.env mutation is inherently scoped.
-const tmpRoot = join(tmpdir(), `action-hub-chaos-${process.pid}-${Date.now()}`);
-for (const d of ["home", "cache", "config", "state", "data", "skills", "pi", "daemon"]) {
-  mkdirSync(join(tmpRoot, d), { recursive: true });
-}
-const isolationPaths = {
-  HOME: join(tmpRoot, "home"),
-  USERPROFILE: join(tmpRoot, "home"),
-  APPDATA: join(tmpRoot, "config"),
-  LOCALAPPDATA: join(tmpRoot, "cache"),
-  XDG_CACHE_HOME: join(tmpRoot, "cache"),
-  XDG_CONFIG_HOME: join(tmpRoot, "config"),
-  XDG_STATE_HOME: join(tmpRoot, "state"),
-  XDG_DATA_HOME: join(tmpRoot, "data"),
-  ACTION_HUB_CONFIG: join(tmpRoot, "servers.json"), // live config lives in the run root
-  ACTION_HUB_CACHE: join(tmpRoot, "action-hub-cache.json"), // FILE-shaped: no EISDIR if exercised
-  ACTION_HUB_SKILLS_DIR: join(tmpRoot, "skills"),
-  ACTION_HUB_DAEMON_DIR: join(tmpRoot, "daemon"),
-  ACTION_HUB_CREDENTIALS: join(tmpRoot, "credentials.json"), // FILE-shaped
-  ACTION_HUB_CONTROL: join(tmpRoot, "control.sock"), // present on this base (control.ts)
-  PI_CODING_AGENT_DIR: join(tmpRoot, "pi"),
-};
-for (const [k, v] of Object.entries(isolationPaths)) {
-  process.env[k] = v; // REPLACE, never forward the caller's value
-}
-const realHome = resolve(osUserInfo().homedir);
-
-// Enumerated real owner app-state / harness directories (revised
-// checklist): macOS Library caches + Application Support, Windows
-// AppData/LocalAppData action-hub dirs, dot-configured harness dirs, and
-// every real-home child matching .claude*.
-function ownerStateDirs(home = realHome) {
-  const dirs = [
-    join(home, ".cache", "action-hub"),
-    join(home, ".config", "action-hub"),
-    join(home, ".action-hub"),
-    join(home, "Library", "Caches", "action-hub"),
-    join(home, "Library", "Application Support", "action-hub"),
-    join(home, "AppData", "Roaming", "action-hub"),
-    join(home, "AppData", "Local", "action-hub"),
-    join(home, ".cursor"),
-    join(home, ".copilot"),
-    join(home, ".pi"),
-    join(home, ".codex"),
-    join(home, ".claude"),
-    join(home, ".claude.json"),
-  ];
-  let entries = [];
-  try {
-    entries = readdirSync(home);
-  } catch (err) {
-    throw new Error(`sentinel: cannot enumerate real-home children for wildcard coverage: ${err?.message ?? err}`);
-  }
-  for (const entry of entries) {
-    if (entry.startsWith(".claude") || entry.startsWith(".codex")) {
-      dirs.push(join(home, entry));
-    }
-  }
-  return dirs;
-}
-
-// Sentinel regression (CHAOS_SENTINEL_SELFTEST=1): builds a fake home with
-// .claude and .codex-plus children and asserts the wildcard entries are
-// present in ownerStateDirs' output — the coverage the readdir must never
-// silently lose.
-if (process.env.CHAOS_SENTINEL_SELFTEST === "1") {
-  const fakeHome = join(tmpdir(), `chaos-sentinel-selftest-${process.pid}`);
-  mkdirSync(join(fakeHome, ".claude"), { recursive: true });
-  mkdirSync(join(fakeHome, ".codex-history"), { recursive: true });
-  const dirs = ownerStateDirs(fakeHome);
-  const ok =
-    dirs.includes(join(fakeHome, ".claude")) &&
-    dirs.includes(join(fakeHome, ".codex-history")) &&
-    dirs.includes(join(fakeHome, ".cache", "action-hub"));
-  rmSync(fakeHome, { recursive: true, force: true });
-  console.log(JSON.stringify({ script: "chaos-sentinel-selftest", ok }));
-  process.exit(ok ? 0 : 1);
-}
-
-// Separator-safe containment: child is inside parent when its relative
-// path is non-empty, not absolute, and does not begin with "..".
-const isInside = (child, parent) => {
-  const rel = relative(resolve(parent), resolve(child));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-};
-
-function validateIsolation() {
-  for (const k of Object.keys(isolationPaths)) {
-    const v = process.env[k]; // FINAL env value, not the table
-    if (!v) {
-      failureSummary(`isolation violation: ${k} is missing from the final process.env`, { phase: "preflight" });
-    }
-    if (!isInside(v, tmpRoot)) {
-      failureSummary(`isolation violation: ${k}=${v} is outside the run root ${tmpRoot}`, { phase: "preflight" });
-    }
-    for (const ownerDir of ownerStateDirs()) {
-      if (isInside(v, ownerDir)) {
-        failureSummary(`isolation violation: ${k}=${v} resolves inside the real owner app state ${ownerDir}`, { phase: "preflight" });
-      }
-    }
-  }
-}
-validateIsolation(); // validate the initial assignment
-const isolationEnv = () => ({ ...process.env }); // children inherit the already-isolated env
-const MANIFEST_DIR = join(tmpRoot, "manifests");
-const CONFIG_PATH = join(tmpRoot, "servers.json"); // INSIDE the run root (checklist rule 1)
+});
 const CLI_ENTRY = join(REPO_ROOT, "packages", "cli", "dist", "index.js");
 
 const SECRET = "CHAOS-SENTINEL-9f3a2b";
@@ -216,13 +144,6 @@ const SLOW_START_MS = 10_000;
 const HUGE_BYTES = 5 * 1024 * 1024;
 const CHAOS_SEED = 7;
 const DOCTOR_TIMEOUT_MS = 180_000;
-
-
-process.on("exit", () => {
-  try {
-    rmSync(tmpRoot, { recursive: true, force: true });
-  } catch {}
-});
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -259,6 +180,7 @@ function percentile(sorted, p) {
 function buildFixtures() {
   mkdirSync(MANIFEST_DIR, { recursive: true });
   mkdirSync(GEN_DIR, { recursive: true });
+  mkdirSync(dirname(CONFIG_PATH), { recursive: true }); // the shared run root does not pre-create this layout
   const tools = [];
   for (let t = 0; t < TOOLS_PER_SERVER; t++) {
     tools.push({
@@ -314,12 +236,16 @@ function buildFixtures() {
 async function main() {
   if (!existsSync(join(REPO_ROOT, "packages", "core", "dist", "index.js")) || !existsSync(CLI_ENTRY)) {
     console.error("[chaos] requires built workspaces; run `npm run build` first");
-    failureSummary("workspaces not built (run npm run build)", { phase: "preflight" });
+    refusal("workspaces not built (run npm run build)", "preflight");
   }
   if (!existsSync(FAKE_SERVER)) {
     console.error(`[chaos] missing ${FAKE_SERVER} (committed by PR 46; run from a checkout of main 55dc286 or later)`);
-    failureSummary(`missing ${FAKE_SERVER}`, { phase: "preflight" });
+    refusal(`missing ${FAKE_SERVER}`, "preflight");
   }
+
+  // Isolation MUST be established inside the shared main()'s guarded region
+  // (REWORK-MIG1-1): hostile-env refusals flow through the one serializer.
+  setupIsolation();
 
   const { ActionHub } = await import(resolve(REPO_ROOT, "packages/core/dist/index.js"));
   const { createSdkClientFactory } = await import(resolve(REPO_ROOT, "packages/cli/dist/client-factory.js"));
@@ -330,8 +256,7 @@ async function main() {
   // indexing to exercise the failure path — used to prove the finally
   // block closes the hub and kills all child transports. Not part of a
   // normal run.
-  process.env.ACTION_HUB_CONFIG = CONFIG_PATH; // real config now exists
-  validateIsolation(); // re-validate FINAL values after every assignment
+  assertIsolated(process.env, runRoot); // re-validate FINAL values after every assignment
   const startedAt = Date.now();
   const rssStartMB = Math.round(process.memoryUsage().rss / 1048576);
 
@@ -355,7 +280,7 @@ async function main() {
     resultCache: { enabled: true, ttlMs: 60_000, maxEntries: 500 },
   });
 
-  const summary = {
+  let summary = {
     script: "chaos",
     servers: SERVER_COUNT,
     misbehaving: MISBEHAVE_COUNT,
@@ -573,68 +498,26 @@ async function main() {
   }
 
   // 6. doctor: bounded time with 44 servers, exits 1 (10 misbehaving), no secret.
+  // Bounded, process-tree-safe run via the SHARED runStep: detached process
+  // group, timeout escalates TERM -> bounded wait -> SIGKILL -> poll until
+  // the group is EMPTY (grandchildren included) on every path — the runner
+  // resolves only after the group is verified dead. Windows uses taskkill /T.
   const doctorStart = Date.now();
-  // Bounded, process-tree-safe run: detached (POSIX group leader) so a
-  // timeout kills doctor AND its MCP grandchildren. On timeout the runner
-  // stays alive through escalation (TERM -> 3s -> KILL -> 1s grace) and
-  // resolves only afterwards; a finally re-kills the whole group so no
-  // grandchild can outlive the harness. Windows uses taskkill /T /F.
-  const IS_WIN = process.platform === "win32";
-  const killTree = (pid, sig) => {
-    if (IS_WIN) {
-      try { spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
-    } else {
-      try { process.kill(-pid, sig); } catch { try { child?.kill(sig); } catch {} }
-    }
-  };
-  const runDoctor = () => new Promise((resolveRun) => {
-    let child;
-    let stdout = "", stderr = "", timedOut = false, escalated = false, settled = false;
-    let killTimer = null;
-    const finish = (info) => {
-      if (settled) return;
-      settled = true;
-      if (killTimer) { clearTimeout(killTimer); killTimer = null; } // every settled path
-      resolveRun(info);
-    };
-    // after escalation begins, only the escalation chain's final finish
-    // resolves — a TERM-close must not resolve while grandchildren may
-    // still be pending the KILL.
-    child = spawn("node", [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"], {
+  const doctorInfo = await runStep(
+    "node",
+    [CLI_ENTRY, "doctor", "--config", CONFIG_PATH, "--no-check"],
+    {
       env: isolationEnv(), // isolated process.env, captured after repointing
-      cwd: tmpRoot, // cross-cwd proof: not the repo root
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.stdout.on("data", (c) => { stdout += String(c); });
-    child.stderr.on("data", (c) => { stderr += String(c); });
-    child.on("error", (e) => finish({ pid: child.pid, code: null, signal: null, timedOut, escalated, stdout, stderr, error: String(e) }));
-    child.on("close", (code, signal) => {
-      if (!escalated) {
-        finish({ pid: child.pid, code, signal, timedOut, escalated, stdout, stderr });
-      }
-      // escalated closes are ignored: the escalation chain finishes.
-    });
-    killTimer = setTimeout(() => {
-      timedOut = true;
-      escalated = true;
-      killTree(child.pid, "SIGTERM");
-      setTimeout(() => {
-        killTree(child.pid, "SIGKILL");
-        // no unref: the escalation must complete before the run can exit
-        setTimeout(() => finish({ pid: child.pid, code: null, signal: "SIGKILL", timedOut, escalated, stdout, stderr }), 4_000);
-      }, 3_000);
-    }, DOCTOR_TIMEOUT_MS);
-  });
-  let doctorInfo;
-  try {
-    doctorInfo = await runDoctor();
-  } finally {
-    // belt-and-braces: kill the SAME group again whatever happened; the
-    // pid is passed explicitly (no closure over the runner's child).
-    if (doctorInfo?.pid) {
-      try { killTree(doctorInfo.pid, "SIGKILL"); } catch {}
-    }
+      cwd: runRoot, // cross-cwd proof: not the repo root
+      timeoutMs: DOCTOR_TIMEOUT_MS,
+    },
+  );
+  // Documented fault-injection hook (CHAOS_FAULT=doctor-group-empty): forces
+  // groupEmpty=false after the doctor step to prove the REWORK-MIG1-2 gate —
+  // unverified group cleanup must yield a P1 finding, doctorBounded=false,
+  // ok:false and a nonzero exit. Not part of a normal run.
+  if (process.env.CHAOS_FAULT === "doctor-group-empty") {
+    doctorInfo.groupEmpty = false;
   }
   const doctorMs = Date.now() - doctorStart;
   const doctorOut = `${doctorInfo.stdout ?? ""}\n${doctorInfo.stderr ?? ""}`;
@@ -642,12 +525,19 @@ async function main() {
   summary.doctor = {
     exitCode: doctorInfo.code,
     timedOut: doctorInfo.timedOut === true,
+    groupEmpty: doctorInfo.groupEmpty === true, // false when cleanup could NOT be verified (REWORK-MIG1-2)
     durationMs: doctorMs,
     bounded: doctorInfo.timedOut !== true && doctorMs < DOCTOR_TIMEOUT_MS,
     error: doctorInfo.error,
   };
   if (!summary.doctor.bounded) {
     finding("P1", `doctor exceeded ${DOCTOR_TIMEOUT_MS}ms with ${SERVER_COUNT} servers`, `ACTION_HUB_CONFIG=${CONFIG_PATH} node ${CLI_ENTRY} doctor`);
+  }
+  if (summary.doctor.groupEmpty !== true) {
+    // REWORK-MIG1-2: runStep reports groupEmpty:false exactly when it could
+    // not VERIFY the spawned group is gone. A false green here would let
+    // doctor descendants outlive the harness while the gate stays true.
+    finding("P1", `doctor group cleanup could not be verified (groupEmpty=false, pid ${doctorInfo.pid}) — possible surviving descendants`, `stress/lib/harness.mjs runStep returned groupEmpty:false for the doctor step`);
   }
   // doctor checks live boot health; under chaos the same fleet can
   // legitimately exit 0 (all servers bootable at check time) or 1 (a
@@ -670,7 +560,9 @@ async function main() {
     circuitBreakersOpened: circuit.opened.length === crashIds.length,
     circuitBreakersRecovered: circuit.recovered.length === finiteIds.length,
     hangsBounded: hang.bounded,
-    doctorBounded: summary.doctor.bounded,
+    // REWORK-MIG1-2: bounded time alone is not enough — the doctor process
+    // group must be VERIFIED empty (no surviving descendants).
+    doctorBounded: summary.doctor.bounded && summary.doctor.groupEmpty === true,
     secretsContained: !leaked,
   };
   if (!memoryBounded) {
@@ -716,17 +608,39 @@ async function main() {
     };
     summary = redactDeep(summary);
   }
-  emitSummary(summary, summary.ok ? 0 : 1);
+  return summary;
 }
 
-// Single top-level catch: serializes exactly one final summary (via the
-// summaryEmitted guard) for both typed refusals and uncaught errors.
-main().catch((err) => {
-  if (err instanceof FatalSummary) {
-    console.error(`[chaos] refused: ${err.message}`);
-    emitSummary(err.summary, err.code);
-    return;
+// The shared main() implements the final-summary contract: stale results
+// removed at start, exactly ONE compact JSON last stdout line on EVERY path,
+// the SAME final object in the results file, and exitCode derived from the
+// FINAL object (ok:false -> exit 1, including typed chaos refusals which the
+// task below converts back into the chaos summary shape).
+await harnessMain(async () => {
+  try {
+    return await main();
+  } catch (err) {
+    if (err instanceof FatalError) {
+      return {
+        script: "chaos",
+        ok: false,
+        reason: err.message,
+        findings,
+        phase: err.phase ?? "run",
+        elapsedMs: 0,
+      };
+    }
+    // Any non-FatalError failure (e.g. the documented CHAOS_FAULT=mid-run
+    // injection) keeps the chaos summary shape instead of the lib's generic
+    // {ok:false,error} shape — the results contract stays chaos-specific on
+    // every path while the shared main() still owns serialization/exit.
+    return {
+      script: "chaos",
+      ok: false,
+      reason: `fatal: ${String(err?.message ?? err).slice(0, 200)}`,
+      findings,
+      phase: "run",
+      elapsedMs: 0,
+    };
   }
-  console.error(`[chaos] fatal: ${err?.stack ?? err}`);
-  emitSummary({ script: "chaos", ok: false, reason: `fatal: ${String(err?.message ?? err).slice(0, 200)}`, findings, phase: "run" }, 1);
-});
+}, { resultsPath: RESULTS_FILE });
