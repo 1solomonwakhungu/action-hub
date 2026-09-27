@@ -835,7 +835,7 @@ export function lastJsonLine(stdout) {
  *     it as ONE compact JSON last stdout line
  *   - sets process.exitCode (never calls process.exit)
  */
-export async function main(fn, { resultsPath } = {}) {
+export async function main(fn, { resultsPath, extraInterruptCleanup, extraCleanupTimeoutMs = 10_000 } = {}) {
   if (!resultsPath) {
     throw new TypeError("main() requires { resultsPath } — the final summary must have a durable home");
   }
@@ -875,11 +875,62 @@ export async function main(fn, { resultsPath } = {}) {
         survivors.push(...(verdict.survivors.length ? verdict.survivors : [handle.pgid]));
       }
     }
+    // Optional default-off hook (reviewer LIB2-hook bar): a child spawned
+    // DETACHED by the caller's own launcher has NO registry handle (and one
+    // must never be fabricated — object identity is the ownership proof), so
+    // the script owns its kill+verify. The hook runs AFTER the registry
+    // sweep and BEFORE the ONE interrupt summary; it is BOUNDED (a hung hook
+    // must not suppress the summary forever) and its failure is represented
+    // in that same ok:false summary — never a second JSON, never a raw
+    // rejection. Returned survivors are validated (positive integers) and
+    // deduplicated into the registry survivors.
+    let cleanupError = null;
+    if (typeof extraInterruptCleanup === "function") {
+      let timer = null;
+      try {
+        const extra = await Promise.race([
+          Promise.resolve()
+            .then(() => extraInterruptCleanup(signal))
+            .then((r) => r ?? {}),
+          new Promise((_, rejectP) => {
+            timer = setTimeout(() => rejectP(new Error(`extraInterruptCleanup timed out after ${extraCleanupTimeoutMs}ms`)), extraCleanupTimeoutMs);
+          }),
+        ]);
+        // Fail closed on malformed evidence (reviewer PR94-R1): silently
+        // filtering invalid shapes would let a buggy hook report survivors
+        // that the summary then drops. Valid entries are preserved; any
+        // malformed evidence becomes cleanupError in the SAME summary.
+        const raw = extra?.survivors;
+        if (raw !== undefined) {
+          if (!Array.isArray(raw)) {
+            const msg = `extraInterruptCleanup reported survivors in a non-array shape (${typeof raw}); malformed evidence, no entries merged`;
+            cleanupError = cleanupError ? cleanupError + "; " + msg : msg;
+          } else {
+            const valid = raw.filter((s) => Number.isInteger(s) && s > 0);
+            const invalid = raw.filter((s) => !(Number.isInteger(s) && s > 0));
+            for (const s of valid) if (!survivors.includes(s)) survivors.push(s);
+            if (invalid.length > 0) {
+              const msg = `extraInterruptCleanup reported malformed survivor evidence (${JSON.stringify(invalid).slice(0, 200)}); valid entries preserved, malformed entries dropped and recorded here`;
+              cleanupError = cleanupError ? cleanupError + "; " + msg : msg;
+            }
+          }
+        }
+        if (extra?.error) {
+          const msg = String(extra.error);
+          cleanupError = cleanupError ? cleanupError + "; " + msg : msg;
+        }
+      } catch (err) {
+        cleanupError = `extraInterruptCleanup failed: ${String((err && err.message) || err)}`;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
     const final = {
       ok: false,
       interrupted: signal,
       groupsKilled: handles.length,
       ...(survivors.length ? { survivors } : {}),
+      ...(cleanupError ? { cleanupError } : {}),
       totalMs: Math.round(performance.now() - started),
     };
     try {
