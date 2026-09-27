@@ -25,6 +25,7 @@ export class SearchEngine {
   readonly #catalog: Catalog;
   #semanticScorer?: SemanticScorer;
   #semanticWeight = DEFAULT_SEMANTIC_WEIGHT;
+  #fusion: "blend" | "rrf" = "blend";
 
   // Memoized corpus work, keyed by the catalog generation. The dominant F18
   // cost was re-tokenizing the entire corpus on every query; this cache makes
@@ -65,6 +66,18 @@ export class SearchEngine {
     return this.#semanticWeight;
   }
 
+  /**
+   * Selects how the semantic signal is fused with the lexical ranking:
+   * - "blend" (default): weighted interpolation of the two normalized
+   *   scores. Fine-grained but sensitive to score-scale mismatches.
+   * - "rrf": reciprocal-rank fusion over the two orderings. Scale-free;
+   *   measured best for real sentence embeddings (SQ4), which live on a
+   *   different scale than BM25's saturation curve.
+   */
+  setFusion(mode: "blend" | "rrf"): void {
+    this.#fusion = mode;
+  }
+
   async search(query: string, options: SearchOptions = {}): Promise<SearchHit[]> {
     // Invalidate the memoized corpus work BEFORE any early return: otherwise
     // a generation change followed by an empty-candidate or empty-query
@@ -85,14 +98,16 @@ export class SearchEngine {
     // bearing exact name ("delete the user") never equal its own query
     // ("delete user"), so the short-circuit was missed and synonym noise
     // ("remove ...") could demote the exact match.
-    const exactNameHit =
-      literalTokens.length > 0 &&
-      candidates.some(
-        (record) =>
-          tokenize(record.name)
-            .filter((term) => !QUERY_STOPWORDS.has(term))
-            .join(" ") === literalKey,
-      );
+    const exactRecord =
+      literalTokens.length > 0
+        ? candidates.find(
+            (record) =>
+              tokenize(record.name)
+                .filter((term) => !QUERY_STOPWORDS.has(term))
+                .join(" ") === literalKey,
+          )
+        : undefined;
+    const exactNameHit = exactRecord !== undefined;
     const { terms, literalCount } = expandQuery(
       query,
       tokenize,
@@ -125,15 +140,32 @@ export class SearchEngine {
     // contradicting the down-weight contract.
     const semantic = await this.#semanticScores(literalTokens.join(" "), candidates);
     if (semantic) {
-      ranked = lexical.map((entry, i) => ({
-        record: entry.record,
-        score: blend(entry.score, semantic[i] ?? 0, this.#semanticWeight),
-      }));
+      ranked =
+        this.#fusion === "rrf"
+          ? rrfFuse(lexical, semantic, this.#semanticWeight)
+          : lexical.map((entry, i) => ({
+              record: entry.record,
+              score: blend(entry.score, semantic[i] ?? 0, this.#semanticWeight),
+            }));
     }
 
+    // Exact-name invariant (SQ4 review): a query that spells an existing
+    // action's name is an exact lookup and must rank that action FIRST
+    // regardless of how the semantic channel ranks it — under RRF a
+    // disagreeing semantic rank could otherwise push the exact match out of
+    // the visible window entirely. Implemented as a REORDER of the sorted
+    // window (not a score boost) so the documented [0,1] score contract is
+    // preserved.
     const sorted = ranked
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id));
+    if (exactRecord) {
+      const pos = sorted.findIndex((entry) => entry.record === exactRecord);
+      if (pos > 0) {
+        const [exactHit] = sorted.splice(pos, 1);
+        sorted.unshift(exactHit!);
+      }
+    }
 
     // Optional relative cutoff: drop hits far below the best score so a weak
     // partial match cannot pad the result page. Off by default; ships only if
@@ -145,10 +177,17 @@ export class SearchEngine {
         ? (sorted[0]?.score ?? 0) * ratio
         : 0;
 
+    // Raw semantic score per hit (SQ3/SQ4): confidence consumers (e.g. the
+    // abstention gate) key on this scale, not the fused score.
+    const semanticById = semantic
+      ? new Map(candidates.map((record, i) => [record.id, semantic[i] ?? 0]))
+      : undefined;
     return sorted
       .filter((entry) => entry.score >= cutoff)
       .slice(0, limit)
-      .map((entry) => toHit(entry.record, entry.score, options.includeSchema ?? false));
+      .map((entry) =>
+        toHit(entry.record, entry.score, options.includeSchema ?? false, semanticById?.get(entry.record.id)),
+      );
   }
 
   /**
@@ -292,6 +331,49 @@ export type SemanticScorer = (
  */
 export const DEFAULT_SEMANTIC_WEIGHT = 0.2;
 
+/**
+ * Reciprocal-rank fusion of the lexical ranking with the semantic ranking.
+ *
+ * The semantic list only contains candidates the scorer actually scored
+ * above zero; everything else keeps its lexical rank contribution alone.
+ * Scores are small (two 1/(k+r) terms at most) but strictly ordered, which
+ * is all the ranker needs.
+ */
+function rrfFuse(
+  lexical: { record: ActionRecord; score: number }[],
+  semantic: number[],
+  weight: number,
+): { record: ActionRecord; score: number }[] {
+  const k = 60;
+  // Ranks come from SCORE order, not array order (candidates arrive in
+  // catalog order): sort each signal descending and rank by position.
+  const lexOrder = lexical
+    .map((entry, index) => ({ index, score: entry.score }))
+    // Nonpositive lexical scores are EXCLUDED (SQ4 review): a zero-overlap
+    // candidate must not receive a fabricated relevance floor — an all-zero
+    // semantic channel over a no-overlap query used to return
+    // positive-scored hits instead of [].
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || lexical[a.index]!.record.id.localeCompare(lexical[b.index]!.record.id));
+  const lexRank = new Map<number, number>();
+  lexOrder.forEach((entry, position) => lexRank.set(entry.index, position + 1));
+  const semOrder: { index: number; score: number }[] = [];
+  for (let i = 0; i < semantic.length; i += 1) {
+    if ((semantic[i] ?? 0) > 0) semOrder.push({ index: i, score: semantic[i]! });
+  }
+  semOrder.sort((a, b) => b.score - a.score);
+  const semRank = new Map<number, number>();
+  semOrder.forEach((entry, position) => semRank.set(entry.index, position + 1));
+  return lexical.map((entry, i) => {
+    // Zero contribution for signals that did not rank the candidate: no
+    // fabricated floors for zero-overlap or unscored documents.
+    const lex = lexRank.get(i);
+    const sem = semRank.get(i);
+    const score = (lex !== undefined ? 1 / (k + lex) : 0) + (sem !== undefined ? weight / (k + sem) : 0);
+    return { record: entry.record, score };
+  });
+}
+
 function blend(lexicalScore: number, semanticScore: number, weight: number): number {
   // Lexical scores are unbounded, so squash before blending to keep the two
   // signals on comparable scales.
@@ -299,7 +381,7 @@ function blend(lexicalScore: number, semanticScore: number, weight: number): num
   return (1 - weight) * squashed + weight * semanticScore;
 }
 
-function toHit(record: ActionRecord, score: number, includeSchema = false): SearchHit {
+function toHit(record: ActionRecord, score: number, includeSchema = false, semantic?: number): SearchHit {
   return {
     id: record.id,
     kind: record.kind,
@@ -307,6 +389,7 @@ function toHit(record: ActionRecord, score: number, includeSchema = false): Sear
     name: record.name,
     summary: record.summary,
     score: Number(score.toFixed(6)),
+    ...(semantic !== undefined ? { semantic: Number(semantic.toFixed(4)) } : {}),
     ...(includeSchema && record.inputSchema ? { inputSchema: record.inputSchema } : {}),
   };
 }

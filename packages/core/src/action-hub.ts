@@ -3,6 +3,7 @@ import { CATALOG_CACHE_VERSION, type PersistedCatalog } from "./catalog/persiste
 import { BundleRegistry, type Bundle } from "./bundles/bundles.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
+import { EmbeddingSemanticIndex, type EmbeddingIndexOptions, type PersistedEmbeddings } from "./search/embeddings.js";
 import { ConnectionManager, type ConnectionManagerOptions } from "./servers/connection-manager.js";
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
 import { ApprovalRegistry, fingerprintArguments, type ApprovalRegistryOptions } from "./permissions/approvals.js";
@@ -66,6 +67,14 @@ export interface ActionHubOptions {
   semantic?: LocalSemanticOptions;
   /** Blend weight for the semantic signal. Defaults to 0.2. */
   semanticWeight?: number;
+  /**
+   * Real local embeddings (SQ4). Default: on — the model is vendored in the
+   * package and loaded fully offline. Pass `null` to disable (pure lexical +
+   * hashed semantic); pass options to retarget the vendored model path. If
+   * the model cannot load, the hub degrades to the built-in hashed scorer
+   * with a warning — search never breaks.
+   */
+  embeddings?: EmbeddingIndexOptions | null;
   /** Ring-buffer size for invocation history. */
   historyLimit?: number;
   /**
@@ -134,7 +143,12 @@ export class ActionHub {
   readonly #denyOnApprovalRequired: boolean;
   readonly #defaultTimeoutMs: number;
   /** Undefined when the caller supplied their own scorer or disabled scoring. */
-  readonly #semanticIndex?: LocalSemanticIndex;
+  #semanticIndex?: LocalSemanticIndex;
+  /** Real-embedding index (SQ4); #semanticIndex only materializes as fallback. */
+  readonly #embedIndex?: EmbeddingSemanticIndex;
+  #embedFailed = false;
+  #embedRebuild?: Promise<void>;
+  readonly #semanticOptions?: LocalSemanticOptions;
   readonly #approvals: ApprovalRegistry;
   readonly #telemetry: ActionHubTelemetry;
   readonly #resultCache = new Map<string, { content: unknown; expiresAt: number }>();
@@ -143,6 +157,10 @@ export class ActionHub {
   readonly #cacheMaxEntries: number;
   readonly #indexChunkSize: number | undefined;
   readonly #indexYieldFn: (() => Promise<void>) | undefined;
+  /** Set by close(): cancels the fire-and-forget embedding rebuild at the
+   * next chunk boundary so shutdown is never held for minutes of embed work. */
+  #embedCancelled = false;
+  #embedWarned = false;
 
   /** Tool-name prefixes conventionally denoting side-effect-free reads. */
   static readonly #READ_PREFIXES = [
@@ -175,11 +193,24 @@ export class ActionHub {
       this.#search.setSemanticScorer(undefined);
     } else if (options.semanticScorer) {
       this.#search.setSemanticScorer(options.semanticScorer);
-    } else {
-      // Default: the built-in local index. It adds no dependency and no
-      // install-time download, so semantic scoring can be on out of the box.
+    } else if (options.embeddings === null) {
+      // Embeddings explicitly disabled: keep the dependency-free hashed index.
       this.#semanticIndex = new LocalSemanticIndex(options.semantic);
       this.#search.setSemanticScorer(this.#semanticIndex.asScorer());
+    } else {
+      // Default: real local embeddings (SQ4). The model is vendored and loaded
+      // lazily and offline; on failure the hub falls back to the hashed index
+      // with a warning, so search never breaks.
+      this.#semanticOptions = options.semantic;
+      this.#embedIndex = new EmbeddingSemanticIndex(options.embeddings);
+      this.#search.setFusion("rrf");
+      this.#search.setSemanticScorer(this.#embedScorer());
+      // Preload the vendored model while servers activate: the one-time load
+      // (~0.3-0.6 s) then does not extend the index tail, where it would
+      // otherwise race the per-server restart backoff timers (a failing
+      // server retried inside a slow indexAll flips status to "degraded").
+      // load() is failure-safe (returns false, warns once).
+      void this.#embedIndex.load();
     }
     this.#policy = new PermissionPolicy(options.policy ?? {});
     this.#historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
@@ -218,13 +249,37 @@ export class ActionHub {
   async indexAll(): Promise<IndexResult[]> {
     const configs = this.#connections.configs().filter((config) => config.enabled !== false);
     const results = await Promise.all(configs.map((config) => this.#indexServer(config.id)));
-    await this.#rebuildSemanticIndexCooperatively();
+    // The embedding rebuild is deliberately NOT awaited here: holding the
+    // index tail for the one-time model load + corpus embed extends indexAll
+    // past the per-server restart backoff timers, so a server that failed
+    // during indexing gets auto-retried mid-index (status flips to
+    // "degraded" while indexAll is still running). With the non-blocking
+    // rebuild, indexAll's duration is unchanged from the lexical-only path;
+    // searches during the cold embed contribute zero semantic weight (the
+    // D1-R4 boundedness contract), and hosts that need the vectors await
+    // {@link semanticReady}.
+    this.#kickEmbeddingRebuild();
     return results;
+  }
+
+  /**
+   * Resolves when the embedding index has finished embedding the current
+   * catalog (or when embeddings have permanently fallen back). Hosts and
+   * tests that need warm vectors before their first search await this.
+   */
+  async semanticReady(): Promise<void> {
+    await this.#embedRebuild;
+  }
+
+  /** Number of document vectors currently held by the embedding index
+   * (diagnostics/test observability; 0 when embeddings are disabled). */
+  get embeddedDocs(): number {
+    return this.#embedIndex?.embeddedDocs ?? 0;
   }
 
   async indexServer(serverId: string): Promise<IndexResult> {
     const result = await this.#indexServer(serverId);
-    await this.#rebuildSemanticIndexCooperatively();
+    this.#kickEmbeddingRebuild();
     return result;
   }
 
@@ -237,6 +292,136 @@ export class ActionHub {
    */
   rebuildSemanticIndex(): void {
     this.#semanticIndex?.index(this.#catalog.all());
+    // Embeddings rebuild is async (model + embedding work); chain it so a
+    // sync caller (registerSkills, direct catalog mutation) still gets fresh
+    // vectors. One rebuild in flight at a time; the rebuild DRAINS catalog
+    // mutations: it re-runs whenever the catalog generation changed during
+    // or since the last pass (packaging/review round: an in-flight rebuild
+    // used to lose records registered mid-pass). Mutations that land after
+    // the drain exits are picked up by the next trigger call.
+    if (this.#embedIndex && !this.#embedFailed) {
+      this.#embedRebuild ??= (async () => {
+        // In-flight rebuild: semantic channel is zero AND fusion drops to
+        // blend so in-flight searches match the pure-BM25-blend reference
+        // (D1-R4 score contract). Restored to rrf in the finally below.
+        this.#search.setFusion("blend");
+        try {
+          if (!(await this.#embedIndex!.load())) {
+            this.#embedFailed = true;
+            return;
+          }
+          for (;;) {
+            const generation = this.#catalog.generation;
+            // Cooperative cancellation (review-2 round 3): close() flips
+            // #embedCancelled and the next chunk boundary throws, ending the
+            // rebuild instead of holding shutdown open for minutes.
+            const baseYield = this.#indexYieldFn;
+
+                // Production (no test override) MUST yield a real macrotask
+                // tick between chunks (review-2 round 4): `await undefined`
+                // is a microtask that never services timers/signals, so the
+                // event loop starves for the whole embed and close()
+                // cancellation could never run.
+                //
+                // The default is a SINGLE-BOUNDARY timer yield: measured with
+                // a 10ms heartbeat over a 300-doc rebuild, `await undefined`
+                // gives 0 ticks and promise forms that chain within one loop
+                // pass give ~2 ticks; exactly this form (timer awaited once,
+                // directly from the yield function) services the loop every
+                // chunk (~40 ticks). An extra async boundary around the
+                // promise silently reverts to starvation, so keep this exact
+                // shape.
+                const yieldImpl =
+                  baseYield ??
+                  (async () => {
+                    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                  });
+                await this.#embedIndex!.index(this.#catalog.all(), {
+                  chunkSize: this.#indexChunkSize ?? 64,
+                  yieldFn: async () => {
+                    if (this.#embedCancelled) throw new Error("embedding rebuild cancelled by close()");
+                    await yieldImpl();
+                    // Re-check AFTER the yield (review-2 round 5): a close()
+                    // arriving DURING the timer yield must land at this
+                    // boundary — otherwise the rebuild always processes one
+                    // more whole chunk before noticing.
+                    if (this.#embedCancelled) throw new Error("embedding rebuild cancelled by close()");
+                  },
+                });
+            this.#embedIndex!.prune(new Set(this.#catalog.all().map((record) => record.id)));
+            if (this.#embedCancelled) break;
+            if (this.#catalog.generation === generation) break;
+          }
+        } catch (cause) {
+          if (this.#embedCancelled) {
+            // Normal shutdown cancellation (review-2 round 4): NOT a failure.
+            // No warn, no fallback, no discard — the partial in-memory state
+            // is simply left as-is while the hub closes.
+          } else {
+            // Graceful fallback on ANY real rebuild failure (review-2 round 3):
+            // the documented contract is "finished or permanently fallen
+            // back". A PARTIAL embedding map must never serve as the semantic
+            // channel (mixed coverage distorts rankings), so discard it, warn
+            // once, and degrade to the hashed/blend scorer.
+            this.#embedFailed = true;
+            this.#embedIndex!.discardVectors();
+            this.#warnOnce(
+              `embedding rebuild failed; falling back to the built-in semantic scorer (${String(cause).slice(0, 200)})`,
+            );
+          }
+        } finally {
+          this.#embedRebuild = undefined;
+          // Restore RRF fusion unless embeddings permanently failed (the
+          // failure path keeps blend so the zero-semantic channel matches
+          // the pre-SQ4 score contract, including the D1-R4 in-flight
+          // rebuild window where the channel contributes exactly zero).
+          if (!this.#embedFailed) this.#search.setFusion("rrf");
+        }
+      })();
+    }
+  }
+
+  /**
+   * The embeddings scorer with graceful degradation: on the first scorer call
+   * the vendored model is loaded lazily (offline); if that fails, the hub
+   * permanently falls back to the built-in hashed index and the fusion
+   * strategy returns to score blending, so behavior matches pre-SQ4.
+   */
+  #embedScorer(): SemanticScorer {
+    const embed = this.#embedIndex!;
+    const embedScorer = embed.asScorer();
+    const zeros = (n: number) => new Array<number>(n).fill(0);
+    return async (query, candidates) => {
+      if (this.#embedFailed) {
+        return this.#fallbackScorer()(query, candidates);
+      }
+      // D1-R4 boundedness: while a rebuild is in flight, the semantic channel
+      // contributes exactly zero AND fusion drops to blend, so a search
+      // parked behind a slow rebuild never triggers embedding work and its
+      // ranking/scores match the pure-BM25-blend reference exactly.
+      if (this.#embedRebuild) return zeros(candidates.length);
+      if (!(await embed.load())) {
+        this.#embedFailed = true;
+        this.#search.setFusion("blend");
+        return this.#fallbackScorer()(query, candidates);
+      }
+      return embedScorer(query, candidates);
+    };
+  }
+
+  /** Materializes (once) the hashed-index fallback after embedding failure. */
+  #fallbackScorer(): SemanticScorer {
+    return async (query, candidates) => {
+      if (!this.#semanticIndex) {
+        const local = new LocalSemanticIndex(this.#semanticOptions);
+        await local.indexCooperative(this.#catalog.all(), {
+          chunkSize: this.#indexChunkSize,
+          yieldFn: this.#indexYieldFn,
+        });
+        this.#semanticIndex = local;
+      }
+      return this.#semanticIndex.asScorer()(query, candidates);
+    };
   }
 
   /**
@@ -244,11 +429,21 @@ export class ActionHub {
    * {@link rebuildSemanticIndex}, but the event loop is served between chunks.
    */
   async #rebuildSemanticIndexCooperatively(): Promise<void> {
-    if (!this.#semanticIndex) return;
-    await this.#semanticIndex.indexCooperative(this.#catalog.all(), {
-      chunkSize: this.#indexChunkSize,
-      yieldFn: this.#indexYieldFn,
-    });
+    if (this.#embedIndex && !this.#embedFailed) {
+      // Reuse an in-flight sync-triggered rebuild, otherwise run one here.
+      if (!this.#embedRebuild) this.rebuildSemanticIndex();
+      await this.#embedRebuild;
+    } else if (this.#semanticIndex) {
+      await this.#semanticIndex.indexCooperative(this.#catalog.all(), {
+        chunkSize: this.#indexChunkSize,
+        yieldFn: this.#indexYieldFn,
+      });
+    }
+  }
+
+  /** Fire-and-forget embedding rebuild (deduplicated by #embedRebuild). */
+  #kickEmbeddingRebuild(): void {
+    if (this.#embedIndex && !this.#embedFailed) this.rebuildSemanticIndex();
   }
 
   async #indexServer(serverId: string): Promise<IndexResult> {
@@ -898,6 +1093,9 @@ export class ActionHub {
     for (const serverId of known) {
       this.#connections.recordToolCount(serverId, this.#catalog.listByServer(serverId).length);
     }
+    // SQ4: hydrate persisted document vectors so a warm start re-embeds only
+    // changed documents instead of the whole corpus.
+    this.#embedIndex?.hydrate(entry.embeddings);
     return records.length;
   }
 
@@ -913,11 +1111,40 @@ export class ActionHub {
       configHash,
       ...this.snapshot(),
       actions: this.#catalog.all(),
+      // Warm-start vectors (SQ4): persisted only when the model actually
+      // loaded, so a failed/offline-model run never writes empty vectors.
+      ...(this.#embedIndex?.ready ? { embeddings: this.#embedIndex.toPersisted() } : {}),
     };
   }
 
   async close(): Promise<void> {
+    // Stop the fire-and-forget embedding rebuild first: at the measured 15K
+    // cold-embed cost an unclosed rebuild would hold shutdown open for
+    // minutes. Cancellation lands at the next chunk boundary (cooperative);
+    // settlement is bounded so close() stays prompt even if a chunk is
+    // mid-flight.
+    this.#embedCancelled = true;
+    const rebuild = this.#embedRebuild;
+    if (rebuild) {
+      // Bounded settlement. The deadline timer is unref'd (it must never
+      // hold the process open) and cleared once the race settles (review-2
+      // round 4: an uncleared ref'd timer delayed process exit ~2s).
+      let deadline: NodeJS.Timeout | undefined;
+      const timedOut = new Promise<void>((resolve) => {
+        deadline = setTimeout(resolve, 2000);
+        deadline.unref?.();
+      });
+      await Promise.race([rebuild.catch(() => {}), timedOut]);
+      if (deadline) clearTimeout(deadline);
+    }
     await this.#connections.closeAll();
+  }
+
+  /** Warns once per hub (stderr; MCP-safe) on embedding degradation. */
+  #warnOnce(message: string): void {
+    if (this.#embedWarned) return;
+    this.#embedWarned = true;
+    process.stderr.write(`action-hub: ${message}\n`);
   }
 
   #fail(

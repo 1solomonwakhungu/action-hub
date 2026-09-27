@@ -566,7 +566,7 @@ function describe(record: ActionRecord): IndexedDocument {
   return { id: record.id, fingerprint: fingerprintOf(record), terms, weightSum };
 }
 
-function fingerprintOf(record: ActionRecord): string {
+export function fingerprintOf(record: ActionRecord): string {
   return [
     record.name,
     record.serverId,

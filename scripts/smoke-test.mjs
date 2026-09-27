@@ -3,7 +3,7 @@
 // `npm run smoke:binary`. Pass the binary path as the first argument, or let it
 // default to the host-target binary under dist-bin/.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, accessSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync, appendFileSync, readFileSync, statSync, chmodSync, symlinkSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
@@ -68,6 +68,394 @@ function runBinary(bin, args, env = {}) {
   });
   if (result.error) fail(`spawning ${bin} ${args.join(" ")} threw: ${result.error.message}`);
   return result;
+}
+
+/**
+ * SEA embedding proof (review-2 round 3 MUST-FIX 1): the shipped binary must
+ * load the vendored model through the SEA asset-extraction path and actually
+ * score a query — a silent hashed-fallback must fail the smoke. One
+ * machine-readable line is asserted.
+ */
+/**
+ * Platform-safe cache-base suffix matching core's seaVendorRoot behavior
+ * (core uses "unknown" when process.getuid is unavailable, i.e. Windows).
+ */
+function cacheBaseSuffix() {
+  return typeof process.getuid === "function" ? String(process.getuid()) : "unknown";
+}
+
+function checkEmbeddingSelftest(bin) {
+  const { status, stdout } = runBinary(bin, [], {
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const line = (stdout ?? "")
+    .split("\n")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.startsWith("{"))
+    .pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "");
+  } catch {
+    fail(`embedding selftest printed no JSON line (status ${status}, stdout: ${String(stdout).slice(0, 200)})`);
+  }
+  const selftest = parsed?.embeddingSelftest;
+  if (!selftest || selftest.ok !== true) fail(`embedding selftest failed: ${line}`);
+  if (selftest.backend !== "wasm") fail(`embedding selftest backend is ${selftest.backend}, expected wasm`);
+  if (selftest.dims !== 384 || Math.abs(selftest.norm - 1) > 0.01) {
+    fail(`embedding selftest vector wrong (dims ${selftest.dims}, norm ${selftest.norm})`);
+  }
+  if (selftest.nativeAddons !== 0) fail(`embedding selftest loaded ${selftest.nativeAddons} native addons`);
+  process.stderr.write(`  ok  embedding selftest (load ${selftest.loadMs}ms, norm ${selftest.norm})\n`);
+}
+
+/**
+ * The standalone binary must carry the third-party terms internally
+ * (review-1/2 round 4 MUST-FIX 3): `action-hub licenses` prints the
+ * vendored provenance notice plus both license texts from the SEA assets.
+ */
+function checkLicenses(bin) {
+  const { status, stdout } = runBinary(bin, ["licenses"]);
+  if (status !== 0) fail(`licenses exited ${status}`);
+  const out = stdout ?? "";
+  for (const needle of ["Vendored third-party provenance", "Apache License", "MIT License", "onnxruntime"]) {
+    if (!out.includes(needle)) fail(`licenses output missing "${needle}"`);
+  }
+  process.stderr.write(`  ok  licenses prints VENDOR.md + Apache-2.0 + MIT texts\n`);
+}
+
+/**
+ * SEA extraction must not leak a fresh 35MB tree per process
+ * (review-1/2 round 4 MUST-FIX 2): the extraction is content-addressed, so
+ * the first selftest creates exactly one cache tree and a second run REUSES
+ * it — no growth.
+ */
+function checkExtractionCacheReuse(bin) {
+  const tmpRoot = checkDir("sea-extraction");
+  const env = { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
+  const first = runBinary(bin, [], env);
+  const cacheDirs = () => {
+    const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
+    try {
+      return readdirSync(base).filter((n) => n.startsWith("vendor-"));
+    } catch {
+      return [];
+    }
+  };
+  const trees = cacheDirs();
+  if (trees.length !== 1) fail(`expected exactly 1 SEA extraction cache tree, found ${trees.length}`);
+  const second = runBinary(bin, [], env);
+  if (cacheDirs().length !== 1) fail(`second run created new extraction trees (leak); got ${cacheDirs().length}`);
+  for (const r of [first, second]) {
+    const line = (r.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+    const parsed = JSON.parse(line ?? "{}");
+    if (parsed?.embeddingSelftest?.ok !== true) fail(`SEA selftest not ok in cache-reuse check: ${line}`);
+  }
+  process.stderr.write(`  ok  SEA extraction is content-addressed and reused (1 tree, no growth)\n`);
+}
+
+/**
+ * Explicit ACTION_HUB_EMBEDDINGS_MODEL precedence (review-1 round 4 HIGH):
+ * an INVALID explicit override must fail clearly — no silent fallback to the
+ * embedded model.
+ */
+function checkInvalidModelOverride(bin) {
+  const { status, stdout } = runBinary(bin, [], {
+    ACTION_HUB_EMBEDDINGS_MODEL: "/nonexistent/model/root",
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`invalid-override selftest printed no JSON line (status ${status})`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== false) {
+    fail(`invalid explicit model override must fail, got ${line}`);
+  }
+  process.stderr.write(`  ok  invalid explicit model override fails clearly (no silent embedded fallback)\n`);
+}
+
+/**
+ * Valid explicit model override (review-1 round 5 HIGH 2): pointing
+ * ACTION_HUB_EMBEDDINGS_MODEL at a real model root must SUCCEED in SEA — the
+ * embedded ORT runtime is still provided (model extraction is skipped, ORT
+ * extraction is not).
+ */
+function checkValidModelOverride(bin) {
+  const tmpRoot = checkDir("sea-valid-override");
+  const env = {
+    TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
+    ACTION_HUB_EMBEDDINGS_MODEL: resolve(repoRoot, "packages", "core", "vendor", "models"),
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  };
+  const { status, stdout } = runBinary(bin, [], env);
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`valid-override selftest printed no JSON line (status ${status})`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== true) fail(`valid model override must succeed in SEA: ${line}`);
+  // Only the ORT runtime (plus notices) may be extracted — NOT the embedded
+  // 23MB model the caller already supplied.
+  const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
+  const trees = (readdirSync(base, { recursive: true, withFileTypes: true }) ?? []);
+  const hasModelDir = trees.some((e) => e.isDirectory() && e.name === "models");
+  if (hasModelDir) fail("valid-override run extracted the embedded model needlessly");
+  process.stderr.write(`  ok  valid explicit model override succeeds (ORT only extracted)\n`);
+}
+
+/**
+ * Cache tamper (review-2 round 5 P1/F65): a sentinel written into the cached
+ * ORT JS must NEVER be executed — the next run must detect the hash mismatch
+ * (vs the bytes embedded in the binary) and re-extract cleanly.
+ */
+function checkTamperedCache(bin) {
+  const tmpRoot = checkDir("sea-tamper");
+  const env = { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
+  const runSelftest = () => {
+    const { status, stdout } = runBinary(bin, [], env);
+    const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+    let parsed;
+    try {
+      parsed = JSON.parse(line ?? "{}");
+    } catch {
+      fail(`tamper selftest printed no JSON line (status ${status})`);
+    }
+    return parsed?.embeddingSelftest;
+  };
+  if (runSelftest()?.ok !== true) fail("tamper check: first clean run failed");
+  const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
+  const findFile = (name) => {
+    const hits = readdirSync(base, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isFile() && e.name === name)
+      .map((e) => join(e.parentPath ?? "", e.name));
+    return hits[0];
+  };
+  const ortJs = findFile("ort.wasm.mjs");
+  if (!ortJs) fail("tamper check: cached ort.wasm.mjs not found");
+  appendFileSync(ortJs, "\n// sentinel-evil() — must never execute\n");
+  if (runSelftest()?.ok !== true) fail("tamper check: tampered cache must be detected and re-extracted (ok:true)");
+  if ((readFileSync(ortJs, "utf8") ?? "").includes("sentinel-evil")) {
+    fail("tamper check: tampered ORT JS survived — the sentinel tree was reused instead of re-extracted");
+  }
+  process.stderr.write(`  ok  tampered cache is detected and re-extracted (sentinel never executes)\n`);
+}
+
+/**
+ * Foreign/loose-mode cache base (intake round 5): a pre-existing base dir
+ * with 0777 must NOT be reused or chmod'ed — the run falls back to a private
+ * mkdtemp and still succeeds.
+ */
+function checkForeignCacheBase(bin) {
+  // POSIX-only check: 0777 means "world-writable" only where mode bits are
+  // meaningful. Windows security is ACL-based (Node's stat modes are
+  // constant), and core's private-cache gate is likewise POSIX-scoped.
+  if (process.platform === "win32") {
+    process.stderr.write("  ok  foreign cache base check SKIPPED (mode-bit semantics do not apply on Windows)\n");
+    return;
+  }
+  const tmpRoot = checkDir("sea-foreign-base");
+  const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
+  mkdirSync(base, { recursive: true });
+  // chmod, not mkdir mode: mkdirSync's mode is umask-masked (0777 -> 0755),
+  // which would silently weaken the hostility under test.
+  chmodSync(base, 0o777);
+  const { stdout } = runBinary(bin, [], { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" });
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`foreign-base selftest printed no JSON line`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== true) fail(`foreign/loose-mode cache base must fall back to a private mkdtemp: ${line}`);
+  const st = statSync(base);
+  if (!(st.mode & 0o077)) fail("foreign cache base was chmod'ed instead of bypassed");
+  process.stderr.write(`  ok  foreign/0777 cache base is bypassed (private mkdtemp fallback)\n`);
+}
+
+/**
+ * Both cache-base candidates hostile (review-2 round 5 MUST-FIX 1): with the
+ * tmp base AND the user-cache base pre-created loose (0777), the run must
+ * NOT extract anywhere — hashed fallback with ok:false and no import of a
+ * swappable tree.
+ */
+function checkHostileCacheBases(bin) {
+  // POSIX-only for the same reason as checkForeignCacheBase.
+  if (process.platform === "win32") {
+    process.stderr.write("  ok  hostile cache bases check SKIPPED (mode-bit semantics do not apply on Windows)\n");
+    return;
+  }
+  const tmpRoot = checkDir("sea-hostile-bases");
+  const suffix = cacheBaseSuffix();
+  const looseLeaf = join(tmpRoot, `action-hub-cache-${suffix}`);
+  mkdirSync(looseLeaf, { recursive: true });
+  chmodSync(looseLeaf, 0o777);
+  const fakeCache = join(tmpRoot, "fake-xdg");
+  mkdirSync(join(fakeCache, "action-hub"), { recursive: true });
+  chmodSync(join(fakeCache, "action-hub"), 0o777);
+  const { stdout } = runBinary(bin, [], {
+    TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
+    XDG_CACHE_HOME: fakeCache,
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`hostile-bases selftest printed no JSON line`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== false) {
+    fail(`both-hostile cache bases must fail closed (no extraction): ${line}`);
+  }
+  // No extraction tree anywhere under either hostile parent.
+  const base = join(tmpRoot, `action-hub-cache-${suffix}`);
+  const planted = readdirSync(base, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (planted.length > 0) fail(`extraction happened under a hostile cache base (${planted.length} trees)`);
+  process.stderr.write(`  ok  both-hostile cache bases fail closed (no extraction, no import)\n`);
+
+  // (a) private candidate beneath a non-sticky world-writable parent: the
+  // ANCESTRY must be rejected even though the leaf itself is 0700
+  // (review-1 round 6 repro 1).
+  const hostileA = join(tmpRoot, "hostile-a");
+  mkdirSync(join(hostileA, "private-tmp", `action-hub-cache-${suffix}`), { recursive: true, mode: 0o700 });
+  chmodSync(hostileA, 0o777);
+  const envA = {
+    TMPDIR: join(hostileA, "private-tmp"), TMP: join(hostileA, "private-tmp"), TEMP: join(hostileA, "private-tmp"),
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  };
+  const runA = runBinary(bin, [], envA);
+  const lineA = (runA.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  // Either fail closed (ok:false) or fail over to the sanctioned user cache;
+  // in BOTH cases nothing may be extracted beneath the hostile parent.
+  const okA = JSON.parse(lineA ?? "{}")?.embeddingSelftest?.ok;
+  if (okA !== false && okA !== true) fail(`private-leaf-under-hostile-parent: no JSON verdict: ${lineA}`);
+  const plantedA = readdirSync(join(hostileA, "private-tmp", `action-hub-cache-${suffix}`), {
+    recursive: true,
+    withFileTypes: true,
+  }).filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (plantedA.length > 0) fail(`extraction happened under hostile-a/private-tmp (${plantedA.length} trees)`);
+  process.stderr.write(`  ok  private leaf under non-sticky 0777 parent: no vendor tree there (fail closed or safe fallback)\n`);
+
+  // (b) safe-looking XDG symlink into an attacker-private target (review-2
+  // round 5 repro B): cachelink -> 0700 target with no hostile ancestry, so
+  // a symlink-following implementation EXTRACTS THROUGH THE SWAPPABLE LINK
+  // (the old vulnerable behavior — this regression fails on it); the fixed
+  // gate rejects the user-planted link, both candidates are unusable, and
+  // the run must fail closed with ok:false and no vendor tree anywhere
+  // beneath the link target.
+  const linkTarget = join(tmpRoot, "private-target");
+  mkdirSync(linkTarget, { recursive: true, mode: 0o700 });
+  const safeHome = join(tmpRoot, "safe-home");
+  mkdirSync(safeHome, { recursive: true, mode: 0o700 });
+  symlinkSync(linkTarget, join(safeHome, "cachelink"));
+  // BOTH candidates hostile: the tmp base is 0777 (non-sticky) AND the XDG
+  // cache is a symlink into the hostile target — no safe base exists, so the
+  // run MUST fail closed (ok:false) and extract NOTHING anywhere beneath the
+  // hostile target (this is what makes the regression discriminate: the old
+  // vulnerable implementation extracted there and would have failed it).
+  const hostileTmp = join(tmpRoot, "hostile-tmp");
+  mkdirSync(hostileTmp, { recursive: true });
+  chmodSync(hostileTmp, 0o777);
+  const envB = {
+    TMPDIR: hostileTmp, TMP: hostileTmp, TEMP: hostileTmp,
+    XDG_CACHE_HOME: join(safeHome, "cachelink"),
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  };
+  const runB = runBinary(bin, [], envB);
+  const lineB = (runB.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  const okB = JSON.parse(lineB ?? "{}")?.embeddingSelftest?.ok;
+  if (okB !== false) fail(`XDG symlink with no safe base must fail closed (ok:false): ${lineB}`);
+  const plantedB = readdirSync(linkTarget, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (plantedB.length > 0) fail(`extraction happened beneath the symlinked hostile target (${plantedB.join(", ")})`);
+  // Negative control: plant vendor-SENTINEL under the target and prove the
+  // predicate above WOULD catch it (a vulnerable implementation extracts
+  // there, so this pins the search itself).
+  const sentinel = join(linkTarget, "action-hub", "vendor-SENTINEL");
+  mkdirSync(sentinel, { recursive: true });
+  const caught = readdirSync(linkTarget, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (caught.length !== 1) fail(`vendor-* search is not discriminating (planted sentinel not caught)`);
+  rmSync(sentinel, { recursive: true });
+  const after = readdirSync(linkTarget, { recursive: true, withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (after.length !== 0) fail(`sentinel cleanup left a tree beneath the hostile target`);
+  process.stderr.write(`  ok  XDG symlink into hostile ancestry fails closed (no vendor tree)\n`);
+
+  // (c) group-writable (0770, non-sticky) parent: rejected like 0777
+  // (review-2 round 5 repro A).
+  const hostileC = join(tmpRoot, "hostile-c");
+  mkdirSync(join(hostileC, "private-tmp", `action-hub-cache-${suffix}`), { recursive: true, mode: 0o700 });
+  chmodSync(hostileC, 0o770);
+  // XDG hostile too (0777), so NO safe base exists anywhere: the vulnerable
+  // pre-rework implementation accepted the 0700 leaf by stopping the ancestry
+  // walk at the caller-controlled tmpdir (group-write ignored), which would
+  // extract beneath the 0770 parent and FAIL this check; the fixed walk
+  // rejects and must fail closed (ok:false, no tree).
+  const hostileXdg = join(tmpRoot, "hostile-xdg");
+  mkdirSync(join(hostileXdg, "action-hub"), { recursive: true });
+  chmodSync(join(hostileXdg, "action-hub"), 0o777);
+  const runC = runBinary(bin, [], {
+    TMPDIR: join(hostileC, "private-tmp"), TMP: join(hostileC, "private-tmp"), TEMP: join(hostileC, "private-tmp"),
+    XDG_CACHE_HOME: hostileXdg,
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const lineC = (runC.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  const okC = JSON.parse(lineC ?? "{}")?.embeddingSelftest?.ok;
+  if (okC !== false) fail(`0770 parent with no safe base must fail closed (ok:false): ${lineC}`);
+  const plantedC = readdirSync(join(hostileC, "private-tmp", `action-hub-cache-${suffix}`), {
+    recursive: true,
+    withFileTypes: true,
+  }).filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (plantedC.length > 0) fail(`extraction happened under a group-writable (0770) parent`);
+  process.stderr.write(`  ok  private leaf under group-writable 0770 parent: no vendor tree there (fail closed or safe fallback)\n`);
+
+  // (d) symlinked candidate LEAF in sticky tmp: the cache leaf itself is a
+  // symlink to a private 0700 target — a user-plantable, post-gate swappable
+  // link must be rejected (review-2 round 5 repro B).
+  const leafTarget = join(tmpRoot, "leaf-target");
+  mkdirSync(leafTarget, { recursive: true, mode: 0o700 });
+  const leafBase = join(tmpRoot, `action-hub-cache-${suffix}`);
+  rmSync(leafBase, { recursive: true, force: true });
+  symlinkSync(leafTarget, leafBase);
+  try {
+    const runD = runBinary(bin, [], { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" });
+    const lineD = (runD.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+    void lineD;
+    const plantedD = readdirSync(leafTarget, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+    if (plantedD.length > 0) fail(`extraction followed a symlinked cache leaf`);
+    process.stderr.write(`  ok  symlinked cache leaf is rejected (no extraction through the link)\n`);
+  } finally {
+    lstatSync(leafBase).isSymbolicLink() && rmSync(leafBase);
+  }
+}
+
+/**
+ * The CJS bundle (non-SEA distribution) must also serve `licenses` — the
+ * texts are inlined at bundle time (review-1 round 5 HIGH 1).
+ */
+function checkBundleLicenses() {
+  const bundlePath = resolve(repoRoot, "build", "action-hub.cjs");
+  try {
+    accessSync(bundlePath);
+  } catch {
+    process.stderr.write("  ok  bundle licenses SKIPPED (no bundle built in this job)\n");
+    return;
+  }
+  const { status, stdout } = spawnSync(process.execPath, [bundlePath, "licenses"], { encoding: "utf8", timeout: 30_000 });
+  const out = stdout ?? "";
+  for (const needle of ["Vendored third-party provenance", "Apache License", "MIT License"]) {
+    if (!out.includes(needle)) fail(`bundle licenses output missing "${needle}" (exit ${status})`);
+  }
+  process.stderr.write(`  ok  CJS bundle licenses prints the embedded texts\n`);
 }
 
 function checkVersion(bin, version) {
@@ -231,6 +619,15 @@ async function main() {
     checkDoctor(bin);
     checkDaemonLifecycle(bin);
     await checkMcpHandshake(bin);
+    checkEmbeddingSelftest(bin);
+    checkLicenses(bin);
+    checkExtractionCacheReuse(bin);
+    checkInvalidModelOverride(bin);
+    checkValidModelOverride(bin);
+    checkTamperedCache(bin);
+    checkForeignCacheBase(bin);
+    checkHostileCacheBases(bin);
+    checkBundleLicenses();
   } finally {
     rmRunRoot(runRoot);
   }

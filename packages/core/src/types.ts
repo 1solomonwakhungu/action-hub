@@ -156,6 +156,13 @@ export interface SearchHit {
   name: string;
   summary: string;
   score: number;
+  /**
+   * Raw semantic-channel score for this hit, [0,1], when a semantic scorer
+   * is active (SQ3/SQ4): confidence signals (e.g. search abstention) key on
+   * THIS scale — the fused `score` is rank-scale under RRF fusion and has no
+   * absolute meaning.
+   */
+  semantic?: number;
   inputSchema?: JsonSchema;
 }
 

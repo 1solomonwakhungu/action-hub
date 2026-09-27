@@ -24,6 +24,31 @@ async function main() {
   await rm(outDir, { recursive: true, force: true });
   await mkdir(outDir, { recursive: true });
 
+  // Bundle-time inline of the third-party license/provenance texts (review-1
+  // round 5 HIGH 1): the CJS bundle has no filesystem vendor tree next to it,
+  // so `action-hub licenses` reads these inlined texts when neither the SEA
+  // assets nor a resolvable @action-hub/core vendor dir is available.
+  const vendorRoot = resolve(repoRoot, "packages", "core", "vendor");
+  const { readFile } = await import("node:fs/promises");
+  const embeddedLicenses = {
+    "vendor/VENDOR.md": await readFile(resolve(vendorRoot, "VENDOR.md"), "utf8"),
+    "vendor/licenses/Apache-2.0.txt": await readFile(resolve(vendorRoot, "licenses/Apache-2.0.txt"), "utf8"),
+    "vendor/licenses/onnxruntime-LICENSE.txt": await readFile(resolve(vendorRoot, "licenses/onnxruntime-LICENSE.txt"), "utf8"),
+  };
+  const embeddedLicensesPlugin = {
+    name: "embedded-licenses",
+    setup(build) {
+      build.onResolve({ filter: /^virtual:embedded-licenses$/ }, () => ({
+        path: "virtual:embedded-licenses",
+        namespace: "embedded-licenses",
+      }));
+      build.onLoad({ filter: /.*/, namespace: "embedded-licenses" }, () => ({
+        contents: `export const embeddedLicenses = ${JSON.stringify(embeddedLicenses)};`,
+        loader: "js",
+      }));
+    },
+  };
+
   const result = await build({
     entryPoints: [entry],
     bundle: true,
@@ -40,6 +65,7 @@ async function main() {
     legalComments: "none",
     logLevel: "info",
     metafile: true,
+    plugins: [embeddedLicensesPlugin],
   });
 
   const bytes = Object.values(result.metafile.outputs).reduce((sum, o) => sum + o.bytes, 0);

@@ -94,9 +94,23 @@ await main(async () => {
   }
 
   const engine = new SearchEngine(catalog);
-  const index = new LocalSemanticIndex({});
-  await index.index(catalog.all());
-  engine.setSemanticScorer(index.asScorer());
+  // --semantic hashed (default, PR 83 continuity) | embeddings (SQ4)
+  const semanticMode = flag("--semantic", "hashed");
+  if (semanticMode === "embeddings") {
+    const { EmbeddingSemanticIndex } = await import(join(repoRoot, "packages", "core", "dist", "search", "embeddings.js"));
+    const embed = new EmbeddingSemanticIndex({});
+    if (!(await embed.load())) {
+      return { ok: false, error: "embedding model failed to load" };
+    }
+    await embed.index(catalog.all(), { chunkSize: 256 });
+    engine.setFusion("rrf");
+    engine.setSemanticScorer(embed.asScorer());
+  } else {
+    const { LocalSemanticIndex } = await import(join(repoRoot, "packages", "core", "dist", "search", "semantic.js"));
+    const index = new LocalSemanticIndex({});
+    await index.index(catalog.all());
+    engine.setSemanticScorer(index.asScorer());
+  }
 
   const gold = (r) => (r.expected ? [r.expected] : r.expectedAll ?? []);
   const evaluated = rows.filter((r) => gold(r).length > 0);
