@@ -77,6 +77,7 @@ test("inline fake stdio server answers initialize and tools/list", async () => {
     writeFileSync(serverPath, FAKE_STDIO_SERVER);
 
     const child = spawn(process.execPath, [serverPath, "--manifest", manifestPath], { stdio: ["pipe", "pipe", "pipe"] });
+    const closeEvent = new Promise((resolve) => child.once("close", resolve));
     let buf = "";
     const responses = [];
     child.stdout.setEncoding("utf8");
@@ -99,13 +100,23 @@ test("inline fake stdio server answers initialize and tools/list", async () => {
         if (responses.length >= 2) { clearInterval(poll); clearTimeout(timer); resolve(); }
       }, 25);
     });
-    child.kill();
     assert.equal(responses[0].id, 1);
     assert.equal(responses[0].result.protocolVersion, "2025-06-18");
     assert.equal(responses[0].result.serverInfo.name, "test-server");
     assert.equal(responses[1].id, 2);
     assert.equal(responses[1].result.tools[0].name, "do_thing");
   } finally {
+    // Terminate exactly this PID and await close (bounded, SIGKILL
+    // escalation) so the child can never outlive the test on any path.
+    if (child.exitCode === null && child.signalCode === null && child.pid) {
+      child.kill("SIGTERM");
+      const closed = await Promise.race([
+        closeEvent.then(() => true),
+        new Promise((r) => setTimeout(() => r(false), 1_000)),
+      ]);
+      if (!closed && child.exitCode === null && child.pid) child.kill("SIGKILL");
+      await closeEvent;
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });
