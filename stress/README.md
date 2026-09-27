@@ -70,36 +70,58 @@ Numbers from bench-load runs on the shared bench host are noisy (other
 agents' builds run concurrently); treat absolute values as order-of-magnitude
 and re-run before/after any optimization.
 
-1. **Search latency collapses under concurrency** (numbers from the
-   pre-rework run; re-run numbers below once recorded). At c=1 the hub answers
-   in ~0.2-0.8s; at c=10 the p50 is ~1.5-3.6s and at c=50/c=100 p50 reaches
-   ~5-17s with p99 up to ~30s (both HTTP serve and stdio). Zero request
-   errors — the hub never fails, it just does not scale: concurrent searches
-   appear to serialize somewhere below the MCP layer. (Note: c50/c100 bands
-   in that run used a fixed 20-request sample; the reworked harness runs the
-   full fixed sample count per band at true concurrency.)
-2. **Warm start is NOT faster than cold** (warm ~17s vs cold ~19s in the
-   latest run; earlier runs 8.3s vs 5.5s the other way). The catalog cache
-   restore path (`XDG_CACHE_HOME/action-hub/catalog.json`) is not paying for
-   itself at 10K tools — flag for the catalog-cache owner.
-3. **`action_hub` execute response drops `ExecuteResult.cached`** — the
-   hub's result cache works (repeats return `duration_ms: 0`, measured hit
-   ratio ~0.94-1.0) but the dispatch projection omits the `cached` field, so
-   clients cannot detect cache hits. (Filed as a finding; bench counts hits
-   via `duration_ms === 0`.)
-4. **Daemon `start` does not become ready at fleet scale**: its 15s
-   readiness window (`START_TIMEOUT_MS` in packages/cli/src/commands/daemon.ts)
-   is smaller than a 44-server boot (6-19s observed, more under load), and
-   `daemon.log` contains only child stderr with no hub progress markers.
-   Concurrent-connect behavior is packet D1 (builder-1).
-5. **Hub memory at full scale**: hub process peak RSS ~0.5-0.8GB (serve,
-   HTTP) and up to ~1.7GB sampled for the stdio hub; children add ~30MB each
-   × 44 fake servers. Not a hard bottleneck alone, but notable with 1.5GB
-   soft limits configured for servers.
-6. **Token cost of the search surface**: search(limit 10) returns ~3.4KB
-   (~850 tokens); load returns ~0.5-0.7KB (~130-165 tokens). Fine for the
-   tool contract, but a load-with-schema round trip across many actions adds
-   up; include_schema on search multiplies it.
+1. **Search latency scales cleanly post-rework** (PR 58 full-scale rerun,
+   2026-09-27, 44 servers / 10,000 tools / 5,000 skills, exclusive window,
+   zero request errors in every band). HTTP: c1 p50 ~40ms → c100 p50 ~3.4s,
+   p99 ~3.9s; stdio: c1 p50 ~33ms → c100 p50 ~3.0s, p99 ~5.3s. The pre-rework
+   serialization cliff (p99 up to ~30s) is gone from these runs; concurrent
+   searches still queue under high concurrency but with bounded tails.
+2. **Warm start IS faster than cold at full scale, but only modestly**:
+   ~7.5s vs ~8.6s boot-to-ready (~13-19% across reruns; ratios 0.81-0.87).
+   The 10K-tool manifest load dominates both boots, so the catalog-cache
+   restore path pays less than at small scale (~50% there). The bench gate
+   is scale-aware (small: warm must be ≥20% faster; full: ≥15%) and treats
+   this band as advisory — a full-scale rerun can flag while staying green.
+3. **`action_hub` execute response still drops `ExecuteResult.cached`** —
+   the bench measures cache effect indirectly via repeat-vs-distinct latency.
+   Corrected methodology (PR 101 rework): the distinct baseline now uses 100
+   PROVABLY unique schema-valid arg sets (cardinality asserted and reported
+   as `distinctArgSets` in the summary); the first rework iteration silently
+   measured only 2 unique sets (a boolean-only schema) and its ratios were
+   invalid. Corrected full-scale result: speedup http ~0.75, stdio ~1.6 —
+   the cache's full-scale benefit is marginal and noisy in both directions;
+   small scale (~1.2-2.2×) remains the cleaner signal. Do not cite the
+   pre-PR-101 full-scale cache ratios.
+4. **Daemon `start` passes at fleet scale** (PR 58 rerun: the daemon
+   contract passes at full scale — 20/20 clients connect and complete
+   searches, 0 errors). Current behavior: `daemon.ts` caps start at an
+   overall 120s limit plus a 15s no-progress window (`START_TIMEOUT_MS` is
+   the daemon-stop wait, not a start window). Historical: the original run
+   failed with a fixed 15s start window smaller than a 44-server boot —
+   superseded by the current cap-and-progress design; the old fixed-window
+   failure is kept here only as history.
+5. **Hub memory at full scale**: hub process peak RSS ~0.5GB (cold boot)
+   and ~1.0GB steady-state under the HTTP or stdio scenarios; the 20-client
+   daemon hub holds ~346MB. Children add ~30MB each × 44 fake servers.
+6. **Token cost of the search surface** (full-scale manifests): search
+   (limit 10) returns ~3.6KB (~900 tokens); load ~2.9KB (~730 tokens).
+   Fine for the tool contract, but a load-with-schema round trip across many
+   actions adds up; include_schema on search multiplies it.
+
+Bench validity notes (PR 58 follow-up fixes, 2026-09-27): the probe arg
+builders are now corpus-faithful — enum-constrained and min/max-bounded
+properties get valid values (generic placeholders failed validation on ~40%
+of full-scale execute calls), and the cache-probe distinct baseline varies an
+existing schema property instead of injecting an unknown key (full-scale
+tools pin `additionalProperties: false`). The search p99 gate is scale-aware
+(2s small / 15s full); a healthy full-scale hub spans ~4-13s across runs.
+
+F29 (endpoint-level ECONNRESET under cumulative load): did NOT reproduce in
+four full-scale post-merge reruns (all bands 0 errors). Classification from
+the instrumented repro: the failure was endpoint-level with the hub process
+alive — a transient connection-level event, not hub death. Recommend keeping
+the errBreakdown instrumentation in place and watching for recurrence rather
+than blocking on it.
 
 Bench hygiene built in after the early failures: per-call timeouts, per-stage
 watchdogs, process-tree kill (spawns are detached, killed with -pid),
