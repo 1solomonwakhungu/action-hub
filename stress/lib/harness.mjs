@@ -896,11 +896,29 @@ export async function main(fn, { resultsPath, extraInterruptCleanup, extraCleanu
             timer = setTimeout(() => rejectP(new Error(`extraInterruptCleanup timed out after ${extraCleanupTimeoutMs}ms`)), extraCleanupTimeoutMs);
           }),
         ]);
-        const reported = Array.isArray(extra?.survivors)
-          ? extra.survivors.filter((s) => Number.isInteger(s) && s > 0)
-          : [];
-        for (const s of reported) if (!survivors.includes(s)) survivors.push(s);
-        if (extra?.error) cleanupError = String(extra.error);
+        // Fail closed on malformed evidence (reviewer PR94-R1): silently
+        // filtering invalid shapes would let a buggy hook report survivors
+        // that the summary then drops. Valid entries are preserved; any
+        // malformed evidence becomes cleanupError in the SAME summary.
+        const raw = extra?.survivors;
+        if (raw !== undefined) {
+          if (!Array.isArray(raw)) {
+            const msg = `extraInterruptCleanup reported survivors in a non-array shape (${typeof raw}); malformed evidence, no entries merged`;
+            cleanupError = cleanupError ? cleanupError + "; " + msg : msg;
+          } else {
+            const valid = raw.filter((s) => Number.isInteger(s) && s > 0);
+            const invalid = raw.filter((s) => !(Number.isInteger(s) && s > 0));
+            for (const s of valid) if (!survivors.includes(s)) survivors.push(s);
+            if (invalid.length > 0) {
+              const msg = `extraInterruptCleanup reported malformed survivor evidence (${JSON.stringify(invalid).slice(0, 200)}); valid entries preserved, malformed entries dropped and recorded here`;
+              cleanupError = cleanupError ? cleanupError + "; " + msg : msg;
+            }
+          }
+        }
+        if (extra?.error) {
+          const msg = String(extra.error);
+          cleanupError = cleanupError ? cleanupError + "; " + msg : msg;
+        }
       } catch (err) {
         cleanupError = `extraInterruptCleanup failed: ${String((err && err.message) || err)}`;
       } finally {
