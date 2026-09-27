@@ -511,6 +511,11 @@ async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; o
           return false;
         }
         if (lst.isSymbolicLink()) {
+          // A symlink component is acceptable ONLY if the link itself is
+          // root-owned (a user-plantable link — e.g. a swappable cache leaf
+          // in sticky /tmp — is always rejected) AND its target is
+          // system-sanctioned. Later I/O runs on the canonical realpath.
+          if (typeof process.getuid === "function" && lst.uid !== 0) return false;
           let target: string;
           try {
             target = realpathSync(cur);

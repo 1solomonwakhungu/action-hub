@@ -3,7 +3,7 @@
 // `npm run smoke:binary`. Pass the binary path as the first argument, or let it
 // default to the host-target binary under dist-bin/.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync, appendFileSync, readFileSync, statSync, chmodSync, symlinkSync } from "node:fs";
+import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync, appendFileSync, readFileSync, statSync, chmodSync, symlinkSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
@@ -359,6 +359,44 @@ function checkHostileCacheBases(bin) {
     .filter((e) => e.isDirectory() && e.name.startsWith("action-hub-cache"));
   if (plantedB.length > 0) fail(`extraction happened beneath the symlinked hostile target`);
   process.stderr.write(`  ok  XDG symlink into hostile ancestry fails closed\n`);
+
+  // (c) group-writable (0770, non-sticky) parent: rejected like 0777
+  // (review-2 round 5 repro A).
+  const hostileC = join(tmpRoot, "hostile-c");
+  mkdirSync(join(hostileC, "private-tmp", `action-hub-cache-${suffix}`), { recursive: true, mode: 0o700 });
+  chmodSync(hostileC, 0o770);
+  const runC = runBinary(bin, [], {
+    TMPDIR: join(hostileC, "private-tmp"), TMP: join(hostileC, "private-tmp"), TEMP: join(hostileC, "private-tmp"),
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const lineC = (runC.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  void lineC;
+  const plantedC = readdirSync(join(hostileC, "private-tmp", `action-hub-cache-${suffix}`), {
+    recursive: true,
+    withFileTypes: true,
+  }).filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+  if (plantedC.length > 0) fail(`extraction happened under a group-writable (0770) parent`);
+  process.stderr.write(`  ok  private leaf under group-writable (0770) parent fails closed\n`);
+
+  // (d) symlinked candidate LEAF in sticky tmp: the cache leaf itself is a
+  // symlink to a private 0700 target — a user-plantable, post-gate swappable
+  // link must be rejected (review-2 round 5 repro B).
+  const leafTarget = join(tmpRoot, "leaf-target");
+  mkdirSync(leafTarget, { recursive: true, mode: 0o700 });
+  const leafBase = join(tmpRoot, `action-hub-cache-${suffix}`);
+  rmSync(leafBase, { recursive: true, force: true });
+  symlinkSync(leafTarget, leafBase);
+  try {
+    const runD = runBinary(bin, [], { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" });
+    const lineD = (runD.stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+    void lineD;
+    const plantedD = readdirSync(leafTarget, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.startsWith("vendor-"));
+    if (plantedD.length > 0) fail(`extraction followed a symlinked cache leaf`);
+    process.stderr.write(`  ok  symlinked cache leaf is rejected (no extraction through the link)\n`);
+  } finally {
+    lstatSync(leafBase).isSymbolicLink() && rmSync(leafBase);
+  }
 }
 
 /**
