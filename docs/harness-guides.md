@@ -342,8 +342,11 @@ against the running server, both transports):
 - **Valid JSON that is not a JSON-RPC message (HTTP):** e.g. a top-level
   `arguments` object — answered `400` with a JSON-RPC error envelope:
   `{ "code": -32700, "message": "Parse error: Invalid JSON-RPC message" }`
-  (`id: null`). Over **stdio**, the same frame is silently dropped: no
-  response is written and the session continues.
+  (`id: null`). Over **stdio**, the same frame is answered instead of
+  dropped: a parseable-but-invalid frame gets a JSON-RPC `-32600 Invalid
+  Request` reply and an unparseable line gets `-32700` (both with `id: null`
+  — the SDK's error report does not expose the original frame's id, so none
+  is guessed); the session then continues serving.
 
 1. **Request payloads live under `params`, not `arguments`.** A tool call
    is `{ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
