@@ -23,6 +23,7 @@
 import type { ActionRecord } from "../types.js";
 import type { SemanticScorer } from "./search.js";
 import { fingerprintOf } from "./semantic.js";
+import { fileURLToPath } from "node:url";
 
 /** Model shipped in packages/core/vendor/models. MIT/Apache-2.0 licensed. */
 export const EMBEDDING_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
@@ -75,11 +76,15 @@ export class EmbeddingSemanticIndex {
   readonly #onWarning: (message: string) => void;
   #vectors = new Map<string, StoredVector>();
   #pipe?: FeatureExtractionPipeline;
+  #resolvedModelPath?: string;
   #loadFailed = false;
 
   constructor(options: EmbeddingIndexOptions = {}) {
     this.#options = {
-      modelPath: options.modelPath ?? defaultVendorPath(),
+      // Resolution deferred to load() — see defaultVendorPath — so a bundled
+      // (SEA) context without a resolvable module anchor can still supply the
+      // model path via ACTION_HUB_EMBEDDINGS_MODEL.
+      modelPath: options.modelPath ?? "",
       modelId: options.modelId ?? EMBEDDING_MODEL_ID,
       dtype: options.dtype ?? "q8",
       onWarning: options.onWarning,
@@ -116,7 +121,14 @@ export class EmbeddingSemanticIndex {
       // Vendored, offline: never touch the network, never consult the cache.
       env.allowRemoteModels = false;
       env.allowLocalModels = true;
-      env.localModelPath = this.#options.modelPath;
+      const modelPath = this.#options.modelPath || defaultVendorPath();
+      if (!modelPath) {
+        throw new Error(
+          "no model path: set ACTION_HUB_EMBEDDINGS_MODEL (bundled binary hosts extract the vendored model and point this at it)",
+        );
+      }
+      env.localModelPath = modelPath;
+      this.#resolvedModelPath = modelPath;
       // Single WASM thread: measured no throughput gain from multi-thread
       // (70-80 docs/s either way on the reference box) and single-thread
       // keeps vectors bit-deterministic for the persistence tests.
@@ -268,10 +280,23 @@ function defaultYield(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-/** Default vendored model root, resolved relative to this module. */
+/**
+ * Default vendored model root, resolved relative to this module.
+ *
+ * Precedence: the ACTION_HUB_EMBEDDINGS_MODEL env var wins (bundled-binary
+ * hosts extract the vendored model into a temp dir and point this at it —
+ * SEA bundles define import.meta.url to a non-file anchor, so the URL
+ * resolution below must never throw there).
+ */
 function defaultVendorPath(): string {
-  // dist/search/embeddings.js -> ../../vendor/models
-  return new URL("../../vendor/models", import.meta.url).pathname;
+  const fromEnv = process.env["ACTION_HUB_EMBEDDINGS_MODEL"];
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  try {
+    // dist/search/embeddings.js -> ../../vendor/models
+    return fileURLToPath(new URL("../../vendor/models", import.meta.url));
+  } catch {
+    return "";
+  }
 }
 
 function quantize(vec: Float32Array, fingerprint: string): StoredVector {
