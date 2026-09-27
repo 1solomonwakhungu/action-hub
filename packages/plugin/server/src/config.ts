@@ -20,6 +20,10 @@ export interface HubConfigFile {
   autoApproveAtOrAbove?: unknown;
   approvalTtlSeconds?: unknown;
   autoDiscover?: unknown;
+  /** SQ3 (F49 pt2): optional search-tuning block; only `abstention` is read. */
+  search?: {
+    abstention?: { enabled?: unknown; threshold?: unknown };
+  };
 }
 
 export interface HubConfig {
@@ -29,6 +33,8 @@ export interface HubConfig {
   autoApproveAtOrAbove: TrustTier;
   /** Lifetime of an approval token, in milliseconds. */
   approvalTtlMs: number;
+  /** SQ3 (F49 pt2): flagged "no confident match" abstention for search. */
+  searchAbstention: { enabled: boolean; threshold: number };
 }
 
 const DEFAULT_APPROVAL_TTL_SECONDS = 300;
@@ -91,7 +97,28 @@ export async function loadConfig(path: string): Promise<HubConfig> {
       ? parsed.autoApproveAtOrAbove
       : "trusted",
     approvalTtlMs: parseApprovalTtl(parsed.approvalTtlSeconds),
+    searchAbstention: parseSearchAbstention(parsed.search?.abstention),
   };
+}
+
+const DEFAULT_ABSTENTION_THRESHOLD = 0.8;
+
+/**
+ * SQ3 (F49 pt2): parse the flagged search-abstention settings. Default OFF —
+ * intake decides the production default from the calibration data. The
+ * threshold is clamped into [0,1] rather than rejected so a nonsense value
+ * cannot stop the hub booting.
+ */
+function parseSearchAbstention(value: {
+  enabled?: unknown;
+  threshold?: unknown;
+} | undefined): { enabled: boolean; threshold: number } {
+  const enabled = value?.enabled === true;
+  let threshold = DEFAULT_ABSTENTION_THRESHOLD;
+  if (typeof value?.threshold === "number" && Number.isFinite(value.threshold)) {
+    threshold = Math.min(1, Math.max(0, value.threshold));
+  }
+  return { enabled, threshold };
 }
 
 /** Clamped rather than rejected: a nonsensical TTL should not stop the hub booting. */
