@@ -35,6 +35,7 @@ import { fileURLToPath } from "node:url";
 import { aggregateRuns } from "./verdict.mjs";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
 import { startServe, killTree, runTool } from "./serve.mjs";
+import { main as libMain } from "../lib/harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -52,18 +53,16 @@ const hasFlag = (name) => process.argv.includes(name);
 // THIS run's credentials, not from a stale listener on a reused port.
 const token = `stress-external-${Date.now().toString(36)}-${process.pid}`;
 
-/** Prints the final summary (compact JSON, last stdout line) and exits. */
+/**
+ * MIG2: the summary contract is owned by the lib's main() — ONE durable
+ * write + ONE stdout JSON + exit code from the FINAL object. finish() just
+ * returns the runner's summary; the lib adds totalMs, guards the artifact
+ * write, and coordinates interrupts (SIGINT/SIGTERM) with the registry
+ * sweep so a mid-run signal kills every owned group and still emits exactly
+ * one ok:false summary (exit 143).
+ */
 async function finish(summary) {
-  await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
-  try {
-    await writeFile(join(resultsDir, "external.json"), JSON.stringify(summary, null, 2) + "\n");
-  } catch (writeCause) {
-    // Contract: a run that cannot persist its artifact is not green.
-    summary.ok = false;
-    summary.artifactError = String(writeCause).slice(0, 200);
-  }
-  console.log(JSON.stringify(summary));
-  process.exit(summary.ok === true ? 0 : 1);
+  return summary;
 }
 
 async function main() {
@@ -265,7 +264,7 @@ async function main() {
     });
   } finally {
     if (sampler) clearInterval(sampler);
-    if (serve) await killTree(serve.child, serve.exitP);
+    if (serve) await killTree(serve.handle);
   }
 
   const verdict = aggregateRuns(runs);
@@ -284,16 +283,9 @@ async function main() {
     ok: healthy && verdict.ok,
     at: new Date().toISOString(),
   };
-  await finish(summary);
+  return finish(summary);
 }
 
-main().catch(async (cause) => {
-  const summary = {
-    script: "run-external.mjs",
-    ok: false,
-    failures: ["uncaught orchestrator exception"],
-    error: String(cause?.stack ?? cause).slice(-2000),
-    at: new Date().toISOString(),
-  };
-  await finish(summary);
-});
+// MIG2: the orchestration runs under the lib's main() — one guarded region,
+// one summary, interrupt-coordinated sweep of every owned group.
+await libMain(main, { resultsPath: join(resultsDir, "external.json") });

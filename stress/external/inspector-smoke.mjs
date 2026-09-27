@@ -115,7 +115,7 @@ async function main() {
     run.push(await runInspector(isolatedEnv, [...httpArgs, "initialize", "--format", "json"], "http initialize"));
     run.push(await runInspector(isolatedEnv, [...httpArgs, "tools/list", "--format", "json"], "http tools/list"));
   } finally {
-    await killTree(serve.child, serve.exitP);
+    await killTree(serve.handle);
   }
 
   const toolsSeen = run

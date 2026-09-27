@@ -120,7 +120,7 @@ async function main() {
       spawnError: res.spawnError,
     };
   } finally {
-    await killTree(serve.child, serve.exitP);
+    await killTree(serve.handle);
   }
 
   // Parse per-scenario result files: the suite writes one directory per

@@ -102,7 +102,7 @@ async function main() {
       ], "http"),
     );
   } finally {
-    await killTree(serve.child, serve.exitP);
+    await killTree(serve.handle);
   }
 
   const summary = {

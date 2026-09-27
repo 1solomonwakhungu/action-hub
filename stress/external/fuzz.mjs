@@ -135,7 +135,7 @@ async function main() {
       ], "http", runStamp),
     );
   } finally {
-    await killTree(serve.child, serve.exitP);
+    await killTree(serve.handle);
   }
 
   // Collect fuzzer output file names (paths recorded; contents stay in .generated).
