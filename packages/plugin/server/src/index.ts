@@ -4,7 +4,6 @@ import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { isJSONRPCErrorResponse, isJSONRPCRequest, isJSONRPCNotification, isJSONRPCResultResponse } from "@modelcontextprotocol/sdk/types.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { PassThrough, type Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -361,59 +360,58 @@ export async function runDaemonServer(): Promise<void> {
  * `onerror` and never answers). A client that sent a request with an id then
  * waits for that id and hangs.
  *
- * Fix without touching SDK internals: filter the stdin STREAM before the
- * transport sees it. Each newline-delimited frame is checked while raw:
- *  - unparseable JSON -> `-32700 Parse error` with `id: null` is written and
- *    the frame is dropped (never forwarded to the SDK);
- *  - parseable object with an `id` that is not a valid request/notification/
- *    response -> `-32600 Invalid Request` with that id, frame dropped;
- *  - valid JSON-RPC frames pass through unchanged.
- * Scoped to stdio: the HTTP transport already answers 400/-32700 at its own
- * layer (verified in F48).
+ * Fix (packet F53-R2 option A, no stream wrapping): hook the transport error
+ * path via `server.onerror` and classify each reported error:
+ *  - `SyntaxError` (unparseable JSON) -> `-32700 Parse error`, `id: null`
+ *    (the JSON-RPC 2.0 spec requires a null id when the id is undetectable);
+ *  - schema-invalid frames surface as the SDK's ZodError, which does NOT
+ *    expose the parsed frame (verified against the SDK source: union failure
+ *    issues carry no input), so the reply is `-32600 Invalid Request` with
+ *    `id: null` — never a guessed id;
+ *  - the SDK's "Unknown message type" errors embed the parsed frame in the
+ *    message; when its `id` is a string or number it is echoed verbatim.
+ * Every frame is answered at most once (WeakSet guard). Valid frames keep
+ * the SDK's own ReadBuffer path (its 10 MiB bound and UTF-8 handling)
+ * untouched.
  */
-export function makeStdinWithMalformedFrameReplies(
-  source: Readable,
-  reply: (message: JSONRPCMessage) => void,
-): Readable {
-  const filtered = new PassThrough();
-  let pending = "";
-  source.on("data", (chunk: Buffer) => {
-    pending += chunk.toString("utf8");
-    for (;;) {
-      const newline = pending.indexOf("\n");
-      if (newline === -1) break;
-      const line = pending.slice(0, newline).replace(/\r$/, "");
-      pending = pending.slice(newline + 1);
-      if (!line.trim()) continue;
-      let parsed: unknown;
+export function installStdioMalformedFrameReplies(server: McpServer): void {
+  const answered = new WeakSet<object>();
+  // McpServer wraps the raw Protocol (with the connected transport) at
+  // `.server`; error reports and the live transport live there.
+  const protocol = server.server as unknown as {
+    onerror: ((error: unknown) => void) | undefined;
+    transport?: Transport;
+  };
+  protocol.onerror = (error: unknown): void => {
+    if (typeof error !== "object" || error === null || answered.has(error)) return;
+    answered.add(error); // at most one reply per reported frame
+    const isSyntaxError = error instanceof SyntaxError;
+    const isSchemaRejection = !isSyntaxError && (error as { name?: unknown }).name === "ZodError";
+    if (!isSyntaxError && !isSchemaRejection) return; // not a malformed frame; don't guess
+    // JSON-RPC 2.0: unparseable JSON -> -32700; parseable but not a valid
+    // JSON-RPC message -> -32600. The id is echoed only when the SDK error
+    // exposes it (protocol "Unknown message type" errors embed the parsed
+    // frame); ZodError carries no input, so schema-invalid frames are
+    // answered with id null rather than a guessed one.
+    const parseErrorCode = isSyntaxError ? -32700 : -32600;
+    const detail = isSyntaxError
+      ? "Parse error"
+      : "Invalid Request: the frame was not a valid JSON-RPC message";
+    let id: string | number | null = null;
+    const embedded = (error as { message?: unknown }).message;
+    if (typeof embedded === "string" && embedded.startsWith("Unknown message type: ")) {
       try {
-        parsed = JSON.parse(line);
+        const frame: unknown = JSON.parse(embedded.slice("Unknown message type: ".length));
+        const candidate = (frame as { id?: unknown } | null)?.id;
+        if (typeof candidate === "string" || typeof candidate === "number") id = candidate;
       } catch {
-        // Unparseable JSON: JSON-RPC 2.0 reply with id null.
-        reply({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } } as unknown as JSONRPCMessage);
-        continue;
+        id = null;
       }
-      const hasId =
-        typeof parsed === "object" && parsed !== null &&
-        "id" in parsed && (parsed as { id?: unknown }).id !== null;
-      if (
-        !isJSONRPCRequest(parsed) && !isJSONRPCNotification(parsed) &&
-        !isJSONRPCResultResponse(parsed) && !isJSONRPCErrorResponse(parsed)
-      ) {
-        // Parseable but not a recognizable JSON-RPC frame: the SDK dispatcher
-        // would silently drop it. -32600, echoing the id when recoverable.
-        const id =
-          typeof parsed === "object" && parsed !== null && "id" in parsed
-            ? (parsed as { id?: string | number }).id
-            : null;
-        reply({ jsonrpc: "2.0", id: (id ?? null) as string | number | null, error: { code: -32600, message: "Invalid Request: not a valid JSON-RPC message" } } as unknown as JSONRPCMessage);
-        continue;
-      }
-      filtered.write(line + "\n");
     }
-  });
-  source.on("error", () => undefined); // stdio errors surface through the SDK otherwise
-  return filtered;
+    void protocol.transport
+      ?.send({ jsonrpc: "2.0", id, error: { code: parseErrorCode, message: detail } } as unknown as JSONRPCMessage)
+      .catch(() => undefined);
+  };
 }
 
 /**
@@ -422,11 +420,9 @@ export function makeStdinWithMalformedFrameReplies(
  */
 export async function runServer(): Promise<void> {
   const runtime = await createHubRuntime();
-  const transport = new StdioServerTransport(makeStdinWithMalformedFrameReplies(process.stdin, (message) => {
-    void transport.send(message).catch(() => undefined);
-  }));
-  await connectMcpClient(runtime, transport);
-
+  const transport = new StdioServerTransport();
+  const server = await connectMcpClient(runtime, transport);
+  installStdioMalformedFrameReplies(server);
   await new Promise<void>((resolveShutdown) => {
     let closing = false;
     const shutdown = () => {
