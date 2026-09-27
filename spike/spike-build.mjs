@@ -42,7 +42,7 @@ try {
     entryPoints: [join(spike, "sea-entry.mjs")],
     bundle: true, platform: "node", format: "cjs", target: "node20",
     outfile: join(spike, "sea.cjs"), logLevel: "error",
-    define: { "import.meta.url": JSON.stringify("file:///sq4/spike/sea.cjs") },
+    define: { "import.meta.url": JSON.stringify((process.platform === "win32" ? "file:///C:/action-hub/sea.cjs" : "file:///action-hub/sea.cjs")) },
     plugins: [{
       name: "stub-natives",
       setup(b2) {

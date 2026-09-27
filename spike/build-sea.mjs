@@ -10,7 +10,7 @@ await build({
   // esbuild CJS output leaves import.meta.url undefined; onnxruntime-web's
   // node entry does createRequire(import.meta.url). Give it a valid absolute
   // file URL as the resolution base (the path need not exist at runtime).
-  define: { "import.meta.url": JSON.stringify("file:///sq4/spike/sea.cjs") },
+  define: { "import.meta.url": JSON.stringify((process.platform === "win32" ? "file:///C:/action-hub/sea.cjs" : "file:///action-hub/sea.cjs")) },
   plugins: [{
     name: "stub-natives",
     setup(b2) {
