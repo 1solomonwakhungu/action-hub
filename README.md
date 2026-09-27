@@ -140,6 +140,21 @@ action-hub/
 See [`docs/architecture.md`](docs/architecture.md) for why the layers are split
 this way and why search must never return schemas.
 
+### Generated vs realistic evaluation queries
+
+The `stress/` generators emit two kinds of retrieval-evaluation data:
+
+- **Generated sets** (`stress/gen-tools.mjs`, `stress/gen-skills.mjs`) are
+  **synthetic regression data** — every row is marked `synthetic: true`.
+  Paraphrases are plain, boring verb-synonym-plus-verbatim-entity commands;
+  they exercise retrieval mechanics, not natural language. They are not a
+  naturalness benchmark.
+- **The realistic set** (`stress/fixtures/realistic-queries.json`, validated by
+  `stress/validate-realistic-queries.mjs`) is the hand-written natural-language
+  headline measure: 120 queries (40 paraphrase / 30 goal-only / 20
+  near-duplicate with domain clue / 15 multi / 15 no-match), each gold label
+  audited against the seeded corpus.
+
 ## Install
 
 Action Hub ships as a **standalone, zero-dependency binary** — the Node runtime,
