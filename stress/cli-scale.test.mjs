@@ -337,6 +337,45 @@ test("owner-state predicate refuses protected layout with bytes untouched", () =
   rmSync(plainTmp, { recursive: true, force: true });
 });
 
+// S8-R6 R3 MUST-FIX 2: a spawned CLI child is OWNED from the moment of
+// spawn — error listener attached immediately (an 'error' event with no
+// listener would crash the test process), output collected, the close wait is
+// BOUNDED, and the finally ladder is TERM -> bounded wait -> (SIGCONT +)
+// KILL -> awaited close, with stdio streams destroyed. A SIGSTOPped child
+// cannot receive SIGTERM until continued, so the ladder escalates with
+// SIGCONT before SIGKILL (SIGKILL works on stopped processes).
+function attachChildIO(child, sink) {
+  child.on("error", (err) => { sink.err += "\n[spawn error] " + err.message; });
+  child.stdout?.on("data", (d) => { sink.out += d; });
+  child.stderr?.on("data", (d) => { sink.err += d; });
+}
+
+/** Bounded close wait: resolves {code, signal, timedOut}. Never hangs. */
+function awaitClose(child, timeoutMs) {
+  return new Promise((res) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return res({ code: child.exitCode, signal: child.signalCode, timedOut: false });
+    }
+    const timer = setTimeout(() => res({ code: child.exitCode, signal: child.signalCode, timedOut: true }), timeoutMs);
+    child.once("close", (code, signal) => { clearTimeout(timer); res({ code, signal, timedOut: false }); });
+  });
+}
+
+/** Ownership teardown ladder: TERM -> bounded wait -> CONT+KILL -> awaited. */
+async function terminateChildren(children) {
+  for (const c of children) {
+    if (c.exitCode !== null || c.signalCode !== null) continue;
+    try { c.kill("SIGTERM"); } catch { /* already dead */ }
+    const first = await awaitClose(c, 3000);
+    if (first.timedOut && c.exitCode === null && c.signalCode === null) {
+      try { c.kill("SIGCONT"); } catch { /* noop */ }
+      try { c.kill("SIGKILL"); } catch { /* already dead */ }
+      await awaitClose(c, 3000);
+    }
+    try { c.stdout?.destroy(); c.stderr?.destroy(); } catch { /* noop */ }
+  }
+}
+
 // S8-R6 R2 blocker 2: two OVERLAPPING runs from the same checkout (different
 // seeds, forced fallback fixtures) must not mutate each other — each run
 // publishes its own artifact under its own per-run root with its own seed.
@@ -347,14 +386,16 @@ test("overlapping runs are isolated: per-run fixtures + per-run artifacts, no cr
     stdio: ["ignore", "pipe", "pipe"],
   }));
   const outs = children.map(() => ({ out: "", err: "" }));
-  children.forEach((c, i) => {
-    c.stdout.on("data", (d) => { outs[i].out += d; });
-    c.stderr.on("data", (d) => { outs[i].err += d; });
-  });
-  const codes = await Promise.all(children.map((c) => new Promise((res) => c.once("close", (code) => res(code)))));
+  // Own both children IMMEDIATELY (error listeners before any await).
+  children.forEach((c, i) => attachChildIO(c, outs[i]));
+  let closes = null;
   try {
+    // Bounded wait: a stalled child resolves timedOut instead of hanging the
+    // suite; the finally ladder then reaps it for real.
+    closes = await Promise.all(children.map((c) => awaitClose(c, 540_000)));
     for (let i = 0; i < 2; i++) {
-      assert.equal(codes[i], 0, "run " + i + " must exit 0; stderr: " + outs[i].err.slice(-400));
+      assert.equal(closes[i].timedOut, false, "run " + i + " must finish within the bound; stderr: " + outs[i].err.slice(-400));
+      assert.equal(closes[i].code, 0, "run " + i + " must exit 0; stderr: " + outs[i].err.slice(-400));
       const parsed = parseRunOutput(outs[i].out);
       assert.equal(parsed.summary.ok, true, "run " + i + " must be ok");
       assert.equal(parsed.summary.seed, 11 + i, "run " + i + " must record ITS OWN seed");
@@ -363,8 +404,43 @@ test("overlapping runs are isolated: per-run fixtures + per-run artifacts, no cr
       assert.notEqual(parsed.runRoot, parseRunOutput(outs[1 - i].out).runRoot, "run roots must be distinct");
     }
   } finally {
+    // Proven, not assumed: even on assertion failure, timeout, or a stalled
+    // child, both children are reaped with the bounded ladder.
+    await terminateChildren(children);
+    for (let i = 0; i < 2; i++) {
+      assert.ok(children[i].exitCode !== null || children[i].signalCode !== null, "run " + i + " must be fully reaped");
+    }
     rmSync(dirs[0], { recursive: true, force: true });
     rmSync(dirs[1], { recursive: true, force: true });
+  }
+});
+
+// Forced-hang control (S8-R6 R3 MUST-FIX 2): prove the teardown ladder, not
+// just the green path. A real cli-scale run is SIGSTOPped mid-flight; the
+// ladder must TERM (undeliverable while stopped), escalate CONT+KILL, and
+// leave the child reaped — the same ownership contract the overlap test uses.
+test("forced-hang control: SIGSTOPped run child is reaped by the bounded ladder", { timeout: 120_000 }, async () => {
+  const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "cli-scale-hangctl-"));
+  const sink = { out: "", err: "" };
+  const child = spawn(process.execPath, [script, "--scale", "small", "--seed", "13", "--generated", dir], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  attachChildIO(child, sink);
+  try {
+    // Let it reach the bench phase, then freeze it mid-run.
+    await awaitClose(child, 1) ; // not expected to exit; just pacing
+    await new Promise((r) => setTimeout(r, 2000));
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGSTOP");
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      await terminateChildren([child]);
+    }
+    assert.ok(child.exitCode !== null || child.signalCode !== null, "stopped child must be reaped by the ladder");
+  } finally {
+    await terminateChildren([child]);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

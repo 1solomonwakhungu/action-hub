@@ -698,12 +698,37 @@ export const __test = {
 };
 
 // S8-R6: ONE finish path via stress/lib/harness.mjs main() — stale-result
-// removal, guarded artifact write (stress/.generated/results/cli-scale.json),
+// removal, guarded artifact write at <per-run root>/results/cli-scale.json
+// (under the run root in the real tmpdir, NEVER under --generated),
 // exactly one compact JSON summary as the last stdout line, nonzero exit on
 // ok:false, and the interrupt sweep for SIGTERM mid-run. Every failure
-// (bad --scale, bad --seed, setup error, refused --generated path) flows
-// through it; nothing runs at import time (the test imports this module).
+// (unusable TMPDIR, bad --scale, bad --seed, setup error, refused
+// --generated path) flows through a guarded serializer; nothing runs at
+// import time (the test imports this module).
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // Serialize a pre-main() failure (R3 MUST-FIX 1: makeRunRoot itself can
+  // throw, e.g. a hostile TMPDIR=/dev/null gives mkdtemp ENOTDIR — previously
+  // an uncaught crash with ZERO stdout). Produces: one compact ok:false JSON
+  // as the last stdout line, nonzero exit, and a best-effort durable failure
+  // artifact under the first USABLE candidate root (tmpdir, /tmp, cwd).
+  async function earlyFinish(err, stage) {
+    const message = stage + ": " + String((err && err.message) || err);
+    const candidates = [tmpdir(), "/tmp", process.cwd()];
+    let artifactPath = null;
+    for (const root of candidates) {
+      try {
+        const r = mkdtempSync(join(root, "cli-scale-fail-"));
+        artifactPath = join(r, "results", "cli-scale.json");
+        mkdirSync(dirname(artifactPath), { recursive: true });
+        writeFileSync(artifactPath, JSON.stringify({ ok: false, error: message }, null, 2) + "\n");
+        break;
+      } catch { /* try the next candidate root */ }
+    }
+    if (artifactPath) console.error("failure artifact (best effort): " + artifactPath);
+    console.log(JSON.stringify({ ok: false, error: message, early: true }));
+    process.exitCode = 1;
+  }
+
   // S8-R6 R2 blocker 1: harness main() rmSyncs + writes its resultsPath BEFORE
   // the guarded callback runs, so a --generated-derived resultsPath could
   // delete/create a file inside real owner state before cli-scale's refusal
@@ -713,26 +738,33 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // any read or write of the fixture dir). A refused or misused --generated
   // still yields one compact ok:false JSON on stdout, a nonzero exit, and a
   // failure artifact in the SAFE per-run root.
-  const entryRunRoot = makeRunRoot("cli-scale-");
-  // One plain log line so regression tests can locate the per-run artifact.
-  console.log("run root: " + entryRunRoot);
-  await harnessMain(async () => {
-    const t0 = performance.now();
-    parseArgs();
-    if (SCALE !== "small" && SCALE !== "full") {
-      throw new FatalError("Unknown --scale value: " + SCALE + " (expected small|full)");
-    }
-    if (!Number.isFinite(SEED)) {
-      throw new FatalError("Invalid --seed value: " + SEED_ARG);
-    }
-    const generatedConflict = refusedInsideOwnerState(GENERATED);
-    if (generatedConflict) {
-      throw new FatalError("refusing to run: --generated " + GENERATED + " is inside owner state dir " + generatedConflict);
-    }
-    console.log("action-hub cli-scale stress — scale=" + SCALE + " seed=" + SEED);
-    await runAll({ runRoot: entryRunRoot });
-    return emitSummary(Math.round(performance.now() - t0), null);
-  }, { resultsPath: join(entryRunRoot, "results", "cli-scale.json") });
+  let entryRunRoot = null;
+  try {
+    entryRunRoot = makeRunRoot("cli-scale-");
+  } catch (err) {
+    await earlyFinish(err, "run root creation failed");
+  }
+  if (entryRunRoot) {
+    // One plain log line so regression tests can locate the per-run artifact.
+    console.log("run root: " + entryRunRoot);
+    await harnessMain(async () => {
+      const t0 = performance.now();
+      parseArgs();
+      if (SCALE !== "small" && SCALE !== "full") {
+        throw new FatalError("Unknown --scale value: " + SCALE + " (expected small|full)");
+      }
+      if (!Number.isFinite(SEED)) {
+        throw new FatalError("Invalid --seed value: " + SEED_ARG);
+      }
+      const generatedConflict = refusedInsideOwnerState(GENERATED);
+      if (generatedConflict) {
+        throw new FatalError("refusing to run: --generated " + GENERATED + " is inside owner state dir " + generatedConflict);
+      }
+      console.log("action-hub cli-scale stress — scale=" + SCALE + " seed=" + SEED);
+      await runAll({ runRoot: entryRunRoot });
+      return emitSummary(Math.round(performance.now() - t0), null);
+    }, { resultsPath: join(entryRunRoot, "results", "cli-scale.json") });
+  }
 }
 
 // ---------------------------------------------------------------------------
