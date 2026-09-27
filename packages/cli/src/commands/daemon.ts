@@ -88,18 +88,13 @@ function daemonStartCapMs(explicit?: number): number {
 }
 
 /**
- * F63: the anchor's 'exit' event is loop-scheduled and can lag behind a
- * ready-probe success under CPU load. A dead-but-unreported anchor means
- * THIS attempt failed closed — and a ready answer may be OUR OWN orphaned
- * server (the wrapper's group died externally while the server survived),
- * not a concurrent winner. PRIMARY decision (intake ruling, deterministic):
- * the winner path compares the answering pid with OUR relayed SERVER pid —
- * an answer from our own tree is never a winner; it resolves through the
- * anchor's state (healthy = normal start, wrapper-gone = unproven orphan =
- * proof-checked failure). The relay (SERVER/WRAPPER over the anchor's
- * control pipe) is written at spawn time — long before any server could be
- * ready — so it is ordering-stable, unlike the loop-scheduled exit event,
- * which only bounds the residual zombie window (secondary aid below).
+ * F63 (SECONDARY aid only — identity is token-based, see
+ * classifyReadyAnswer): the anchor's 'exit' event is loop-scheduled and can
+ * lag behind a ready-probe success under CPU load. For an OURS-token answer
+ * this grace gives that lagging exit event one bounded turn in the
+ * wrapper-zombie window (kill(wrapper,0) still succeeds until the anchor
+ * reaps it) before the deterministic classification; it never decides
+ * winner-vs-ours and never paper over an unproven tree.
  */
 const WINNER_EXIT_GRACE_MS = 300;
 
@@ -333,14 +328,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     const ready = await daemonReady(paths);
     if (childExited) continue; // an exited child must take the proof-checked path below
     if (ready?.ok) {
-      // F63 DETERMINISTIC identity check (intake ruling, token-based): the
-      // ready answer carries the launch token OUR daemon echoed into its
-      // state — probe-carried, so identity has no relay/event timing
-      // dependency. An answer WITHOUT our token is a foreign winner. An
-      // answer WITH our token is NEVER a winner: it is ours-healthy only
-      // while the anchor/wrapper are provably alive (synchronous liveness
-      // syscalls + the anchor's exit flag), else it takes the proof-checked
-      // failure path.
+      // F63 identity: token-based (probe-carried — see classifyReadyAnswer).
       if (ready.launchToken === launchToken) {
         if (ourWrapperPid === undefined) {
           // Reviewer MUST-FIX (PR 97 r1): readiness arrived before identity.
