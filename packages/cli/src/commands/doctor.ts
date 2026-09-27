@@ -52,11 +52,12 @@ function serverTimeoutMs(srv: ServerConfig | undefined): number {
 /**
  * Routes stdio servers through the anchored supervisor (process-anchor.ts) so
  * every server runs inside a wrapper-owned process group whose leader we
- * spawned ourselves. The anchor records wrapper/server PIDs to a meta file
- * BEFORE the client connects, so a server that hangs during initialize (F27:
- * activation has no deadline in core) can be torn down exactly — regardless
- * of whether it ever wrote valid stdout. HTTP servers are unaffected. The
- * original transport description is preserved for display.
+ * spawned ourselves. The anchor is held directly by the factory (its
+ * ChildProcess), so a server that hangs during initialize (F27: activation
+ * has no deadline in core) can be torn down exactly — regardless of whether
+ * it ever wrote valid stdout, and with no disk metadata the untrusted server
+ * could see or forge. HTTP servers are unaffected. The original transport
+ * description is preserved for display.
  */
 function supervisedServers(servers: readonly ServerConfig[]): ServerConfig[] {
   return servers.map((srv) => {

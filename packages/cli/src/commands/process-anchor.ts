@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
-import { isSea } from "node:sea";
+import { createRequire } from "node:module";
 import { platform } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -37,7 +37,10 @@ export const WRAPPER_MODE = "__wrapper-run";
 /** True when this process runs inside a SEA single-file binary. */
 function runningAsSea(): boolean {
   try {
-    return isSea();
+    // node:sea exists only from Node 20.12; the declared floor is 20.11, so
+    // the import must stay best-effort (never a static module load).
+    const sea = createRequire(import.meta.url)("node:sea") as { isSea(): boolean } | undefined;
+    return Boolean(sea?.isSea());
   } catch {
     return false;
   }
@@ -319,7 +322,6 @@ export async function teardownAnchorChild(
   return { survivors: pidAlive(child.pid) ? [child.pid] : [], proven: false };
 }
 
-/** Bounded spawn of the anchor used by hosts. Returns the child. */
 /** Bounded spawn of the anchor used by hosts. Returns the child. */
 export function spawnAnchor(
   mode: "daemon" | "doctor",
