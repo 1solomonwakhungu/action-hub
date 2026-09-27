@@ -111,6 +111,9 @@ async function main() {
         stdout: genRes.stdoutTail.trim().slice(-2000),
         stderr: genRes.stderrTail.slice(-2000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], genRes, "make-fixture");
       if (genSummary?.outDir) {
         configPath = resolve(genSummary.outDir, "servers.json");
         skillsDir = resolve(genSummary.outDir, "skills");
@@ -192,6 +195,9 @@ async function main() {
       const k6 = runTool(K6_BIN, ["run", "--summary-export", summaryOut, join(here, "k6-mcp.js")], {
         env: k6Env, timeoutMs: 20 * 60_000,
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], smokeRes, "inspector-smoke");
       const k6Res = await k6.exitP;
       let k6Summary = null;
       try {
@@ -210,6 +216,9 @@ async function main() {
         summary: k6Summary,
         stderr: k6Res.stderrTail.slice(-3000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], k6Res, "k6");
     }
 
     // 3c. mcp-fuzzer (python venv).
@@ -232,6 +241,9 @@ async function main() {
         summary: fSummary,
         stderr: fRes.stderrTail.slice(-2000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], fRes, "mcp-fuzzer");
     }
 
     // 3d. @hasmcp/mcp-spec-test (npx).
@@ -254,6 +266,9 @@ async function main() {
         summary: sSummary,
         stderr: sRes.stderrTail.slice(-2000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], sRes, "mcp-spec-test");
     }
   } catch (cause) {
     runs.push({

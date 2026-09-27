@@ -113,3 +113,35 @@ test("END-TO-END: anchor killed mid-flight -> fail-closed verdict -> fold fails 
     await new Promise((r) => setTimeout(r, 100));
   }
 });
+
+test("CALLER-LEVEL: every production runTool call site folds its verdict", async () => {
+  // Reviewer MIG2-R1: runTool returning honest verdicts is not enough — the
+  // PRODUCTION runners must fold them. This regression reads the runner
+  // sources and requires every runTool call site to be matched by a
+  // foldCleanupVerdict call (removing a fold makes this red).
+  const { readFile } = await import("node:fs/promises");
+  const dir = new URL("../", import.meta.url).pathname;
+  const counts = [];
+  for (const f of ["run-external.mjs", "conformance.mjs", "fuzz.mjs", "inspector-smoke.mjs", "spec-test.mjs"]) {
+    const src = await readFile(dir + f, "utf8");
+    const calls = (src.match(/runTool\(/g) ?? []).length;
+    const folds = (src.match(/foldCleanupVerdict\(/g) ?? []).length;
+    counts.push(`${f}: runTool=${calls} folds=${folds}`);
+    assert.ok(folds >= calls, `${f} must fold every runTool verdict (runTool=${calls}, folds=${folds})`);
+  }
+});
+
+test("CALLER-LEVEL: aggregateRuns fails a row with cleanup failures", async () => {
+  const { aggregateRuns } = await import("../verdict.mjs");
+  const ok = aggregateRuns([{ label: "clean", requiresSummary: true, exitCode: 0, summary: { ok: true } }]);
+  assert.equal(ok.ok, true);
+  const bad = aggregateRuns([{
+    label: "green-workload-broken-cleanup",
+    requiresSummary: true,
+    exitCode: 0,
+    summary: { ok: true },
+    cleanupFailures: [{ label: "k6", problems: ["groupEmpty !== true (false)"] }],
+  }]);
+  assert.equal(bad.ok, false, "a cleanup-failed row must fail the aggregate even with exit 0 + summary ok");
+  assert.match(bad.failures[0], /cleanup/);
+});

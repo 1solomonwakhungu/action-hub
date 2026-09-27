@@ -168,6 +168,8 @@ async function main() {
     at: new Date().toISOString(),
   };
   foldCleanupVerdict(summary, serveCleanup, "serve");
+  // MIG2-R1: the tool step's own cleanup verdict is load-bearing too.
+  foldCleanupVerdict(summary, res, "step");
   await finish(summary);
 }
 
