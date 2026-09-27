@@ -69,19 +69,34 @@ const HUGE_CONFIG_BYTES = 10 << 20; // harness-install fixture configs target 10
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes("--" + name);
+// S8-R6 R2 blocker 3: a PRESENT but VALUELESS flag is a usage error, not an
+// absent flag — it must fail loudly inside the guarded finish path instead of
+// silently running with the default (false green).
 const opt = (name, fallback) => {
   const i = argv.indexOf("--" + name);
-  return i !== -1 && argv[i + 1] !== undefined ? argv[i + 1] : fallback;
+  if (i === -1) return fallback;
+  if (argv[i + 1] === undefined) {
+    throw new FatalError("--" + name + " requires a value (got a bare flag)");
+  }
+  return argv[i + 1];
 };
 
-// Fixture root: overridable so regressions can force the fixture-free
-// fallback path regardless of ambient generated state.
-const GENERATED = resolve(opt("generated", GENERATED_DEFAULT));
-const SCALE = opt("scale", "small");
-const SEED_ARG = opt("seed");
-// Seed 0 is valid; only an unparseable value is rejected (checked in main so a
-// final JSON summary is always emitted).
-const SEED = SEED_ARG !== undefined ? Number.parseInt(SEED_ARG, 10) : 1337;
+// Parsed ONLY inside the guarded finish path (parseArgs) so every failure —
+// valueless flag, bad scale/seed, refused --generated — flows through the one
+// JSON summary with nonzero exit. Nothing parses or touches the filesystem at
+// import time (the test imports this module).
+let GENERATED = GENERATED_DEFAULT;
+let SCALE = "small";
+let SEED_ARG;
+let SEED = 1337;
+
+function parseArgs() {
+  GENERATED = resolve(opt("generated", GENERATED_DEFAULT));
+  SCALE = opt("scale", "small");
+  SEED_ARG = opt("seed");
+  // Seed 0 is valid; only an unparseable value is rejected.
+  SEED = SEED_ARG !== undefined ? Number.parseInt(SEED_ARG, 10) : 1337;
+}
 
 // ---------------------------------------------------------------------------
 // Deterministic fixture generation
@@ -381,8 +396,8 @@ async function runCli(stepName, args, { configPath, cwd } = {}) {
   return step;
 }
 
-function loadQueries(name, { fallback = [], required = false } = {}) {
-  const p = join(GENERATED, name);
+function loadQueries(name, { dir = GENERATED, fallback = [], required = false } = {}) {
+  const p = join(dir, name);
   if (!existsSync(p)) {
     if (required) throw new Error("required query artifact missing: " + name);
     return fallback;
@@ -423,8 +438,12 @@ async function phaseCliBenchmarks({ configPath, serverIds }) {
     const stepSize = Math.max(1, Math.floor(qs.length / n));
     return qs.filter((_, i) => i % stepSize === 0).slice(0, n);
   };
-  const toolQueries = loadQueries("tools-queries.json", { fallback: ["list crm contacts", "invoices export", "pipelines reports"], required: fixtureSource === "shared" });
-  const skillQueries = loadQueries("skills-queries.json", { fallback: [], required: fixtureSource === "shared" });
+  const sharedMode = fixtureSource === "shared";
+  // S8-R6 R2 blocker 2: in fallback mode the query artifacts (if any) live
+  // under the per-run root, never under the shared GENERATED dir.
+  const queryDir = sharedMode ? GENERATED : join(env.runRoot, "fixtures");
+  const toolQueries = loadQueries("tools-queries.json", { dir: queryDir, fallback: ["list crm contacts", "invoices export", "pipelines reports"], required: sharedMode });
+  const skillQueries = loadQueries("skills-queries.json", { dir: queryDir, fallback: [], required: sharedMode });
   for (const q of sample(toolQueries.map((x) => (typeof x === "string" ? x : x.query)), 10)) {
     await runCli("cli.test-search", ["test-search", q], opts);
   }
@@ -685,18 +704,35 @@ export const __test = {
 // (bad --scale, bad --seed, setup error, refused --generated path) flows
 // through it; nothing runs at import time (the test imports this module).
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // S8-R6 R2 blocker 1: harness main() rmSyncs + writes its resultsPath BEFORE
+  // the guarded callback runs, so a --generated-derived resultsPath could
+  // delete/create a file inside real owner state before cli-scale's refusal
+  // ever fires. The durable artifact therefore ALWAYS lives under a per-run
+  // root in the real tmpdir — never under GENERATED — and the owner-state
+  // refusal runs as the FIRST statement inside the guarded callback (before
+  // any read or write of the fixture dir). A refused or misused --generated
+  // still yields one compact ok:false JSON on stdout, a nonzero exit, and a
+  // failure artifact in the SAFE per-run root.
+  const entryRunRoot = makeRunRoot("cli-scale-");
+  // One plain log line so regression tests can locate the per-run artifact.
+  console.log("run root: " + entryRunRoot);
   await harnessMain(async () => {
     const t0 = performance.now();
+    parseArgs();
     if (SCALE !== "small" && SCALE !== "full") {
       throw new FatalError("Unknown --scale value: " + SCALE + " (expected small|full)");
     }
     if (!Number.isFinite(SEED)) {
       throw new FatalError("Invalid --seed value: " + SEED_ARG);
     }
+    const generatedConflict = refusedInsideOwnerState(GENERATED);
+    if (generatedConflict) {
+      throw new FatalError("refusing to run: --generated " + GENERATED + " is inside owner state dir " + generatedConflict);
+    }
     console.log("action-hub cli-scale stress — scale=" + SCALE + " seed=" + SEED);
-    await runAll();
+    await runAll({ runRoot: entryRunRoot });
     return emitSummary(Math.round(performance.now() - t0), null);
-  }, { resultsPath: join(GENERATED, "results", "cli-scale.json") });
+  }, { resultsPath: join(entryRunRoot, "results", "cli-scale.json") });
 }
 
 // ---------------------------------------------------------------------------
@@ -749,9 +785,9 @@ function expectedFleet() {
 // Orchestration
 // ---------------------------------------------------------------------------
 
-function buildBundles(serverIds) {
+function buildBundles(serverIds, toolsDir) {
   // Reference real tool ids from the first manifest so bundle export works.
-  const manifest = JSON.parse(readFileSync(join(GENERATED, "tools", serverIds[0] + ".json"), "utf8"));
+  const manifest = JSON.parse(readFileSync(join(toolsDir, serverIds[0] + ".json"), "utf8"));
   return [0, 1, 2, 3, 4].map((b) => ({
     id: "triage-" + b,
     displayName: "Stress Bundle " + b,
@@ -760,12 +796,16 @@ function buildBundles(serverIds) {
   }));
 }
 
-async function runAll() {
+async function runAll({ runRoot }) {
   const cfg = SCALES[SCALE];
+  // The seed was parsed inside the guarded path; the fixture RNG must be
+  // (re)keyed from the PARSED seed, not the import-time default.
+  rng = mulberry32(SEED);
 
-  // Owner-state guard for the FIXTURE/artifact dir (revised ISOLATION.md, and
-  // the cheap non-blocking item from S8-R5): refuse before any work when the
-  // overridable --generated path sits inside the owner's real app-state.
+  // Defense in depth: the entry-level refusal already ran before any fs op;
+  // this check stays so no future call path can skip it (revised
+  // ISOLATION.md: refuse only when the path sits inside the owner's REAL
+  // app-state/harness dirs).
   const generatedConflict = refusedInsideOwnerState(GENERATED);
   if (generatedConflict) {
     throw new FatalError("refusing to run: --generated " + GENERATED + " is inside owner state dir " + generatedConflict);
@@ -773,7 +813,6 @@ async function runAll() {
 
   // Per-run UNIQUE root under the real tmpdir (S8-R5 blocker 2): two runs from
   // the same checkout must never share — or delete each other's — state.
-  const runRoot = makeRunRoot("cli-scale-");
   const home = join(runRoot, "home");
   const skillsDir = join(home, "skills"); // fallback skill fixtures; corpus travels via config.skills
   for (const d of [home, join(home, ".cache"), join(home, ".config"), skillsDir, join(runRoot, "logs")]) {
@@ -818,8 +857,8 @@ async function runAll() {
     if (!existsSync(sharedSkills) || readdirSync(sharedSkills).filter((d) => existsSync(join(sharedSkills, d, "SKILL.md"))).length === 0) {
       throw new Error("shared skills tree missing or empty at " + sharedSkills);
     }
-    loadQueries("tools-queries.json", { required: true });
-    loadQueries("skills-queries.json", { required: true });
+    loadQueries("tools-queries.json", { dir: GENERATED, required: true });
+    loadQueries("skills-queries.json", { dir: GENERATED, required: true });
 
     serverIds = base.servers.map((srv) => srv.id);
     // Merge the skills corpus into the config so `list --kind skill` and
@@ -828,7 +867,12 @@ async function runAll() {
     configPath = join(runRoot, "servers-with-skills.json");
     writeFileSync(configPath, JSON.stringify({ autoDiscover: false, servers: base.servers, bundles: base.bundles ?? [], skills: configSkills }, null, 2));
   } else {
-    serverIds = writeToolManifests(cfg, GENERATED);
+    // S8-R6 R2 blocker 2: ALL mutable run data lives under the per-run root.
+    // The shared GENERATED dir is read-only input in shared mode; the fallback
+    // branch writes its manifests under <runRoot>/tools so two concurrent runs
+    // from one checkout cannot overwrite each other's active fixtures.
+    const toolsDir = join(runRoot, "tools");
+    serverIds = writeToolManifests(cfg, runRoot);
     writeSkillFixtures(cfg, skillsDir);
     configSkills = buildConfigSkills(cfg);
 
@@ -846,10 +890,10 @@ async function runAll() {
         displayName: "Acme " + id,
         trust: "trusted",
         enabled: true,
-        transport: { type: "stdio", command: process.execPath, args: [fakeServerPath, "--manifest", join(GENERATED, "tools", id + ".json")] },
+        transport: { type: "stdio", command: process.execPath, args: [fakeServerPath, "--manifest", join(toolsDir, id + ".json")] },
       })),
       skills: configSkills,
-      bundles: buildBundles(serverIds),
+      bundles: buildBundles(serverIds, toolsDir),
     }, null, 2));
   }
 

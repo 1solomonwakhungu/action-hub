@@ -5,10 +5,10 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { __test } from "./cli-scale.mjs";
 
 const { writeToolManifests, buildConfigSkills, writeSkillFixtures, FAKE_STDIO_SERVER, SCALES } = __test;
@@ -240,55 +240,132 @@ test("padTomlServers: 10MB padding completes linearly (no quadratic byteLength l
   }
 });
 
-test("setup error (--scale bogus): nonzero exit and last stdout line is the JSON summary", { timeout: 60_000 }, () => {
+// Shared helper: every CLI invocation announces its per-run root with a plain
+// "run root: <path>" line, and the LAST stdout line is the one JSON summary.
+function parseRunOutput(stdout) {
+  const lines = String(stdout ?? "").split("\n").filter((l) => l.trim().length > 0);
+  const rootLine = lines.find((l) => l.startsWith("run root: "));
+  return {
+    runRoot: rootLine ? rootLine.slice("run root: ".length) : null,
+    lineCount: lines.length,
+    summary: JSON.parse(lines[lines.length - 1]),
+  };
+}
+
+// S8-R6 R2 blocker 3: a PRESENT but VALUELESS flag is a usage error, not an
+// absent flag — every case must fail inside the guarded finish path with one
+// compact ok:false JSON, nonzero exit, and ARTIFACT PARITY (the durable
+// artifact exists in the SAFE per-run root with ok:false — never under
+// --generated, which this test also asserts directly).
+test("valueless --scale / --seed / --generated and bogus scale all fail with one ok:false JSON + artifact parity", { timeout: 120_000 }, () => {
   const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
-  const r = spawnSync(process.execPath, [script, "--scale", "bogus"], {
-    encoding: "utf8",
-    cwd: import.meta.dirname,
-    timeout: 30_000,
-  });
-  assert.equal(r.status, 1, "setup failure must exit nonzero");
-  const lines = (r.stdout ?? "").split("\n").filter((l) => l.trim().length > 0);
-  assert.equal(lines.length, 1, "exactly one stdout line: the JSON summary");
-  const summary = JSON.parse(lines[lines.length - 1]); // last stdout line IS the summary
-  assert.equal(summary.ok, false);
-  // S8-R6: the failure summary comes from the shared harness finish path —
-  // the preflight failure happens before emitSummary, so there is no scale
-  // field, just the reserved ok/error contract.
-  assert.ok(summary.error, "summary must carry the error");
-  assert.match(String(summary.error), /Unknown --scale value/);
+  const cases = [
+    { argv: [script, "--scale"], error: /--scale requires a value/, useGen: false },
+    { argv: [script, "--seed"], error: /--seed requires a value/, useGen: false },
+    { argv: [script, "--generated"], error: /--generated requires a value/, useGen: false },
+    { argv: [script, "--scale", "bogus"], error: /Unknown --scale value/, useGen: true },
+    { argv: [script, "--scale", "small", "--seed", "abc"], error: /Invalid --seed/, useGen: true },
+  ];
+  for (const c of cases) {
+    const gen = c.useGen ? mkdtempSync(join(tmpdir(), "cli-scale-usage-")) : null;
+    // Valueless-flag cases must NOT get a trailing value that could be
+    // consumed as the missing value; --generated is appended only when the
+    // primary flag already has its value.
+    const fullArgv = c.useGen ? [...c.argv, "--generated", gen] : [...c.argv];
+    const r = spawnSync(process.execPath, fullArgv, {
+      encoding: "utf8",
+      cwd: import.meta.dirname,
+      timeout: 60_000,
+    });
+    assert.equal(r.status, 1, fullArgv.join(" ") + " must exit nonzero");
+    const parsed = parseRunOutput(r.stdout);
+    assert.equal(parsed.summary.ok, false, fullArgv.join(" ") + " must be ok:false");
+    assert.match(String(parsed.summary.error ?? ""), c.error, fullArgv.join(" "));
+    // Artifact parity: the failure artifact lives under the per-run root and
+    // carries the same ok:false.
+    assert.ok(parsed.runRoot, "run root must be announced on stdout");
+    const artifactPath = join(parsed.runRoot, "results", "cli-scale.json");
+    assert.ok(existsSync(artifactPath), "failure artifact must exist at " + artifactPath);
+    const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
+    assert.equal(artifact.ok, false, "failure artifact must be ok:false");
+    // And --generated itself was never written to or wiped.
+    if (gen) assert.ok(existsSync(gen), "--generated dir must survive a usage failure");
+    if (gen) rmSync(gen, { recursive: true, force: true });
+  }
 });
 
-test("invalid seed: fails loudly with a final summary", { timeout: 60_000 }, () => {
+// S8-R6 R2 blocker 1 (e2e half): the durable artifact is NEVER derived from
+// --generated anymore, so a pre-existing file at <generated>/results/... must
+// survive a failing run byte-for-byte. (The owner-protected half is covered
+// by the predicate regression below plus the entry-order guarantee: the
+// resultsPath is computed from the per-run tmp root before main() runs.)
+test("failing run never writes under --generated: sentinel bytes unchanged", { timeout: 60_000 }, () => {
   const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
-  const r = spawnSync(process.execPath, [script, "--scale", "small", "--seed", "abc"], {
-    encoding: "utf8",
-    cwd: import.meta.dirname,
-    timeout: 30_000,
-  });
-  assert.equal(r.status, 1);
-  const lines = (r.stdout ?? "").split("\n").filter((l) => l.trim().length > 0);
-  const summary = JSON.parse(lines[lines.length - 1]);
-  assert.equal(summary.ok, false);
-  assert.ok(/Invalid --seed/.test(summary.error ?? ""));
-});
-
-test("results-artifact write failure => ok:false, nonzero exit, last JSON line intact", { timeout: 60_000 }, () => {
-  const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
-  const gen = mkdtempSync(join(tmpdir(), "cli-scale-artifact-"));
-  // Pre-occupy <generated>/results with a FILE so mkdirSync/writeFileSync fail.
-  writeFileSync(join(gen, "results"), "occupied");
+  const gen = mkdtempSync(join(tmpdir(), "cli-scale-guard-"));
+  mkdirSync(join(gen, "results"), { recursive: true });
+  const sentinel = join(gen, "results", "cli-scale.json");
+  writeFileSync(sentinel, "SENTINEL-BYTES");
   const r = spawnSync(process.execPath, [script, "--scale", "bogus", "--generated", gen], {
     encoding: "utf8",
     cwd: import.meta.dirname,
     timeout: 30_000,
   });
-  assert.equal(r.status, 1, "artifact write failure must exit nonzero");
-  const lines = (r.stdout ?? "").split("\n").filter((l) => l.trim().length > 0);
-  const summary = JSON.parse(lines[lines.length - 1]);
-  assert.equal(summary.ok, false, "artifact write failure must flip ok to false");
-  assert.ok(/results write failed/.test(summary.error ?? ""), "error must name the artifact failure");
+  assert.equal(r.status, 1);
+  assert.equal(readFileSync(sentinel, "utf8"), "SENTINEL-BYTES", "protected results file must be byte-identical after a run");
+  const parsed = parseRunOutput(r.stdout);
+  assert.ok(parsed.runRoot && parsed.runRoot.startsWith(tmpdir()), "durable artifact must live under the per-run tmp root, not --generated");
   rmSync(gen, { recursive: true, force: true });
+});
+
+// S8-R6 R2 blocker 1 (predicate half): the owner-state refusal must fire for
+// a path inside the REAL app-state layout and must never touch that path —
+// proven with an injected real home (the real one is never written to).
+test("owner-state predicate refuses protected layout with bytes untouched", () => {
+  const { insideOwnerProtectedState } = __test;
+  const fakeHome = mkdtempSync(join(tmpdir(), "cli-scale-owner-"));
+  const protectedResults = join(fakeHome, ".cache", "action-hub", "results", "cli-scale.json");
+  mkdirSync(dirname(protectedResults), { recursive: true });
+  writeFileSync(protectedResults, "OWNER-SENTINEL");
+  const verdict = insideOwnerProtectedState(protectedResults, fakeHome);
+  assert.ok(verdict, "a path inside the protected app-state layout must be refused: " + String(verdict));
+  assert.equal(readFileSync(protectedResults, "utf8"), "OWNER-SENTINEL", "protected file bytes must be unchanged");
+  // A plain tmp path is NOT owner state (being under home alone is fine on
+  // platforms where tmpdir is under USERPROFILE).
+  const plainTmp = mkdtempSync(join(tmpdir(), "cli-scale-notowner-"));
+  assert.ok(!insideOwnerProtectedState(plainTmp, fakeHome), "a plain tmp path is not owner state");
+  rmSync(fakeHome, { recursive: true, force: true });
+  rmSync(plainTmp, { recursive: true, force: true });
+});
+
+// S8-R6 R2 blocker 2: two OVERLAPPING runs from the same checkout (different
+// seeds, forced fallback fixtures) must not mutate each other — each run
+// publishes its own artifact under its own per-run root with its own seed.
+test("overlapping runs are isolated: per-run fixtures + per-run artifacts, no cross-run mutation", { timeout: 600_000 }, async () => {
+  const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
+  const dirs = [mkdtempSync(join(tmpdir(), "cli-scale-ovl-a-")), mkdtempSync(join(tmpdir(), "cli-scale-ovl-b-"))];
+  const children = dirs.map((d, i) => spawn(process.execPath, [script, "--scale", "small", "--seed", String(11 + i), "--generated", d], {
+    stdio: ["ignore", "pipe", "pipe"],
+  }));
+  const outs = children.map(() => ({ out: "", err: "" }));
+  children.forEach((c, i) => {
+    c.stdout.on("data", (d) => { outs[i].out += d; });
+    c.stderr.on("data", (d) => { outs[i].err += d; });
+  });
+  const codes = await Promise.all(children.map((c) => new Promise((res) => c.once("close", (code) => res(code)))));
+  try {
+    for (let i = 0; i < 2; i++) {
+      assert.equal(codes[i], 0, "run " + i + " must exit 0; stderr: " + outs[i].err.slice(-400));
+      const parsed = parseRunOutput(outs[i].out);
+      assert.equal(parsed.summary.ok, true, "run " + i + " must be ok");
+      assert.equal(parsed.summary.seed, 11 + i, "run " + i + " must record ITS OWN seed");
+      const artifact = JSON.parse(readFileSync(join(parsed.runRoot, "results", "cli-scale.json"), "utf8"));
+      assert.equal(artifact.seed, 11 + i, "run " + i + " artifact must carry its own seed");
+      assert.notEqual(parsed.runRoot, parseRunOutput(outs[1 - i].out).runRoot, "run roots must be distinct");
+    }
+  } finally {
+    rmSync(dirs[0], { recursive: true, force: true });
+    rmSync(dirs[1], { recursive: true, force: true });
+  }
 });
 
 // Full small-scale integration against a FIXTURE-FREE generated dir: this
