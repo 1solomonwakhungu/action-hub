@@ -38,6 +38,39 @@ test("expandQuery: multi-word phrases contribute canonical verbs", () => {
   assert.ok(expanded.includes("deactivate"));
 });
 
+test("expandQuery: phrase matching survives punctuation and whitespace (SQ2 review finding 2)", () => {
+  const variants = [
+    "turn off the user",
+    "turn off, the user",
+    "turn off. the user",
+    "turn  off the user",
+    "please TURN OFF the user",
+  ];
+  for (const q of variants) {
+    const expanded = expandQuery(q, tokenize, SYNONYM_TERM_WEIGHT).terms
+      .filter((t) => t.weight < 1)
+      .map((t) => t.term);
+    assert.ok(expanded.includes("disable"), `"${q}" must expand (got ${JSON.stringify(expanded)})`);
+  }
+  // terminal punctuation on the phrase itself
+  const trailing = expandQuery("turn off", tokenize, SYNONYM_TERM_WEIGHT).terms
+    .filter((t) => t.weight < 1)
+    .map((t) => t.term);
+  assert.ok(trailing.includes("disable"), "punctuated trailing phrase must still expand");
+  // a phrase that is only a substring must NOT match (boundaries are token-level)
+  const noMatch = expandQuery("turnoff the user", tokenize, SYNONYM_TERM_WEIGHT).terms
+    .filter((t) => t.weight < 1);
+  assert.ok(!noMatch.map((t) => t.term).includes("disable"));
+});
+
+test("expandQuery: stopwords are dropped from literals and expansions", () => {
+  const QUERY_STOPWORDS = new Set(["the", "my"]);
+  const { terms, literalCount } = expandQuery("hold my the project", tokenize, SYNONYM_TERM_WEIGHT, QUERY_STOPWORDS);
+  const literal = terms.filter((t) => t.weight === 1).map((t) => t.term);
+  assert.deepEqual(literal, ["hold", "project"]);
+  assert.equal(literalCount, 2);
+});
+
 test("expandQuery: zero weight short-circuits expansion", () => {
   const { terms } = expandQuery("hold the project", tokenize, 0);
   assert.ok(terms.every((t) => t.weight === 1));
@@ -64,7 +97,7 @@ test("verb paraphrase reaches the canonical tool: hold -> pause_project", async 
   assert.equal(hits[0].id, "acme:pause_project");
 });
 
-test("exact-name lookup is never demoted by synonym noise", async () => {
+test("exact-name lookup is never demoted by synonym noise (vs independent literal baseline)", async () => {
   const catalog = new Catalog();
   catalog.add(record("acme:disable_user", "Disables the user account and revokes sessions."));
   catalog.add(record("acme:pause_user", "Pauses the user account temporarily."));
@@ -73,10 +106,32 @@ test("exact-name lookup is never demoted by synonym noise", async () => {
   // "disable_user" tokenizes to an exact existing name -> expansion skipped.
   const exact = await engine.search("disable_user");
   assert.equal(exact[0].id, "acme:disable_user");
-  // and the ranking must equal a literal-only search
-  const { terms } = expandQuery("disable_user", tokenize, 0);
-  const literalOnly = terms.map((t) => t.term);
-  assert.deepEqual(exact.map((h) => h.id).slice(0, 3), (await engine.search(literalOnly.join(" "))).map((h) => h.id).slice(0, 3));
+  // Independent baseline: a SEPARATE engine built without the synonyms module
+  // in play at all — expansion-weight 0 equals pure lexical on a fresh engine.
+  const baseline = new SearchEngine(catalog);
+  assert.deepEqual(
+    exact.map((h) => h.id),
+    (await baseline.search("disable_user")).map((h) => h.id),
+  );
+});
+
+test("the semantic scorer receives ONLY the literal query terms (SQ2 review finding 3)", async () => {
+  const catalog = new Catalog();
+  catalog.add(record("acme:disable_user", "Disables the user account and revokes sessions."));
+  const engine = new SearchEngine(catalog);
+  const seen: string[] = [];
+  engine.setSemanticScorer(async (query) => {
+    seen.push(query);
+    return new Array(catalog.all().length).fill(0);
+  });
+  await engine.search("turn off the user account");
+  assert.equal(seen.length, 1);
+  // "disable"/"deactivate" are synonym expansions and must be absent.
+  assert.ok(!seen[0].includes("disable"), `scorer saw expanded query: "${seen[0]}"`);
+  assert.ok(!seen[0].includes("deactivate"), `scorer saw expanded query: "${seen[0]}"`);
+  for (const literal of ["turn", "off", "user", "account"]) {
+    assert.ok(seen[0].includes(literal), `scorer must still see literal "${literal}"`);
+  }
 });
 
 test("paraphrased query beats same-noun distractors", async () => {
