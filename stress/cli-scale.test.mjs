@@ -415,6 +415,33 @@ test("overlapping runs are isolated: per-run fixtures + per-run artifacts, no cr
   }
 });
 
+// S8-R6 R3 MUST-FIX 1: run-root creation happens BEFORE harness main(), so a
+// hostile TMPDIR must still produce one compact ok:false JSON, nonzero exit,
+// and a best-effort durable failure artifact under a fallback root — never an
+// uncaught crash with zero stdout.
+test("hostile TMPDIR (=/dev/null): one ok:false JSON + nonzero + fallback artifact", { timeout: 60_000 }, () => {
+  const script = resolvePath(import.meta.dirname, "cli-scale.mjs");
+  const r = spawnSync(process.execPath, [script, "--scale", "bogus"], {
+    encoding: "utf8",
+    cwd: import.meta.dirname,
+    timeout: 30_000,
+    env: { ...process.env, TMPDIR: "/dev/null", TMP: "/dev/null", TEMP: "/dev/null" },
+  });
+  assert.equal(r.status, 1, "hostile TMPDIR must exit nonzero");
+  assert.ok((r.stdout ?? "").trim().length > 0, "stdout must not be empty on a pre-main failure");
+  const lines = String(r.stdout).split("\n").filter((l) => l.trim().length > 0);
+  const summary = JSON.parse(lines[lines.length - 1]);
+  assert.equal(summary.ok, false);
+  assert.match(String(summary.error ?? ""), /run root creation failed/);
+  // Artifact parity: a best-effort failure artifact must exist under a usable
+  // fallback root and carry the same ok:false.
+  assert.ok(existsSync("/tmp"), "fallback root sanity");
+  const matches = String(r.stderr ?? "").match(/failure artifact \(best effort\): (\S+)/);
+  assert.ok(matches, "stderr must announce the fallback artifact path");
+  const artifact = JSON.parse(readFileSync(matches[1], "utf8"));
+  assert.equal(artifact.ok, false, "fallback failure artifact must be ok:false");
+});
+
 // Forced-hang control (S8-R6 R3 MUST-FIX 2): prove the teardown ladder, not
 // just the green path. A real cli-scale run is SIGSTOPped mid-flight; the
 // ladder must TERM (undeliverable while stopped), escalate CONT+KILL, and
