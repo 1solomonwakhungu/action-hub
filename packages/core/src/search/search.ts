@@ -1,7 +1,17 @@
 import type { ActionRecord, SearchHit, SearchOptions } from "../types.js";
 import type { Catalog } from "../catalog/catalog.js";
+import { expandQuery, type WeightedTerm } from "./synonyms.js";
 
 const DEFAULT_LIMIT = 10;
+
+/**
+ * Weight applied to synonym-expanded terms relative to the literal query
+ * terms (literal = 1). Deliberately well below 1: an exact-name match must
+ * always outrank a synonym-only match, and a wrong synonym must barely move
+ * the ranking. 0.5 was validated on the SQ2 tune split without regressing
+ * exact-name recall.
+ */
+export const SYNONYM_TERM_WEIGHT = 0.5;
 
 /**
  * Lexical BM25-style retrieval over the catalog.
@@ -60,17 +70,29 @@ export class SearchEngine {
     this.#invalidateIfChanged();
     const limit = options.limit ?? DEFAULT_LIMIT;
     const candidates = this.#catalog.filter(options);
-    // Query-side stopword filtering: common function words carry no retrieval
-    // signal for BM25 and only dilute the query. Document tokens are NOT
-    // filtered — a record whose summary legitimately contains one of these
-    // words should still match the content words around it.
-    const terms = tokenize(query).filter((term) => !QUERY_STOPWORDS.has(term));
+    // Verb-synonym expansion (SQ2) over PR 52's stopword-filtered literal
+    // tokens: synonyms at SYNONYM_TERM_WEIGHT. The browse path still keys on
+    // the literal token count only. Short-circuit: when the query names an
+    // existing action exactly (its tokens equal a record's name tokens), the
+    // user is doing exact-name lookup — expansion is skipped entirely so
+    // synonym noise can never demote the exact match.
+    const literalTokens = tokenize(query).filter((term) => !QUERY_STOPWORDS.has(term));
+    const literalKey = literalTokens.join(" ");
+    const exactNameHit =
+      literalTokens.length > 0 &&
+      candidates.some((record) => tokenize(record.name).join(" ") === literalKey);
+    const { terms, literalCount } = expandQuery(
+      query,
+      tokenize,
+      exactNameHit ? 0 : SYNONYM_TERM_WEIGHT,
+      QUERY_STOPWORDS,
+    );
 
     if (candidates.length === 0) return [];
 
     // An empty query is a browse request, not an error: return a stable
     // alphabetical slice so callers can enumerate the catalog.
-    if (terms.length === 0) {
+    if (literalCount === 0) {
       return candidates
         .slice()
         .sort((a, b) => a.id.localeCompare(b.id))
@@ -85,7 +107,11 @@ export class SearchEngine {
     }));
 
     let ranked = lexical;
-    const semantic = await this.#semanticScores(query, candidates);
+    // Finding (SQ2 review): the semantic scorer sees ONLY the literal query
+    // terms. Down-weighted synonyms are a lexical-BM25 device; feeding them
+    // into the scorer as a flat string gave them full semantic influence,
+    // contradicting the down-weight contract.
+    const semantic = await this.#semanticScores(literalTokens.join(" "), candidates);
     if (semantic) {
       ranked = lexical.map((entry, i) => ({
         record: entry.record,
@@ -308,14 +334,14 @@ export const QUERY_STOPWORDS: ReadonlySet<string> = new Set([
 const K1 = 1.2;
 const B = 0.75;
 
-function bm25(record: ActionRecord, terms: readonly string[], stats: CorpusStats): number {
+function bm25(record: ActionRecord, terms: readonly WeightedTerm[], stats: CorpusStats): number {
   const freq = stats.termFreq.get(record.id);
   if (!freq) return 0;
   const length = stats.lengths.get(record.id) ?? 0;
   const avg = stats.avgLength || 1;
 
   let score = 0;
-  for (const term of terms) {
+  for (const { term, weight } of terms) {
     const tf = freq.get(term);
     if (!tf) continue;
     const df = stats.docFreq.get(term) ?? 0;
@@ -323,7 +349,7 @@ function bm25(record: ActionRecord, terms: readonly string[], stats: CorpusStats
     // when a term appears in every document.
     const idf = Math.log(1 + (stats.docCount - df + 0.5) / (df + 0.5));
     const denominator = tf + K1 * (1 - B + (B * length) / avg);
-    score += idf * ((tf * (K1 + 1)) / denominator);
+    score += weight * idf * ((tf * (K1 + 1)) / denominator);
   }
   return score;
 }
