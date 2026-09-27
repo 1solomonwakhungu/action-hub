@@ -140,9 +140,10 @@ export function runWrapperProcess(argvTail: string[]): void {
             return;
           }
           if (attempts < 6) { attemptTeardown(); return; }
-          // Every bounded attempt failed: never exit while the server
-          // lives. Keep attempting (and holding the group) instead of
-          // silently orphaning it.
+          // Every bounded attempt failed: report it LOUDLY, then never
+          // exit while the server lives — keep attempting (and holding the
+          // group open) instead of silently orphaning it.
+          try { fs.writeSync(2, "__wrapper-run: WARNING teardown attempts exhausted; server still alive; continuing attempts\n"); } catch {}
           const keepTrying = setInterval(attemptTeardown, 2000);
 
         }, 400);
