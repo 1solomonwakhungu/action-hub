@@ -515,3 +515,45 @@ test("a cold bootstrap that cannot write the cache still returns a catalog", asy
 
   await chmod(nested, 0o700);
 });
+
+test("a deferred warm bootstrap serves the cache and re-indexes only on startRefresh", async () => {
+  const path = await tempCachePath();
+  const cold = buildHub();
+  const coldResult = await bootstrapCatalog(cold.hub, { servers, path });
+  await coldResult.refreshed;
+
+  const warm = buildHub();
+  const result = await bootstrapCatalog(warm.hub, { servers, path, deferRefresh: true });
+
+  // Served from cache; the authoritative re-index has NOT run yet.
+  assert.equal(result.fromCache, true);
+  assert.equal(result.actions, 3);
+  assert.deepEqual(warm.activations, []);
+
+  // startRefresh is memoised: repeated calls share one re-index.
+  const first = result.startRefresh();
+  const second = result.startRefresh();
+  assert.equal(first, second);
+  const results = await first;
+  assert.deepEqual(warm.activations.sort(), ["github", "slack"]);
+  assert.equal(results.length, 2);
+
+  // The refreshed write-back persists the authoritative catalog.
+  const entry = await new CatalogCache({ path }).load(result.configHash);
+  assert.ok(entry);
+  assert.equal(entry.actions.length, 3);
+});
+
+test("a deferred warm bootstrap never started leaves activations empty", async () => {
+  const path = await tempCachePath();
+  const cold = buildHub();
+  await (await bootstrapCatalog(cold.hub, { servers, path })).refreshed;
+
+  const warm = buildHub();
+  const result = await bootstrapCatalog(warm.hub, { servers, path, deferRefresh: true });
+  assert.equal(result.fromCache, true);
+  assert.deepEqual(warm.activations, []);
+  // The host never calls startRefresh(); nothing re-indexes behind its back.
+  await warm.hub.close();
+  assert.deepEqual(warm.activations, []);
+});

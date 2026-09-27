@@ -15,7 +15,7 @@ import {
 } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { createSdkClientFactory } from "./sdk-client.js";
-import { warn, writeSnapshot } from "./snapshot.js";
+import { warn, writeSnapshot, SnapshotDebouncer } from "./snapshot.js";
 import {
   LOAD_DESCRIPTION_MAX_BYTES,
   LOAD_SCHEMA_MAX_BYTES,
@@ -104,7 +104,25 @@ export interface HubRuntime {
   cache: CatalogCache;
   configHash: string;
   configPath: string;
+  /**
+   * Resolves when the authoritative re-index has completed and been written
+   * back. With the deferred startup refresh this stays pending until
+   * `startRefresh()` is called; `close()` awaits it only once started.
+   */
   refreshed: Promise<unknown>;
+  /**
+   * Starts the deferred re-index exactly once (subsequent calls return the
+   * same promise). Hosts call this after the MCP transport is connected so
+   * the re-index cannot steal the event loop before the server answers its
+   * first request (stress finding F23).
+   */
+  startRefresh(): Promise<unknown>;
+  /**
+   * Coalesces the post-execute snapshot writes (F18 part 2). Optional so
+   * lightweight test runtimes can omit it; dispatch falls back to the
+   * per-execute write when absent.
+   */
+  snapshotDebouncer?: Pick<SnapshotDebouncer, "markDirty" | "flush">;
   close(): Promise<void>;
 }
 
@@ -160,24 +178,40 @@ export async function createHubRuntime(): Promise<HubRuntime> {
 
   const cache = new CatalogCache({ onWarning: warn });
 
-  // A warm cache makes the hub answerable immediately; the authoritative index
-  // then runs behind it and writes the refreshed catalog back.
+  // A warm cache makes the hub answerable immediately. The authoritative
+  // re-index is DEFERRED (F23): starting it here monopolises the event loop
+  // before the MCP server answers initialize, which measured ~2 s of added
+  // first-response latency at 15K actions and erased the warm-start win.
+  // connectMcpClient starts it once the transport is connected.
   const bootstrap = await bootstrapCatalog(hub, {
     servers: config.servers,
     cache,
     onWarning: warn,
+    deferRefresh: true,
   });
 
   hub.replaceSkills(skillRecords);
 
-  bootstrap.refreshed.then(
-    (results) => {
-      for (const result of results) {
-        if (result.error) warn(`failed to index "${result.serverId}": ${result.error}`);
-      }
-    },
-    (cause: unknown) => warn(`re-index failed: ${cause instanceof Error ? cause.message : String(cause)}`),
-  );
+  // F18 part 2: coalesce the post-execute snapshot writes into at most one
+  // per interval instead of rewriting the whole catalog after every execute.
+  const snapshotDebouncer = new SnapshotDebouncer(() => writeSnapshot(hub, bootstrap.configHash, cache));
+
+  let startedRefresh: Promise<unknown> | undefined;
+  const startRefresh = (): Promise<unknown> => {
+    startedRefresh ??= bootstrap.startRefresh().then(
+      (results) => {
+        for (const result of results) {
+          if (result.error) warn(`failed to index "${result.serverId}": ${result.error}`);
+        }
+        return results;
+      },
+      (cause: unknown) => {
+        warn(`re-index failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        return [];
+      },
+    );
+    return startedRefresh;
+  };
 
   return {
     hub,
@@ -185,8 +219,13 @@ export async function createHubRuntime(): Promise<HubRuntime> {
     configHash: bootstrap.configHash,
     configPath,
     refreshed: bootstrap.refreshed,
+    startRefresh,
+    snapshotDebouncer,
     close: async () => {
-      await bootstrap.refreshed.catch(() => undefined);
+      // Await only a refresh that was actually started; a runtime that never
+      // connected must not force a full re-index at shutdown.
+      if (startedRefresh) await startedRefresh.catch(() => undefined);
+      await snapshotDebouncer.dispose();
       await hub.close();
     },
   };
@@ -197,6 +236,16 @@ export { startHttpServer, HUB_HTTP_TOKEN_ENV_VAR, type HttpServerOptions, type H
 export function createMcpServer(runtime: HubRuntime): McpServer {
   const server = new McpServer({ name: "action-hub", version: "0.1.0" });
 
+  // F23 rework: the authoritative re-index starts only after the server has
+  // actually HANDLED an initialize handshake — `server.connect` merely
+  // attaches the transport and would start the refresh before the first
+  // response. The SDK fires `oninitialized` after the initialize exchange is
+  // processed, for both stdio and HTTP transports. Memoised in the runtime,
+  // so repeated connects or stateless HTTP requests start it at most once.
+  server.server.oninitialized = () => {
+    runtime.startRefresh();
+  };
+
   server.registerTool(
     "action_hub",
     {
@@ -206,7 +255,7 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
     },
     async (input) => {
       try {
-        return text(await dispatch(runtime.hub, input, runtime.configHash, runtime.cache));
+        return text(await dispatch(runtime.hub, input, runtime.configHash, runtime.cache, runtime.snapshotDebouncer));
       } catch (cause) {
         const message =
           cause instanceof ActionHubError || cause instanceof Error
@@ -223,6 +272,13 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
 export async function connectMcpClient(runtime: HubRuntime, transport: Transport): Promise<McpServer> {
   const server = createMcpServer(runtime);
   await server.connect(transport);
+  // The authoritative re-index is NOT started here: `server.connect` only
+  // attaches the transport. createMcpServer wires it to the initialize
+  // handshake (`server.server.oninitialized`), so the refresh begins after
+  // the server has actually handled a request, never before its first
+  // response (F23 rework). A client that never handshakes simply never
+  // triggers it; HTTP stateless requests additionally trigger it after the
+  // first handled request in http-server.ts.
   return server;
 }
 
@@ -272,6 +328,7 @@ async function dispatch(
   input: ToolInput,
   configHash: string,
   cache: CatalogCache,
+  snapshots?: Pick<SnapshotDebouncer, "markDirty" | "flush">,
 ): Promise<unknown> {
   switch (input.operation) {
     case "search": {
@@ -363,10 +420,12 @@ async function dispatch(
         input.arguments ?? {},
         input.approval_token ? { approvalToken: input.approval_token } : {},
       );
-      // Refreshes server activation state and invocation history in the snapshot.
-      // Reuse the bootstrap cache instance so this unawaited write is serialised
-      // with the background refresh on the same promise chain.
-      void writeSnapshot(hub, configHash, cache);
+      // Marks the on-disk snapshot stale instead of rewriting the whole
+      // persisted catalog after every execute (F18 part 2); the debouncer
+      // coalesces bursts and flushes on close. Falls back to the per-execute
+      // write when the runtime provides no debouncer (lightweight tests).
+      if (snapshots) snapshots.markDirty();
+      else void writeSnapshot(hub, configHash, cache);
 
       if (result.approval) {
         const approval = result.approval;
@@ -395,6 +454,7 @@ async function dispatch(
         content: result.content,
         error: result.error,
         duration_ms: result.durationMs,
+        cached: result.cached === true,
       };
     }
   }

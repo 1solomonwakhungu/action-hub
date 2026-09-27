@@ -3,6 +3,7 @@ import http from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createHubRuntime, createMcpServer, type HubRuntime } from "./index.js";
+import { createDeferredTrigger } from "./deferred-trigger.js";
 
 /**
  * Streamable HTTP MCP server mode.
@@ -72,6 +73,8 @@ export interface HttpServerHandle {
   token: string;
   /** Where the token came from — never derived after the env scrub. */
   tokenSource: HttpTokenSource;
+  /** The hub runtime behind this server (introspection and tests). */
+  runtime: HubRuntime;
   /** Stops the HTTP listener and tears down the hub runtime. */
   close(): Promise<void>;
 }
@@ -196,6 +199,16 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
       await requestServer.connect(requestTransport);
       try {
         await requestTransport.handleRequest(req, res, parsedBody);
+        // F23 rework: stateless HTTP clients may skip the initialize
+        // handshake, so the deferred refresh is also triggered after the
+        // first request — but only AFTER the response has flushed and off
+        // this callback's turn (setImmediate), so the authoritative re-index
+        // can never extend the client-observed response latency even if its
+        // work is synchronous. Memoised in the runtime, so repeated
+        // stateless requests cannot duplicate it.
+        const fire = () => void runtime.startRefresh().catch(() => undefined);
+        if (res.writableFinished) refreshTrigger.schedule(fire);
+        else res.once("finish", () => refreshTrigger.schedule(fire));
       } finally {
         await requestTransport.close().catch(() => undefined);
       }
@@ -218,12 +231,21 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   const address = httpServer.address();
   const boundPort = typeof address === "object" && address !== null ? address.port : port;
 
+  // The deferred refresh is triggered after a response flushes plus one
+  // turn (shared deferred-trigger lifecycle, FX12-R4): close() cancels a
+  // trigger that has not run, and a late callback re-checks `closing` — so
+  // the authoritative re-index can never start against a closed hub.
+  let closing = false;
+  const refreshTrigger = createDeferredTrigger(() => closing);
+
   async function close(): Promise<void> {
+    closing = true;
+    refreshTrigger.cancel();
     await new Promise<void>((resolve, reject) => {
       httpServer.close((cause) => (cause ? reject(cause) : resolve()));
     });
     await runtime.close();
   }
 
-  return { port: boundPort, host, token, tokenSource, close };
+  return { runtime, port: boundPort, host, token, tokenSource, close };
 }
