@@ -22,7 +22,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
 import { conformanceEvidence } from "./parsers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -86,6 +86,7 @@ async function main() {
   });
 
   let run;
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     const res = await runTool(
       "npx",
@@ -120,7 +121,7 @@ async function main() {
       spawnError: res.spawnError,
     };
   } finally {
-    await killTree(serve.handle);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
   // Parse per-scenario result files: the suite writes one directory per
@@ -166,6 +167,7 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }
 

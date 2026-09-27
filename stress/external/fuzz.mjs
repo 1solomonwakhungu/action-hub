@@ -24,7 +24,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
 import { fuzzEvidence } from "./parsers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -120,6 +120,7 @@ async function main() {
     root,
     repoRoot,
   });
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     fuzzRuns.push(
       await runFuzzer(isolatedEnv, [
@@ -135,7 +136,7 @@ async function main() {
       ], "http", runStamp),
     );
   } finally {
-    await killTree(serve.handle);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
   // Collect fuzzer output file names (paths recorded; contents stay in .generated).
@@ -159,6 +160,7 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }
 

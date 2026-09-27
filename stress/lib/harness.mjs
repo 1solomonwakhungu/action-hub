@@ -694,7 +694,30 @@ export async function killGroupAndVerify(target, { termGraceMs = TERM_TO_KILL_MS
   return target.teardownPromise;
 }
 
-async function teardownAnchoredGroup(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner, win32: win32Override, hooks } = {}) {
+/**
+ * Wrapper: on ANY non-green verdict (fail-closed, taskkill failure, group
+ * still non-empty, anchor-shutdown failure) the handle's OWN relay pipes and
+ * control channel are destroyed — they are ours regardless of the group-kill
+ * decision, and an open relay must never hold the caller's event loop
+ * hostage (reviewer MIG2-R1 drain). This signals nothing to the group.
+ */
+async function teardownAnchoredGroup(target, opts) {
+  const verdict = await teardownAnchoredGroupImpl(target, opts);
+  // Destroy our OWN relay pipes + control channel ONLY when the anchor is
+  // already gone: destroying the control channel of a LIVE anchor would end
+  // its fd3 read and terminate the ownership proof mid-flight (the healthy
+  // dissolve closes them properly instead). When the group is unmanageable
+  // (dead anchor / leaderless), the fds are pure leftovers and must never
+  // hold the caller's event loop hostage (reviewer MIG2-R1 drain).
+  if (verdict && verdict.groupEmpty !== true && !anchorLive(target.anchor)) {
+    for (const s of [target.stdin, target.stdout, target.stderr, target.anchor?.stdio?.[3]]) {
+      try { s?.destroy?.(); } catch { /* already closed */ }
+    }
+  }
+  return verdict;
+}
+
+async function teardownAnchoredGroupImpl(target, { termGraceMs = TERM_TO_KILL_MS, killDeadlineMs = KILL_GRACE_MS, taskkillRunner, win32: win32Override, hooks } = {}) {
   // Platform + verdict-mapping seam (reviewer LIB2-R3.3): the win32 branch
   // (taskkill /T /F against the anchor pid, truthful verdict mapping) is
   // EXERCISABLE on any host by passing win32:true with an injectable

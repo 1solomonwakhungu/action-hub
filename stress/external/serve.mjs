@@ -185,6 +185,27 @@ export async function startServe({
 }
 
 /**
+ * Fail-closed fold of a cleanup verdict into a runner summary (reviewer
+ * MIG2-R1): groupEmpty !== true, a killError, or ANY survivor evidence makes
+ * the summary NOT ok — a successful workload with failed cleanup can never
+ * pass. Returns the mutated summary; evidence lands in summary.cleanupFailures.
+ */
+export function foldCleanupVerdict(summary, verdict, label = "cleanup") {
+  if (!verdict) return summary;
+  const problems = [];
+  if (verdict.groupEmpty !== true) problems.push(`groupEmpty !== true (${JSON.stringify(verdict.groupEmpty)})`);
+  if (verdict.error) problems.push(`error: ${String(verdict.error).slice(0, 300)}`);
+  if (verdict.killError) problems.push(`killError: ${String(verdict.killError).slice(0, 300)}`);
+  const survivors = Array.isArray(verdict.survivors) ? verdict.survivors : [];
+  if (survivors.length > 0) problems.push(`survivors: ${JSON.stringify(survivors).slice(0, 300)}`);
+  if (problems.length > 0) {
+    summary.ok = false;
+    summary.cleanupFailures = [...(summary.cleanupFailures ?? []), { label, problems }];
+  }
+  return summary;
+}
+
+/**
  * Terminates a served group via the lib's gated ladder (MIG2): TERM ->
  * bounded wait -> FINAL KILL -> verify, every negative-pgid signal gated on
  * the exact anchor being provably ours and alive immediately before it
@@ -209,13 +230,13 @@ export function isInside(root, candidate) {
  * stderrTail, durationMs}. Use this instead of spawnSync so timed-out runs
  * cannot leak descendants.
  */
-export function runTool(cmd, args, { env, timeoutMs = 30 * 60_000 } = {}) {
+export function runTool(cmd, args, { env, timeoutMs = 30 * 60_000, win32, taskkillRunner } = {}) {
   // MIG2: one anchored, drained, bounded step through the lib. The group is
   // reaped on EVERY completion path (timeout -> TERM -> FINAL KILL ->
   // verify; successful-launcher stragglers reaped too). Keep this
   // SYNCHRONOUS — runners do `const t = runTool(...); await t.exitP`.
   const started = Date.now();
-  const stepP = runStep(cmd, args, { env, timeoutMs });
+  const stepP = runStep(cmd, args, { env, timeoutMs, win32, taskkillRunner });
   return {
     exitP: stepP.then((r) => ({
       code: r.pid === null && r.error ? -1 : r.code,
@@ -228,6 +249,10 @@ export function runTool(cmd, args, { env, timeoutMs = 30 * 60_000 } = {}) {
       // Truthful teardown evidence from the lib (never folded away):
       groupEmpty: r.groupEmpty,
       survivors: r.survivors ?? [],
+      killError: r.killError ?? null,
+      // The anchored pgid for follow-up cleanup through the authoritative
+      // handle (registeredHandleFor) when a verdict is non-green.
+      pgid: r.pgid ?? null,
     })),
   };
 }

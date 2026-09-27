@@ -19,7 +19,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
 import { copyFile, symlink, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 
@@ -99,6 +99,7 @@ async function main() {
     repoRoot,
   });
   let port = null;
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     port = serve.port;
     const httpArgs = [
@@ -115,7 +116,7 @@ async function main() {
     run.push(await runInspector(isolatedEnv, [...httpArgs, "initialize", "--format", "json"], "http initialize"));
     run.push(await runInspector(isolatedEnv, [...httpArgs, "tools/list", "--format", "json"], "http tools/list"));
   } finally {
-    await killTree(serve.handle);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
   const toolsSeen = run
@@ -134,6 +135,7 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }
 

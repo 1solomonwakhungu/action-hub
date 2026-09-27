@@ -34,7 +34,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { aggregateRuns } from "./verdict.mjs";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
 import { main as libMain } from "../lib/harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -87,6 +87,7 @@ async function main() {
   let skillsDir = null;
   let healthy = false;
 
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     // 1. Fixture unless an external config is provided. The generator's own
     // summary is validated like every other step: unparsable output or a
@@ -264,7 +265,7 @@ async function main() {
     });
   } finally {
     if (sampler) clearInterval(sampler);
-    if (serve) await killTree(serve.handle);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
   const verdict = aggregateRuns(runs);
@@ -283,6 +284,7 @@ async function main() {
     ok: healthy && verdict.ok,
     at: new Date().toISOString(),
   };
+  foldCleanupVerdict(summary, serveCleanup, "serve");
   return finish(summary);
 }
 
