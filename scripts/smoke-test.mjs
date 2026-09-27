@@ -3,7 +3,7 @@
 // `npm run smoke:binary`. Pass the binary path as the first argument, or let it
 // default to the host-target binary under dist-bin/.
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, accessSync, rmSync, readdirSync, appendFileSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { repoRoot, binaryFileName, readCliVersion } from "./lib/util.mjs";
@@ -127,7 +127,7 @@ function checkExtractionCacheReuse(bin) {
   const env = { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
   const first = runBinary(bin, [], env);
   const cacheDirs = () => {
-    const base = join(tmpRoot, "action-hub");
+    const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
     try {
       return readdirSync(base).filter((n) => n.startsWith("vendor-"));
     } catch {
@@ -167,6 +167,117 @@ function checkInvalidModelOverride(bin) {
     fail(`invalid explicit model override must fail, got ${line}`);
   }
   process.stderr.write(`  ok  invalid explicit model override fails clearly (no silent embedded fallback)\n`);
+}
+
+/**
+ * Valid explicit model override (review-1 round 5 HIGH 2): pointing
+ * ACTION_HUB_EMBEDDINGS_MODEL at a real model root must SUCCEED in SEA — the
+ * embedded ORT runtime is still provided (model extraction is skipped, ORT
+ * extraction is not).
+ */
+function checkValidModelOverride(bin) {
+  const tmpRoot = checkDir("sea-valid-override");
+  const env = {
+    TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot,
+    ACTION_HUB_EMBEDDINGS_MODEL: resolve(repoRoot, "packages", "core", "vendor", "models"),
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  };
+  const { status, stdout } = runBinary(bin, [], env);
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`valid-override selftest printed no JSON line (status ${status})`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== true) fail(`valid model override must succeed in SEA: ${line}`);
+  // Only the ORT runtime (plus notices) may be extracted — NOT the embedded
+  // 23MB model the caller already supplied.
+  const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
+  const trees = (readdirSync(base, { recursive: true, withFileTypes: true }) ?? []);
+  const hasModelDir = trees.some((e) => e.isDirectory() && e.name === "models");
+  if (hasModelDir) fail("valid-override run extracted the embedded model needlessly");
+  process.stderr.write(`  ok  valid explicit model override succeeds (ORT only extracted)\n`);
+}
+
+/**
+ * Cache tamper (review-2 round 5 P1/F65): a sentinel written into the cached
+ * ORT JS must NEVER be executed — the next run must detect the hash mismatch
+ * (vs the bytes embedded in the binary) and re-extract cleanly.
+ */
+function checkTamperedCache(bin) {
+  const tmpRoot = checkDir("sea-tamper");
+  const env = { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" };
+  const runSelftest = () => {
+    const { status, stdout } = runBinary(bin, [], env);
+    const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+    let parsed;
+    try {
+      parsed = JSON.parse(line ?? "{}");
+    } catch {
+      fail(`tamper selftest printed no JSON line (status ${status})`);
+    }
+    return parsed?.embeddingSelftest;
+  };
+  if (runSelftest()?.ok !== true) fail("tamper check: first clean run failed");
+  const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
+  const findFile = (name) => {
+    const hits = readdirSync(base, { recursive: true, withFileTypes: true })
+      .filter((e) => e.isFile() && e.name === name)
+      .map((e) => join(e.parentPath ?? "", e.name));
+    return hits[0];
+  };
+  const ortJs = findFile("ort.wasm.mjs");
+  if (!ortJs) fail("tamper check: cached ort.wasm.mjs not found");
+  appendFileSync(ortJs, "\n// sentinel-evil() — must never execute\n");
+  if (runSelftest()?.ok !== true) fail("tamper check: tampered cache must be detected and re-extracted (ok:true)");
+  if ((readFileSync(ortJs, "utf8") ?? "").includes("sentinel-evil")) {
+    fail("tamper check: tampered ORT JS survived — the sentinel tree was reused instead of re-extracted");
+  }
+  process.stderr.write(`  ok  tampered cache is detected and re-extracted (sentinel never executes)\n`);
+}
+
+/**
+ * Foreign/loose-mode cache base (intake round 5): a pre-existing base dir
+ * with 0777 must NOT be reused or chmod'ed — the run falls back to a private
+ * mkdtemp and still succeeds.
+ */
+function checkForeignCacheBase(bin) {
+  const tmpRoot = checkDir("sea-foreign-base");
+  const base = join(tmpRoot, `action-hub-cache-${process.getuid()}`);
+  mkdirSync(base, { recursive: true, mode: 0o777 });
+  const { stdout } = runBinary(bin, [], { TMPDIR: tmpRoot, TMP: tmpRoot, TEMP: tmpRoot, ACTION_HUB_EMBEDDINGS_SELFTEST: "1" });
+  const line = (stdout ?? "").split("\n").map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "{}");
+  } catch {
+    fail(`foreign-base selftest printed no JSON line`);
+  }
+  if (parsed?.embeddingSelftest?.ok !== true) fail(`foreign/loose-mode cache base must fall back to a private mkdtemp: ${line}`);
+  const st = statSync(base);
+  if (!(st.mode & 0o077)) fail("foreign cache base was chmod'ed instead of bypassed");
+  process.stderr.write(`  ok  foreign/0777 cache base is bypassed (private mkdtemp fallback)\n`);
+}
+
+/**
+ * The CJS bundle (non-SEA distribution) must also serve `licenses` — the
+ * texts are inlined at bundle time (review-1 round 5 HIGH 1).
+ */
+function checkBundleLicenses() {
+  const bundlePath = resolve(repoRoot, "build", "action-hub.cjs");
+  try {
+    accessSync(bundlePath);
+  } catch {
+    process.stderr.write("  ok  bundle licenses SKIPPED (no bundle built in this job)\n");
+    return;
+  }
+  const { status, stdout } = spawnSync(process.execPath, [bundlePath, "licenses"], { encoding: "utf8", timeout: 30_000 });
+  const out = stdout ?? "";
+  for (const needle of ["Vendored third-party provenance", "Apache License", "MIT License"]) {
+    if (!out.includes(needle)) fail(`bundle licenses output missing "${needle}" (exit ${status})`);
+  }
+  process.stderr.write(`  ok  CJS bundle licenses prints the embedded texts\n`);
 }
 
 function checkVersion(bin, version) {
@@ -334,6 +445,10 @@ async function main() {
     checkLicenses(bin);
     checkExtractionCacheReuse(bin);
     checkInvalidModelOverride(bin);
+    checkValidModelOverride(bin);
+    checkTamperedCache(bin);
+    checkForeignCacheBase(bin);
+    checkBundleLicenses();
   } finally {
     rmRunRoot(runRoot);
   }

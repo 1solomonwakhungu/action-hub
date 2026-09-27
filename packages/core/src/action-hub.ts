@@ -341,6 +341,11 @@ export class ActionHub {
                   yieldFn: async () => {
                     if (this.#embedCancelled) throw new Error("embedding rebuild cancelled by close()");
                     await yieldImpl();
+                    // Re-check AFTER the yield (review-2 round 5): a close()
+                    // arriving DURING the timer yield must land at this
+                    // boundary — otherwise the rebuild always processes one
+                    // more whole chunk before noticing.
+                    if (this.#embedCancelled) throw new Error("embedding rebuild cancelled by close()");
                   },
                 });
             this.#embedIndex!.prune(new Set(this.#catalog.all().map((record) => record.id)));

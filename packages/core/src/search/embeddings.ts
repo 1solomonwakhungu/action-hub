@@ -153,7 +153,10 @@ export class EmbeddingSemanticIndex {
       // asked for, and no 35MB extraction happens needlessly. The embedded
       // extraction is used only when nothing else is configured.
       const explicitModel = this.#options.modelPath || process.env["ACTION_HUB_EMBEDDINGS_MODEL"] || "";
-      const sea = explicitModel ? null : await seaVendorRoot();
+      // ORT is ALWAYS needed (even with a caller-supplied model, the bundled
+      // binary has no resolvable vendor/ort — review-1 round 5 HIGH 2); the
+      // embedded MODEL is extracted only when nothing else is configured.
+      const sea = await seaVendorRoot(!explicitModel);
       const modelRoot = explicitModel || sea?.modelRoot || defaultVendorPath();
       if (!modelRoot) {
         throw new Error(
@@ -162,8 +165,7 @@ export class EmbeddingSemanticIndex {
       }
       const modelDir = `${modelRoot}/${this.#options.modelId}`;
       this.#tokenizer = loadTokenizer(`${modelDir}/tokenizer.json`);
-      const ortDir =
-        process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] || (explicitModel ? "" : sea?.ortDir) || "";
+      const ortDir = process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] || sea?.ortDir || "";
       const ortUrl = ortDir
         ? pathToFileURL(`${ortDir}/${ORT_MODULE}`)
         : new URL(`../../vendor/ort/${ORT_MODULE}`, import.meta.url);
@@ -406,7 +408,7 @@ function defaultYield(): Promise<void> {
  * scorer). Failure is cached — load() must not retry a broken extraction on
  * every scorer call.
  */
-async function seaVendorRoot(): Promise<{ modelRoot: string; ortDir: string } | null> {
+async function seaVendorRoot(wantModel: boolean): Promise<{ modelRoot: string; ortDir: string } | null> {
   if (seaVendor !== undefined) return seaVendor;
   seaVendor = null;
   try {
@@ -423,35 +425,119 @@ async function seaVendorRoot(): Promise<{ modelRoot: string; ortDir: string } | 
     // Content-addressed cache (review-2/round 4): extract ONCE under a
     // stable per-content key and REUSE across processes. A fresh temp dir per
     // invocation leaked ~35MB per embedding-enabled process; a shared,
-    // content-addressed tree is bounded (one tree per shipped model/ORT
-    // version) and survives repeated invocations.
-    const modelBytes = Buffer.from(sea.getRawAsset(SEA_ASSETS[0]!) ?? new ArrayBuffer(0));
-    const wasmBytes = Buffer.from(sea.getRawAsset(`vendor/ort/${ORT_WASM}`) ?? new ArrayBuffer(0));
-    if (modelBytes.length === 0 || wasmBytes.length === 0) throw new Error("SEA assets missing");
-    const key = `${createHash("sha256").update(wasmBytes).digest("hex").slice(0, 12)}-${createHash("sha256").update(modelBytes).digest("hex").slice(0, 12)}`;
-    const root = join(tmpdir(), "action-hub", `vendor-${key}`);
-    const mark = (paths: string[]): boolean => paths.every((p) => existsSync(p));
-    const needed = [...SEA_ASSETS, ...SEA_LICENSE_ASSETS].map((assetKey) => join(root, assetKey));
-    if (!mark(needed)) {
-      // Extract into a sibling temp dir and atomically rename; if another
-      // process won the race, drop the temp tree and reuse the winner's.
+    // content-addressed tree is bounded (one tree per shipped asset set)
+    // and survives repeated invocations. The key hashes the FULL embedded
+    // asset set (review-1 round 5 hardening: model/wasm-only keys could
+    // reuse stale tokenizer/config/ORT-JS/license files across releases).
+    const wanted = wantModel ? SEA_ASSETS : SEA_ASSETS.filter((key) => !key.startsWith("vendor/models/"));
+    const assetKeys = [...wanted, ...SEA_LICENSE_ASSETS];
+    const hash = createHash("sha256");
+    for (const assetKey of assetKeys) {
+      hash.update(assetKey);
+      hash.update(Buffer.from(sea.getRawAsset(assetKey) ?? new ArrayBuffer(0)));
+    }
+    // Private per-user cache root (review-2 round 5, MUST-FIX 1 — cache
+    // tampering): a shared world-writable tmp tree that only trusts
+    // existsSync let another user pre-create/plant the directory, and
+    // load() IMPORTS the cached ORT JS — planted code would execute.
+    // The cache therefore lives under a 0700 per-uid directory we create and
+    // verify (owner + mode + no symlinks), and every extracted asset is
+    // authenticated against the SHA-256 of the bytes embedded in the binary
+    // before ANY reuse/import.
+    const uid = typeof process.getuid === "function" ? String(process.getuid()) : "unknown";
+    const cacheBase = join(tmpdir(), `action-hub-cache-${uid}`);
+    const { statSync, lstatSync, mkdtempSync } = await import("node:fs");
+    // A pre-existing base that is foreign-owned or loose-mode is NEVER reused
+    // or chmod'ed (intake round 5): fall back to a fresh private mkdtemp
+    // (0700) so the run still works; the shared cache is simply skipped.
+    // Candidate bases, in order (intake round 5): the per-uid tmp cache dir;
+    // the user cache dir (XDG_CACHE_HOME / %LOCALAPPDATA% / ~/.cache) when
+    // tmpdir itself is unusable (e.g. a TMPDIR pointing at a nonexistent
+    // tree); a fresh private mkdtemp as the final filesystem resort. A base
+    // that is foreign-owned or loose-mode is never reused or chmod'ed.
+    const usable = (dir: string): boolean => {
+      try {
+        const st = statSync(dir);
+        return (
+          st.isDirectory() &&
+          !(st.mode & 0o077) &&
+          (typeof process.getuid !== "function" || st.uid === process.getuid())
+        );
+      } catch {
+        return false;
+      }
+    };
+    const userCache = join(
+      process.env["XDG_CACHE_HOME"] || process.env["LOCALAPPDATA"] || join(process.env["HOME"] ?? tmpdir(), ".cache"),
+      "action-hub",
+    );
+    const privateFallback = (): string => {
+      try {
+        return mkdtempSync(join(userCache, "cache-"));
+      } catch {
+        return mkdtempSync(join(tmpdir(), "action-hub-cache-"));
+      }
+    };
+    let base = cacheBase;
+    if (!usable(base)) {
+      try {
+        mkdirSync(cacheBase, { recursive: true, mode: 0o700 });
+      } catch {
+        /* fall through to the user cache dir */
+      }
+      if (!usable(base)) {
+        try {
+          mkdirSync(userCache, { recursive: true, mode: 0o700 });
+        } catch {
+          /* final fallback below */
+        }
+        base = usable(cacheBase) ? cacheBase : usable(userCache) ? userCache : privateFallback();
+      }
+    }
+    const root = join(base, `vendor-${hash.digest("hex").slice(0, 16)}`);
+    const readFileF = (await import("node:fs/promises")).readFile;
+    const sha256Bytes = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
+    // Expected hashes are computed from the bytes EMBEDDED IN THE BINARY
+    // (getRawAsset) — a compile-time source of truth an on-disk attacker
+    // cannot rewrite. No disk manifest is trusted for authentication.
+    const expected = new Map<string, string>();
+    for (const assetKey of assetKeys) {
+      expected.set(assetKey, sha256Bytes(Buffer.from(sea.getRawAsset(assetKey) ?? new ArrayBuffer(0))));
+    }
+    const verifyTree = async (): Promise<boolean> => {
+      // No symlinks anywhere in the tree; every needed file must be a regular
+      // file whose bytes hash to the EMBEDDED asset's SHA-256.
+      try {
+        for (const assetKey of assetKeys) {
+          const st = lstatSync(join(root, assetKey));
+          if (!st.isFile()) return false;
+          if (sha256Bytes(await readFileF(join(root, assetKey))) !== expected.get(assetKey)) return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!(await verifyTree())) {
+      // Missing/corrupt/stale/foreign tree: extract fresh. If the existing
+      // tree cannot be replaced (not ours), extraction fails -> fail closed.
       const staging = `${root}.staging-${process.pid}`;
       rmSync(staging, { recursive: true, force: true });
       try {
-        for (const assetKey of [...SEA_ASSETS, ...SEA_LICENSE_ASSETS]) {
+        for (const assetKey of assetKeys) {
           const bytes = sea.getRawAsset(assetKey);
           if (!bytes) throw new Error(`SEA asset missing: ${assetKey}`);
           const target = join(staging, assetKey);
           mkdirSync(dirname(target), { recursive: true });
-          writeFileSync(target, Buffer.from(bytes));
+          writeFileSync(target, Buffer.from(bytes), { mode: 0o600 });
         }
-        mkdirSync(dirname(root), { recursive: true });
+        mkdirSync(base, { recursive: true, mode: 0o700 });
         try {
-          renameSync(staging, root);
+          rmSync(root, { recursive: true, force: true });
         } catch {
-          if (!mark(needed)) throw new Error("extraction cache rename race and incomplete winner");
-          rmSync(staging, { recursive: true, force: true });
+          /* a tree we do not own — rename below will fail and fail closed */
         }
+        renameSync(staging, root);
       } catch (cause) {
         // Partial-failure cleanup: never leave a half-written cache tree.
         rmSync(staging, { recursive: true, force: true });
@@ -462,13 +548,31 @@ async function seaVendorRoot(): Promise<{ modelRoot: string; ortDir: string } | 
     // Process-global handoff (NOT module state): a bundled binary can contain
     // more than one copy of this module (package entry + deep imports), and
     // each copy has its own cache. Writing the env vars once (first copy
-    // wins) makes the extraction visible to every copy.
-    process.env["ACTION_HUB_EMBEDDINGS_MODEL"] ??= join(root, "vendor/models");
-    process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] ??= join(root, "vendor/ort");
-    seaVendor = {
-      modelRoot: join(root, "vendor/models"),
-      ortDir: join(root, "vendor/ort"),
-    };
+    // wins) makes the extraction visible to every copy. The MODEL env is
+    // only set when the embedded model was actually extracted — a caller's
+    // explicit ACTION_HUB_EMBEDDINGS_MODEL must never be overwritten.
+    // The extraction created intermediate dirs with the default mode; the
+    // private tree must be 0700 end to end (we own it — chmod is safe).
+    try {
+      const { chmodSync } = await import("node:fs");
+      chmodSync(root, 0o700);
+      chmodSync(join(root, "vendor"), 0o700);
+    } catch {
+      /* gated below */
+    }
+    // Import gate (intake round 5): the tree must be owned + 0700 AT THIS
+    // MOMENT (closes the swap-after-verify window as far as stat allows);
+    // every file load() imports was hashed in verifyTree against the bytes
+    // embedded in this binary.
+    const rootSt = statSync(root);
+    if (!rootSt.isDirectory() || rootSt.mode & 0o077 || (typeof process.getuid === "function" && rootSt.uid !== process.getuid())) {
+      throw new Error(`embeddings cache tree not private: ${root}`);
+    }
+    const ortDir = join(root, "vendor/ort");
+    process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] ??= ortDir;
+    const modelRoot = wantModel ? join(root, "vendor/models") : undefined;
+    if (modelRoot) process.env["ACTION_HUB_EMBEDDINGS_MODEL"] ??= modelRoot;
+    seaVendor = { modelRoot: modelRoot ?? "", ortDir };
   } catch {
     /* fall back to normal resolution */
   }

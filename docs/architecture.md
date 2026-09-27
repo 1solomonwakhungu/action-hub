@@ -97,10 +97,13 @@ Retrieval never fails because of the semantic layer.
 
 ### The local semantic index
 
-`LocalSemanticIndex` is the default scorer, wired up by `ActionHub` unless you
-pass `semanticScorer: null`. It is deliberately dependency-free: no model
-weights, no download at install time, no network at query time. Embeddings are
-deterministic, so two processes indexing the same catalog agree exactly.
+Since SQ4, the default scorer is `EmbeddingSemanticIndex` (real local
+embeddings: a vendored int8 all-MiniLM-L6-v2 model served by an unmodified
+onnxruntime-web WASM runtime — no native addons, nothing fetched at runtime).
+Pass `semanticScorer: null` or `embeddings: null` to use the older
+dependency-free `LocalSemanticIndex` hashed scorer instead; it remains the
+automatic fallback whenever the embedding model cannot be loaded or a rebuild
+fails (the hub warns once and degrades, so retrieval never breaks).
 
 A document embedding is the IDF-weighted sum of two signals, hashed into a
 fixed 256-dimensional space and L2-normalized; scoring is a cosine similarity.
