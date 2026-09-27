@@ -192,50 +192,39 @@ test("filtered searches stay identical to the reference", async () => {
   );
 });
 
-test("microbench: warm per-query cost collapses (no per-query corpus tokenization)", async () => {
-  const sizes = [2_000, 10_000];
-  const timings: { size: number; coldMs: number; warmMs: number }[] = [];
-  for (const size of sizes) {
-    const catalog = makeCatalog(size, 7);
-    const engine = new SearchEngine(catalog);
-    const coldStart = performance.now();
-    await engine.search(QUERIES[2]);
-    const coldMs = performance.now() - coldStart;
-    const iters = 20;
-    const warmStart = performance.now();
-    for (let i = 0; i < iters; i += 1) await engine.search(QUERIES[i % QUERIES.length]);
-    const warmMs = (performance.now() - warmStart) / iters;
-    timings.push({ size, coldMs, warmMs });
-  }
-  // The warm path no longer tokenizes/accumulates the corpus per query, so
-  // its per-document cost must be a small fraction of the cold path's. The
-  // residual bm25 scan is still O(candidates) by design (it must score every
-  // document); what matters is that the constant collapsed.
-  for (const t of timings) {
-    const coldPerDoc = t.coldMs / t.size;
-    const warmPerDoc = t.warmMs / t.size;
-    // >3 still proves the collapsed constant (warm is the same scan minus
-    // tokenization/stats); 5 was marginal on slow CI runners.
-    assert.ok(
-      coldPerDoc / warmPerDoc > 3,
-      `cold/warm per-doc cost ${coldPerDoc.toFixed(4)} vs ${warmPerDoc.toFixed(4)} (${JSON.stringify(timings)})`,
-    );
-  }
-  // Contention-tolerant bounds only (D1-R4): absolute wall-clock thresholds
-  // went red under normal root-suite CPU contention with no regression. The
-  // warm path is the same scan as cold minus tokenization/stats, so same-run
-  // relative bounds carry the information:
-  //  - warm 10k must scale sub-quadratically vs warm 2k (it is O(n), ~5x;
-  //    25x tolerates CI-runner jitter/GC: 10x went red at 10.01x on a
-  //    shared runner with no regression);
-  //  - warm 10k must stay below half the cold 10k cost (the collapsed
-  //    constant is the actual claim).
-  assert.ok(
-    timings[1].warmMs < timings[0].warmMs * 25,
-    `warm 10k (${timings[1].warmMs.toFixed(2)}ms) vs warm 2k (${timings[0].warmMs.toFixed(2)}ms) scaled too steeply`,
+test("microbench (F57): warm queries tokenize NO corpus documents (deterministic)", async () => {
+  // Wall-clock ratios flaked under CI contention ("scaled too steeply" at
+  // warm 10k 12.58ms vs warm 2k 1.19ms on PR 75 run 36283419116). The
+  // PROPERTY the bench was pointing at is memoization: a warm query over an
+  // unchanged catalog must tokenize zero corpus documents. That is
+  // deterministic and contention-proof; timing is recorded informationally
+  // only, never asserted.
+  const catalog = makeCatalog(2_000, 7);
+  const engine = new SearchEngine(catalog);
+
+  // Cold path: populates the per-document token memo + full-corpus stats.
+  await engine.search(QUERIES[2]);
+  const missesAfterCold = engine.documentTokenMissesForTest;
+  assert.equal(missesAfterCold, catalog.size, "the cold query tokenizes every corpus document once");
+
+  // Warm path: identical candidate set, unchanged generation.
+  for (let i = 0; i < 20; i += 1) await engine.search(QUERIES[i % QUERIES.length]);
+  assert.equal(
+    engine.documentTokenMissesForTest,
+    missesAfterCold,
+    "warm queries over an unchanged catalog must tokenize zero corpus documents",
   );
-  assert.ok(
-    timings[1].warmMs < timings[1].coldMs * 0.5,
-    `warm 10k (${timings[1].warmMs.toFixed(2)}ms) not clearly below cold 10k (${timings[1].coldMs.toFixed(2)}ms)`,
+
+  // And the results must still be bit-identical to the reference path.
+  const warm = (await engine.search(QUERIES[2])).map((hit) => ({ id: hit.id, score: hit.score }));
+  assert.deepEqual(warm, referenceRank(catalog.all(), QUERIES[2], 10));
+
+  // Catalog mutation MUST invalidate: every document tokenizes again once.
+  catalog.add(makeRecord(99_000, mulberry32(7)));
+  await engine.search(QUERIES[2]);
+  assert.equal(
+    engine.documentTokenMissesForTest,
+    missesAfterCold + catalog.size,
+    "a generation bump must re-tokenize the whole corpus exactly once",
   );
 });
