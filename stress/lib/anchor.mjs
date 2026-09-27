@@ -197,7 +197,10 @@ export function spawnAnchoredGroup(cmd, args, { env, cwd, stdio = ["ignore", "pi
       try {
         ctrlWrite(issued, { op: "spawn", cmd, args, stdio, env, cwd });
       } catch (err) {
-        issued.terminal = true;
+        // NOT terminalized: a synchronous serialization/write failure leaves
+        // the anchor live with no workload — the authoritative handle must be
+        // reaped through the gated ladder, never blessed (reviewer LIB2-R5.1;
+        // repro: BigInt args make JSON.stringify throw before the write).
         return { code: null, signal: null, error: "anchor control write failed: " + err.message };
       }
       const spawned = await nextControl(ANCHOR_SPAWN_CONFIRM_MS);

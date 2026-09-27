@@ -39,26 +39,7 @@ function aliveByProbe(pid) {
   }
 }
 
-function strayCount() {
-  try {
-    const out = spawnSync("ps", ["-eo", "pid,ppid,command"], { encoding: "utf8", timeout: 3_000 });
-    if (out.status !== 0) return -1;
-    let n = 0;
-    for (const line of String(out.stdout).split("\n")) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length >= 3 && Number(parts[1]) === 1 && line.includes('setInterval(()=>{},500)')) n++;
-    }
-    return n;
-  } catch { return -1; }
-}
-let __lastStrays = null;
-function strayDelta(label) {
-  const n = strayCount();
-  if (__lastStrays !== null && n > __lastStrays) console.error("[stray-delta]", label, __lastStrays, "->", n);
-  if (n >= 0) __lastStrays = n;
-}
-
-const __final = await main(async () => {
+await main(async () => {
   const checks = [];
 
   // --- 0. env-table single source of truth (drift check) -------------------
@@ -412,7 +393,6 @@ const __final = await main(async () => {
       assert.deepEqual(gone.survivors, []);
       assert.equal(gone.error, undefined, "terminal refusal is a clean verdict, not an error");
       checks.push({ check: "spawnGroup-killGroupAndVerify-ladder", ok: true, childPid });
-      strayDelta("spawnGroup-killGroupAndVerify-ladder");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -445,7 +425,6 @@ const __final = await main(async () => {
       assert.equal(killed.groupEmpty, true, "the surviving grandchild must be reaped by the owned kill");
       assert.ok(!aliveByProbe(grandchildPid), "the orphaned grandchild must be dead");
       checks.push({ check: "spawnGroup-leader-exit-keeps-registry-until-group-empty", ok: true, grandchildPid });
-      strayDelta("spawnGroup-leader-exit-keeps-registry-until-group-empty");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -515,7 +494,6 @@ await main(async () => {
       await new Promise((r) => setTimeout(r, TERM_LADDER_GRACE_MS));
       assert.ok(!aliveByProbe(groupLeaderPid), "the registered long-lived group must be dead after the interrupt");
       checks.push({ check: "main-sigterm-one-json-groups-dead-exit-143", ok: true, groupLeaderPid, groupsKilled: summary.groupsKilled });
-      strayDelta("main-sigterm-one-json-groups-dead-exit-143");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -576,7 +554,6 @@ await main(async () => {
       await new Promise((r) => setTimeout(r, TERM_LADDER_GRACE_MS));
       assert.ok(!aliveByProbe(stepPid), "the in-flight step's group must be dead");
       checks.push({ check: "main-sigterm-inflight-runstep-one-json-exit-143", ok: true, stepPid });
-      strayDelta("main-sigterm-inflight-runstep-one-json-exit-143");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -631,12 +608,10 @@ await main(async () => {
           try { process.kill(-reused.pid, "SIGKILL"); } catch { /* reaping our own probe */ }
         }
         checks.push({ check: "terminal-handle-cannot-signal-reused-pgid", ok: true, reusedPgid: reused.pid });
-        strayDelta("terminal-handle-cannot-signal-reused-pgid");
       } else {
         // pgid reuse not observed within the window (OS-dependent); the
         // terminal no-op path is still proven above (b/c).
         checks.push({ check: "terminal-handle-cannot-signal-reused-pgid", ok: true, reusedPgid: null, note: "pgid reuse not observed in window; terminal no-op verified" });
-        strayDelta("terminal-handle-cannot-signal-reused-pgid");
       }
       // Cleanup of the (a)/(b) probe group.
       try { process.kill(-realPgid, "SIGKILL"); } catch { /* already gone */ }
@@ -695,15 +670,25 @@ await main(async () => {
       assert.ok(handleN);
       assert.equal((await killGroupAndVerify(handleN, { termGraceMs: 1_000, killDeadlineMs: 2_000 })).groupEmpty, true);
 
-      // (d) A SUCCESSFUL stubbed verdict maps to groupEmpty:true + terminal
-      // (the mapping's green side; on POSIX the real group is then cleaned
-      // through the normal ladder because the stub did not actually kill it).
+      // (d) A SUCCESSFUL stubbed verdict maps to groupEmpty:true + terminal —
+      // and the stub makes that green TRUE: it kills the exact owned group
+      // (the check owns this handle; the kill is a deliberate verification
+      // kill) so the mapping's green is never asserted against a live group.
       const h2 = await spawnGroup(process.execPath, ["-e", "setInterval(()=>{},500)"], { env, cwd: root });
-      const okStubKill = await killGroupAndVerify(h2, { win32: true, taskkillRunner: () => ({ ok: true, status: 0 }) });
+      const okStubKill = await killGroupAndVerify(h2, {
+        win32: true,
+        taskkillRunner: (pid) => {
+          try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+          return { ok: true, status: 0 };
+        },
+      });
       assert.equal(okStubKill.groupEmpty, true);
       assert.equal(h2.terminal, true);
-      const realDown2 = await killGroupAndVerify(h2, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
-      assert.equal(realDown2.groupEmpty, true, "stubbed-win32 green must still be followed by real cleanup on a POSIX host");
+      // The green must be REAL: anchor and workload are actually dead.
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(h2.anchor.pid), "the anchor must be dead after a TRUE successful verdict");
+      assert.ok(!aliveByProbe(h2.pid), "the workload must be dead after a TRUE successful verdict");
+      assert.deepEqual(registeredGroups(), [], "no leak from the success-mapping check");
 
       if (process.platform === "win32") {
         // Real win32 host: the default (non-seam) path with the REAL taskkill.
@@ -712,12 +697,9 @@ await main(async () => {
         assert.equal(realWin.groupEmpty, true, "real win32 taskkill must verify empty");
         assert.equal(h3.terminal, true);
         checks.push({ check: "win32-taskkill-real-host", ok: true });
-        strayDelta("win32-taskkill-real-host");
       }
       checks.push({ check: "win32-taskkill-failure-not-a-green", ok: true, note: "verdict mapping exercised on this host via the win32 seam (failed + successful stubs, runStep timeout + nominal paths); real win32 branch retained for win32 hosts" });
-      strayDelta("win32-taskkill-failure-not-a-green");
       checks.push({ check: "win32-taskkill-failure-not-a-green-contract", ok: true });
-      strayDelta("win32-taskkill-failure-not-a-green-contract");
       assert.deepEqual(registeredGroups(), [], "all seam-driven handles must be reaped");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -743,7 +725,6 @@ await main(async () => {
       assert.equal(h.terminal, true);
       assert.deepEqual(registeredGroups(), []);
       checks.push({ check: "anchor-survives-workload-exit-dies-via-cleanup", ok: true });
-      strayDelta("anchor-survives-workload-exit-dies-via-cleanup");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -776,7 +757,29 @@ await main(async () => {
       assert.match(String(resBadCwd.killError ?? resBadCwd.error ?? ""), /fail closed|anchor/i);
       assert.deepEqual(registeredGroups(), [], "no spawn-failure handle may leak in the registry");
       checks.push({ check: "spawn-failure-reaped-never-blessed", ok: true });
-      strayDelta("spawn-failure-reaped-never-blessed");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  // --- 8l. reviewer LIB2-R5.1: sync control-serialization failure is reaped -
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-ctrl-ser-" });
+    try {
+      // BigInt args make JSON.stringify throw SYNCHRONOUSLY in ctrlWrite —
+      // before any byte reaches the anchor. The anchor stays live with no
+      // workload; the handle must remain non-terminal and authoritative, and
+      // the gated ladder must reap it (never a terminal false green).
+      const bad = await spawnGroup(process.execPath, [1n], { env, cwd: root });
+      assert.equal(bad.pid, null, "a serialization failure must not produce a workload pid");
+      assert.equal(bad.terminal, false, "a serialization failure must NOT terminalize the live anchor's handle");
+      assert.ok(bad.pgid, "the anchor pgid exists (the anchor is live, unconfirmed)");
+      const down = await killGroupAndVerify(bad, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
+      assert.equal(down.groupEmpty, true, "the serialization-failure group must be reaped through the normal ladder");
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(bad.pgid), "no anchor may survive a serialization-failure cleanup");
+      assert.ok(!registeredGroups().includes(bad.pgid), "the reaped handle must unregister");
+      checks.push({ check: "ctrl-serialization-failure-reaped-never-blessed", ok: true });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -810,8 +813,10 @@ await main(async () => {
       }
       // Check hygiene: the workload is our own descendant via the handle pid.
       try { realKill(h.pid, "SIGKILL"); } catch { /* gone */ }
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(h.pid), "the check's own workload must be dead after hygiene (no leak)");
+      assert.ok(!aliveByProbe(h.anchor.pid), "the check's own anchor must be dead after hygiene (no leak)");
       checks.push({ check: "term-gated-on-live-anchor-zero-signals", ok: true });
-      strayDelta("term-gated-on-live-anchor-zero-signals");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -851,8 +856,10 @@ await main(async () => {
       // Check hygiene: the workload is our own descendant (handle.pid — a
       // single pid we spawned); clean it up with a direct pid kill.
       try { realKill(h.pid, "SIGKILL"); } catch { /* already gone */ }
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(h.pid), "the check's own workload must be dead after hygiene (no leak)");
+      assert.ok(!aliveByProbe(h.anchor.pid), "the check's own anchor must be dead after hygiene (no leak)");
       checks.push({ check: "anchor-death-fail-closed-zero-signals", ok: true });
-      strayDelta("anchor-death-fail-closed-zero-signals");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -860,9 +867,5 @@ await main(async () => {
 
   return { checks, suite: "harness.check" };
 }, { resultsPath: RESULTS_PATH });
-// The final object is on disk and stdout; any lingering loop holder (a dying
-// anchor's pipe racing its own close) must not wedge the harness after the
-// evidence is durable.
-process.exit(__final && __final.ok === false ? 1 : 0);
 
 
