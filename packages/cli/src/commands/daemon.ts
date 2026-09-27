@@ -84,11 +84,43 @@ function daemonStartCapMs(explicit?: number): number {
  * ready-probe success under CPU load. A dead-but-unreported anchor means
  * THIS attempt failed closed — and a ready answer may be OUR OWN orphaned
  * server (the wrapper's group died externally while the server survived),
- * not a concurrent winner. Before declaring success on the winner path, the
- * loop gives the exit event a bounded grace and then decides on the
- * freshest ground truth (event flag OR synchronous exitCode/signalCode).
+ * not a concurrent winner. PRIMARY decision (intake ruling, deterministic):
+ * the winner path compares the answering pid with OUR relayed SERVER pid —
+ * an answer from our own tree is never a winner; it resolves through the
+ * anchor's state (healthy = normal start, wrapper-gone = unproven orphan =
+ * proof-checked failure). The relay (SERVER/WRAPPER over the anchor's
+ * control pipe) is written at spawn time — long before any server could be
+ * ready — so it is ordering-stable, unlike the loop-scheduled exit event,
+ * which only bounds the residual zombie window (secondary aid below).
  */
 const WINNER_EXIT_GRACE_MS = 300;
+
+/** Deterministic F63 identity classification (intake ruling; exported for
+ * the injected ordering regression): how a ready answer relates to OUR
+ * spawned tree. The wrapper liveness here is a SYNCHRONOUS liveness
+ * syscall — not a loop-scheduled event — so the ours/unproven decision is
+ * deterministic even when the anchor's exit event has not been delivered
+ * yet. */
+export type ReadyAnswerClass = "winner" | "ours-healthy" | "ours-unproven";
+export function classifyReadyAnswer(
+  readyPid: number,
+  ourServerPid: number | undefined,
+  wrapperAlive: boolean,
+  anchorExited: boolean,
+): ReadyAnswerClass {
+  // Not provably ours (no relay yet, or a foreign pid) -> a legitimate
+  // winner regardless of our anchor's state.
+  if (ourServerPid === undefined || readyPid !== ourServerPid) return "winner";
+  // The answer IS our server. Healthy only while our wrapper provably leads
+  // the tree AND the anchor has not exited; anything else is an unproven
+  // orphan of a failed attempt (never a winner, never a silent success).
+  if (wrapperAlive && !anchorExited) return "ours-healthy";
+  return "ours-unproven";
+}
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
 
 function noProgressWindowMs(): number {
   const envRaw = process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"];
@@ -168,9 +200,41 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   // leader can never be a reused PGID.
   const child = spawnAnchor("daemon", process.execPath, daemonChildArgs(options.entryPath), {
     detached: true,
-    stdio: ["ignore", logFd, logFd],
+    stdio: ["ignore", logFd, logFd, "pipe"],
     env,
   });
+  // F63 identity relay (deterministic winner check, intake ruling): the
+  // anchor reports WRAPPER:<pid> at spawn and SERVER:<pid> as soon as the
+  // wrapper spawns the server — both land long before any server can be
+  // ready, so the winner check can classify answers on ordering-stable
+  // ground truth instead of the loop-scheduled exit event.
+  let ourServerPid: number | undefined;
+  let ourWrapperPid: number | undefined;
+  if (child.stdio && child.stdio[3] && typeof (child.stdio[3] as import("node:stream").Readable).on === "function") {
+    let relayBuffer = "";
+    (child.stdio[3] as import("node:stream").Readable).on("data", (chunk: Buffer) => {
+      relayBuffer += chunk.toString("utf8");
+      let idx;
+      while ((idx = relayBuffer.indexOf("\n")) >= 0) {
+        const line = relayBuffer.slice(0, idx).trim();
+        relayBuffer = relayBuffer.slice(idx + 1);
+        if (line.startsWith("SERVER:")) {
+          const parsed = Number.parseInt(line.slice(7), 10);
+          if (Number.isSafeInteger(parsed) && parsed > 0) ourServerPid = parsed;
+        } else if (line.startsWith("WRAPPER:")) {
+          const parsed = Number.parseInt(line.slice(8), 10);
+          if (Number.isSafeInteger(parsed) && parsed > 0) ourWrapperPid = parsed;
+        }
+      }
+    });
+    (child.stdio[3] as import("node:stream").Readable).on("error", () => {});
+    // The relay stream MUST NOT hold the host's event loop open: the pipe
+    // lives as long as the anchor does, and `daemon start` must exit after
+    // reporting success. (Found via the binary smoke: without this, the
+    // CLI hung forever after printing "daemon started".) The stdio entry
+    // is a net Socket at runtime; only its static type is Readable.
+    (child.stdio[3] as unknown as { unref?: () => void }).unref?.();
+  }
   child.once("error", (cause) => {
     spawnError = cause;
   });
@@ -228,20 +292,43 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     }
 
     const ready = await daemonReady(paths);
-    // F63 winner-path grace: if the anchor is alive at probe-success, give
-    // its exit event a bounded window to land before adopting the answer —
-    // a dead anchor means this attempt failed closed and the ready answer
-    // may be our own orphaned server.
-    if (ready?.ok && !childExited && child.exitCode === null && child.signalCode === null) {
-      await Promise.race([
-        new Promise<void>((resolve) => child.once("exit", () => resolve())),
-        new Promise<void>((resolve) => setTimeout(resolve, WINNER_EXIT_GRACE_MS)),
-      ]);
-    }
-    if (childExited || child.exitCode !== null || child.signalCode !== null) {
-      continue; // an exited child must take the proof-checked path below
-    }
+    if (childExited) continue; // an exited child must take the proof-checked path below
     if (ready?.ok) {
+      // F63 DETERMINISTIC identity check (intake ruling): a ready answer
+      // whose pid is in OUR spawned tree is never a legitimate winner — the
+      // winner path only adopts answers that are provably NOT ours. The
+      // SERVER/WRAPPER pids are relayed over the control channel at spawn
+      // time (ordering-stable), unlike the loop-scheduled exit event.
+      if (ourServerPid !== undefined && ready.pid === ourServerPid) {
+        // The answering daemon is OUR tree. The anchor can never legitimately
+        // exit while its server runs healthy, so success requires the anchor
+        // to be alive AND our wrapper to provably lead the tree (synchronous
+        // liveness syscalls, not events). The grace is SECONDARY here: it
+        // only gives the anchor's lagging exit event one bounded turn in the
+        // zombie window (wrapper kill(0) still succeeds until the anchor
+        // reaps it) before classifying.
+        if (!childExited && child.exitCode === null && child.signalCode === null) {
+          await Promise.race([
+            new Promise<void>((resolve) => child.once("exit", () => resolve())),
+            new Promise<void>((resolve) => setTimeout(resolve, WINNER_EXIT_GRACE_MS)),
+          ]);
+        }
+        const anchorExitedNow = childExited || child.exitCode !== null || child.signalCode !== null;
+        // Synchronous liveness syscalls, not loop-scheduled events: the
+        // wrapper's reaped-death (ESRCH) is the deterministic half of the
+        // decision; the grace above only bounds the zombie window.
+        const wrapperAliveNow = ourWrapperPid === undefined ? true : pidAlive(ourWrapperPid);
+        // Foreign (or not-yet-identifiable) answers are legitimate winners;
+        // ours-healthy is the normal successful start. Both are decided on
+        // the injected ordering seam below (classifyReadyAnswer).
+        if (classifyReadyAnswer(ready.pid, ourServerPid, wrapperAliveNow, anchorExitedNow) === "ours-unproven") {
+          childExited = true;
+          continue;
+        }
+        console.log(`Action Hub daemon started (pid ${ready.pid}).`);
+        return 0;
+      }
+      // A foreign (or not-yet-identifiable) answer is a legitimate winner.
       console.log(`Action Hub daemon started (pid ${ready.pid}).`);
       return 0;
     }

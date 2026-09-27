@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { daemonStartCommand } from "../dist/commands/daemon.js";
 import { spawnAnchor, startGuardedRetryLoop } from "../dist/commands/process-anchor.js";
+import { classifyReadyAnswer } from "../dist/commands/daemon.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const stub = resolve(testDir, "fixtures/stub-daemon.mjs");
@@ -607,4 +608,28 @@ test("win32 parent loss: exits 4 only after a successful tree sweep", async () =
   await new Promise((r) => setTimeout(r, 400));
   loop.stop();
   assert.deepEqual(exits, [4], `must exit 4 exactly once after the tree sweep succeeds, got ${JSON.stringify(exits)}`);
+});
+
+// F63 deterministic winner check (intake ruling): the decision must NOT
+// depend on the loop-scheduled 'exit' event. Injected ordering seam: the
+// ready probe answers with OUR relayed server pid while the anchor's exit
+// event is UNDELIVERED (anchorExited=false) — combined with a provably dead
+// wrapper this MUST classify as unproven (failure path), and every other
+// combination must keep its deterministic meaning.
+test("F63 identity classification is deterministic under the injected ordering (exit event undelivered)", async () => {
+  const { classifyReadyAnswer } = await import("../dist/commands/daemon.js");
+  // THE F63 scenario: our server answered, the anchor exited but its exit
+  // event is undelivered (anchorExited=false), and the wrapper is
+  // verifiably dead (synchronous ESRCH) -> unproven orphan -> failure path.
+  assert.equal(classifyReadyAnswer(4242, 4242, false, false), "ours-unproven");
+  // Same answer with the wrapper PROVABLY alive -> the normal healthy start.
+  assert.equal(classifyReadyAnswer(4242, 4242, true, false), "ours-healthy");
+  // Anchor definitively exited (flag/exitCode) + ours -> unproven.
+  assert.equal(classifyReadyAnswer(4242, 4242, true, true), "ours-unproven");
+  assert.equal(classifyReadyAnswer(4242, 4242, false, true), "ours-unproven");
+  // Foreign answers are winners regardless of our anchor's state.
+  assert.equal(classifyReadyAnswer(9999, 4242, false, false), "winner");
+  assert.equal(classifyReadyAnswer(9999, 4242, true, true), "winner");
+  // Relay not landed yet: not provably ours -> winner (deterministic).
+  assert.equal(classifyReadyAnswer(4242, undefined, false, false), "winner");
 });
