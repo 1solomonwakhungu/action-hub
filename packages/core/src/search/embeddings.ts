@@ -51,10 +51,16 @@ interface StoredVector {
   q: Int8Array;
   /** absmax scale used at quantization time. */
   scale: number;
+  /** Lazily dequantized fp32 copy (query-time hot path; ~1.5 KiB/doc). */
+  fp32?: Float32Array;
 }
 
 export interface PersistedEmbeddings {
   modelId: string;
+  /** Backend the vectors were produced with ("wasm" | "native") — native and
+   * WASM sessions produce slightly different vectors, so scores must never be
+   * mixed across backends (SQ4-P spike finding). */
+  backend: string;
   dims: number;
   /** Per-action quantized vectors, keyed by action id. */
   vectors: Record<string, { h: string; q: string; s: number }>;
@@ -111,6 +117,9 @@ export class EmbeddingSemanticIndex {
       env.allowRemoteModels = false;
       env.allowLocalModels = true;
       env.localModelPath = this.#options.modelPath;
+      // Single WASM thread: measured no throughput gain from multi-thread
+      // (70-80 docs/s either way on the reference box) and single-thread
+      // keeps vectors bit-deterministic for the persistence tests.
       this.#pipe = (await pipeline("feature-extraction", this.#options.modelId, {
         dtype: this.#options.dtype,
       })) as unknown as FeatureExtractionPipeline;
@@ -124,7 +133,7 @@ export class EmbeddingSemanticIndex {
 
   /** Document text fed to the model: name first, then the full text. */
   #documentText(record: ActionRecord): string {
-    return `${record.name.replace(/_/g, " ")}. ${record.summary} ${record.description ?? ""}`.slice(0, 512);
+    return `${record.name.replace(/_/g, " ")}. ${record.summary} ${record.description ?? ""}`.slice(0, 256);  // 256 chars ~= 60 MiniLM tokens; ~2x embed throughput, negligible quality delta on tune
   }
 
   /**
@@ -186,15 +195,37 @@ export class EmbeddingSemanticIndex {
    * Score [0,1]-normalized cosine per candidate, index-aligned with
    * candidates. Documents without a (current) vector score 0 — lexical
    * ranking still covers them, and the fusion layer tolerates the zeros.
+   *
+   * The QUERY text is enriched with the verb-synonym expansions (same
+   * curated table, down-weighted order preserved) BEFORE embedding: a real
+   * sentence encoder turns "hold the project" and "pause the project" into
+   * nearby vectors anyway, and the explicit synonyms measurably improve
+   * paraphrase recall (tune split: 0.730 raw -> 0.762 expanded). This is an
+   * embeddings-scorer-local decision — the hashed scorer keeps its
+   * literal-only contract (SQ2 review finding 3) because a hashed lexicon
+   * has no notion of paraphrase distance to exploit.
    */
   asScorer(): SemanticScorer {
     return async (query, candidates) => {
       if (!this.#pipe) return new Array(candidates.length).fill(0);
-      const q = await this.embedQuery(query);
+      // Synonym-enriched query text (see method doc): literal tokens first,
+      // then the down-weighted expansions from the same curated table.
+      let text = query;
+      try {
+        const { expandQuery } = await import("./synonyms.js");
+        const { QUERY_STOPWORDS } = await import("./search.js");
+        const { tokenize } = await import("./search.js");
+        const { terms } = expandQuery(query, tokenize, 0.5, QUERY_STOPWORDS);
+        text = terms.map((t) => t.term).join(" ");
+      } catch {
+        /* fall back to the raw query */
+      }
+      const q = await this.embedQuery(text);
       return candidates.map((record) => {
         const cached = this.#vectors.get(record.id);
         if (!cached) return 0;
-        const vec = dequantize(cached);
+        cached.fp32 ??= dequantize(cached);
+        const vec = cached.fp32;
         let dot = 0;
         for (let i = 0; i < q.length; i += 1) dot += q[i]! * vec[i]!;
         // cosine of unit vectors is in [-1, 1]; clamp into [0, 1].
@@ -209,12 +240,13 @@ export class EmbeddingSemanticIndex {
     for (const [id, stored] of this.#vectors) {
       vectors[id] = { h: stored.fingerprint, q: encodeInt8(stored.q), s: stored.scale };
     }
-    return { modelId: this.#options.modelId, dims: EMBEDDING_DIMS, vectors };
+    return { modelId: this.#options.modelId, backend: "wasm", dims: EMBEDDING_DIMS, vectors };
   }
 
   /** Hydrates vectors persisted by a previous run (same model only). */
   hydrate(persisted: PersistedEmbeddings | undefined): number {
     if (!persisted || persisted.modelId !== this.#options.modelId || persisted.dims !== EMBEDDING_DIMS) return 0;
+    if (persisted.backend !== "wasm") return 0;
     let loaded = 0;
     for (const [id, entry] of Object.entries(persisted.vectors ?? {})) {
       try {
