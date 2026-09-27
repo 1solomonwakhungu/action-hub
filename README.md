@@ -263,11 +263,16 @@ Running the stress suite **requires a fully isolated environment**
 (temp `HOME`/`XDG_*`/`TMPDIR`/`ACTION_HUB_*`); never point it at your real
 config or cache.
 
-**Load profile** (k6 JSON-RPC mix, from the #47 evidence at `205aaf6`, which
-predates the #63/#68 responsiveness work): served **85 RPS** at the extreme
-end of a 100→500-VU ramp with **13.7% failures** at that extreme, and
-**~0.8% failures** in the sustained 10–40 RPS band. Treat these as worst-case
-saturation numbers, not steady-state SLAs.
+**Load profile** (k6 JSON-RPC mix, full profile on main `f53adbc`, which
+includes #63 and #68): **263.6 RPS** served at the top of the 100→500-VU ramp
+with **1.73% HTTP failures** and **98.3% checks** (the 99% checks bar
+narrowly fails only at that extreme), overall p99 **2.9 s**, `initialize`
+p99 **12.9 s**, peak RSS **765 MB**. In the sustained 10–40 RPS steps:
+**0 failures**, search p95 **747 ms**; the throughput knee sits near
+**~110 RPS**. For history: the pre-#63/#68 run (#47 evidence, `205aaf6`)
+measured 85 RPS served / 13.7% failures at the extreme ramp and ~0.8% in the
+10–40 RPS band. Treat the ramp numbers as worst-case saturation, not
+steady-state SLAs.
 
 Reliability behaviors shipped in the current release:
 
