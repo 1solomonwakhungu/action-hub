@@ -865,6 +865,191 @@ await main(async () => {
     }
   }
 
+  // --- 9. extraInterruptCleanup hook (reviewer LIB2-hook bar) ---------------
+  console.error("[progress] 9. hook checks");
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-hook-" });
+
+    /**
+     * Runs a main() target with the given hook body. FULL OWNERSHIP
+     * (reviewer PR94-R2): the exact target pid and detached pid are tracked;
+     * the target gets TERM then a bounded awaited exit, then KILL if needed;
+     * the detached pid is killed by record; ALL of it happens in finally, so
+     * an assertion failure, a signal-handling regression, or a target that
+     * never exits can neither leak the pair nor hang the suite.
+     */
+    const runHookTarget = async (hookBody, hookTimeoutExpr, { corrupt = false } = {}) => {
+      const token = Math.random().toString(36).slice(2);
+      const scriptPath = join(root, `hook-target-${token}.mjs`);
+      const targetResults = join(root, `hook-results-${token}.json`);
+      const pidFile = join(root, `detached-${token}`);
+      const started = join(root, `started-${token}`);
+      writeFileSync(scriptPath, corrupt ? ")))not valid javascript(((" : `
+import { main } from ${JSON.stringify(resolve(LIB_DIR, "harness.mjs"))};
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+await main(async () => {
+  // A DETACHED, non-registry child: no handle exists (and none may be
+  // fabricated). It records its pid for the hook to kill+verify.
+  const child = spawn(process.execPath, ["-e", "const fs = require('node:fs'); fs.writeFileSync(process.env.DETACHED_PID, String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 500)"], { env: process.env, cwd: process.cwd(), detached: true, stdio: "ignore" });
+  child.unref();
+  writeFileSync(process.env.STARTED, "1");
+  // Hold the event loop: the detached child is unref'd by design, so
+  // without a ref'd timer node would drain the loop and exit with
+  // "unsettled top-level await" BEFORE the SIGTERM ever lands.
+  setInterval(() => {}, 3_600_000);
+  await new Promise(() => {}); // SIGTERM is the only way out
+}, { resultsPath: ${JSON.stringify(targetResults)}, extraCleanupTimeoutMs: ${hookTimeoutExpr}, extraInterruptCleanup: async (signal) => {
+${hookBody}
+} });
+`);
+      const proc = spawn(process.execPath, [scriptPath], { env: { ...env, DETACHED_PID: pidFile, STARTED: started }, cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+      const targetPid = proc.pid;
+      let detachedPid = null;
+      let stdoutText = "";
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (d) => { stdoutText += d; });
+      const exitWait = new Promise((resolveP) => proc.on("exit", (code2) => resolveP(code2)));
+      const killHard = (p) => { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } };
+      try {
+        if (corrupt) {
+          // Forced startup-failure control: the target must fail FAST and be
+          // cleaned up (bounded), never hang the suite.
+          const t0 = performance.now();
+          const code = await Promise.race([
+            exitWait,
+            new Promise((r) => setTimeout(() => r(null), 10_000)),
+          ]);
+          assert.notEqual(code, null, `a corrupt target must exit on its own (bounded), took ${Math.round(performance.now() - t0)}ms`);
+          assert.notEqual(code, 0, "a corrupt target must not exit cleanly");
+          return { corrupt: true, code, targetPid };
+        }
+        const deadline = performance.now() + 10_000;
+        while (!existsSync(started) && performance.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+        assert.ok(existsSync(started), "target must have spawned its detached child");
+        await new Promise((r) => setTimeout(r, 150));
+        detachedPid = Number(readFileSync(pidFile, "utf8").trim());
+        assert.ok(aliveByProbe(detachedPid), "the detached non-registry child must be alive before the signal");
+        // Signal the target: its fn awaits forever; SIGTERM drives its
+        // interrupt path (hook + ONE summary + exit 143). The exit wait is
+        // BOUNDED — a target that never exits cannot hang the suite.
+        proc.kill("SIGTERM");
+        const t0 = performance.now();
+        const exit = await Promise.race([
+          exitWait,
+          new Promise((r) => setTimeout(() => r(null), 30_000)),
+        ]);
+        assert.notEqual(exit, null, `target must exit after SIGTERM within 30s (waited ${Math.round(performance.now() - t0)}ms)`);
+        const lines = stdoutText.split("\n").filter((l) => l.trim() !== "");
+        let summary = null;
+        try { summary = JSON.parse(lines[lines.length - 1]); } catch { summary = null; }
+        return { exit, lines, summary, pidFile, targetResults, detachedPid };
+      } finally {
+        // OWNERSHIP (runs on every path, including assertion failures):
+        // TERM the target, bounded awaited exit, KILL if still alive; kill
+        // the detached pid by record. Never leak, never hang.
+        try { process.kill(targetPid, "SIGTERM"); } catch { /* gone */ }
+        const gone = await Promise.race([exitWait, new Promise((r) => setTimeout(r, 2_000))]);
+        if (gone === null || gone === undefined) killHard(targetPid);
+        if (detachedPid && aliveByProbe(detachedPid)) {
+          killHard(detachedPid);
+        } else if (detachedPid === null && existsSync(pidFile)) {
+          try { killHard(Number(readFileSync(pidFile, "utf8").trim())); } catch { /* unreadable */ }
+        }
+        await Promise.race([exitWait, new Promise((r) => setTimeout(r, 1_000))]);
+      }
+    };
+
+    try {
+      // (a) Hook kills+verifies the exact recorded pid: one JSON, exit 143,
+      // child dead, artifact parity.
+      const a = await runHookTarget(`
+  const fs = await import("node:fs");
+  const pid = Number(fs.readFileSync(process.env.DETACHED_PID, "utf8").trim());
+  const survivors = [];
+  try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+  await new Promise((r) => setTimeout(r, 200));
+  try { process.kill(pid, 0); survivors.push(pid); } catch { /* dead: verified */ }
+  return { survivors };
+`, "10_000");
+      assert.equal(a.exit, 143, `hook kill+verify must exit 143, got ${a.exit}`);
+      assert.equal(a.lines.length, 1, `exactly ONE stdout JSON line, got ${JSON.stringify(a.lines)}`);
+      assert.equal(a.summary?.ok, false);
+      assert.equal(a.summary?.interrupted, "SIGTERM");
+      assert.equal("survivors" in a.summary, false, "a verified hook kill must leave no survivors in the summary");
+      await new Promise((r) => setTimeout(r, 300));
+      assert.ok(!aliveByProbe(a.detachedPid), "the detached non-registry child must be dead");
+      assert.deepEqual(JSON.parse(readFileSync(a.targetResults, "utf8")), a.summary, "artifact parity: disk summary equals stdout summary");
+      checks.push({ check: "interrupt-hook-kills-detached-child-one-json-exit-143", ok: true });
+
+      // (b) Hook REPORTS a survivor without killing: honest survivor evidence.
+      const b = await runHookTarget(`
+  const fs = await import("node:fs");
+  const pid = Number(fs.readFileSync(process.env.DETACHED_PID, "utf8").trim());
+  return { survivors: [pid] };
+`, "10_000");
+      assert.equal(b.exit, 143);
+      assert.equal(b.lines.length, 1);
+      assert.deepEqual(b.summary?.survivors, [b.detachedPid], "hook-reported survivors must merge into the summary");
+      checks.push({ check: "interrupt-hook-reports-survivor-merged", ok: true });
+
+      // (c) Hook THROWS: one summary with honest cleanup error, still exit 143.
+      const c = await runHookTarget(`
+  throw new Error("hook boom (test)");
+`, "10_000");
+      assert.equal(c.exit, 143);
+      assert.equal(c.lines.length, 1, "a hook throw must not produce a second JSON");
+      assert.match(String(c.summary?.cleanupError ?? ""), /hook boom \(test\)/, "the hook failure must be represented in the ONE summary");
+      checks.push({ check: "interrupt-hook-throw-one-summary", ok: true });
+
+      // (d) Hook HANGS: bounded; the summary still emits with the timeout error.
+      const d = await runHookTarget(`
+  await new Promise(() => {});
+`, "1_000");
+      assert.equal(d.exit, 143);
+      assert.equal(d.lines.length, 1, "a hung hook must not suppress the summary");
+      assert.match(String(d.summary?.cleanupError ?? ""), /timed out after 1000ms/);
+      checks.push({ check: "interrupt-hook-timeout-bounded-one-summary", ok: true });
+
+      // (e) Malformed survivor evidence FAILS CLOSED: valid entries preserved,
+      // invalid shapes named in cleanupError — never silently dropped.
+      const e = await runHookTarget(`
+  const fs = await import("node:fs");
+  const pid = Number(fs.readFileSync(process.env.DETACHED_PID, "utf8").trim());
+  return { survivors: [pid, "456", -7, 1.5, 0] };
+`, "10_000");
+      assert.equal(e.exit, 143);
+      assert.equal(e.lines.length, 1);
+      assert.deepEqual(e.summary?.survivors, [e.detachedPid], "the valid survivor entry must be preserved");
+      const ce = String(e.summary?.cleanupError ?? "");
+      assert.match(ce, /malformed survivor evidence/, "malformed entries must surface as cleanupError");
+      for (const frag of ['"456"', "-7", "1.5", "0"]) {
+        assert.ok(ce.includes(frag), `cleanupError must name the malformed entry ${frag}`);
+      }
+      checks.push({ check: "interrupt-hook-malformed-survivors-fail-closed", ok: true });
+
+      // (f) Non-array survivor shape fails closed.
+      const f = await runHookTarget(`
+  return { survivors: "456" };
+`, "10_000");
+      assert.equal(f.exit, 143);
+      assert.equal(f.lines.length, 1);
+      assert.equal("survivors" in f.summary, false, "a non-array survivors shape merges no entries");
+      assert.match(String(f.summary?.cleanupError ?? ""), /non-array shape/);
+      checks.push({ check: "interrupt-hook-nonarray-survivors-fail-closed", ok: true });
+
+      // (g) Forced startup-failure control: a corrupt target fails fast and
+      // the ownership finally proves no leak (bounded, both pids settled).
+      const g = await runHookTarget(``, "10_000", { corrupt: true });
+      assert.equal(g.corrupt, true);
+      await new Promise((r) => setTimeout(r, 200));
+      assert.ok(!aliveByProbe(g.targetPid), "the corrupt target must be reaped (no leak)");
+      checks.push({ check: "interrupt-hook-startup-failure-control-cleanup", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
   return { checks, suite: "harness.check" };
 }, { resultsPath: RESULTS_PATH });
 
