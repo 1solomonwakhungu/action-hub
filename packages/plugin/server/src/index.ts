@@ -111,6 +111,8 @@ export interface HubRuntime {
    * `startRefresh()` is called; `close()` awaits it only once started.
    */
   refreshed: Promise<unknown>;
+  /** SQ3 (F49 pt2): flagged "no confident match" abstention settings. */
+  searchAbstention: { enabled: boolean; threshold: number };
   /**
    * Starts the deferred re-index exactly once (subsequent calls return the
    * same promise). Hosts call this after the MCP transport is connected so
@@ -220,6 +222,7 @@ export async function createHubRuntime(): Promise<HubRuntime> {
     configHash: bootstrap.configHash,
     configPath,
     refreshed: bootstrap.refreshed,
+    searchAbstention: config.searchAbstention,
     startRefresh,
     snapshotDebouncer,
     close: async () => {
@@ -256,7 +259,16 @@ export function createMcpServer(runtime: HubRuntime): McpServer {
     },
     async (input) => {
       try {
-        return text(await dispatch(runtime.hub, input, runtime.configHash, runtime.cache, runtime.snapshotDebouncer));
+        return text(
+          await dispatch(
+            runtime.hub,
+            input,
+            runtime.configHash,
+            runtime.cache,
+            runtime.snapshotDebouncer,
+            runtime.searchAbstention,
+          ),
+        );
       } catch (cause) {
         const message =
           cause instanceof ActionHubError || cause instanceof Error
@@ -380,6 +392,7 @@ async function dispatch(
   configHash: string,
   cache: CatalogCache,
   snapshots?: Pick<SnapshotDebouncer, "markDirty" | "flush">,
+  abstention: { enabled: boolean; threshold: number } = { enabled: false, threshold: 0.8 },
 ): Promise<unknown> {
   switch (input.operation) {
     case "search": {
@@ -389,6 +402,32 @@ async function dispatch(
         serverIds: input.server_id ? [input.server_id] : undefined,
         includeSchema,
       });
+      // SQ3 (F49 part 2): flagged "no confident match" abstention. When the
+      // flag is on and the top hit scores below the calibrated threshold, the
+      // response says so instead of presenting low-confidence hits as facts.
+      // Additive and backward compatible: `results` is empty and `abstained`
+      // explains why; `closestMatch` preserves the near miss for the agent.
+      // Calibration (SQ1 2d, disjoint rows, self-mode 15K corpus): threshold
+      // 0.8 refused 0/51 real matches and abstained 5/7 no-match queries;
+      // caveat: only 12 negative rows — thin calibration base.
+      if (abstention.enabled) {
+        const topScore = hits[0]?.score ?? 0;
+        if (hits.length === 0 || topScore < abstention.threshold) {
+          return {
+            ok: true,
+            count: 0,
+            results: [],
+            abstained: true,
+            reason: "no_confident_match",
+            query: input.query ?? "",
+            threshold: abstention.threshold,
+            closestMatch: hits[0]
+              ? { id: hits[0].id, score: Math.round((hits[0].score ?? 0) * 1000) / 1000 }
+              : null,
+            hint: "No action scored above the confidence threshold. Rephrase with the exact tool or domain name, or ask the user how to proceed.",
+          };
+        }
+      }
       const matchingBundles = hub.searchBundles(input.query ?? "");
       return {
         ok: true,
