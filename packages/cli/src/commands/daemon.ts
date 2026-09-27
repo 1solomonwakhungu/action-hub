@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
-import { anchorMetaPath, readAnchorMeta, spawnAnchor, teardownAnchorTree } from "./process-anchor.js";import { connect, type Socket } from "node:net";
+import { spawnAnchor, teardownAnchorChild } from "./process-anchor.js";import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { runDaemonServer } from "@action-hub/mcp-server";
@@ -155,12 +155,10 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
   // the anchor's wrapper is the group leader, so every later group signal is
   // provably safe (the leader is verified alive before each signal) and the
   // leader can never be a reused PGID.
-  const anchorMeta = anchorMetaPath("daemon", "start");
   const child = spawnAnchor("daemon", process.execPath, daemonChildArgs(options.entryPath), {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env,
-    metaFile: anchorMeta,
   });
   child.once("error", (cause) => {
     spawnError = cause;
@@ -190,7 +188,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child, anchorMeta);
+      await killAndReapSpawned(child);
       console.error(`Could not start Action Hub daemon: ${spawnError.message}`);
       return 1;
     }
@@ -202,7 +200,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child, anchorMeta);
+      await killAndReapSpawned(child);
       console.error(
         `Action Hub daemon exited during startup (code ${childExitCode ?? "signal"}). See ${paths.log}`,
       );
@@ -244,37 +242,25 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
 
   console.error(`Action Hub daemon did not become ready. See ${paths.log}`);
   if (await waitForAnotherDaemon(paths)) return 0;
-  await killAndReapSpawned(child, anchorMeta);
+  await killAndReapSpawned(child);
   return 1;
 }
 
 /**
  * Terminates and reaps the anchored daemon tree this start spawned. Called on
  * EVERY failure path before returning: a daemon that never became ready must
- * not survive its own failed start as an orphan. SIGTERM to the anchor lets
- * it run its own gated cleanup; the wrapper group is only signalled while
- * the wrapper (the group's leader) is verifiably alive, so a PGID can never
- * be signalled after it was freed and potentially reused.
+ * not survive its own failed start as an orphan. The host only signals the
+ * ANCHOR it spawned (single-PID, always safe); the anchor performs its own
+ * gated group cleanup from inside. If the anchor cannot be proven cleaned,
+ * the result fails closed — no group is ever signalled on guesswork.
  */
-async function killAndReapSpawned(child: ChildProcess, metaFile: string): Promise<void> {
+async function killAndReapSpawned(child: ChildProcess): Promise<void> {
   if (!child.pid) return;
-  const meta = await readAnchorMeta(metaFile);
-  if (meta) {
-    const survivors = await teardownAnchorTree(meta, 5_000);
-    if (survivors.length > 0) {
-      console.error(`Warning: daemon start teardown left surviving processes (PIDs ${survivors.join(", ")}).`);
-    }
-    return;
-  }
-  // Meta never written (spawn failed very early): nothing to clean up beyond
-  // a best-effort direct-child kill. Never signal a process group here: the
-  // child never became a group leader we can prove is still ours.
-  try {
-    child.kill("SIGKILL");
-  } catch {}
-  const deadline = Date.now() + 2_000;
-  while (child.exitCode === null && child.signalCode === null && Date.now() < deadline) {
-    await delay(50);
+  const result = await teardownAnchorChild(child.pid, 5_000);
+  if (!result.proven || result.survivors.length > 0) {
+    console.error(
+      `Warning: daemon start teardown could not be proven (anchor pid ${child.pid}${result.survivors.length > 0 ? `, surviving: ${result.survivors.join(", ")}` : ""}).`,
+    );
   }
 }
 
