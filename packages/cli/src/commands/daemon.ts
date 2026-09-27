@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
-import { spawnAnchor, teardownAnchorChild } from "./process-anchor.js";import { connect, type Socket } from "node:net";
+import { spawnAnchor, teardownAnchorChild, type TeardownResult } from "./process-anchor.js";import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { runDaemonServer } from "@action-hub/mcp-server";
@@ -183,16 +183,26 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
 
   for (;;) {
     if (spawnError) {
+      await killAndReapSpawned(child);
       // Another concurrent start may have won the race even though ours
       // failed to spawn — report success if a daemon is already ready.
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child);
       console.error(`Could not start Action Hub daemon: ${spawnError.message}`);
       return 1;
     }
     if (childExited) {
+      // Teardown FIRST and consult its PROOF: a failed anchor proof (e.g.
+      // unexpected wrapper death) must never be papered over by a probe that
+      // happens to find the orphaned server of THIS failed start answering.
+      const res = await killAndReapSpawned(child);
+      if (!res.proven || res.survivors.length > 0) {
+        console.error(
+          `Action Hub daemon start teardown failed closed (anchor proof invalid). See ${paths.log}`,
+        );
+        return 1;
+      }
       // Concurrent starts are allowed: if OUR child exited but a daemon is
       // already answering (e.g. a sibling start won the lock), succeed. The
       // sibling may still be mid-startup, so poll briefly instead of a single
@@ -200,7 +210,6 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child);
       console.error(
         `Action Hub daemon exited during startup (code ${childExitCode ?? "signal"}). See ${paths.log}`,
       );
@@ -208,6 +217,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     }
 
     const ready = await daemonReady(paths);
+    if (childExited) continue; // an exited child must take the proof-checked path below
     if (ready?.ok) {
       console.log(`Action Hub daemon started (pid ${ready.pid}).`);
       return 0;
@@ -242,7 +252,8 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
 
   console.error(`Action Hub daemon did not become ready. See ${paths.log}`);
   if (await waitForAnotherDaemon(paths)) return 0;
-  await killAndReapSpawned(child);
+  const res = await killAndReapSpawned(child);
+  if (!res.proven || res.survivors.length > 0) return 1;
   return 1;
 }
 
@@ -254,14 +265,15 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
  * gated group cleanup from inside. If the anchor cannot be proven cleaned,
  * the result fails closed — no group is ever signalled on guesswork.
  */
-async function killAndReapSpawned(child: ChildProcess): Promise<void> {
-  if (!child.pid) return;
+async function killAndReapSpawned(child: ChildProcess): Promise<TeardownResult> {
+  if (!child.pid) return { survivors: [], proven: false };
   const result = await teardownAnchorChild(child, 5_000);
   if (!result.proven || result.survivors.length > 0) {
     console.error(
       `Warning: daemon start teardown could not be proven (anchor pid ${child.pid}${result.survivors.length > 0 ? `, surviving: ${result.survivors.join(", ")}` : ""}).`,
     );
   }
+  return result;
 }
 
 /**
