@@ -157,6 +157,10 @@ export class ActionHub {
   readonly #cacheMaxEntries: number;
   readonly #indexChunkSize: number | undefined;
   readonly #indexYieldFn: (() => Promise<void>) | undefined;
+  /** Set by close(): cancels the fire-and-forget embedding rebuild at the
+   * next chunk boundary so shutdown is never held for minutes of embed work. */
+  #embedCancelled = false;
+  #embedWarned = false;
 
   /** Tool-name prefixes conventionally denoting side-effect-free reads. */
   static readonly #READ_PREFIXES = [
@@ -302,13 +306,32 @@ export class ActionHub {
           }
           for (;;) {
             const generation = this.#catalog.generation;
+            // Cooperative cancellation (review-2 round 3): close() flips
+            // #embedCancelled and the next chunk boundary throws, ending the
+            // rebuild instead of holding shutdown open for minutes.
+            const baseYield = this.#indexYieldFn;
             await this.#embedIndex!.index(this.#catalog.all(), {
               chunkSize: this.#indexChunkSize ?? 64,
-              yieldFn: this.#indexYieldFn,
+              yieldFn: async () => {
+                if (this.#embedCancelled) throw new Error("embedding rebuild cancelled by close()");
+                await baseYield?.();
+              },
             });
             this.#embedIndex!.prune(new Set(this.#catalog.all().map((record) => record.id)));
+            if (this.#embedCancelled) break;
             if (this.#catalog.generation === generation) break;
           }
+        } catch (cause) {
+          // Graceful fallback on ANY rebuild failure (review-2 round 3): the
+          // documented contract is "finished or permanently fallen back".
+          // A PARTIAL embedding map must never serve as the semantic channel
+          // (mixed coverage distorts rankings), so discard it, warn once,
+          // and degrade to the hashed/blend scorer.
+          this.#embedFailed = true;
+          this.#embedIndex!.discardVectors();
+          this.#warnOnce(
+            `embedding rebuild failed; falling back to the built-in semantic scorer (${String(cause).slice(0, 200)})`,
+          );
         } finally {
           this.#embedRebuild = undefined;
           // Restore RRF fusion unless embeddings permanently failed (the
@@ -1058,7 +1081,24 @@ export class ActionHub {
   }
 
   async close(): Promise<void> {
+    // Stop the fire-and-forget embedding rebuild first: at the measured 15K
+    // cold-embed cost an unclosed rebuild would hold shutdown open for
+    // minutes. Cancellation lands at the next chunk boundary (cooperative);
+    // settlement is bounded so close() stays prompt even if a chunk is
+    // mid-flight.
+    this.#embedCancelled = true;
+    const rebuild = this.#embedRebuild;
+    if (rebuild) {
+      await Promise.race([rebuild.catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
+    }
     await this.#connections.closeAll();
+  }
+
+  /** Warns once per hub (stderr; MCP-safe) on embedding degradation. */
+  #warnOnce(message: string): void {
+    if (this.#embedWarned) return;
+    this.#embedWarned = true;
+    process.stderr.write(`action-hub: ${message}\n`);
   }
 
   #fail(

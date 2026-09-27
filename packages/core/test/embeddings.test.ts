@@ -8,6 +8,7 @@ import { ActionHub } from "../dist/action-hub.js";
 import { Catalog } from "../dist/catalog/catalog.js";
 import { SearchEngine } from "../dist/search/search.js";
 import { EmbeddingSemanticIndex } from "../dist/search/embeddings.js";
+import { LocalSemanticIndex } from "../dist/search/semantic.js";
 import type { ActionRecord } from "../dist/types.js";
 import { FakeClient, makeFactory } from "./fakes.ts";
 
@@ -314,4 +315,117 @@ test("WASM pipeline matches the captured reference vectors within backend-numeri
     worst >= 0.98 && median >= 0.99,
     `parity out of tolerance: worst ${worst.toFixed(5)}, median ${median.toFixed(5)}`,
   );
+});
+
+test("vectors survive a real disk cache round-trip: cold write -> fresh cache load -> 0 re-embed", async () => {
+  // Real CatalogCache disk regression (review-2 round 3 HIGH): the previous
+  // proof passed toPersisted() straight into hydrate() and never exercised
+  // the write/coerce/load path on disk.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { CatalogCache, hashServerConfigs } = await import("../dist/catalog/persistence.js");
+  const dir = mkdtempSync(join(tmpdir(), "sq4-disk-"));
+  try {
+    const cachePath = join(dir, "catalog-cache.json");
+    const configHash = hashServerConfigs([...servers]);
+    const { factory } = makeFactory(buildClients());
+    const hub = new ActionHub({ servers: [...servers], clientFactory: factory });
+    await hub.indexAll();
+    await hub.semanticReady(); // vectors now in memory AND ready to persist
+    const cache = new CatalogCache({ path: cachePath });
+    await cache.write(hub.toPersisted(configHash));
+
+    // Fresh hub + fresh cache over the SAME file (simulated restart).
+    const cache2 = new CatalogCache({ path: cachePath });
+    const entry = await cache2.load(configHash);
+    assert.ok(entry?.embeddings, "persisted entry on disk must carry the embeddings block");
+    const hub2 = new ActionHub({ servers: [...servers], clientFactory: factory });
+    hub2.restoreCatalog(entry);
+    const freshIndex = new EmbeddingSemanticIndex();
+    const hydrated = freshIndex.hydrate(entry.embeddings);
+    assert.ok(hydrated >= 3, `expected >=3 hydrated vectors, got ${hydrated}`);
+    const records = [...hub2.catalog.all()];
+    const fresh = new EmbeddingSemanticIndex();
+    assert.equal(await fresh.load(), true);
+    assert.equal(await fresh.hydrate ? hydrated : 0, hydrated);
+    // Warm start: unchanged catalog re-embeds nothing (fingerprint match).
+    assert.equal(await freshIndex.index(records), 0, "warm start must not re-embed hydrated docs");
+    await hub.close();
+    await hub2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("close() cancels the fire-and-forget embedding rebuild (bounded shutdown)", async () => {
+  // 300 tools x chunk 8 => many chunks; close() must land at the first
+  // boundary and settle promptly (review-2 round 3 MUST-FIX 3).
+  const { factory } = makeFactory({
+    acme: new EmbeddingFakeClient(
+      Array.from({ length: 300 }, (_, i) => ({
+        name: `tool_${i}`,
+        description: `Synthetic tool number ${i} for the cancellation regression.`,
+        inputSchema: { type: "object" },
+      })),
+    ),
+  });
+  const hub = new ActionHub({
+    servers: [...servers],
+    clientFactory: factory,
+    indexing: { chunkSize: 8 },
+  });
+  void hub.indexAll();
+  await hub.semanticReady === undefined ? null : null;
+  // Give the rebuild a tick to start, then close and time the settlement.
+  await new Promise((r) => setTimeout(r, 50));
+  const started = Date.now();
+  await hub.close();
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 5000, `close() took ${elapsed}ms; rebuild must settle bounded (<=2s)`);
+  // The process must not linger: after close() the rebuild is cancelled and
+  // hub.embeddedDocs stops growing.
+  const after = hub.embeddedDocs;
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(hub.embeddedDocs, after, "embedding work must stop after close()");
+});
+
+test("rebuild failure falls back gracefully: warn once, discard partials, hashed scorer, settled semanticReady", async () => {
+  // review-2 round 3 MUST-FIX 4: a throwing yieldFn used to reject
+  // semanticReady and leave the PARTIAL embedding map serving searches.
+  const { factory } = makeFactory(buildClients());
+  const hub = new ActionHub({
+    servers: [...servers],
+    clientFactory: factory,
+    indexing: {
+      yieldFn: async () => {
+        throw new Error("yield sentinel");
+      },
+    },
+  });
+  await hub.indexAll();
+  await hub.semanticReady(); // must RESOLVE (finished or permanently fallen back)
+  const hits = await hub.search("pause the project");
+  assert.ok(hits.length > 0, "search must still work after rebuild failure");
+  // The served semantic scores must come from the HASHED fallback, not the
+  // partial embedding map: build the reference hashed scorer over the same
+  // records and compare exactly.
+  const reference = new LocalSemanticIndex();
+  await reference.indexCooperative([...hub.catalog.all()], { chunkSize: 64, yieldFn: () => Promise.resolve() });
+  // The search engine feeds the scorer the literal (stopword-filtered) token
+  // string, not the raw query — mirror that exactly.
+  const { tokenize, QUERY_STOPWORDS } = await import("../dist/search/search.js");
+  const literal = tokenize("pause the project").filter((term: string) => !QUERY_STOPWORDS.has(term)).join(" ");
+  const expected = await reference.asScorer()(literal, [...hub.catalog.all()]);
+  let matched = 0;
+  for (const hit of hits) {
+    const idx = [...hub.catalog.all()].findIndex((r) => r.id === hit.id);
+    assert.ok(
+      hit.semantic !== undefined && Math.abs(hit.semantic - expected[idx]!) < 0.01,
+      `fallback search must serve hashed scores, not partial embeddings (hit ${hit.semantic} vs hashed ${expected[idx]})`,
+    );
+    matched += 1;
+  }
+  assert.ok(matched > 0);
+  await hub.close();
 });

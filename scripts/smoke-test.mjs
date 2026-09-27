@@ -70,6 +70,37 @@ function runBinary(bin, args, env = {}) {
   return result;
 }
 
+/**
+ * SEA embedding proof (review-2 round 3 MUST-FIX 1): the shipped binary must
+ * load the vendored model through the SEA asset-extraction path and actually
+ * score a query — a silent hashed-fallback must fail the smoke. One
+ * machine-readable line is asserted.
+ */
+function checkEmbeddingSelftest(bin) {
+  const { status, stdout } = runBinary(bin, [], {
+    ACTION_HUB_EMBEDDINGS_SELFTEST: "1",
+  });
+  const line = (stdout ?? "")
+    .split("\n")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.startsWith("{"))
+    .pop();
+  let parsed;
+  try {
+    parsed = JSON.parse(line ?? "");
+  } catch {
+    fail(`embedding selftest printed no JSON line (status ${status}, stdout: ${String(stdout).slice(0, 200)})`);
+  }
+  const selftest = parsed?.embeddingSelftest;
+  if (!selftest || selftest.ok !== true) fail(`embedding selftest failed: ${line}`);
+  if (selftest.backend !== "wasm") fail(`embedding selftest backend is ${selftest.backend}, expected wasm`);
+  if (selftest.dims !== 384 || Math.abs(selftest.norm - 1) > 0.01) {
+    fail(`embedding selftest vector wrong (dims ${selftest.dims}, norm ${selftest.norm})`);
+  }
+  if (selftest.nativeAddons !== 0) fail(`embedding selftest loaded ${selftest.nativeAddons} native addons`);
+  process.stderr.write(`  ok  embedding selftest (load ${selftest.loadMs}ms, norm ${selftest.norm})\n`);
+}
+
 function checkVersion(bin, version) {
   const { status, stdout } = runBinary(bin, ["--version"]);
   const out = (stdout ?? "").trim();
@@ -231,6 +262,7 @@ async function main() {
     checkDoctor(bin);
     checkDaemonLifecycle(bin);
     await checkMcpHandshake(bin);
+    checkEmbeddingSelftest(bin);
   } finally {
     rmRunRoot(runRoot);
   }

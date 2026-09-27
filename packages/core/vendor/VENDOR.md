@@ -50,9 +50,9 @@ fetched at runtime.
 
 | file | upstream source | SHA-256 |
 |---|---|---|
-| `ort.wasm.mjs` | onnxruntime-web 1.23.2 `dist/ort.wasm.mjs` | `fa4e7e18dfbc5d6cfd660de1776bac33b6db66557fc4886693e1c5d9deb47762` |
-| `ort-wasm-simd-threaded.wasm` | onnxruntime-web 1.23.2 `dist/ort-wasm-simd-threaded.wasm` | `06ba057753da3847e4c24f02d91ab133455b0817c69a44993a9a53a2146df9e3` |
-| `ort-wasm-simd-threaded.mjs` | onnxruntime-web 1.23.2 `dist/ort-wasm-simd-threaded.mjs` | `c57ca56328877353a575e51bbca6f18450027d6c9bf2307a2cb2c41363b4de9f` |
+| `ort.wasm.mjs` | onnxruntime-web 1.23.2 `dist/ort.wasm.mjs` | `721ff16fbab457ed31bd70ed14c74a609b661fc31d720d0d9b67c93ae3a852b7` |
+| `ort-wasm-simd-threaded.wasm` | onnxruntime-web 1.23.2 `dist/ort-wasm-simd-threaded.wasm` | `45eaee27761ad883742a8d4b8fce1538d60ce43b51adf1726fafccc59b8c1a15` |
+| `ort-wasm-simd-threaded.mjs` | onnxruntime-web 1.23.2 `dist/ort-wasm-simd-threaded.mjs` | `90a557d15c02bac4504d95b67f431d8594635ed2a0a62a7f2cd83d090ff91d3e` |
 
 - **License:** MIT (onnxruntime-web; https://github.com/microsoft/onnxruntime,
   copyright Microsoft Corporation). The files above are unmodified copies of

@@ -33,7 +33,24 @@ export const EMBEDDING_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
 export const EMBEDDING_DIMS = 384;
 /** ORT build + wasm binary are vendored alongside the model (MIT; see VENDOR.md). */
 const ORT_MODULE = "ort.wasm.mjs";
+/** ORT module segment under vendor/ort (module or wasm binary). */
 const ORT_WASM = "ort-wasm-simd-threaded.wasm";
+
+/**
+ * SEA asset keys (build-binary.mjs embeds the vendor tree verbatim):
+ * extracted to a temp dir at first embeddings load inside a bundled binary,
+ * because import.meta.url is unusable there (esbuild emits import_meta = {}).
+ */
+const SEA_ASSETS = [
+  "vendor/models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx",
+  "vendor/models/Xenova/all-MiniLM-L6-v2/tokenizer.json",
+  "vendor/models/Xenova/all-MiniLM-L6-v2/tokenizer_config.json",
+  "vendor/models/Xenova/all-MiniLM-L6-v2/config.json",
+  `vendor/ort/${ORT_MODULE}`,
+  "vendor/ort/ort-wasm-simd-threaded.mjs",
+  `vendor/ort/${ORT_WASM}`,
+];
+let seaVendor: { modelRoot: string; ortDir: string } | null | undefined;
 
 export interface EmbeddingIndexOptions {
   /** Vendored model root (contains <modelId> subdirectories). */
@@ -123,7 +140,10 @@ export class EmbeddingSemanticIndex {
     if (this.#session) return true;
     if (this.#loadFailed) return false;
     try {
-      const modelRoot = this.#options.modelPath || defaultVendorPath();
+      const modelRoot =
+        this.#options.modelPath ||
+        (await seaVendorRoot())?.modelRoot ||
+        defaultVendorPath();
       if (!modelRoot) {
         throw new Error(
           "no model path: set ACTION_HUB_EMBEDDINGS_MODEL (bundled binary hosts extract the vendored model and point this at it)",
@@ -131,14 +151,19 @@ export class EmbeddingSemanticIndex {
       }
       const modelDir = `${modelRoot}/${this.#options.modelId}`;
       this.#tokenizer = loadTokenizer(`${modelDir}/tokenizer.json`);
-      const ortUrl = new URL(`../../vendor/ort/${ORT_MODULE}`, import.meta.url);
+      const ortDir =
+        process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] || (await seaVendorRoot())?.ortDir || "";
+      const ortUrl = ortDir
+        ? pathToFileURL(`${ortDir}/${ORT_MODULE}`)
+        : new URL(`../../vendor/ort/${ORT_MODULE}`, import.meta.url);
       const ort = (await import(ortUrl.href)) as unknown as OrtLike;
       ort.env.wasm.numThreads = 1;
       // Feed ORT the wasm binary directly: the web build resolves wasmPaths
       // with fetch(), which cannot read file:// URLs in Node.
-      ort.env.wasm.wasmBinary = readFileSync(
-        fileURLToPath(new URL(`../../vendor/ort/${ORT_WASM}`, import.meta.url)),
-      );
+      const wasmPath = ortDir
+        ? `${ortDir}/${ORT_WASM}`
+        : fileURLToPath(new URL(`../../vendor/ort/${ORT_WASM}`, import.meta.url));
+      ort.env.wasm.wasmBinary = readFileSync(wasmPath);
       const modelBytes = readFileSync(`${modelDir}/onnx/model_quantized.onnx`);
       this.#ortTensor = ort.Tensor;
       this.#session = await ort.InferenceSession.create(new Uint8Array(modelBytes), {
@@ -249,6 +274,14 @@ export class EmbeddingSemanticIndex {
     return embedded;
   }
 
+  /** Discards ALL in-memory vectors (rebuild-failure cleanup: a partially
+   * embedded map must never serve as a semantic channel — the fallback then
+   * covers the whole corpus uniformly). Persisted vectors are untouched;
+   * hydration can restore them on the next successful run. */
+  discardVectors(): void {
+    this.#vectors = new Map();
+  }
+
   /** Drops vectors for ids not in the given set (post reindex cleanup). */
   prune(aliveIds: ReadonlySet<string>): number {
     let removed = 0;
@@ -351,6 +384,52 @@ interface StoredVector {
 
 function defaultYield(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * Inside a bundled SEA binary the vendor tree is embedded as assets (see
+ * build-binary.mjs): extract them once to a per-process temp dir and serve
+ * both the model root and the ORT module from there. Returns null outside
+ * SEA, when node:sea is unavailable, or when extraction fails (callers then
+ * fall back to the normal resolution paths and, ultimately, the hashed
+ * scorer). Failure is cached — load() must not retry a broken extraction on
+ * every scorer call.
+ */
+async function seaVendorRoot(): Promise<{ modelRoot: string; ortDir: string } | null> {
+  if (seaVendor !== undefined) return seaVendor;
+  seaVendor = null;
+  try {
+    const sea = (await import("node:sea")) as {
+      isSea?: () => boolean;
+      getRawAsset?: (key: string) => ArrayBuffer;
+    };
+    if (!sea.isSea?.() || !sea.getRawAsset) return null;
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join, dirname } = await import("node:path");
+    const root = mkdtempSync(join(tmpdir(), "action-hub-vendor-"));
+    for (const key of SEA_ASSETS) {
+      const bytes = sea.getRawAsset(key);
+      if (!bytes) throw new Error(`SEA asset missing: ${key}`);
+      const target = join(root, key);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, Buffer.from(bytes));
+    }
+    // Process-global handoff (NOT module state): a bundled binary can contain
+    // more than one copy of this module (package entry + deep imports), and
+    // each copy has its own cache. Writing the env vars once (first copy
+    // wins) makes the extraction visible to every copy.
+    process.env["ACTION_HUB_EMBEDDINGS_MODEL"] ??= join(root, "vendor/models");
+    process.env["ACTION_HUB_EMBEDDINGS_ORT_DIR"] ??= join(root, "vendor/ort");
+    seaVendor = {
+      modelRoot: join(root, "vendor/models"),
+      ortDir: join(root, "vendor/ort"),
+    };
+
+  } catch {
+    /* fall back to normal resolution */
+  }
+  return seaVendor;
 }
 
 /**

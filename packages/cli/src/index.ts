@@ -96,6 +96,39 @@ EXAMPLES:
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
 
+  // SEA embeddings selftest (SQ4 packaging round): with this env var set, the
+  // (bundled) binary must load the vendored model through its SEA asset
+  // extraction path and score a query, printing ONE machine-readable line.
+  // The binary smoke test asserts this line — it is the proof that the
+  // shipped executable serves real embeddings rather than the hashed
+  // fallback.
+  if (process.env["ACTION_HUB_EMBEDDINGS_SELFTEST"] === "1") {
+    const { EmbeddingSemanticIndex } = await import("@action-hub/core");
+    const index = new EmbeddingSemanticIndex();
+    const t0 = Date.now();
+    const ok = await index.load();
+    let dims: number | null = null;
+    let norm: number | null = null;
+    if (ok) {
+      const v = await index.embedQuery("pause the project in the staging environment");
+      dims = v.length;
+      norm = Math.sqrt([...v].reduce((sum, x) => sum + x * x, 0));
+    }
+    const so = ((process.report?.getReport() as { sharedObjects?: string[] } | undefined)?.sharedObjects ?? []) as string[];
+    process.stdout.write(
+      `${JSON.stringify({
+        embeddingSelftest: {
+          ok,
+          backend: index.backend,
+          dims,
+          norm: norm === null ? null : Number(norm.toFixed(4)),
+          loadMs: Date.now() - t0,
+          nativeAddons: so.filter((entry: string) => entry.endsWith(".node")).length,
+        },
+      })}\n`,
+    );
+    process.exit(ok ? 0 : 1);
+
   // Hidden internal anchor/wrapper modes (process-anchor.ts): the anchored
   // process tree re-invokes THIS CLI instead of requiring an external
   // interpreter, so the standalone SEA binary stays zero-dependency. Must be

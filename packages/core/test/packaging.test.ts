@@ -39,3 +39,20 @@ test("npm pack of @action-hub/core includes the vendored model", () => {
     `required assets missing from the packed artifact (${paths.length} files packed): ${missing.join(", ")}`,
   );
 });
+
+test("vendored ORT bytes match the SHAs recorded in vendor/VENDOR.md", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { createHash } = await import("node:crypto");
+  const vendorDir = new URL("../vendor/", import.meta.url);
+  const provenance = await readFile(new URL("VENDOR.md", vendorDir), "utf8");
+  // The VENDOR.md ORT table pins "<upstream path> | <sha256>" per file.
+  const rows = [
+    ...provenance.matchAll(/\| `(ort\.[^`]+|ort-wasm[^`]+)` \| onnxruntime-web[^|]+\| `([0-9a-f]{64})` \|/g),
+  ];
+  assert.ok(rows.length >= 3, "VENDOR.md ORT provenance table must pin all vendored files");
+  for (const [, file, sha] of rows) {
+    const bytes = await readFile(new URL(`ort/${file}`, vendorDir));
+    const actual = createHash("sha256").update(bytes).digest("hex");
+    assert.equal(actual, sha, `vendor/ort/${file} does not match its recorded SHA-256 (provenance drift)`);
+  }
+});

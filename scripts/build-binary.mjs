@@ -54,11 +54,40 @@ async function main() {
   await mkdir(outDir, { recursive: true });
   await rm(seaBlob, { force: true });
 
-  // 1. Generate the SEA preparation blob from the bundle.
+  // 1. Generate the SEA preparation blob from the bundle. The vendored
+  // embedding assets (model + tokenizer data + ORT WASM runtime) are embedded
+  // as SEA assets and extracted at runtime (core/search/embeddings.ts,
+  // seaVendorRoot) — without them the bundled binary silently falls back to
+  // the hashed scorer (review-2 round 3 MUST-FIX 1).
+  const assetRoot = resolve(repoRoot, "packages", "core", "vendor");
+  const assetKeys = [
+    "models/Xenova/all-MiniLM-L6-v2/onnx/model_quantized.onnx",
+    "models/Xenova/all-MiniLM-L6-v2/tokenizer.json",
+    "models/Xenova/all-MiniLM-L6-v2/tokenizer_config.json",
+    "models/Xenova/all-MiniLM-L6-v2/config.json",
+    "ort/ort.wasm.mjs",
+    "ort/ort-wasm-simd-threaded.mjs",
+    "ort/ort-wasm-simd-threaded.wasm",
+  ];
+  const assets = {};
+  for (const key of assetKeys) {
+    const path = resolve(assetRoot, key);
+    if (!(await exists(path))) {
+      throw new Error(`Missing vendored embedding asset packages/core/vendor/${key}; run npm ci first.`);
+    }
+    // Node's SEA config takes a map of asset KEY -> file PATH (strings);
+    // getRawAsset(key) then returns the bytes at runtime.
+    assets[`vendor/${key}`] = path;
+  }
   await writeFile(
     seaConfig,
     JSON.stringify(
-      { main: bundle, output: seaBlob, disableExperimentalSEAWarning: true },
+      {
+        main: bundle,
+        output: seaBlob,
+        disableExperimentalSEAWarning: true,
+        assets,
+      },
       null,
       2,
     ),
