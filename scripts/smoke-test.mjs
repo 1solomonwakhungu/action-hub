@@ -251,6 +251,13 @@ function checkTamperedCache(bin) {
  * mkdtemp and still succeeds.
  */
 function checkForeignCacheBase(bin) {
+  // POSIX-only check: 0777 means "world-writable" only where mode bits are
+  // meaningful. Windows security is ACL-based (Node's stat modes are
+  // constant), and core's private-cache gate is likewise POSIX-scoped.
+  if (process.platform === "win32") {
+    process.stderr.write("  ok  foreign cache base check SKIPPED (mode-bit semantics do not apply on Windows)\n");
+    return;
+  }
   const tmpRoot = checkDir("sea-foreign-base");
   const base = join(tmpRoot, `action-hub-cache-${cacheBaseSuffix()}`);
   mkdirSync(base, { recursive: true, mode: 0o777 });
@@ -275,6 +282,11 @@ function checkForeignCacheBase(bin) {
  * swappable tree.
  */
 function checkHostileCacheBases(bin) {
+  // POSIX-only for the same reason as checkForeignCacheBase.
+  if (process.platform === "win32") {
+    process.stderr.write("  ok  hostile cache bases check SKIPPED (mode-bit semantics do not apply on Windows)\n");
+    return;
+  }
   const tmpRoot = checkDir("sea-hostile-bases");
   const suffix = cacheBaseSuffix();
   mkdirSync(join(tmpRoot, `action-hub-cache-${suffix}`), { recursive: true, mode: 0o777 });
