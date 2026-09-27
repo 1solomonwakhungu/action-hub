@@ -111,7 +111,7 @@ try {
   parsed = JSON.parse((out.stdout || "").trim().split("\n").filter(Boolean).pop());
   verdict = parsed.ok === true && parsed.dim === 384 && parsed.fetchCalls === 0;
 } catch { /* fallthrough */ }
-step("run-embed", verdict === true, JSON.stringify(parsed ?? { exit: out.status, stderr: (out.stderr || "").slice(0, 300) }));
+step("run-embed", verdict === true, JSON.stringify(parsed ?? { exit: out.status, stdout: (out.stdout || "").slice(-800), stderr: (out.stderr || "").slice(-1600) }));
 results.platform = process.platform;
 results.node = process.version;
 results.assert = { ok: parsed?.ok, dim: parsed?.dim, fetchCalls: parsed?.fetchCalls, totalMs: parsed?.totalMs };
