@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { isJSONRPCErrorResponse, isJSONRPCRequest, isJSONRPCNotification, isJSONRPCResultResponse } from "@modelcontextprotocol/sdk/types.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { PassThrough, type Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -351,12 +354,77 @@ export async function runDaemonServer(): Promise<void> {
 }
 
 /**
+ * F53 (P3): over stdio, the MCP SDK silently drops malformed JSON-RPC frames:
+ * `StdioServerTransport` reports both unparseable lines and parseable-but-
+ * non-JSON-RPC frames (e.g. a top-level `arguments` object) to `onerror`
+ * without replying (shared/protocol.js dispatches unclassifiable frames to
+ * `onerror` and never answers). A client that sent a request with an id then
+ * waits for that id and hangs.
+ *
+ * Fix without touching SDK internals: filter the stdin STREAM before the
+ * transport sees it. Each newline-delimited frame is checked while raw:
+ *  - unparseable JSON -> `-32700 Parse error` with `id: null` is written and
+ *    the frame is dropped (never forwarded to the SDK);
+ *  - parseable object with an `id` that is not a valid request/notification/
+ *    response -> `-32600 Invalid Request` with that id, frame dropped;
+ *  - valid JSON-RPC frames pass through unchanged.
+ * Scoped to stdio: the HTTP transport already answers 400/-32700 at its own
+ * layer (verified in F48).
+ */
+export function makeStdinWithMalformedFrameReplies(
+  source: Readable,
+  reply: (message: JSONRPCMessage) => void,
+): Readable {
+  const filtered = new PassThrough();
+  let pending = "";
+  source.on("data", (chunk: Buffer) => {
+    pending += chunk.toString("utf8");
+    for (;;) {
+      const newline = pending.indexOf("\n");
+      if (newline === -1) break;
+      const line = pending.slice(0, newline).replace(/\r$/, "");
+      pending = pending.slice(newline + 1);
+      if (!line.trim()) continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        // Unparseable JSON: JSON-RPC 2.0 reply with id null.
+        reply({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } } as unknown as JSONRPCMessage);
+        continue;
+      }
+      const hasId =
+        typeof parsed === "object" && parsed !== null &&
+        "id" in parsed && (parsed as { id?: unknown }).id !== null;
+      if (
+        !isJSONRPCRequest(parsed) && !isJSONRPCNotification(parsed) &&
+        !isJSONRPCResultResponse(parsed) && !isJSONRPCErrorResponse(parsed)
+      ) {
+        // Parseable but not a recognizable JSON-RPC frame: the SDK dispatcher
+        // would silently drop it. -32600, echoing the id when recoverable.
+        const id =
+          typeof parsed === "object" && parsed !== null && "id" in parsed
+            ? (parsed as { id?: string | number }).id
+            : null;
+        reply({ jsonrpc: "2.0", id: (id ?? null) as string | number | null, error: { code: -32600, message: "Invalid Request: not a valid JSON-RPC message" } } as unknown as JSONRPCMessage);
+        continue;
+      }
+      filtered.write(line + "\n");
+    }
+  });
+  source.on("error", () => undefined); // stdio errors surface through the SDK otherwise
+  return filtered;
+}
+
+/**
  * Boots the Action Hub meta-MCP server on stdio and resolves on transport
  * close or a termination signal.
  */
 export async function runServer(): Promise<void> {
   const runtime = await createHubRuntime();
-  const transport = new StdioServerTransport();
+  const transport = new StdioServerTransport(makeStdinWithMalformedFrameReplies(process.stdin, (message) => {
+    void transport.send(message).catch(() => undefined);
+  }));
   await connectMcpClient(runtime, transport);
 
   await new Promise<void>((resolveShutdown) => {
