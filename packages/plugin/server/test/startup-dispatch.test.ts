@@ -558,3 +558,28 @@ test("FX19: HTTP serve mode returns -32602 for the same violations", async () =>
     else process.env["ACTION_HUB_CONFIG"] = prevConfig;
   }
 });
+
+test("F47: stateless POSTs answer with plain JSON, not a per-request SSE stream", async () => {
+  const { startHttpServer } = await import("../dist/http-server.js");
+  const handle = await startHttpServer({ port: 0, token: "tok" });
+  try {
+    const post = async (body: unknown) =>
+      await fetch(`http://127.0.0.1:${handle.port}/mcp`, {
+        method: "POST",
+        headers: { authorization: "Bearer tok", "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify(body),
+      });
+    const init = await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
+    assert.equal(init.headers.get("content-type")?.includes("application/json"), true, "initialize answers application/json (no SSE stream)");
+    const initBody = (await init.json()) as { result?: unknown };
+    assert.ok(initBody.result, "initialize succeeds");
+    const list = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    assert.equal(list.headers.get("content-type")?.includes("application/json"), true);
+    assert.ok(((await list.json()) as { result?: { tools?: unknown[] } }).result?.tools, "tools/list works over plain JSON");
+    const call = await post({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "action_hub", arguments: { operation: "search", query: "lookup" } } });
+    const callBody = (await call.json()) as { result?: unknown; error?: unknown };
+    assert.ok(callBody.result ?? callBody.error, "tools/call works over plain JSON");
+  } finally {
+    await handle.close();
+  }
+});
