@@ -30,7 +30,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -237,6 +237,11 @@ async function main() {
     if (!Number.isFinite(SEED)) {
       throw new Error("Invalid --seed value: " + SEED_ARG);
     }
+    // A protected --generated location must be refused BEFORE any write,
+    // including the setup-error summary path (results live under GENERATED).
+    if (insideOwnerProtectedState(GENERATED, userInfo().homedir)) {
+      throw new Error("refusing to run: --generated " + GENERATED + " is inside owner-protected state");
+    }
     console.log("action-hub cli-scale stress — scale=" + SCALE + " seed=" + SEED);
     await runAll();
   } catch (err) {
@@ -338,6 +343,26 @@ const OWNER_PROTECTED_DIRS = [
   "AppData/Roaming/action-hub", "AppData/Local/action-hub",
   ".claude", ".claude.json", ".codex", ".cursor", ".copilot", ".pi", ".vscode",
 ];
+
+function pruneStaleRunRoots() {
+  const cutoff = Date.now() - 6 * 60 * 60 * 1000; // 6h — no live run is that old
+  let entries;
+  try {
+    entries = readdirSync(GENERATED).filter((e) => e.startsWith("cli-scale-"));
+  } catch (err) {
+    if (err.code === "ENOENT") return;
+    throw err;
+  }
+  for (const name of entries) {
+    const dir = join(GENERATED, name);
+    try {
+      if (statSync(dir).mtimeMs < cutoff) rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      if (err.code === "ENOENT") continue; // another run raced us to it
+      throw err;
+    }
+  }
+}
 
 function insideOwnerProtectedState(runRoot, realHome) {
   const absRoot = resolve(runRoot);
@@ -677,9 +702,17 @@ function emitSummary(totalMs, error = null) {
   // stdout line.
   let writeError = null;
   const resultsPath = join(GENERATED, "results", "cli-scale.json");
+  // Refuse a protected --generated location on the summary path too (covers
+  // setup-error runs): the artifact must never land in owner state.
+  if (insideOwnerProtectedState(GENERATED, userInfo().homedir)) {
+    writeError = "refusing to write results artifact inside owner-protected state (" + GENERATED + ")";
+    console.error(writeError);
+  }
   try {
-    mkdirSync(dirname(resultsPath), { recursive: true });
-    writeFileSync(resultsPath, "PENDING");
+    if (writeError === null) {
+      mkdirSync(dirname(resultsPath), { recursive: true });
+      writeFileSync(resultsPath, "PENDING");
+    }
   } catch (writeErr) {
     writeError = "results artifact write failed: " + writeErr.message;
     console.error(writeError);
@@ -702,6 +735,7 @@ function emitSummary(totalMs, error = null) {
   };
   if (writeError === null) {
     try {
+      if (insideOwnerProtectedState(GENERATED, userInfo().homedir)) throw new Error("location became owner-protected");
       writeFileSync(resultsPath, JSON.stringify(summary, null, 2) + "\n");
     } catch (writeErr) {
       // The file appeared then failed (rare): mark the run not-ok and surface.
@@ -807,8 +841,11 @@ function buildBundles(serverIds) {
 async function runAll() {
   const cfg = SCALES[SCALE];
 
-  // Isolated run root under stress/.generated/cli-scale/ (never committed).
-  const runRoot = join(GENERATED, "cli-scale");
+  // Isolated, UNIQUE run root under stress/.generated/ (never committed):
+  // mkdtemp so two runs from the same checkout can never delete or kill each
+  // other. Stale roots (older than 6h) are pruned by name+age only.
+  pruneStaleRunRoots();
+  const runRoot = resolve(mkdtempSync(join(GENERATED, "cli-scale-")));
   // Owner-state guard (revised ISOLATION.md): refuse only when the run root
   // lands inside the owner's real app-state/harness dirs; being under home
   // alone is fine (os.tmpdir() is under USERPROFILE on Windows).
@@ -865,11 +902,28 @@ async function runAll() {
     loadQueries("skills-queries.json", { required: true });
 
     serverIds = base.servers.map((srv) => srv.id);
+    // Re-point each server's manifest at a run-scoped SYMLINK under the run
+    // root: the fake servers' command lines then carry a run-unique path, so
+    // cleanup can target exactly this run's children (no shared-path pkill).
+    const manifestsDir = join(runRoot, "manifests");
+    mkdirSync(manifestsDir, { recursive: true });
+    const servers = base.servers.map((srv) => {
+      const args = (srv.transport && srv.transport.args) || [];
+      const i = args.indexOf("--manifest");
+      if (i !== -1) {
+        const linkPath = join(manifestsDir, srv.id + ".json");
+        symlinkSync(resolve(REPO_ROOT, args[i + 1]), linkPath);
+        const next = [...args];
+        next[i + 1] = linkPath;
+        return { ...srv, transport: { ...srv.transport, args: next } };
+      }
+      return srv;
+    });
     // Merge the skills corpus into the config so `list --kind skill` and
     // test-search exercise them (make-config emits servers only).
     configSkills = parseSkillFrontmatters(sharedSkills);
     configPath = join(runRoot, "servers-with-skills.json");
-    writeFileSync(configPath, JSON.stringify({ autoDiscover: false, servers: base.servers, bundles: base.bundles ?? [], skills: configSkills }, null, 2));
+    writeFileSync(configPath, JSON.stringify({ autoDiscover: false, servers, bundles: base.bundles ?? [], skills: configSkills }, null, 2));
   } else {
     serverIds = writeToolManifests(cfg, GENERATED);
     writeSkillFixtures(cfg, skillsDir);
@@ -911,11 +965,12 @@ async function runAll() {
     phaseImportMigrate({ perConfig: cfg.harnessServersPerConfig });
     phaseHarnessInstall();
   } finally {
-    // Best-effort cleanup of fake servers OUR worktree spawned (path-scoped so
-    // other agents' identically-named processes are untouched).
-    try {
-      spawnSync("/usr/bin/pkill", ["-f", join(REPO_ROOT, "stress", "fake-mcp-server.mjs")]);
-      spawnSync("/usr/bin/pkill", ["-f", join(runRoot, "fake-stdio-server.mjs")]);
-    } catch { /* best effort */ }
+    // Best-effort cleanup of THIS RUN's children only: both the shared
+    // fake server (via its run-unique symlinked --manifest path) and the
+    // fallback inline server carry the unique run root in their command
+    // line, so the pattern can never match another run's processes.
+    for (const marker of [join(runRoot, "manifests"), join(runRoot, "fake-stdio-server")]) {
+      spawnSync("/usr/bin/pkill", ["-f", marker]);
+    }
   }
 }
