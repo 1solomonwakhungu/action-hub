@@ -6,6 +6,7 @@
 async function main() {
 const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
 const { tmpdir } = await import("node:os");
+  const { pathToFileURL } = await import("node:url");
 const { join } = await import("node:path");
 const t0 = performance.now();
 
@@ -67,9 +68,11 @@ if (await existsSyncAssetSupport()) {
     writeFileSync(join(scratch, dest), data);
   }
   const wasmDir = join(scratch, "wasm");
+  // wasmPaths must be file:// URLs (Windows paths as bare strings break the
+  // ESM factory import with "Received protocol 'c:'").
   env.backends.onnx.wasm.wasmPaths = {
-    wasm: join(wasmDir, "ort-wasm-simd-threaded.wasm"),
-    mjs: join(wasmDir, "ort-wasm-simd-threaded.mjs"),
+    wasm: pathToFileURL(join(wasmDir, "ort-wasm-simd-threaded.wasm")).href,
+    mjs: pathToFileURL(join(wasmDir, "ort-wasm-simd-threaded.mjs")).href,
   };
   env.backends.onnx.wasm.numThreads = 1; // keep it simple/portable in SEA
   env.allowLocalModels = true;
@@ -79,8 +82,8 @@ if (await existsSyncAssetSupport()) {
 } else {
   // Non-SEA sanity path: use the spike checkout's own local model + wasm.
   env.backends.onnx.wasm.wasmPaths = {
-    wasm: join(process.cwd(), "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm"),
-    mjs: join(process.cwd(), "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs"),
+    wasm: pathToFileURL(join(process.cwd(), "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm")).href,
+    mjs: pathToFileURL(join(process.cwd(), "node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.mjs")).href,
   };
   env.backends.onnx.wasm.numThreads = 1;
   env.allowLocalModels = true;
