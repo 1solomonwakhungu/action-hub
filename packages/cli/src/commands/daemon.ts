@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile } from "node:fs/promises";import { connect, type Socket } from "node:net";
+import { chmod, lstat, mkdir, readFile } from "node:fs/promises";
+import { anchorMetaPath, readAnchorMeta, spawnAnchor, teardownAnchorTree } from "./process-anchor.js";import { connect, type Socket } from "node:net";
 import { homedir, platform, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import { runDaemonServer } from "@action-hub/mcp-server";
@@ -150,10 +151,16 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
     ...(options.configPath ? { ACTION_HUB_CONFIG: resolvePath(options.configPath) } : {}),
   };
   let spawnError: Error | undefined;
-  const child = spawn(process.execPath, daemonChildArgs(options.entryPath), {
+  // The daemon runs inside an anchored process group (process-anchor.ts):
+  // the anchor's wrapper is the group leader, so every later group signal is
+  // provably safe (the leader is verified alive before each signal) and the
+  // leader can never be a reused PGID.
+  const anchorMeta = anchorMetaPath("daemon", "start");
+  const child = spawnAnchor("daemon", process.execPath, daemonChildArgs(options.entryPath), {
     detached: true,
     stdio: ["ignore", logFd, logFd],
     env,
+    metaFile: anchorMeta,
   });
   child.once("error", (cause) => {
     spawnError = cause;
@@ -183,7 +190,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child);
+      await killAndReapSpawned(child, anchorMeta);
       console.error(`Could not start Action Hub daemon: ${spawnError.message}`);
       return 1;
     }
@@ -195,7 +202,7 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
       if (await waitForAnotherDaemon(paths)) {
         return 0;
       }
-      await killAndReapSpawned(child);
+      await killAndReapSpawned(child, anchorMeta);
       console.error(
         `Action Hub daemon exited during startup (code ${childExitCode ?? "signal"}). See ${paths.log}`,
       );
@@ -237,67 +244,36 @@ export async function daemonStartCommand(options: DaemonOptions = {}): Promise<n
 
   console.error(`Action Hub daemon did not become ready. See ${paths.log}`);
   if (await waitForAnotherDaemon(paths)) return 0;
-  await killAndReapSpawned(child);
+  await killAndReapSpawned(child, anchorMeta);
   return 1;
 }
 
 /**
- * Terminates and reaps the detached child (and its whole process group) this
- * start spawned. Called on EVERY failure path before returning: a daemon that
- * never became ready must not survive its own failed start as an orphan.
+ * Terminates and reaps the anchored daemon tree this start spawned. Called on
+ * EVERY failure path before returning: a daemon that never became ready must
+ * not survive its own failed start as an orphan. SIGTERM to the anchor lets
+ * it run its own gated cleanup; the wrapper group is only signalled while
+ * the wrapper (the group's leader) is verifiably alive, so a PGID can never
+ * be signalled after it was freed and potentially reused.
  */
-async function killAndReapSpawned(child: ChildProcess): Promise<void> {
+async function killAndReapSpawned(child: ChildProcess, metaFile: string): Promise<void> {
   if (!child.pid) return;
-  const pid = child.pid;
-  const isWindows = platform() === "win32";
-  // True while ANY member of the daemon's process group still lives — direct
-  // child exit is NOT tree death, so verification must always target the
-  // group, even when the leader has already exited.
-  const groupAlive = (): boolean => {
-    if (isWindows) return false;
-    try {
-      process.kill(-pid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException)?.code !== "ESRCH";
+  const meta = await readAnchorMeta(metaFile);
+  if (meta) {
+    const survivors = await teardownAnchorTree(meta, 5_000);
+    if (survivors.length > 0) {
+      console.error(`Warning: daemon start teardown left surviving processes (PIDs ${survivors.join(", ")}).`);
     }
-  };
-  const signalTree = (signal: NodeJS.Signals): void => {
-    if (isWindows) {
-      // child.kill does not kill a Windows process tree; taskkill /T /F does.
-      const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
-      tk.on("error", () => {
-        try {
-          child.kill("SIGKILL");
-        } catch {}
-      });
-      return;
-    }
-    try {
-      process.kill(-pid, signal);
-    } catch {
-      // Leader already exited and no group members remain.
-    }
-    try {
-      child.kill(signal);
-    } catch {}
-  };
-  signalTree("SIGTERM");
-  await delay(150);
-  if (isWindows) {
-    // Await the force kill before verifying.
-    await new Promise<void>((resolve) => {
-      const tk = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
-      tk.on("exit", () => resolve());
-      tk.on("error", () => resolve());
-    });
-  } else {
-    signalTree("SIGKILL");
+    return;
   }
-  const deadline = Date.now() + 5_000;
-  for (;;) {
-    if (!groupAlive()) return;
-    if (Date.now() >= deadline) return;
+  // Meta never written (spawn failed very early): nothing to clean up beyond
+  // a best-effort direct-child kill. Never signal a process group here: the
+  // child never became a group leader we can prove is still ours.
+  try {
+    child.kill("SIGKILL");
+  } catch {}
+  const deadline = Date.now() + 2_000;
+  while (child.exitCode === null && child.signalCode === null && Date.now() < deadline) {
     await delay(50);
   }
 }

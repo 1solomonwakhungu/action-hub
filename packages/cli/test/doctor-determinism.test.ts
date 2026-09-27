@@ -306,3 +306,53 @@ test("doctor cleans up the process group when the server exits on its own", asyn
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+// Reviewer-1 (PR 61 round 6): a server that writes one arbitrary stdout byte
+// and then hangs must NOT defeat the activation deadline. The anchor meta
+// file (written before connect resolves) bounds the attempt and the exact
+// tree is torn down; the doctor must return nonzero within a tight bound
+// with every recorded PID dead.
+test("doctor bounds a partial-stdout-then-hang server and leaves no survivors", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "ah-doctor-trickle-"));
+  const startedAt = Date.now();
+  try {
+    const servers = [stdioServer("trickle", [resolve(testDir, "fixtures/trickle-server.mjs")], { timeoutMs: 1000 })];
+    const cfgPath = await makeFleet(tempDir, servers);
+    const { code } = await withIsolatedEnv(tempDir, () => runDoctor(cfgPath));
+    const wallMs = Date.now() - startedAt;
+    assert.equal(code, 1, "a server that never initializes must fail the doctor");
+    assert.ok(wallMs < 25_000, `doctor took ${wallMs}ms for a hanging server; expected a tight bound`);
+
+    const recordedPids = (await readFile(join(tempDir, "recorded-pids.txt"), "utf8"))
+      .split("\n")
+      .map((l) => Number.parseInt(l.trim(), 10))
+      .filter((n) => Number.isSafeInteger(n) && n > 0);
+    assert.ok(recordedPids.length >= 2, `expected >=2 recorded server PIDs (2 attempts), got ${recordedPids.length}`);
+
+    // The anchor meta file records the wrapper (group leader) PID before
+    // connect resolves; it must be dead too.
+    const { anchorMetaPath } = await import("../dist/commands/process-anchor.js");
+    const meta = JSON.parse(await readFile(anchorMetaPath("doctor", "trickle"), "utf8")) as {
+      anchor: number;
+      wrapper: number;
+    };
+    const allPids = [...recordedPids, meta.anchor, meta.wrapper];
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const pollDeadline = Date.now() + 8_000;
+    let survivors = allPids.filter(isAlive);
+    while (survivors.length > 0 && Date.now() < pollDeadline) {
+      await new Promise((r) => setTimeout(r, 250));
+      survivors = allPids.filter(isAlive);
+    }
+    assert.deepEqual(survivors, [], `partial-stdout hang tree survived: ${survivors.join(", ")}`);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

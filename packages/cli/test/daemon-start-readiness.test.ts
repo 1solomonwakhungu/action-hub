@@ -42,19 +42,39 @@ function stubEnv(vars: Record<string, string>): { restore: () => void } {
   };
 }
 
-async function killStub(daemonDir: string): Promise<void> {
-  try {
-    const state = JSON.parse(await readFile(join(daemonDir, "daemon.json"), "utf8")) as {
-      pid: number;
-    };
+/** Kills only PIDs THIS test spawned, then asserts they are all dead. */
+async function cleanupSpawned(daemonDir: string, spawnedPids: number[]): Promise<void> {
+  // SIGTERM first: the anchor runs its own gated group cleanup (SIGKILLing
+  // the anchor directly would orphan the wrapper and the server).
+  for (const pid of spawnedPids) {
     try {
-      process.kill(state.pid, "SIGKILL");
+      process.kill(pid, "SIGTERM");
     } catch {
       // already gone
     }
-  } catch {
-    // state file never written
   }
+  const pollDeadline = Date.now() + 5_000;
+  let survivors: number[] = [];
+  do {
+    await new Promise((r) => setTimeout(r, 250));
+    survivors = spawnedPids.filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  } while (survivors.length > 0 && Date.now() < pollDeadline);
+  // Last resort: SIGKILL whatever of OUR spawns is still alive.
+  for (const pid of survivors) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+  assert.deepEqual(survivors, [], `spawned processes survived: ${survivors.join(", ")}`);
+  // The test runner itself must survive every cleanup (F39 regression guard).
+  assert.doesNotThrow(() => process.kill(process.pid, 0));
 }
 
 // FX10/F25: a daemon that takes longer than the OLD fixed 15s wall but shows
@@ -63,6 +83,7 @@ async function killStub(daemonDir: string): Promise<void> {
 test("daemon start succeeds for a slow-but-progressing daemon beyond 15s", async () => {
   const root = await mkdtemp(join(tmpdir(), "ah-dstart-slow-"));
   const daemonDir = join(root, "daemon");
+  const spawnedPids: number[] = [];
   try {
     const env = stubEnv({ SLOW_MS: "16000" });
     const captured = captureConsole();
@@ -73,6 +94,7 @@ test("daemon start succeeds for a slow-but-progressing daemon beyond 15s", async
         entryPath: stub,
         startTimeoutMs: 30_000,
         configPath: join(root, "servers.json"),
+        onSpawn: (pid) => void spawnedPids.push(pid),
       });
       const wall = Date.now() - startedAt;
       assert.equal(code, 0, `expected start success, got ${code}; stderr=${captured.errors.join("\n")}`);
@@ -87,7 +109,7 @@ test("daemon start succeeds for a slow-but-progressing daemon beyond 15s", async
       env.restore();
     }
   } finally {
-    await killStub(daemonDir);
+    await cleanupSpawned(daemonDir, spawnedPids);
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -96,6 +118,7 @@ test("daemon start succeeds for a slow-but-progressing daemon beyond 15s", async
 test("daemon start fails fast when the daemon exits during startup", async () => {
   const root = await mkdtemp(join(tmpdir(), "ah-dstart-die-"));
   const daemonDir = join(root, "daemon");
+  const spawnedPids: number[] = [];
   try {
     const env = stubEnv({ DIE_MS: "2000" });
     const captured = captureConsole();
@@ -106,17 +129,19 @@ test("daemon start fails fast when the daemon exits during startup", async () =>
         entryPath: stub,
         startTimeoutMs: 60_000,
         configPath: join(root, "servers.json"),
+        onSpawn: (pid) => void spawnedPids.push(pid),
       });
       const wall = Date.now() - startedAt;
       assert.equal(code, 1);
       assert.ok(wall < 10_000, `failed after ${wall}ms; expected fast failure`);
       assert.match(captured.errors.join("\n"), /exited during startup/);
+      assert.equal(spawnedPids.length, 1, "start must report the spawned anchor PID");
     } finally {
       captured.restore();
       env.restore();
     }
   } finally {
-    await killStub(daemonDir);
+    await cleanupSpawned(daemonDir, spawnedPids);
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -166,7 +191,7 @@ test("daemon start fails on a silent daemon after the no-progress window", async
   } finally {
     if (savedNoProgress === undefined) delete process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"];
     else process.env["ACTION_HUB_DAEMON_NO_PROGRESS_TIMEOUT_MS"] = savedNoProgress;
-    await killStub(daemonDir);
+    await cleanupSpawned(daemonDir, spawnedPids);
     await rm(root, { recursive: true, force: true });
   }
 });
