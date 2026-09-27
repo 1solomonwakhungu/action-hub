@@ -24,7 +24,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
 import { fuzzEvidence } from "./parsers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -120,6 +120,7 @@ async function main() {
     root,
     repoRoot,
   });
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     fuzzRuns.push(
       await runFuzzer(isolatedEnv, [
@@ -135,7 +136,7 @@ async function main() {
       ], "http", runStamp),
     );
   } finally {
-    await killTree(serve.child, serve.exitP);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
   // Collect fuzzer output file names (paths recorded; contents stay in .generated).
@@ -147,6 +148,8 @@ async function main() {
     }
   }
 
+  // MIG2-R1 (ordering): fold every run row BEFORE summary.ok snapshots.
+  for (const r of fuzzRuns) foldCleanupVerdict(r, r.stepVerdict, `fuzz ${r.label}`);
   const summary = {
     script: "fuzz.mjs",
     tool: "mcp-fuzzer",
@@ -159,6 +162,7 @@ async function main() {
     durationMs: Date.now() - started,
     at: new Date().toISOString(),
   };
+  foldCleanupVerdict(summary, serveCleanup, "serve");
   await finish(summary);
 }
 
@@ -180,6 +184,8 @@ async function runFuzzer(env, args, label, runStamp) {
     stderr: res.stderrTail.slice(-3000),
     stdoutTail: res.stdoutTail.slice(-1500),
     spawnError: res.spawnError,
+    // MIG2-R1: the step verdict rides on the run row and is folded below.
+    stepVerdict: res,
   };
   // Strict evidence parse: positive tool count, not blocked, exit 0, no timeout.
   let report = null;

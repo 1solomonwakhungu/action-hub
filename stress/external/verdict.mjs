@@ -12,6 +12,11 @@ export function aggregateRuns(runs) {
   for (const run of runs) {
     if (run.exitCode !== 0 && run.exitCode !== undefined) {
       failures.push(`${run.label}: exitCode ${run.exitCode}`);
+    }
+    if (Array.isArray(run.cleanupFailures) && run.cleanupFailures.length > 0) {
+      // MIG2-R1: cleanup evidence is load-bearing at the aggregate too —
+      // a green workload with a failed teardown can never aggregate green.
+      failures.push(`${run.label}: cleanup: ${run.cleanupFailures.map((f) => f.problems.join("; ")).join(" | ").slice(0, 300)}`);
       continue;
     }
     if (run.requiresSummary) {

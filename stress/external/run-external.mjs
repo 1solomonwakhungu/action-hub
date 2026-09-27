@@ -34,7 +34,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { aggregateRuns } from "./verdict.mjs";
 import { buildIsolatedEnv, assertFinalEnv } from "./isolation.mjs";
-import { startServe, killTree, runTool } from "./serve.mjs";
+import { startServe, killTree, runTool, foldCleanupVerdict } from "./serve.mjs";
+import { main as libMain } from "../lib/harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
@@ -52,18 +53,16 @@ const hasFlag = (name) => process.argv.includes(name);
 // THIS run's credentials, not from a stale listener on a reused port.
 const token = `stress-external-${Date.now().toString(36)}-${process.pid}`;
 
-/** Prints the final summary (compact JSON, last stdout line) and exits. */
+/**
+ * MIG2: the summary contract is owned by the lib's main() — ONE durable
+ * write + ONE stdout JSON + exit code from the FINAL object. finish() just
+ * returns the runner's summary; the lib adds totalMs, guards the artifact
+ * write, and coordinates interrupts (SIGINT/SIGTERM) with the registry
+ * sweep so a mid-run signal kills every owned group and still emits exactly
+ * one ok:false summary (exit 143).
+ */
 async function finish(summary) {
-  await mkdir(resultsDir, { recursive: true }).catch(() => undefined);
-  try {
-    await writeFile(join(resultsDir, "external.json"), JSON.stringify(summary, null, 2) + "\n");
-  } catch (writeCause) {
-    // Contract: a run that cannot persist its artifact is not green.
-    summary.ok = false;
-    summary.artifactError = String(writeCause).slice(0, 200);
-  }
-  console.log(JSON.stringify(summary));
-  process.exit(summary.ok === true ? 0 : 1);
+  return summary;
 }
 
 async function main() {
@@ -88,6 +87,7 @@ async function main() {
   let skillsDir = null;
   let healthy = false;
 
+    let serveCleanup = null; // captured kill verdict — folded into ok (MIG2-R1)
   try {
     // 1. Fixture unless an external config is provided. The generator's own
     // summary is validated like every other step: unparsable output or a
@@ -111,6 +111,9 @@ async function main() {
         stdout: genRes.stdoutTail.trim().slice(-2000),
         stderr: genRes.stderrTail.slice(-2000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], genRes, "make-fixture");
       if (genSummary?.outDir) {
         configPath = resolve(genSummary.outDir, "servers.json");
         skillsDir = resolve(genSummary.outDir, "skills");
@@ -178,6 +181,11 @@ async function main() {
       stderr: smokeRes.stderrTail.slice(-2000),
     });
 
+    // MIG2-R1: the smoke step's cleanup verdict is LOAD-BEARING and folded
+    // IMMEDIATELY after its row — inside no conditional branch, so the
+    // default run folds it too (reviewer-1 ordering item).
+    foldCleanupVerdict(runs[runs.length - 1], smokeRes, "inspector-smoke");
+
     // 3b. k6 load (async, detached, group-killed on timeout).
     if (hasFlag("--k6")) {
       const profile = hasFlag("--k6-full") ? "full" : "quick";
@@ -210,6 +218,9 @@ async function main() {
         summary: k6Summary,
         stderr: k6Res.stderrTail.slice(-3000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], k6Res, "k6");
     }
 
     // 3c. mcp-fuzzer (python venv).
@@ -232,6 +243,9 @@ async function main() {
         summary: fSummary,
         stderr: fRes.stderrTail.slice(-2000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], fRes, "mcp-fuzzer");
     }
 
     // 3d. @hasmcp/mcp-spec-test (npx).
@@ -254,6 +268,9 @@ async function main() {
         summary: sSummary,
         stderr: sRes.stderrTail.slice(-2000),
       });
+      // MIG2-R1: the step's cleanup verdict is LOAD-BEARING — a green
+      // workload with a failed teardown fails this row.
+      foldCleanupVerdict(runs[runs.length - 1], sRes, "mcp-spec-test");
     }
   } catch (cause) {
     runs.push({
@@ -265,7 +282,7 @@ async function main() {
     });
   } finally {
     if (sampler) clearInterval(sampler);
-    if (serve) await killTree(serve.child, serve.exitP);
+    serveCleanup = serve ? await killTree(serve.handle) : null;
   }
 
   const verdict = aggregateRuns(runs);
@@ -284,16 +301,10 @@ async function main() {
     ok: healthy && verdict.ok,
     at: new Date().toISOString(),
   };
-  await finish(summary);
+  foldCleanupVerdict(summary, serveCleanup, "serve");
+  return finish(summary);
 }
 
-main().catch(async (cause) => {
-  const summary = {
-    script: "run-external.mjs",
-    ok: false,
-    failures: ["uncaught orchestrator exception"],
-    error: String(cause?.stack ?? cause).slice(-2000),
-    at: new Date().toISOString(),
-  };
-  await finish(summary);
-});
+// MIG2: the orchestration runs under the lib's main() — one guarded region,
+// one summary, interrupt-coordinated sweep of every owned group.
+await libMain(main, { resultsPath: join(resultsDir, "external.json") });

@@ -52,6 +52,21 @@ await main(async () => {
     const shared = [...ISOLATION_CHECKLIST].sort();
     assert.deepEqual(names, shared, "ISOLATION_VARS must derive exactly from test-isolation.mjs ISOLATION_CHECKLIST");
     const { root, env } = createSandbox({ prefix: "harness-check-drift-" });
+
+if (process.env["HC_DEBUG_DRAIN"]) {
+  // Drain proof harness (reviewer MIG2-R1 non-blocking item): after the final
+  // JSON, every handle must be gone — the process exits within milliseconds.
+  const handles = process._getActiveHandles();
+  console.error(`[drain-debug] active handles after final JSON: ${handles.length}`);
+  for (const h of handles) {
+    const kind = h?.constructor?.name;
+    const detail = kind === "Timeout" ? `idle=${h._idleTimeout} refd=${h.hasRef()}`
+      : kind === "Socket" ? `${h.remoteAddress ?? ""}:${h.remotePort ?? ""} refd=${h.hasRef()}`
+      : kind === "ChildProcess" ? `pid=${h.pid} exited=${h.exitCode}`
+      : "";
+    console.error(`[drain-debug] ${kind} ${detail}`);
+  }
+}
     rmSync(root, { recursive: true, force: true });
     for (const name of ISOLATION_CHECKLIST) {
       assert.ok(env[name], `buildIsolatedEnv must set ${name} from the shared checklist`);
@@ -916,10 +931,11 @@ ${hookBody}
           // Forced startup-failure control: the target must fail FAST and be
           // cleaned up (bounded), never hang the suite.
           const t0 = performance.now();
+          let raceTimer;
           const code = await Promise.race([
             exitWait,
-            new Promise((r) => setTimeout(() => r(null), 10_000)),
-          ]);
+            new Promise((r) => { raceTimer = setTimeout(() => r(null), 10_000); raceTimer.unref?.(); }),
+          ]).finally(() => clearTimeout(raceTimer));
           assert.notEqual(code, null, `a corrupt target must exit on its own (bounded), took ${Math.round(performance.now() - t0)}ms`);
           assert.notEqual(code, 0, "a corrupt target must not exit cleanly");
           return { corrupt: true, code, targetPid };
@@ -935,10 +951,11 @@ ${hookBody}
         // BOUNDED — a target that never exits cannot hang the suite.
         proc.kill("SIGTERM");
         const t0 = performance.now();
+        let raceTimer;
         const exit = await Promise.race([
           exitWait,
-          new Promise((r) => setTimeout(() => r(null), 30_000)),
-        ]);
+          new Promise((r) => { raceTimer = setTimeout(() => r(null), 30_000); raceTimer.unref?.(); }),
+        ]).finally(() => clearTimeout(raceTimer));
         assert.notEqual(exit, null, `target must exit after SIGTERM within 30s (waited ${Math.round(performance.now() - t0)}ms)`);
         const lines = stdoutText.split("\n").filter((l) => l.trim() !== "");
         let summary = null;
@@ -949,14 +966,22 @@ ${hookBody}
         // TERM the target, bounded awaited exit, KILL if still alive; kill
         // the detached pid by record. Never leak, never hang.
         try { process.kill(targetPid, "SIGTERM"); } catch { /* gone */ }
-        const gone = await Promise.race([exitWait, new Promise((r) => setTimeout(r, 2_000))]);
+        let finTimer;
+        const gone = await Promise.race([
+          exitWait,
+          new Promise((r) => { finTimer = setTimeout(() => r(undefined), 2_000); finTimer.unref?.(); }),
+        ]).finally(() => clearTimeout(finTimer));
         if (gone === null || gone === undefined) killHard(targetPid);
         if (detachedPid && aliveByProbe(detachedPid)) {
           killHard(detachedPid);
         } else if (detachedPid === null && existsSync(pidFile)) {
           try { killHard(Number(readFileSync(pidFile, "utf8").trim())); } catch { /* unreadable */ }
         }
-        await Promise.race([exitWait, new Promise((r) => setTimeout(r, 1_000))]);
+        let drainTimer;
+        await Promise.race([
+          exitWait,
+          new Promise((r) => { drainTimer = setTimeout(() => r(undefined), 1_000); drainTimer.unref?.(); }),
+        ]).finally(() => clearTimeout(drainTimer));
       }
     };
 
