@@ -78,9 +78,19 @@ export class SearchEngine {
     // synonym noise can never demote the exact match.
     const literalTokens = tokenize(query).filter((term) => !QUERY_STOPWORDS.has(term));
     const literalKey = literalTokens.join(" ");
+    // Symmetric comparison (SQ2-R4 review): BOTH sides are filtered with the
+    // same QUERY_STOPWORDS. Filtering only the query side made a stopword-
+    // bearing exact name ("delete the user") never equal its own query
+    // ("delete user"), so the short-circuit was missed and synonym noise
+    // ("remove ...") could demote the exact match.
     const exactNameHit =
       literalTokens.length > 0 &&
-      candidates.some((record) => tokenize(record.name).join(" ") === literalKey);
+      candidates.some(
+        (record) =>
+          tokenize(record.name)
+            .filter((term) => !QUERY_STOPWORDS.has(term))
+            .join(" ") === literalKey,
+      );
     const { terms, literalCount } = expandQuery(
       query,
       tokenize,
