@@ -170,9 +170,10 @@ export interface SearchOptions {
   includeSchema?: boolean;
   /**
    * Optional relative cutoff: drop hits whose score is below
-   * `minScoreRatio * bestScore` (ratio clamped to (0, 1]). Off by default;
-   * enable when the retrieval eval shows fewer no-match false positives
-   * without a recall regression.
+   * `minScoreRatio * bestScore`. Valid range is (0, 1]; values outside it —
+   * non-finite, zero, negative, or above 1 — are **ignored** (no cutoff is
+   * applied), not clamped. Off by default; enable when the retrieval eval
+   * shows fewer no-match false positives without a recall regression.
    */
   minScoreRatio?: number;
 }

@@ -212,7 +212,7 @@ Budgets verified against real harnesses at fleet scale
 
 | Harness | MCP startup budget | Source |
 | --- | --- | --- |
-| pi (pi-mcp-adapter) | **30 s** adapter wait budget (`INIT_WAIT_TIMEOUT_MS`, an `awaitWithTimeout` around initialization — it returns `init_timeout` while initialization keeps running; it is **not** a spawn kill) | [pi-mcp-adapter on npm](https://www.npmjs.com/package/pi-mcp-adapter) (`index.ts:30`) |
+| pi (pi-mcp-adapter) | **30 s** adapter wait budget (`INIT_WAIT_TIMEOUT_MS`, an `awaitWithTimeout` around initialization — it returns `init_timeout` while initialization keeps running; it is **not** a spawn kill) | [pi-mcp-adapter `index.ts` (pinned v3.0.0)](https://github.com/nicobailon/pi-mcp-adapter/blob/v3.0.0/index.ts#L56) (`INIT_WAIT_TIMEOUT_MS = 30_000`) |
 | Codex | **30 s** spawn-kill deadline (`DEFAULT_STARTUP_TIMEOUT`) | [openai/codex `rust-v0.154.0`](https://github.com/openai/codex/blob/6b9826e3aa83b1a5947db50f4332cb9c65f1b340/codex-rs/codex-mcp/src/rmcp_client.rs#L102) (`codex-rs/codex-mcp/src/rmcp_client.rs:102`); the 1.1 s constant is `DEFAULT_OPTIONAL_MCP_STARTUP_GRACE`, not a spawn kill |
 
 Startup measurements at 15K actions:
@@ -333,15 +333,25 @@ the same way — the response gives you no confidence signal by itself.
 ## Raw MCP clients
 
 If you hand-roll an MCP client instead of using an SDK, three framing
-details matter. Malformed frames are rejected explicitly, not silently:
-HTTP answers `400` with JSON-RPC `-32700` ("Parse error: Invalid JSON-RPC
-message") for payloads that are not valid JSON-RPC requests.
+details matter. Malformed-frame behavior is transport-specific (verified
+against the running server, both transports):
+
+- **Body is not valid JSON at all (HTTP):** the HTTP layer answers `400`
+  with a plain `{ "error": "Invalid JSON body" }` — the payload never
+  reaches the JSON-RPC layer, so there is no `-32700` envelope.
+- **Valid JSON that is not a JSON-RPC message (HTTP):** e.g. a top-level
+  `arguments` object — answered `400` with a JSON-RPC error envelope:
+  `{ "code": -32700, "message": "Parse error: Invalid JSON-RPC message" }`
+  (`id: null`). Over **stdio**, the same frame is silently dropped: no
+  response is written and the session continues.
 
 1. **Request payloads live under `params`, not `arguments`.** A tool call
    is `{ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
    "name": "action_hub", "arguments": { "operation": "search", "query":
-   "deploy" } } }`. A top-level `arguments` key is not a valid JSON-RPC
-   `params` member and the request is rejected as invalid params.
+   "deploy" } } }`. A top-level `arguments` key is rejected as a parse
+   error (see above), not `-32602 invalid params`; `-32602` is reserved for
+   well-formed requests whose `params` do not validate (e.g. `tools/list`
+   with a `cursor`, below).
 2. **Send the `initialized` notification before any other request.** After
    the `initialize` response, send `{ "jsonrpc": "2.0", "method":
    "notifications/initialized" }` (no `id`), then call tools. The SDK
