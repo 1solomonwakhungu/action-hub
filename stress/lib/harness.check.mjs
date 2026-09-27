@@ -631,6 +631,37 @@ await main(async () => {
     }
   }
 
+  // --- 8g. builder-5 adoption: spawnGroup stdio passthrough -----------------
+  {
+    const { root, env } = createSandbox({ prefix: "harness-check-stdio-" });
+    try {
+      // bench-load's stdio MCP hub needs a PIPED stdin; the default stays
+      // ['ignore','pipe','pipe']. Piped-stdin handles must still register,
+      // exchange data, and die through the normal ladder.
+      const h = spawnGroup(process.execPath, ["-e",
+        `let buf=''; process.stdin.on('data', (c) => { buf += c; if (buf.includes('ping')) process.stdout.write('pong'); }); setInterval(() => {}, 500);`],
+        { env, cwd: root, stdio: ["pipe", "pipe", "pipe"] });
+      assert.ok(registeredGroups().includes(h.pgid), "custom-stdio handle must auto-register");
+      h.child.stdin.write("ping");
+      const pong = await new Promise((resolveP) => {
+        let out = "";
+        h.stdout.on("data", (c) => { out += c; if (out.includes("pong")) resolveP(true); });
+        setTimeout(() => resolveP(false), 3_000);
+      });
+      assert.equal(pong, true, "piped stdin must reach the child (ping/pong)");
+      const killed = await killGroupAndVerify(h, { termGraceMs: 1_000, killDeadlineMs: 2_000 });
+      assert.equal(killed.groupEmpty, true, "custom-stdio group must die through the normal ladder");
+      assert.ok(!registeredGroups().includes(h.pgid));
+      // Default stdio unchanged: spawnGroup without the option still pipes stdout.
+      const h2 = spawnGroup(process.execPath, ["-e", "console.log('default-stdio')"], { env, cwd: root });
+      const exited = await h2.exited;
+      assert.equal(exited.code, 0);
+      checks.push({ check: "spawnGroup-stdio-passthrough", ok: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
   return { checks, suite: "harness.check" };
 }, { resultsPath: RESULTS_PATH });
 

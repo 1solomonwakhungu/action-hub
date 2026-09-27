@@ -569,13 +569,13 @@ function enumerateGroupPids(pgid) {
  * After an interrupt has been received, spawnGroup REFUSES (FatalError):
  * main() has promised to stop starting work.
  */
-export function spawnGroup(cmd, args, { env, cwd } = {}) {
+export function spawnGroup(cmd, args, { env, cwd, stdio = ["ignore", "pipe", "pipe"] } = {}) {
   if (interruptReceived) {
     throw new FatalError("interrupt received; refusing to start new group work");
   }
   let child;
   try {
-    child = spawn(cmd, args, { env, cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    child = spawn(cmd, args, { env, cwd, stdio, detached: true });
   } catch (err) {
     const failed = issueHandle({
       pid: null,
