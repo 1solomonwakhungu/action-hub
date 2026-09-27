@@ -38,8 +38,10 @@ export const WRAPPER_MODE = "__wrapper-run";
 function runningAsSea(): boolean {
   try {
     // node:sea exists only from Node 20.12; the declared floor is 20.11, so
-    // the import must stay best-effort (never a static module load).
-    const sea = createRequire(import.meta.url)("node:sea") as { isSea(): boolean } | undefined;
+    // the resolution must stay best-effort (never a static module import).
+    // process.execPath is always absolute and valid, unlike the bundler-shimmed
+    // import.meta.url / relative argv[1] inside a SEA binary.
+    const sea = createRequire(process.execPath)("node:sea") as { isSea(): boolean } | undefined;
     return Boolean(sea?.isSea());
   } catch {
     return false;
