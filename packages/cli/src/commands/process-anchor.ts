@@ -1,227 +1,246 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
+import { isSea } from "node:sea";
 import { platform } from "node:os";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 /**
- * Anchored process-group supervision (F39/F39b).
- *
- * Problem: POSIX process groups are identified by the leader's PID. Once the
- * leader exits and is reaped, that PGID can be REUSED by an unrelated group,
- * so any signal sent to `-PGID` after the leader died can hit innocent
- * processes (observed: verification runners were SIGTERMed). Signalling is
- * only provably safe while a member of OUR group — ideally the leader we
- * spawned ourselves — is still alive.
- *
- * Design:
- *  - The CLI/doctor spawns the ANCHOR (detached where we control the spawn).
- *  - The anchor spawns the WRAPPER detached, so the WRAPPER is ALWAYS a fresh
- *    process-group leader whose PGID cannot be reused while it lives.
- *  - The wrapper spawns the real server NON-detached inside its group,
- *    relays stdio, ignores SIGTERM, and never exits on its own: it stays
- *    alive as the living proof that the PGID is ours until the final
- *    group SIGKILL (which includes the wrapper itself).
- *  - EVERY group signal is gated: `kill(wrapperPid, 0)` must succeed
- *    immediately before `kill(-wrapperPid, sig)`. No group signal is ever
- *    sent after the wrapper died. No polling loops re-signal groups.
- *  - The wrapper reports the server's exit to the anchor over fd 3
- *    ("EXIT:<code>"); the anchor then runs the kill sequence and exits with
- *    the server's code.
- *  - The HOST holds the anchor's PID directly (its own ChildProcess, or the
- *    transport child captured at spawn). There is NO disk PID metadata: the
- *    untrusted server can never see or forge control state. Host teardown
- *    only ever signals the anchor (single-PID, always safe) and lets the
- *    anchor do the gated group work it can prove from inside. If the anchor
- *    is unexpectedly dead, the host FAILS CLOSED and reports — it never
- *    signals a group it cannot prove is its own.
+ * This CLI's own entry path (dist/index.js under node, the binary itself
+ * inside a SEA single-file build). Module-derived — argv[1] is unreliable for
+ * embedded/library callers (e.g. in-process tests).
  */
-
-const KILLER_REQUIRED = false; // no detached killer needed: gated signals only
-
-const WRAPPER_SRC = `
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const command = process.argv[1];
-const serverArgs = process.argv.slice(2);
-if (!command) process.exit(2);
-// The wrapper is the group leader and must stay alive (anchoring the PGID)
-// until the anchor SIGKILLs the whole group. SIGTERM is ignored on purpose.
-process.on("SIGTERM", () => {});
-// SECURITY (PR 77 rework): the server is untrusted and must never see host
-// control metadata. Strip every ANCHOR_* variable from its environment.
-const serverEnv = { ...process.env };
-for (const key of Object.keys(serverEnv)) {
-  if (key.startsWith("ANCHOR_")) delete serverEnv[key];
+function selfEntryPath(): string {
+  // ESM dist build (in-repo and tests): this module is dist/commands/process-anchor.js.
+  try {
+    const here = fileURLToPath(import.meta.url);
+    if (here && here.endsWith("process-anchor.js")) {
+      return resolve(dirname(here), "..", "index.js");
+    }
+  } catch {}
+  // CJS bundle (SEA): __filename is the bundle script path; inside a SEA
+  // build it is the binary path itself. Eval keeps bundlers from renaming it.
+  try {
+    const fn = (0, eval)("typeof __filename !== 'undefined' ? __filename : undefined") as string | undefined;
+    if (typeof fn === "string") {
+      if (resolve(fn) === resolve(process.execPath)) return process.execPath;
+      return resolve(dirname(fn), "..", "index.js");
+    }
+  } catch {}
+  // Last resort: the running CLI was invoked as the main module.
+  return process.argv[1] ?? process.execPath;
 }
-const server = spawn(command, serverArgs, {
-  stdio: ["pipe", "pipe", "pipe"],
-  env: serverEnv,
-  cwd: process.cwd(),
-});
-const report = (line) => { try { fs.writeSync(3, line + "\\n"); } catch {} };
-const swallow = (fn) => () => { try { fn(); } catch {} };
-process.stdin.on("data", (chunk) => { try { server.stdin.write(chunk); } catch {} });
-process.stdin.on("end", swallow(() => server.stdin.end()));
-process.stdin.on("error", () => {});
-server.stdin.on("error", () => {});
-server.stdout.on("data", (chunk) => { try { fs.writeSync(1, chunk); } catch {} });
-server.stderr.on("data", (chunk) => { try { fs.writeSync(2, chunk); } catch {} });
-server.stdout.on("error", () => {});
-server.stderr.on("error", () => {});
-server.on("error", () => report("EXIT:1"));
-server.on("exit", (code) => report("EXIT:" + (code === null ? "signal" : code)));
-// Never exit on our own: only the anchor's group SIGKILL ends us.
-setInterval(() => {}, 60000);
-`;
 
-export const ANCHOR_SRC = `
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const isWin = process.platform === "win32";
-const mode = process.argv[1];
-const command = process.argv[2];
-const serverArgs = process.argv.slice(3);
-if (!command) process.exit(2);
-const stdoutDeadlineMs = Number(process.env["ANCHOR_STDOUT_DEADLINE_MS"] || 0);
-const relayStdin = mode === "doctor";
-let sawStdout = false;
-let killStarted = false;
-let serverExitCode = null;
-let serverSignalled = false;
-let escalated = false;
-let wrapperDiedUnexpectedly = false;
-// The anchor may receive SIGTERM from its host (bounded teardown): run the
-// cleanup sequence, then exit. It is NOT a member of the wrapper's group.
-process.on("SIGTERM", () => { startKillSequence("host-sigterm"); });
-process.on("SIGINT", () => { startKillSequence("host-sigint"); });
-const wrapperAlive = () => {
-  try { process.kill(wrapper.pid, 0); return true; } catch { return false; }
-};
-// Gated group signal: provably safe because the wrapper (the group's leader)
-// is verified alive immediately beforehand, so the PGID cannot have been
-// reused. Never called after the wrapper died.
-const signalGroup = (signal) => {
-  if (isWin) { try { wrapper.kill("SIGKILL"); } catch {} return; }
-  if (!wrapperAlive()) return false;
-  try { process.kill(-wrapper.pid, signal); } catch {}
-  return true;
-};
-// Teardown PROOF protocol: the anchor exits 0 only after VERIFIED cleanup
-// (the wrapper group is proven empty); any other exit code reports failure
-// to the host, which holds this exact ChildProcess and fails closed.
-const EXIT_PROVEN = 0;
-const EXIT_FAILED = 3;
-const startKillSequence = (why) => {
-  if (killStarted) return;
-  killStarted = true;
-  // An unexpected wrapper death means the group state is unverifiable —
-  // there is no reuse-safe way to signal a dead leader's group. Never
-  // convert it into proof.
-  if (wrapperDiedUnexpectedly) {
-    finalize(false);
-    return;
+export const ANCHOR_MODE = "__anchor-run";
+export const WRAPPER_MODE = "__wrapper-run";
+
+/** True when this process runs inside a SEA single-file binary. */
+function runningAsSea(): boolean {
+  try {
+    return isSea();
+  } catch {
+    return false;
   }
-  if (isWin) {
-    // child.kill is NOT a tree kill on Windows and the wrapper is not a
-    // group leader there: taskkill /T /F the wrapper tree, await it, verify
-    // the wrapper is gone, then exit with the proof code. The taskkill is
-    // OUR kill: a wrapper exit from here is expected, not unexpected.
-    escalated = true;
-    const tk = spawn("taskkill", ["/pid", String(wrapper.pid), "/T", "/F"], { stdio: "ignore" });
-    const done = () => {
-      if (tk.exitCode === 0 && !wrapperAlive()) finalize(true);
-      else finalize(false);
-    };
-    tk.on("exit", done);
-    tk.on("error", () => { try { wrapper.kill("SIGKILL"); } catch {} finalize(false); });
-    return;
-  }
-  signalGroup("SIGTERM");
-  const escalate = setTimeout(() => {
-    escalated = true;
-    signalGroup("SIGKILL");
-    // Verify before claiming success: the wrapper must die BY OUR SIGKILL
-    // (wrapperDied after escalation) — poll bounded.
-    const verifyDeadline = Date.now() + 2000;
-    const verify = setInterval(() => {
-      if (wrapperDiedUnexpectedly) {
-        clearInterval(verify);
-        finalize(false);
-      } else if (!wrapperAlive()) {
-        clearInterval(verify);
-        finalize(true);
-      } else if (Date.now() > verifyDeadline) {
-        clearInterval(verify);
-        finalize(false);
-      }
-    }, 50);
-  }, 150);
-  // Ref'd on purpose: the anchor must stay alive to escalate, verify and exit.
-  escalate.unref?.();
-};
-const finalize = (proven) => {
-  process.exit(proven ? EXIT_PROVEN : EXIT_FAILED);
-};
-const wrapper = spawn(process.execPath, ["-e", ${JSON.stringify(WRAPPER_SRC)}, command, ...serverArgs], {
-  detached: !isWin,
-  stdio: relayStdin ? ["pipe", "pipe", "pipe", "pipe"] : ["ignore", "inherit", "inherit", "pipe"],
-  env: process.env,
-  cwd: process.cwd(),
-});
-wrapper.on("error", () => { startKillSequence("wrapper-error"); });
-wrapper.once("exit", () => {
-  // The wrapper must never exit on its own. If it dies before OUR group
-  // SIGKILL (or taskkill) was sent, the group state is unverifiable —
-  // report failure (the host fails closed); never convert it into proof.
-  if (!escalated) {
-    wrapperDiedUnexpectedly = true;
-    startKillSequence("wrapper-external-exit");
-  }
-});
-wrapper.once("error", () => {
-  if (!escalated) {
-    wrapperDiedUnexpectedly = true;
-    startKillSequence("wrapper-error");
-  }
-});
-if (relayStdin) {
-  process.stdin.on("data", (chunk) => { try { wrapper.stdin.write(chunk); } catch {} });
-  process.stdin.on("end", () => { startKillSequence("stdin-end"); });
-  process.stdin.on("error", () => { startKillSequence("stdin-error"); });
-  wrapper.stdin.on("error", () => {});
-  wrapper.stdout.on("data", (chunk) => { sawStdout = true; process.stdout.write(chunk); });
-  wrapper.stderr.on("data", (chunk) => process.stderr.write(chunk));
-  wrapper.stdout.on("error", () => {});
-  wrapper.stderr.on("error", () => {});
-} else {
-  wrapper.stdout?.on?.("error", () => {});
-  wrapper.stderr?.on?.("error", () => {});
 }
-if (stdoutDeadlineMs > 0) {
-  const t = setTimeout(() => { if (!sawStdout) startKillSequence("stdout-deadline"); }, stdoutDeadlineMs);
-  t.unref?.();
+
+/**
+ * Args to re-invoke THIS CLI so it dispatches to `mode`. Under plain node the
+ * interpreter needs the script path first; a SEA binary reserves argv[1] for
+ * itself, so user args begin there directly.
+ */
+function hostArgs(mode: string, rest: string[]): string[] {
+  return runningAsSea() ? [mode, ...rest] : [selfEntryPath(), mode, ...rest];
 }
-const reportFd = wrapper.stdio[3];
-if (reportFd && typeof reportFd.on === "function") {
-  let buffered = "";
-  reportFd.on("data", (chunk) => {
-    buffered += chunk.toString("utf8");
-    let idx;
-    while ((idx = buffered.indexOf("\\n")) >= 0) {
-      const line = buffered.slice(0, idx).trim();
-      buffered = buffered.slice(idx + 1);
-      if (line.startsWith("EXIT:")) {
-        const raw = line.slice(5);
-        const parsed = Number.parseInt(raw, 10);
-        serverExitCode = Number.isSafeInteger(parsed) ? parsed : null;
-        serverSignalled = raw === "signal";
-        startKillSequence("server-exit");
-      }
+
+/** How the host re-invokes this CLI to run an internal anchor mode. */
+export function anchorSpawnArgs(
+  mode: "daemon" | "doctor",
+  command: string,
+  serverArgs: string[],
+): string[] {
+  return hostArgs(ANCHOR_MODE, [mode, command, ...serverArgs]);
+}
+
+/**
+ * WRAPPER process (runs as `this-cli __wrapper-run <command> <serverArgs...>`).
+ * Ported verbatim from the previous `-e` wrapper script: the wrapper is the
+ * group leader and must stay alive (anchoring the PGID) until the anchor
+ * SIGKILLs the whole group; it relays stdio and reports the server's exit to
+ * the anchor over fd 3.
+ */
+export function runWrapperProcess(argvTail: string[]): void {
+  const command = argvTail[0];
+  const serverArgs = argvTail.slice(1);
+  if (!command) process.exit(2);
+  // The wrapper is the group leader and must stay alive (anchoring the PGID)
+  // until the anchor SIGKILLs the whole group. SIGTERM is ignored on purpose.
+  process.on("SIGTERM", () => {});
+  // SECURITY (PR 77 rework): the server is untrusted and must never see host
+  // control metadata. Strip every ANCHOR_* variable from its environment.
+  const serverEnv: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(serverEnv)) {
+    if (key.startsWith("ANCHOR_")) delete serverEnv[key];
+  }
+  const server = spawn(command, serverArgs, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: serverEnv,
+    cwd: process.cwd(),
+  });
+  const report = (line: string) => { try { fs.writeSync(3, line + "\n"); } catch {} };
+  const swallow = (fn: () => void) => () => { try { fn(); } catch {} };
+  process.stdin.on("data", (chunk) => { try { server.stdin!.write(chunk); } catch {} });
+  process.stdin.on("end", swallow(() => server.stdin!.end()));
+  process.stdin.on("error", () => {});
+  server.stdin!.on("error", () => {});
+  server.stdout!.on("data", (chunk) => { try { fs.writeSync(1, chunk); } catch {} });
+  server.stderr!.on("data", (chunk) => { try { fs.writeSync(2, chunk); } catch {} });
+  server.stdout!.on("error", () => {});
+  server.stderr!.on("error", () => {});
+  server.on("error", () => report("EXIT:1"));
+  server.on("exit", (code) => report("EXIT:" + (code === null ? "signal" : code)));
+  // Never exit on our own: only the anchor's group SIGKILL ends us.
+  setInterval(() => {}, 60000);
+}
+
+/**
+ * ANCHOR process (runs as `this-cli __anchor-run <mode> <command> <serverArgs...>`).
+ * Ported verbatim from the previous `-e` anchor script, including the
+ * teardown PROOF protocol: the anchor exits 0 (EXIT_PROVEN) only after
+ * VERIFIED cleanup, anything else (EXIT_FAILED) fails the host closed.
+ */
+export function runAnchorProcess(argvTail: string[]): void {
+  const isWin = process.platform === "win32";
+  const mode = argvTail[0] as "daemon" | "doctor";
+  const command = argvTail[1];
+  const serverArgs = argvTail.slice(2);
+  if (!command) process.exit(2);
+  const stdoutDeadlineMs = Number(process.env["ANCHOR_STDOUT_DEADLINE_MS"] || 0);
+  const relayStdin = mode === "doctor";
+  let sawStdout = false;
+  let killStarted = false;
+  let escalated = false;
+  let wrapperDiedUnexpectedly = false;
+  // The anchor may receive SIGTERM from its host (bounded teardown): run the
+  // cleanup sequence, then exit. It is NOT a member of the wrapper's group.
+  process.on("SIGTERM", () => { startKillSequence("host-sigterm"); });
+  process.on("SIGINT", () => { startKillSequence("host-sigint"); });
+  const wrapperAlive = () => {
+    try { process.kill(wrapper.pid!, 0); return true; } catch { return false; }
+  };
+  // Gated group signal: provably safe because the wrapper (the group's leader)
+  // is verified alive immediately beforehand, so the PGID cannot have been
+  // reused. Never called after the wrapper died.
+  const signalGroup = (signal: NodeJS.Signals) => {
+    if (isWin) { try { wrapper.kill("SIGKILL"); } catch {} return; }
+    if (!wrapperAlive()) return;
+    try { process.kill(-(wrapper.pid as number), signal); } catch {}
+  };
+  const startKillSequence = (why: string) => {
+    if (killStarted) return;
+    killStarted = true;
+    // An unexpected wrapper death means the group state is unverifiable —
+    // there is no reuse-safe way to signal a dead leader's group. Never
+    // convert it into proof.
+    if (wrapperDiedUnexpectedly) {
+      finalize(false);
+      return;
+    }
+    if (isWin) {
+      // child.kill is NOT a tree kill on Windows and the wrapper is not a
+      // group leader there: taskkill /T /F the wrapper tree, await it, verify
+      // the wrapper is gone, then exit with the proof code. The taskkill is
+      // OUR kill: a wrapper exit from here is expected, not unexpected.
+      escalated = true;
+      const tk = spawn("taskkill", ["/pid", String(wrapper.pid), "/T", "/F"], { stdio: "ignore" });
+      const done = () => {
+        if (tk.exitCode === 0 && !wrapperAlive()) finalize(true);
+        else finalize(false);
+      };
+      tk.on("exit", done);
+      tk.on("error", () => { try { wrapper.kill("SIGKILL"); } catch {} finalize(false); });
+      return;
+    }
+    signalGroup("SIGTERM");
+    const escalate = setTimeout(() => {
+      escalated = true;
+      signalGroup("SIGKILL");
+      // Verify before claiming success: the wrapper must die BY OUR SIGKILL
+      // (wrapperDied after escalation) — poll bounded.
+      const verifyDeadline = Date.now() + 2000;
+      const verify = setInterval(() => {
+        if (wrapperDiedUnexpectedly) {
+          clearInterval(verify);
+          finalize(false);
+        } else if (!wrapperAlive()) {
+          clearInterval(verify);
+          finalize(true);
+        } else if (Date.now() > verifyDeadline) {
+          clearInterval(verify);
+          finalize(false);
+        }
+      }, 50);
+    }, 150);
+    // Ref'd on purpose: the anchor must stay alive to escalate, verify and exit.
+    escalate.unref?.();
+  };
+  const finalize = (proven: boolean) => {
+    process.exit(proven ? EXIT_PROVEN : EXIT_FAILED);
+  };
+  // The wrapper is ALSO this CLI re-invoking itself (zero external deps, safe
+  // inside the SEA binary), spawned detached so it is ALWAYS a fresh
+  // process-group leader whose PGID cannot be reused while it lives.
+  const wrapper = spawn(process.execPath, hostArgs(WRAPPER_MODE, [command, ...serverArgs]), {
+    detached: !isWin,
+    stdio: relayStdin ? ["pipe", "pipe", "pipe", "pipe"] : ["ignore", "inherit", "inherit", "pipe"],
+    env: process.env,
+    cwd: process.cwd(),
+  });
+  wrapper.on("error", () => { startKillSequence("wrapper-error"); });
+  wrapper.once("exit", () => {
+    // The wrapper must never exit on its own. If it dies before OUR group
+    // SIGKILL (or taskkill) was sent, the group state is unverifiable —
+    // report failure (the host fails closed); never convert it into proof.
+    if (!escalated) {
+      wrapperDiedUnexpectedly = true;
+      startKillSequence("wrapper-external-exit");
     }
   });
-  reportFd.on("error", () => {});
+  if (relayStdin) {
+    process.stdin.on("data", (chunk) => { try { wrapper.stdin!.write(chunk); } catch {} });
+    process.stdin.on("end", () => { startKillSequence("stdin-end"); });
+    process.stdin.on("error", () => { startKillSequence("stdin-error"); });
+    wrapper.stdin!.on("error", () => {});
+    wrapper.stdout!.on("data", (chunk) => { sawStdout = true; process.stdout.write(chunk); });
+    wrapper.stderr!.on("data", (chunk) => process.stderr.write(chunk));
+    wrapper.stdout!.on("error", () => {});
+    wrapper.stderr!.on("error", () => {});
+  } else {
+    wrapper.stdout?.on?.("error", () => {});
+    wrapper.stderr?.on?.("error", () => {});
+  }
+  if (stdoutDeadlineMs > 0) {
+    const t = setTimeout(() => { if (!sawStdout) startKillSequence("stdout-deadline"); }, stdoutDeadlineMs);
+    t.unref?.();
+  }
+  const reportFd = wrapper.stdio![3];
+  if (reportFd && typeof (reportFd as import("node:stream").Readable).on === "function") {
+    let buffered = "";
+    (reportFd as import("node:stream").Readable).on("data", (chunk: Buffer) => {
+      buffered += chunk.toString("utf8");
+      let idx;
+      while ((idx = buffered.indexOf("\n")) >= 0) {
+        const line = buffered.slice(0, idx).trim();
+        buffered = buffered.slice(idx + 1);
+        if (line.startsWith("EXIT:")) {
+          startKillSequence("server-exit");
+        }
+      }
+    });
+    (reportFd as import("node:stream").Readable).on("error", () => {});
+  }
+  // Keep the anchor alive while the wrapper lives; finalize() exits explicitly.
+  setInterval(() => {}, 60000);
 }
-// Keep the anchor alive while the wrapper lives; finalize() exits explicitly.
-setInterval(() => {}, 60000);
-`.replace("${JSON.stringify(WRAPPER_SRC)}", "'\" + JSON.stringify(WRAPPER_SRC) + \"'");
 
 export interface TeardownResult {
   /** PIDs that are still alive after teardown. Empty = all dead. */
@@ -301,26 +320,7 @@ export async function teardownAnchorChild(
 }
 
 /** Bounded spawn of the anchor used by hosts. Returns the child. */
-/**
- * The interpreter that runs `-e` anchor/wrapper scripts. Under a SEA binary
- * (dist-bin single-file build) process.execPath is the SEA binary itself,
- * which rejects `-e` — the anchor and wrapper must run under real node.
- */
-function anchorInterpreter(command: string): { node: string; args: string[] } {
-  let sea = false;
-  try {
-    // node:sea exists on Node >= 20.12; isSea() is true inside SEA binaries.
-    sea = (require("node:sea") as { isSea(): boolean }).isSea();
-  } catch {
-    sea = false;
-  }
-  if (!sea) return { node: process.execPath, args: [] };
-  // Inside a SEA binary the bundled node runtime is not addressable; run the
-  // anchor scripts under a real node from PATH (or an explicit override).
-  const override = process.env["ACTION_HUB_NODE_BIN"];
-  return { node: override && override.trim() ? override : "node", args: [] };
-}
-
+/** Bounded spawn of the anchor used by hosts. Returns the child. */
 export function spawnAnchor(
   mode: "daemon" | "doctor",
   command: string,
@@ -329,13 +329,12 @@ export function spawnAnchor(
 ): ChildProcess {
   const env = { ...options.env };
   if (options.stdoutDeadlineMs) env["ANCHOR_STDOUT_DEADLINE_MS"] = String(options.stdoutDeadlineMs);
-  const { node } = anchorInterpreter(command);
-  return spawn(node, ["-e", ANCHOR_SRC, mode, command, ...args], {
+  // The anchor is THIS CLI re-invoking itself with a hidden internal mode —
+  // no external interpreter is required, so the standalone SEA binary keeps
+  // its zero-dependency contract (docs/releasing.md).
+  return spawn(process.execPath, hostArgs(ANCHOR_MODE, [mode, command, ...args]), {
     detached: options.detached,
     stdio: options.stdio,
     env,
   });
 }
-
-// Silence unused warnings for optional knobs kept for clarity.
-void KILLER_REQUIRED;
