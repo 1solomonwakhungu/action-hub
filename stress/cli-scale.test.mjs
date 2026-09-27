@@ -5,7 +5,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +64,7 @@ test("small-scale fixtures have the expected shape (contract formats)", () => {
 
 test("inline fake stdio server answers initialize and tools/list", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cli-scale-t4-"));
+  let child = null;
   try {
     const manifest = {
       serverId: "test-server",
@@ -76,7 +77,7 @@ test("inline fake stdio server answers initialize and tools/list", async () => {
     writeFileSync(manifestPath, JSON.stringify(manifest));
     writeFileSync(serverPath, FAKE_STDIO_SERVER);
 
-    const child = spawn(process.execPath, [serverPath, "--manifest", manifestPath], { stdio: ["pipe", "pipe", "pipe"] });
+    child = spawn(process.execPath, [serverPath, "--manifest", manifestPath], { stdio: ["pipe", "pipe", "pipe"] });
     let buf = "";
     const responses = [];
     child.stdout.setEncoding("utf8");
@@ -99,13 +100,31 @@ test("inline fake stdio server answers initialize and tools/list", async () => {
         if (responses.length >= 2) { clearInterval(poll); clearTimeout(timer); resolve(); }
       }, 25);
     });
-    child.kill();
     assert.equal(responses[0].id, 1);
     assert.equal(responses[0].result.protocolVersion, "2025-06-18");
     assert.equal(responses[0].result.serverInfo.name, "test-server");
     assert.equal(responses[1].id, 2);
     assert.equal(responses[1].result.tools[0].name, "do_thing");
   } finally {
+    // S8-R6 (S8-R5 blocker 3): the child's open stdio pipes kept the test
+    // process alive (the reported 7.5h hang). Kill ONLY this pid, await its
+    // close with a bounded SIGKILL escalation, and destroy every stream.
+    if (child) {
+      try { child.stdin?.end(); } catch { /* already closed */ }
+      if (child.exitCode === null && !child.killed) {
+        try { child.kill("SIGTERM"); } catch { /* already dead */ }
+      }
+      const closed = new Promise((resolveClose) => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolveClose();
+        child.once("close", resolveClose);
+        setTimeout(() => {
+          try { child.kill("SIGKILL"); } catch { /* already dead */ }
+          child.once("close", resolveClose);
+        }, 2000);
+      });
+      await closed;
+      try { child.stdout?.destroy(); child.stderr?.destroy(); } catch { /* noop */ }
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -160,17 +179,17 @@ test("isolation: every path-bearing var is pinned inside the sandbox home", () =
   }
 });
 
-test("spawnStep: ok child, failing child and timeout all normalize", { timeout: 20_000 }, () => {
-  const ok = spawnStep([process.execPath, "-e", "process.exit(0)"], { timeoutMs: 10_000 });
+test("spawnStep: ok child, failing child and timeout all normalize", { timeout: 20_000 }, async () => {
+  const ok = await spawnStep([process.execPath, "-e", "process.exit(0)"], { timeoutMs: 10_000 });
   assert.equal(ok.ok, true);
   assert.equal(ok.exit, 0);
 
-  const fail = spawnStep([process.execPath, "-e", "console.log('boom'); process.exit(3)"], { timeoutMs: 10_000 });
+  const fail = await spawnStep([process.execPath, "-e", "console.log('boom'); process.exit(3)"], { timeoutMs: 10_000 });
   assert.equal(fail.ok, false);
   assert.equal(fail.exit, 3);
   assert.ok(fail.stdout.includes("boom"));
 
-  const slow = spawnStep([process.execPath, "-e", "setTimeout(() => {}, 60_000)"], { timeoutMs: 300 });
+  const slow = await spawnStep([process.execPath, "-e", "setTimeout(() => {}, 60_000)"], { timeoutMs: 300 });
   assert.equal(slow.ok, false);
   assert.ok(slow.error, "timeout must produce an error field");
 });
@@ -230,11 +249,14 @@ test("setup error (--scale bogus): nonzero exit and last stdout line is the JSON
   });
   assert.equal(r.status, 1, "setup failure must exit nonzero");
   const lines = (r.stdout ?? "").split("\n").filter((l) => l.trim().length > 0);
-  assert.ok(lines.length > 0, "a summary must still be printed");
+  assert.equal(lines.length, 1, "exactly one stdout line: the JSON summary");
   const summary = JSON.parse(lines[lines.length - 1]); // last stdout line IS the summary
   assert.equal(summary.ok, false);
-  assert.equal(summary.scale, "bogus");
+  // S8-R6: the failure summary comes from the shared harness finish path —
+  // the preflight failure happens before emitSummary, so there is no scale
+  // field, just the reserved ok/error contract.
   assert.ok(summary.error, "summary must carry the error");
+  assert.match(String(summary.error), /Unknown --scale value/);
 });
 
 test("invalid seed: fails loudly with a final summary", { timeout: 60_000 }, () => {
@@ -265,7 +287,7 @@ test("results-artifact write failure => ok:false, nonzero exit, last JSON line i
   const lines = (r.stdout ?? "").split("\n").filter((l) => l.trim().length > 0);
   const summary = JSON.parse(lines[lines.length - 1]);
   assert.equal(summary.ok, false, "artifact write failure must flip ok to false");
-  assert.ok(/results artifact write failed/.test(summary.error ?? ""), "error must name the artifact failure");
+  assert.ok(/results write failed/.test(summary.error ?? ""), "error must name the artifact failure");
   rmSync(gen, { recursive: true, force: true });
 });
 
