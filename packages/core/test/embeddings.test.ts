@@ -208,7 +208,7 @@ test("cold cache write -> fresh cache load -> unchanged catalog re-embeds 0 docu
   assert.equal(await fresh.index(records), 0, "warm start must not re-embed unchanged docs");
 
   // Backend pinning: a differently-labelled backend rejects the vectors.
-  assert.equal(fresh.hydrate({ ...persisted, backend: "wasm" }), 0);
+  assert.equal(fresh.hydrate({ ...persisted, backend: "native" }), 0);
 });
 
 test("rebuild drains catalog mutations: a skill registered mid-rebuild is embedded", async () => {
@@ -261,5 +261,57 @@ test("rebuild drains catalog mutations: a skill registered mid-rebuild is embedd
   assert.ok(
     "local:extra-skill" in (persisted.embeddings as { vectors: Record<string, unknown> }).vectors,
     "the mid-rebuild skill must be embedded after the drain",
+  );
+});
+
+test("WASM pipeline matches the captured reference vectors within backend-numerics tolerance", async () => {
+  const { readFileSync } = await import("node:fs");
+  const fixture = JSON.parse(
+    readFileSync(new URL("./fixtures/embedding-vectors.json", import.meta.url), "utf8"),
+  ) as { texts: string[]; vectors: number[][] };
+  const index = new EmbeddingSemanticIndex();
+  assert.equal(await index.load(), true);
+  const records = fixture.texts.map((text, i) => ({
+    id: `t${i}`,
+    kind: "tool" as const,
+    serverId: "s",
+    name: `n${i}`,
+    summary: text,
+    description: "",
+    tags: [] as string[],
+    trust: "trusted" as const,
+  }));
+  await index.index(records, { chunkSize: 64, yieldFn: () => Promise.resolve() });
+  const persisted = index.toPersisted();
+  // Cosine per text; distribution documented for intake: the int8 GEMM
+  // kernels differ between ORT-node (native) and ORT-web (WASM), so exact
+  // 0.999 parity is not achievable across backends. Floor = worst-case.
+  const cosines: number[] = [];
+  for (let i = 0; i < fixture.texts.length; i += 1) {
+    const ref = Float32Array.from(fixture.vectors[i]!);
+    const entry = persisted.vectors[`t${i}`]!;
+    // Signed view: Buffer is unsigned (a negative int8 byte reads as 248).
+    // Buffer pooling: a Buffer.from(base64) may have byteOffset != 0, so
+    // view it at its own offset (signed — Buffer indexes unsigned).
+    const raw = Buffer.from(entry.q, "base64");
+    const bytes = new Int8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    const cur = new Float32Array(384);
+    for (let f = 0; f < 384; f += 1) cur[f] = bytes[f]! * entry.s;
+    let dot = 0;
+    let na = 0;
+    let nb = 0;
+    for (let f = 0; f < 384; f += 1) {
+      dot += ref[f]! * cur[f]!;
+      na += ref[f]! * ref[f]!;
+      nb += cur[f]! * cur[f]!;
+    }
+    cosines.push(dot / (Math.sqrt(na) * Math.sqrt(nb)));
+  }
+  const worst = Math.min(...cosines);
+  const sorted = [...cosines].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)]!;
+  assert.ok(
+    worst >= 0.98 && median >= 0.99,
+    `parity out of tolerance: worst ${worst.toFixed(5)}, median ${median.toFixed(5)}`,
   );
 });

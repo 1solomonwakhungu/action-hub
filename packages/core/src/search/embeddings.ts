@@ -1,76 +1,54 @@
 /**
- * Real local embeddings for semantic search (SQ4 / F49 part 3).
+ * Real local embeddings for semantic search (SQ4; WASM-only per SQ4-R2).
  *
- * Replaces/augments the hashed subword scorer with a real sentence-embedding
- * model (int8 all-MiniLM-L6-v2 via @huggingface/transformers, ONNX WASM
- * backend — native onnxruntime-node by default (the transformers Node build
- * hard-requires it); WASM is the bundled-binary path via the packaging shim
- * + ACTION_HUB_EMBEDDINGS_BACKEND=wasm. The model is VENDORED in
- * the repo (`packages/core/vendor/models`) and loaded with remote downloads
- * disabled: no network is touched, ever.
+ * Pipeline: own faithful BERT WordPiece tokenizer (search/tokenizer.ts,
+ * pinned by vector-parity fixtures) -> direct onnxruntime-web WASM session
+ * (vendored: vendor/ort/{ort.wasm.mjs,ort-wasm-simd-threaded.{mjs,wasm}})
+ * over the vendored int8 all-MiniLM-L6-v2 -> mean-pooled L2-normalized
+ * vectors. NO native addons anywhere in the tree (the @huggingface/
+ * transformers runtime was dropped with its onnxruntime-node/sharp
+ * requirements); nothing is fetched at runtime.
  *
- * Cost model, measured on the reference box (M-series Mac):
- *  - one-time corpus embedding at 15K docs: ~56 s batched, cooperative
- *    (chunked with yields so the event loop stays responsive);
- *  - vectors persisted in the catalog cache keyed by (modelId, text hash),
- *    int8-quantized per vector (~390 B/doc => ~6 MB for 15K), so a warm
- *    start hydrates from disk and re-embeds only changed documents;
- *  - query embedding: ~10-15 ms; cosine over pre-fetched candidates is
- *    negligible.
+ * Cost model (WASM, reference box):
+ *  - one-time corpus embedding at 15K docs: minutes (measured honestly below
+ *    in the PR), cooperative (chunked with event-loop yields);
+ *  - vectors persisted in the catalog cache keyed by (modelId, backend,
+ *    dims), int8-quantized (~390 B/doc => ~6 MB for 15K); a warm start
+ *    hydrates from disk and re-embeds only changed documents;
+ *  - query embedding: tens of ms; cosine over cached fp32 is negligible.
  *
- * Failure policy: if the model cannot load (corrupt/missing files), load()
+ * Failure policy: if the model or ORT cannot load (corrupt/missing), load()
  * reports failure and the hub degrades to the previous hashed scorer with a
  * warning — search must never break because an embedding model is missing.
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ActionRecord } from "../types.js";
 import type { SemanticScorer } from "./search.js";
 import { fingerprintOf } from "./semantic.js";
-import { fileURLToPath } from "node:url";
+import { encode, loadTokenizer, type TokenizerData } from "./tokenizer.js";
 
-/** Model shipped in packages/core/vendor/models. MIT/Apache-2.0 licensed. */
+/** Model shipped in packages/core/vendor/models. Apache-2.0 (see vendor/VENDOR.md). */
 export const EMBEDDING_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
 export const EMBEDDING_DIMS = 384;
+/** ORT build + wasm binary are vendored alongside the model (MIT; see VENDOR.md). */
+const ORT_MODULE = "ort.wasm.mjs";
+const ORT_WASM = "ort-wasm-simd-threaded.wasm";
 
 export interface EmbeddingIndexOptions {
   /** Vendored model root (contains <modelId> subdirectories). */
   modelPath?: string;
   modelId?: string;
-  /**
-   * Execution backend. Default: probe ("native" when onnxruntime-node is
-   * loadable — the transformers Node build hard-requires it — else "wasm").
-   * The ACTION_HUB_EMBEDDINGS_BACKEND env var overrides the probe: a bundled
-   * binary that shims onnxruntime-node onto onnxruntime-web must declare
-   * "wasm" so the persisted-backend key stays truthful.
-   */
-  backend?: "native" | "wasm";
-  /** Quantization of the ONNX file ("q8" matches the vendored artifact). */
-  dtype?: "q8" | "fp32";
   /** Called with warnings (stderr by default, MCP-safe). */
   onWarning?: (message: string) => void;
 }
 
-/** Structural type for the transformers.js feature-extraction pipeline. */
-type FeatureExtractionPipeline = (
-  texts: string | string[],
-  options?: Record<string, unknown>,
-) => Promise<{ data: Float32Array; dims: number[] }>;
-/** A single document vector, int8-quantized for persistence. */
-interface StoredVector {
-  /** Fingerprint of the text that produced the vector (invalidation key). */
-  fingerprint: string;
-  /** int8 quantized values, length = EMBEDDING_DIMS. */
-  q: Int8Array;
-  /** absmax scale used at quantization time. */
-  scale: number;
-  /** Lazily dequantized fp32 copy (query-time hot path; ~1.5 KiB/doc). */
-  fp32?: Float32Array;
-}
+/** WASM-only by construction; the persisted key pins it for cache safety. */
+export const EMBEDDING_BACKEND = "wasm";
 
 export interface PersistedEmbeddings {
   modelId: string;
-  /** Backend the vectors were produced with ("wasm" | "native") — native and
-   * WASM sessions produce slightly different vectors, so scores must never be
-   * mixed across backends (SQ4-P spike finding). */
+  /** Backend the vectors were produced with — "wasm" (the only one). */
   backend: string;
   dims: number;
   /** Per-action quantized vectors, keyed by action id. */
@@ -81,13 +59,26 @@ function warnDefault(message: string): void {
   process.stderr.write(`action-hub: ${message}\n`);
 }
 
+/** Structural shape of the vendored ORT module we rely on. */
+interface OrtLike {
+  Tensor: new (type: string, data: BigInt64Array | Float32Array, dims: number[]) => { data: Float32Array | BigInt64Array; dims: number[] };
+  InferenceSession: {
+    create(model: Uint8Array, options: { executionProviders: string[] }): Promise<{
+      inputNames: readonly string[];
+      outputNames: readonly string[];
+      run(feeds: Record<string, unknown>): Promise<Record<string, { data: Float32Array; dims: number[] }>>;
+    }>;
+  };
+  env: { wasm: { numThreads?: number; wasmBinary?: Uint8Array } };
+}
+
 export class EmbeddingSemanticIndex {
-  readonly #options: Required<Pick<EmbeddingIndexOptions, "modelPath" | "modelId" | "dtype">> & EmbeddingIndexOptions;
+  readonly #options: Required<Pick<EmbeddingIndexOptions, "modelId">> & EmbeddingIndexOptions;
   readonly #onWarning: (message: string) => void;
   #vectors = new Map<string, StoredVector>();
-  #pipe?: FeatureExtractionPipeline;
-  #backend = "native";
-  #resolvedModelPath?: string;
+  #tokenizer?: TokenizerData;
+  #session?: Awaited<ReturnType<OrtLike["InferenceSession"]["create"]>>;
+  #ortTensor?: OrtLike["Tensor"];
   #loadFailed = false;
 
   constructor(options: EmbeddingIndexOptions = {}) {
@@ -97,7 +88,6 @@ export class EmbeddingSemanticIndex {
       // model path via ACTION_HUB_EMBEDDINGS_MODEL.
       modelPath: options.modelPath ?? "",
       modelId: options.modelId ?? EMBEDDING_MODEL_ID,
-      dtype: options.dtype ?? "q8",
       onWarning: options.onWarning,
     };
     this.#onWarning = options.onWarning ?? warnDefault;
@@ -111,9 +101,13 @@ export class EmbeddingSemanticIndex {
     return EMBEDDING_DIMS;
   }
 
+  get backend(): string {
+    return EMBEDDING_BACKEND;
+  }
+
   /** Whether the model loaded and scoring is active. */
   get ready(): boolean {
-    return this.#pipe !== undefined;
+    return this.#session !== undefined;
   }
 
   get embeddedDocs(): number {
@@ -121,42 +115,35 @@ export class EmbeddingSemanticIndex {
   }
 
   /**
-   * Loads the vendored model. Idempotent. Returns false when the model is
-   * unavailable — the caller must then fall back to the hashed scorer.
+   * Loads the vendored tokenizer + WASM session. Idempotent. Returns false
+   * when anything is unavailable — the caller must then fall back to the
+   * hashed scorer.
    */
   async load(): Promise<boolean> {
-    if (this.#pipe) return true;
+    if (this.#session) return true;
     if (this.#loadFailed) return false;
     try {
-      // Backend truth (packaging review R1-1): the transformers Node build
-      // hard-requires onnxruntime-node, so a successful probe = native
-      // execution. Persisted vectors are keyed on this — never mix native
-      // and WASM vectors (they differ in low-order bits).
-      this.#backend =
-        this.#options.backend ??
-        process.env["ACTION_HUB_EMBEDDINGS_BACKEND"] ??
-        (await import("onnxruntime-node").then(
-          () => "native",
-          () => "wasm",
-        ));
-      const { pipeline, env } = await import("@huggingface/transformers");
-      // Vendored, offline: never touch the network, never consult the cache.
-      env.allowRemoteModels = false;
-      env.allowLocalModels = true;
-      const modelPath = this.#options.modelPath || defaultVendorPath();
-      if (!modelPath) {
+      const modelRoot = this.#options.modelPath || defaultVendorPath();
+      if (!modelRoot) {
         throw new Error(
           "no model path: set ACTION_HUB_EMBEDDINGS_MODEL (bundled binary hosts extract the vendored model and point this at it)",
         );
       }
-      env.localModelPath = modelPath;
-      this.#resolvedModelPath = modelPath;
-      // Single WASM thread: measured no throughput gain from multi-thread
-      // (70-80 docs/s either way on the reference box) and single-thread
-      // keeps vectors bit-deterministic for the persistence tests.
-      this.#pipe = (await pipeline("feature-extraction", this.#options.modelId, {
-        dtype: this.#options.dtype,
-      })) as unknown as FeatureExtractionPipeline;
+      const modelDir = `${modelRoot}/${this.#options.modelId}`;
+      this.#tokenizer = loadTokenizer(`${modelDir}/tokenizer.json`);
+      const ortUrl = new URL(`../../vendor/ort/${ORT_MODULE}`, import.meta.url);
+      const ort = (await import(ortUrl.href)) as unknown as OrtLike;
+      ort.env.wasm.numThreads = 1;
+      // Feed ORT the wasm binary directly: the web build resolves wasmPaths
+      // with fetch(), which cannot read file:// URLs in Node.
+      ort.env.wasm.wasmBinary = readFileSync(
+        fileURLToPath(new URL(`../../vendor/ort/${ORT_WASM}`, import.meta.url)),
+      );
+      const modelBytes = readFileSync(`${modelDir}/onnx/model_quantized.onnx`);
+      this.#ortTensor = ort.Tensor;
+      this.#session = await ort.InferenceSession.create(new Uint8Array(modelBytes), {
+        executionProviders: ["wasm"],
+      });
       return true;
     } catch (cause) {
       this.#loadFailed = true;
@@ -167,7 +154,66 @@ export class EmbeddingSemanticIndex {
 
   /** Document text fed to the model: name first, then the full text. */
   #documentText(record: ActionRecord): string {
-    return `${record.name.replace(/_/g, " ")}. ${record.summary} ${record.description ?? ""}`.slice(0, 256);  // 256 chars ~= 60 MiniLM tokens; ~2x embed throughput, negligible quality delta on tune
+    return `${record.name.replace(/_/g, " ")}. ${record.summary} ${record.description ?? ""}`.slice(0, 256);
+  }
+
+  /** Embeds a batch of texts: tokenize, pad, run, mean-pool, normalize. */
+  async #embedBatch(texts: readonly string[]): Promise<Float32Array[]> {
+    if (!this.#session || !this.#tokenizer || !this.#ortTensor) throw new Error("embedding index not loaded");
+    const encoded = texts.map((text) => encode(text, this.#tokenizer!));
+    const maxLen = Math.max(...encoded.map((ids) => ids.length));
+    const batch = encoded.length;
+    const inputIds = new BigInt64Array(batch * maxLen);
+    const attentionMask = new BigInt64Array(batch * maxLen);
+    const tokenTypeIds = new BigInt64Array(batch * maxLen);
+    for (let b = 0; b < batch; b += 1) {
+      const ids = encoded[b] ?? [];
+      for (let t = 0; t < maxLen; t += 1) {
+        const inRange = t < ids.length;
+        inputIds[b * maxLen + t] = BigInt(inRange ? ids[t]! : 0);
+        attentionMask[b * maxLen + t] = inRange ? 1n : 0n;
+      }
+    }
+    const dims = [batch, maxLen];
+    const makeTensor = (data: BigInt64Array): unknown =>
+      new (this.#ortTensor as unknown as { new (type: string, data: BigInt64Array, dims: number[]): unknown })(
+        "int64",
+        data,
+        dims,
+      );
+    const feeds: Record<string, unknown> = {
+      input_ids: makeTensor(inputIds),
+      attention_mask: makeTensor(attentionMask),
+      token_type_ids: makeTensor(tokenTypeIds),
+    };
+    const output = await this.#session.run(feeds);
+    const hiddenKey = Object.keys(output)[0]!;
+    const hidden = output[hiddenKey]!;
+    const seqLen = hidden.dims[1] ?? 0;
+    const featureDim = hidden.dims[2] ?? EMBEDDING_DIMS;
+    const data = hidden.data as Float32Array;
+    const out: Float32Array[] = [];
+    for (let b = 0; b < batch; b += 1) {
+      const vec = new Float32Array(featureDim);
+      let used = 0;
+      const lenB = encoded[b]?.length ?? 0;
+      for (let t = 0; t < Math.min(maxLen, lenB); t += 1) {
+        // Mean pool over ALL non-pad tokens (attention mask), matching the
+        // sentence-transformers pooling the reference vectors were built
+        // with — special tokens INCLUDED.
+        const base = (b * seqLen + t) * featureDim;
+        for (let f = 0; f < featureDim; f += 1) vec[f] = vec[f]! + data[base + f]!;
+        used += 1;
+      }
+      if (used > 0) for (let f = 0; f < featureDim; f += 1) vec[f] = vec[f]! / used;
+      // L2 normalize (guarded against all-zero rows).
+      let norm = 0;
+      for (let f = 0; f < featureDim; f += 1) norm += vec[f]! * vec[f]!;
+      norm = Math.sqrt(norm);
+      if (norm > 0) for (let f = 0; f < featureDim; f += 1) vec[f] = vec[f]! / norm;
+      out.push(vec);
+    }
+    return out;
   }
 
   /**
@@ -180,12 +226,10 @@ export class EmbeddingSemanticIndex {
     records: readonly ActionRecord[],
     { chunkSize = 64, yieldFn = defaultYield }: { chunkSize?: number; yieldFn?: () => Promise<void> } = {},
   ): Promise<number> {
-    if (!this.#pipe && !(await this.load())) return 0;
-    // Normalize like LocalSemanticIndex: non-finite/non-positive/fractional
-    // chunk sizes would otherwise stall the loop (0) or throw inside the
-    // pipeline (NaN).
-    const effectiveChunk =
-      Number.isFinite(chunkSize) && chunkSize >= 1 ? Math.floor(chunkSize) : 64;
+    if (!this.#session && !(await this.load())) return 0;
+    // Normalize: non-finite/non-positive/fractional chunk sizes would
+    // otherwise stall the loop (0) or throw (NaN).
+    const effectiveChunk = Number.isFinite(chunkSize) && chunkSize >= 1 ? Math.floor(chunkSize) : 64;
     const todo = records.filter((record) => {
       const fingerprint = fingerprintOf(record);
       const cached = this.#vectors.get(record.id);
@@ -194,14 +238,10 @@ export class EmbeddingSemanticIndex {
     let embedded = 0;
     for (let i = 0; i < todo.length; i += effectiveChunk) {
       const batch = todo.slice(i, i + effectiveChunk);
-      const outputs = await this.#pipe!(batch.map((r) => this.#documentText(r)), {
-        pooling: "mean",
-        normalize: true,
-      });
+      const vectors = await this.#embedBatch(batch.map((r) => this.#documentText(r)));
       for (let j = 0; j < batch.length; j += 1) {
         const record = batch[j]!;
-        const vec = new Float32Array(outputs.data.slice(j * EMBEDDING_DIMS, (j + 1) * EMBEDDING_DIMS));
-        this.#vectors.set(record.id, quantize(vec, fingerprintOf(record)));
+        this.#vectors.set(record.id, quantize(vectors[j]!, fingerprintOf(record)));
       }
       embedded += batch.length;
       await yieldFn();
@@ -223,11 +263,8 @@ export class EmbeddingSemanticIndex {
 
   /** Embeds a query string. Throws if the model is not loaded. */
   async embedQuery(query: string): Promise<Float32Array> {
-    if (!this.#pipe) throw new Error("embedding index not loaded");
-    // Same underscore normalization as #documentText so exact-name queries
-    // ("disable_user") embed like their document text.
-    const output = await this.#pipe(query.replace(/_/g, " "), { pooling: "mean", normalize: true });
-    return new Float32Array(output.data.slice(0, EMBEDDING_DIMS));
+    const [vec] = await this.#embedBatch([query]);
+    return vec!;
   }
 
   /**
@@ -239,21 +276,19 @@ export class EmbeddingSemanticIndex {
    * curated table, down-weighted order preserved) BEFORE embedding: a real
    * sentence encoder turns "hold the project" and "pause the project" into
    * nearby vectors anyway, and the explicit synonyms measurably improve
-   * paraphrase recall (tune split: 0.730 raw -> 0.762 expanded). This is an
-   * embeddings-scorer-local decision — the hashed scorer keeps its
-   * literal-only contract (SQ2 review finding 3) because a hashed lexicon
-   * has no notion of paraphrase distance to exploit.
+   * paraphrase recall (tune split). This is an embeddings-scorer-local
+   * decision — the hashed scorer keeps its literal-only contract (SQ2
+   * review finding 3).
    */
   asScorer(): SemanticScorer {
     return async (query, candidates) => {
-      if (!this.#pipe) return new Array(candidates.length).fill(0);
+      if (!this.#session) return new Array(candidates.length).fill(0);
       // Synonym-enriched query text (see method doc): literal tokens first,
       // then the down-weighted expansions from the same curated table.
       let text = query;
       try {
         const { expandQuery } = await import("./synonyms.js");
-        const { QUERY_STOPWORDS } = await import("./search.js");
-        const { tokenize } = await import("./search.js");
+        const { QUERY_STOPWORDS, tokenize } = await import("./search.js");
         const { terms } = expandQuery(query, tokenize, 0.5, QUERY_STOPWORDS);
         text = terms.map((t) => t.term).join(" ");
       } catch {
@@ -279,13 +314,13 @@ export class EmbeddingSemanticIndex {
     for (const [id, stored] of this.#vectors) {
       vectors[id] = { h: stored.fingerprint, q: encodeInt8(stored.q), s: stored.scale };
     }
-    return { modelId: this.#options.modelId, backend: this.#backend, dims: EMBEDDING_DIMS, vectors };
+    return { modelId: this.#options.modelId, backend: EMBEDDING_BACKEND, dims: EMBEDDING_DIMS, vectors };
   }
 
   /** Hydrates vectors persisted by a previous run (same model only). */
   hydrate(persisted: PersistedEmbeddings | undefined): number {
     if (!persisted || persisted.modelId !== this.#options.modelId || persisted.dims !== EMBEDDING_DIMS) return 0;
-    if (persisted.backend !== this.#backend) return 0;
+    if (persisted.backend !== EMBEDDING_BACKEND) return 0;
     let loaded = 0;
     for (const [id, entry] of Object.entries(persisted.vectors ?? {})) {
       try {
@@ -301,6 +336,17 @@ export class EmbeddingSemanticIndex {
   stats(): { docs: number; dims: number; modelId: string } {
     return { docs: this.#vectors.size, dims: EMBEDDING_DIMS, modelId: this.#options.modelId };
   }
+}
+
+interface StoredVector {
+  /** Fingerprint of the text that produced the vector (invalidation key). */
+  fingerprint: string;
+  /** int8 quantized values, length = EMBEDDING_DIMS. */
+  q: Int8Array;
+  /** absmax scale used at quantization time. */
+  scale: number;
+  /** Lazily dequantized fp32 copy (query-time hot path; ~1.5 KiB/doc). */
+  fp32?: Float32Array;
 }
 
 function defaultYield(): Promise<void> {

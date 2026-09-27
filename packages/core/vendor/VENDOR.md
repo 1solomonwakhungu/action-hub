@@ -15,10 +15,14 @@ fetched at runtime.
 - **Pinned artifact SHA-256:**
   `afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1`
   (`sha256 onnx/model_quantized.onnx`; matches the upstream LFS object).
-- **Runtime:** `@huggingface/transformers` 4.3.0, loaded with
-  `allowRemoteModels=false` and `localModelPath` pointed at this directory
-  (or at `ACTION_HUB_EMBEDDINGS_MODEL` for bundled-binary hosts that extract
-  these files at startup).
+- **Runtime:** direct `onnxruntime-web` WASM session over the vendored
+  subset (see below) + the project's own BERT WordPiece tokenizer
+  (`src/search/tokenizer.ts`), pinned by the vector-parity fixture
+  (`test/fixtures/embedding-vectors.json`, captured from
+  transformers-native q8 on the same model; median cosine 0.993, worst
+  0.986 over 200 texts — int8 GEMM kernels differ between runtimes).
+  `ACTION_HUB_EMBEDDINGS_MODEL` overrides the model root for bundled-binary
+  hosts that extract these files at startup.
 
 ## Files
 
@@ -38,3 +42,31 @@ fetched at runtime.
    (persisted entries are keyed by model id + backend + dims, so a model
    change invalidates old caches cleanly), and the quality eval
    (`stress/split-eval.mjs --semantic embeddings`).
+
+## Onnxruntime-web runtime (vendored)
+
+`packages/core/vendor/ort/` ships an unmodified subset of **onnxruntime-web**
+1.23.2 (npm tarball `onnxruntime-web-1.23.2.tgz`), selected by file:
+
+| file | upstream source | SHA-256 |
+|---|---|---|
+| `ort.wasm.mjs` | onnxruntime-web 1.23.2 `dist/ort.wasm.mjs` | `fa4e7e18dfbc5d6cfd660de1776bac33b6db66557fc4886693e1c5d9deb47762` |
+| `ort-wasm-simd-threaded.wasm` | onnxruntime-web 1.23.2 `dist/ort-wasm-simd-threaded.wasm` | `06ba057753da3847e4c24f02d91ab133455b0817c69a44993a9a53a2146df9e3` |
+| `ort-wasm-simd-threaded.mjs` | onnxruntime-web 1.23.2 `dist/ort-wasm-simd-threaded.mjs` | `c57ca56328877353a575e51bbca6f18450027d6c9bf2307a2cb2c41363b4de9f` |
+
+- **License:** MIT (onnxruntime-web; https://github.com/microsoft/onnxruntime,
+  copyright Microsoft Corporation). The files above are unmodified copies of
+  the published npm tarball — no internals were hand-edited.
+- **Runtime behavior:** the WASM execution provider only, single-threaded
+  (`ort.env.wasm.numThreads = 1`, wasm binary injected via
+  `ort.env.wasm.wasmBinary` because `fetch()` cannot read `file://` URLs in
+  Node). No native addons are loaded anywhere in the dependency tree.
+
+## Update procedure (ORT)
+
+1. Pick a new `onnxruntime-web` npm version; extract `dist/ort.wasm.mjs`,
+   `dist/ort-wasm-simd-threaded.{mjs,wasm}` unmodified.
+2. Compute and record SHA-256 for each file in the table above BEFORE
+   committing; verify no other runtime file is referenced.
+3. Re-run the embeddings parity test (fixture vs vendored runtime) and the
+   quality eval.
