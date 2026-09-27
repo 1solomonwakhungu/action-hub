@@ -44,6 +44,22 @@ export interface BootstrapResult {
    * finished) and this is equivalent to awaiting `refreshed`.
    */
   startRefresh(): Promise<IndexResult[]>;
+  /**
+   * F69: stable drain for the post-embedding vector write. Resolves only
+   * when QUIESCENT: the current write has settled, any refresh that has
+   * been started has settled (so a write it schedules is covered), and no
+   * newer write was scheduled meanwhile. The promise never rejects — a
+   * failure is surfaced via `onWarning` (the next re-index re-embeds).
+   * Shutdown paths await this (bounded) so a pending `cache.json.tmp`
+   * rename cannot outlive close.
+   *
+   * A never-started deferred refresh counts as quiescent (no write can
+   * appear from a refresh the host never starts); a host that starts the
+   * refresh after draining races its own shutdown. The plugin runtime's
+   * close() awaits `startedRefresh` BEFORE draining, which makes its drain
+   * cover every write.
+   */
+  vectorsWritten(): Promise<void>;
 }
 
 /**
@@ -71,10 +87,39 @@ export async function bootstrapCatalog(
 
   const entry = await cache.load(configHash);
 
+  // F69: the post-semantic vector write is tracked, not fire-and-forget —
+  // every scheduling site records its promise here. vectorsWritten() drains
+  // it until QUIESCENT: it awaits the current write, then (if a refresh has
+  // been started but not yet settled) waits for that refresh so a write
+  // scheduled by it is covered too, looping until no newer write appeared.
+  // A never-started deferred refresh is treated as quiescent: no write can
+  // appear from a refresh the host never starts (a host that starts one
+  // later races its own shutdown). Lifecycle-correct callers await
+  // refreshed/startRefresh before draining — the plugin runtime's close()
+  // does exactly that.
+  let vectorsGeneration = 0;
+  let pendingVectors: Promise<void> = Promise.resolve();
+  let refreshStarted = false;
+  let refreshSettled: Promise<void> = Promise.resolve();
+  const recordVectorsWrite = (promise: Promise<void>): void => {
+    vectorsGeneration += 1;
+    pendingVectors = promise;
+  };
+  const vectorsWritten = (): Promise<void> =>
+    (async () => {
+      for (;;) {
+        const generation = vectorsGeneration;
+        const current = pendingVectors;
+        await current;
+        if (refreshStarted) await refreshSettled;
+        if (vectorsGeneration === generation) return; // quiescent
+      }
+    })();
+
   if (!entry) {
     const results = await hub.indexAll();
     await cache.write(hub.toPersisted(configHash));
-    persistVectorsWhenReady(hub, cache, configHash, options.onWarning);
+    recordVectorsWrite(persistVectorsWhenReady(hub, cache, configHash, options.onWarning));
     return {
       fromCache: false,
       actions: hub.catalog.size,
@@ -82,6 +127,7 @@ export async function bootstrapCatalog(
       cache,
       refreshed: Promise.resolve(results),
       startRefresh: () => Promise.resolve(results),
+      vectorsWritten,
     };
   }
 
@@ -96,37 +142,47 @@ export async function bootstrapCatalog(
     const startRefresh = (): Promise<IndexResult[]> => {
       // reindexAndPersist never rejects (failures become warnings), so the
       // refreshed promise only needs the fulfilment path.
-      started ??= reindexAndPersist(hub, cache, configHash, options.onWarning).then((results) => {
+      refreshStarted = true;
+      refreshSettled = (
+        started ??= reindexAndPersist(hub, cache, configHash, options.onWarning, recordVectorsWrite).then((results) => {
         settleRefreshed(results);
         return results;
-      });
+      })).then(() => undefined);
       return started;
     };
-    return { fromCache: true, actions, configHash, cache, refreshed, startRefresh };
+    return { fromCache: true, actions, configHash, cache, refreshed, startRefresh, vectorsWritten };
   }
 
   const refreshed =
     options.refreshInBackground === false
       ? Promise.resolve<IndexResult[]>([])
-      : reindexAndPersist(hub, cache, configHash, options.onWarning);
+      : reindexAndPersist(hub, cache, configHash, options.onWarning, recordVectorsWrite);
+  refreshStarted = options.refreshInBackground !== false;
+  refreshSettled = refreshed.then(() => undefined);
 
-  return { fromCache: true, actions, configHash, cache, refreshed, startRefresh: () => refreshed };
+  return { fromCache: true, actions, configHash, cache, refreshed, startRefresh: () => refreshed, vectorsWritten };
 }
 
 /**
  * SQ4: after the embedding rebuild drains, re-persist the catalog so the
- * document vectors land in the cache. Fire-and-forget by design (never blocks
- * startup); a failure becomes a warning — the next re-index re-embeds.
+ * document vectors land in the cache. Kept OFF the startup critical path, but
+ * no longer fire-and-forget (F69): the returned promise is tracked by the
+ * bootstrap result so hosts can drain it during shutdown — a pending
+ * cache.json.tmp rename used to outlive close() (post-close ENOENT). The
+ * promise never rejects: a failure is surfaced via `onWarning` and the next
+ * re-index re-embeds.
  */
 function persistVectorsWhenReady(
   hub: ActionHub,
   cache: CatalogCache,
   configHash: string,
   onWarning?: (message: string) => void,
-): void {
-  void hub
+): Promise<void> {
+  return hub
     .semanticReady()
-    .then(() => cache.write(hub.toPersisted(configHash)))
+    .then(async () => {
+      await cache.write(hub.toPersisted(configHash));
+    })
     .catch((cause: unknown) => {
       const message = cause instanceof Error ? cause.message : String(cause);
       onWarning?.(`post-embedding cache write failed: ${message}`);
@@ -143,6 +199,7 @@ async function reindexAndPersist(
   cache: CatalogCache,
   configHash: string,
   onWarning?: (message: string) => void,
+  recordVectorsWrite?: (promise: Promise<void>) => void,
 ): Promise<IndexResult[]> {
   try {
     const results = await hub.indexAll();
@@ -150,7 +207,9 @@ async function reindexAndPersist(
     // SQ4: indexAll returns before the (off-critical-path) embedding rebuild
     // finishes, so this first write carries no vectors. Re-persist once the
     // rebuild drains so a warm start hydrates them instead of re-embedding.
-    persistVectorsWhenReady(hub, cache, configHash, onWarning);
+    // F69: the write promise is recorded on the bootstrap result so shutdown
+    // can drain it (bounded) instead of leaving it fire-and-forget.
+    recordVectorsWrite?.(persistVectorsWhenReady(hub, cache, configHash, onWarning));
     return results;
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);

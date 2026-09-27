@@ -8,9 +8,9 @@ import { test } from "node:test";
 import { resolve } from "node:path";
 import { writeFileSync, readFileSync, rmSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { ActionHub } from "@action-hub/core";
 import { createSdkClientFactory } from "../dist/client-factory.js";
 import type { ServerConfig } from "@action-hub/core";
+import { testActionHub } from "./test-hub.ts";
 
 const SERVER_SCRIPT = resolve(import.meta.dirname, "fixtures", "f26-server.mjs");
 const CWD = resolve(import.meta.dirname, "..", "..", "..");
@@ -50,7 +50,7 @@ test("a hanging tools/call on a live stdio server opens the circuit after the th
     // deadline. This scenario is "activates fine, every tools/call hangs",
     // so only the hub-level EXECUTE timeout is short.
   };
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [config],
     clientFactory: createSdkClientFactory(),
     resilience: { cooldownMs: 3_000, heartbeat: { enabled: false } },

@@ -14,6 +14,7 @@ import { bootstrapCatalog } from "../dist/catalog/bootstrap.js";
 import type { PersistedCatalog } from "../dist/catalog/persistence.js";
 import type { ServerConfig } from "../dist/types.js";
 import { FakeClient, makeFactory } from "./fakes.ts";
+import { testActionHub } from "./test-hub.ts";
 
 const servers: ServerConfig[] = [
   { id: "github", transport: { type: "stdio", command: "gh-mcp" }, trust: "trusted" },
@@ -41,7 +42,7 @@ function buildHub(overrides: Partial<ConstructorParameters<typeof ActionHub>[0]>
     ]),
   };
   const { factory, activations } = makeFactory(clients);
-  const hub = new ActionHub({ servers, clientFactory: factory, ...overrides });
+  const hub = testActionHub({  servers, clientFactory: factory, ...overrides });
   return { hub, clients, activations };
 }
 
@@ -364,7 +365,7 @@ test("restoreCatalog drops actions for servers no longer configured", async () =
   const entry = seed.hub.toPersisted("hash-a") as PersistedCatalog;
 
   const { factory } = makeFactory({ github: new FakeClient([]) });
-  const trimmed = new ActionHub({ servers: [servers[0]!], clientFactory: factory });
+  const trimmed = testActionHub({  servers: [servers[0]!], clientFactory: factory });
 
   assert.equal(trimmed.restoreCatalog(entry), 2);
   assert.equal(trimmed.catalog.get("slack:post_message"), undefined);
@@ -481,7 +482,7 @@ test("a failing background re-index leaves the cached catalog usable", async () 
   const failing = async (): Promise<never> => {
     throw new Error("downstream unreachable");
   };
-  const hub = new ActionHub({ servers, clientFactory: failing });
+  const hub = testActionHub({  servers, clientFactory: failing });
 
   const result = await bootstrapCatalog(hub, { servers, path });
   assert.equal(result.fromCache, true);
@@ -556,4 +557,89 @@ test("a deferred warm bootstrap never started leaves activations empty", async (
   // The host never calls startRefresh(); nothing re-indexes behind its back.
   await warm.hub.close();
   assert.deepEqual(warm.activations, []);
+});
+
+test("F69: the post-embedding vector write is tracked, not fire-and-forget", async () => {
+  // Deterministic probe (reviewer-2, PR 102 rework): a CatalogCache whose
+  // SECOND write blocks must leave bootstrap.vectorsWritten() pending until
+  // the write settles — so a host's shutdown path can drain it instead of
+  // resolving close() while cache.json.tmp is still being renamed.
+  let writes = 0;
+  let releaseSecond!: (value: void) => void;
+  const secondGate = new Promise<void>((resolve) => {
+    releaseSecond = resolve;
+  });
+  const fake = {
+    async load() {
+      return null; // cold start
+    },
+    async write() {
+      writes += 1;
+      if (writes >= 2) return secondGate;
+    },
+  } as unknown as CatalogCache;
+
+  const { hub } = buildHub({ embeddings: null });
+  const boot = await bootstrapCatalog(hub, { servers, cache: fake });
+  assert.equal(boot.fromCache, false);
+
+  let settled = false;
+  void boot.vectorsWritten().then(() => {
+    settled = true;
+  });
+  await new Promise((done) => setImmediate(done));
+  await new Promise((done) => setImmediate(done));
+  assert.equal(writes, 2, "the post-semantic vector write must be scheduled");
+  assert.equal(settled, false, "vectorsWritten must stay pending while the vector write is in flight");
+
+  releaseSecond(undefined);
+  await boot.vectorsWritten();
+  assert.equal(settled, true, "vectorsWritten resolves once the write settles");
+  await hub.close();
+});
+
+test("F69 rework: the stable drain covers a write scheduled by a later startRefresh", async () => {
+  // Deferred mode: an EARLY vectorsWritten() call (before startRefresh) is
+  // quiescent by contract (a never-started refresh schedules nothing); the
+  // caller that matters — a shutdown path after startRefresh — must observe
+  // the write the refresh schedules, even when that write blocks.
+  let writes = 0;
+  let releaseSecond!: (value: void) => void;
+  const secondGate = new Promise<void>((resolve) => {
+    releaseSecond = resolve;
+  });
+  const fake = {
+    async load() {
+      return { actions: [], configHash: "hash-a", version: CATALOG_CACHE_VERSION }; // warm start
+    },
+    async write() {
+      writes += 1;
+      if (writes >= 2) return secondGate;
+    },
+  } as unknown as CatalogCache;
+
+  const { hub } = buildHub({ embeddings: null });
+  const boot = await bootstrapCatalog(hub, { servers, cache: fake, deferRefresh: true });
+
+  let earlySettled = false;
+  void boot.vectorsWritten().then(() => {
+    earlySettled = true;
+  });
+  await new Promise((done) => setImmediate(done));
+  assert.equal(earlySettled, true, "an early call is quiescent (documented): no refresh started, no write scheduled");
+
+  await boot.startRefresh();
+  // Post-refresh drain must observe the write the refresh scheduled, even
+  // while it is blocked.
+  let drained = false;
+  const drain = boot.vectorsWritten().then(() => {
+    drained = true;
+  });
+  await new Promise((done) => setImmediate(done));
+  assert.equal(writes, 2, "the refresh scheduled the post-embedding vector write");
+  assert.equal(drained, false, "the drain stays pending while the scheduled write is in flight");
+  releaseSecond(undefined);
+  await drain;
+  assert.equal(drained, true, "the drain resolves once the scheduled write settles");
+  await hub.close();
 });

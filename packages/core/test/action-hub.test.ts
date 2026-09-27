@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { ActionHub } from "../dist/action-hub.js";
 import type { ServerConfig } from "../dist/types.js";
 import { FakeClient, makeFactory } from "./fakes.ts";
+import { testActionHub } from "./test-hub.ts";
 
 const servers: ServerConfig[] = [
   { id: "github", transport: { type: "stdio", command: "gh-mcp" }, trust: "trusted" },
@@ -32,7 +33,7 @@ function buildClients() {
 function buildHub(overrides: Partial<ConstructorParameters<typeof ActionHub>[0]> = {}) {
   const clients = buildClients();
   const { factory, activations } = makeFactory(clients);
-  const hub = new ActionHub({ servers, clientFactory: factory, ...overrides });
+  const hub = testActionHub({  servers, clientFactory: factory, ...overrides });
   return { hub, clients, activations };
 }
 
@@ -56,7 +57,7 @@ test("duplicate tool names within one server keep the first occurrence and warn 
       { name: "unique_tool", description: "unaffected", inputSchema: { type: "object" } },
       { name: "dup_tool", description: "hostile shadow copy", inputSchema: { type: "object" } },
     ]);
-    const hub = new ActionHub({
+    const hub = testActionHub({
       servers: [{ id: "dup", transport: { type: "stdio", command: "dup-mcp" }, trust: "trusted" }],
       clientFactory: async () => client,
     });
@@ -153,7 +154,7 @@ test("readOnlyHint annotation makes non-prefixed tools cacheable and cache hits 
     },
     close: async () => {},
   };
-  const hub = new ActionHub({
+  const hub = testActionHub({
     clientFactory: async () => client,
     servers: [{ id: "rep", transport: { type: "stdio", command: "rep-mcp" }, trust: "trusted" }],
   });
@@ -180,7 +181,7 @@ test("a typed annotations object from a client marks the action readOnly", async
   // untyped inline client) carry annotations, so the hub must honor
   // readOnlyHint without any local casts.
   let downstreamCalls = 0;
-  const hub = new ActionHub({
+  const hub = testActionHub({
     clientFactory: makeFactory({
       rep: new FakeClient(
         [
@@ -224,7 +225,7 @@ test("gated servers are refused when approval is denied", async () => {
 test("a disabled server is neither indexed nor executable", async () => {
   const clients = buildClients();
   const { factory } = makeFactory(clients);
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [servers[0]!, { ...servers[1]!, enabled: false }],
     clientFactory: factory,
   });
@@ -238,7 +239,7 @@ test("a disabled server is neither indexed nor executable", async () => {
 test("denied tools are excluded from the index", async () => {
   const clients = buildClients();
   const { factory } = makeFactory(clients);
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [{ ...servers[0]!, denyTools: ["create_pull_request"] }],
     clientFactory: factory,
   });
@@ -255,7 +256,7 @@ test("a failing server does not break the rest of the catalog", async () => {
     return clients.github;
   };
 
-  const hub = new ActionHub({ servers, clientFactory: factory });
+  const hub = testActionHub({  servers, clientFactory: factory });
   const results = await hub.indexAll();
 
   const slack = results.find((result) => result.serverId === "slack");
@@ -327,14 +328,21 @@ test("execute enforces timeout when downstream server hangs", async () => {
       return [{ name: "slow_action", description: "Slow action" }];
     },
     async callTool() {
-      // Hang indefinitely or longer than timeout
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      // Hang far longer than the 50ms timeout. F68: a 200ms hang gave the
+      // 50ms timeout timer only ~4x headroom — under suite load (background
+      // embedding rebuilds) the timer fired late and the downstream won the
+      // race, flipping ok to true. 5s + an unref'd timer keeps the hang
+      // decisively on the timeout side and lets the process exit promptly.
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 5_000);
+        timer.unref();
+      });
       return "done";
     },
     async close() {},
   };
 
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [
       {
         id: "slow",
