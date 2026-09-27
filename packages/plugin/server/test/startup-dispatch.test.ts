@@ -448,3 +448,112 @@ test("F23 rework 3: closing cancels the queued refresh trigger (deterministic)",
     else process.env["ACTION_HUB_CONFIG"] = prevConfig;
   }
 });
+
+test("FX19/F6: empty search query is a JSON-RPC -32602, not an unfiltered top-10", async () => {
+  const { runtime } = await buildRuntime();
+  const server = createMcpServer(runtime);
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test", version: "0.0.0" });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  await assert.rejects(
+    client.callTool({ name: "action_hub", arguments: { operation: "search", query: "" } }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  await assert.rejects(
+    client.callTool({ name: "action_hub", arguments: { operation: "search" } }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  await assert.rejects(
+    client.callTool({ name: "action_hub", arguments: { operation: "load" } }),
+    (cause: { code?: number; message?: string }) =>
+      cause.code === -32602 && (cause.message ?? "").includes("action_id"),
+  );
+  // FX19 rework: whitespace-only identifiers are invalid params too, and
+  // load keeps its second route: a nonblank bundle_id must reach dispatch.
+  await assert.rejects(
+    client.callTool({ name: "action_hub", arguments: { operation: "load", action_id: "   " } }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  await assert.rejects(
+    client.callTool({ name: "action_hub", arguments: { operation: "execute", action_id: "  " } }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  // A nonblank bundle_id must pass the guard and reach dispatch (an unknown
+  // bundle surfaces as a tool-level error result, NOT a -32602 rejection).
+  const bundleRoute = await client.callTool({
+    name: "action_hub",
+    arguments: { operation: "load", bundle_id: "no-such-bundle-probe" },
+  });
+  assert.equal(bundleRoute.isError, true, "bundle route reaches dispatch (tool-level error, not -32602)");
+  // Valid calls keep working.
+  const ok = await client.callTool({ name: "action_hub", arguments: { operation: "search", query: "lookup" } });
+  assert.ok(!ok.isError);
+  await client.close();
+  await server.close();
+});
+
+test("FX19/F7: an unrecognized tools/list cursor is a JSON-RPC -32602", async () => {
+  const { runtime } = await buildRuntime();
+  const server = createMcpServer(runtime);
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test", version: "0.0.0" });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  await assert.rejects(
+    client.listTools({ cursor: "bogus-cursor" }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  // FX19 rework: cursor presence is the trigger — "" is valid Cursor input
+  // syntax (z.string()) but identifies no page this server issued.
+  await assert.rejects(
+    client.listTools({ cursor: "" }),
+    (cause: { code?: number }) => cause.code === -32602,
+  );
+  // No cursor: the single action_hub tool is still listed.
+  const listed = await client.listTools();
+  assert.equal(listed.tools.length, 1);
+  assert.equal(listed.tools[0]!.name, "action_hub");
+  await client.close();
+  await server.close();
+});
+
+test("FX19: HTTP serve mode returns -32602 for the same violations", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "hub-conformance-"));
+  const configPath = join(tmp, "config.json");
+  await writeFile(configPath, JSON.stringify({ autoDiscover: false }), "utf8");
+  const prevConfig = process.env["ACTION_HUB_CONFIG"];
+  process.env["ACTION_HUB_CONFIG"] = configPath;
+  try {
+    const { startHttpServer } = await import("../dist/http-server.js");
+    const handle = await startHttpServer({ port: 0, token: "tok" });
+    const post = async (body: unknown) => {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/mcp`, {
+        method: "POST",
+        headers: { authorization: "Bearer tok", "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify(body),
+      });
+      const raw = await res.text();
+      // The streamable-HTTP transport may answer JSON or an SSE frame
+      // ("event: message\ndata: {...}"); normalise both to the payload.
+      const payload = raw.startsWith("event:")
+        ? (JSON.parse(raw.split("data: ")[1]!.split("\n")[0]!) as Record<string, unknown>)
+        : (JSON.parse(raw) as Record<string, unknown>);
+      return { status: res.status, body: payload };
+    };
+    await post({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
+    const badSearch = await post({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "action_hub", arguments: { operation: "search" } } });
+    assert.equal(badSearch.status, 200);
+    assert.equal((badSearch.body?.error as { code?: number } | undefined)?.code, -32602, "empty search query -> JSON-RPC -32602");
+    const emptyCursor = await post({ jsonrpc: "2.0", id: 5, method: "tools/list", params: { cursor: "" } });
+    assert.equal((emptyCursor.body?.error as { code?: number } | undefined)?.code, -32602, "empty cursor -> JSON-RPC -32602");
+    const badCursor = await post({ jsonrpc: "2.0", id: 3, method: "tools/list", params: { cursor: "bogus" } });
+    assert.equal((badCursor.body?.error as { code?: number } | undefined)?.code, -32602, "unknown cursor -> JSON-RPC -32602");
+    const goodList = await post({ jsonrpc: "2.0", id: 4, method: "tools/list" });
+    assert.ok((goodList.body?.result as { tools?: unknown[] } | undefined)?.tools, "cursor-less tools/list still works");
+    await handle.close();
+  } finally {
+    if (prevConfig === undefined) delete process.env["ACTION_HUB_CONFIG"];
+    else process.env["ACTION_HUB_CONFIG"] = prevConfig;
+  }
+});
