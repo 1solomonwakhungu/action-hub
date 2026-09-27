@@ -21,6 +21,8 @@ export class SearchEngine {
   // tokenization O(1) per record after the first pass and lets a full-corpus
   // query (the server's default path) reuse whole stats wholesale.
   #tokensCache = new Map<string, { generation: number; tokens: string[] }>();
+  /** Test-only: counts document tokenizations NOT served from the memo. */
+  #documentTokenMisses = 0;
   #fullStats?: { generation: number; stats: CorpusStats };
   #tokensGeneration = -1;
 
@@ -135,6 +137,16 @@ export class SearchEngine {
   }
 
   /**
+   * Test-only (F57): number of document tokenizations that were NOT served
+   * from the memo. A warm query over an unchanged catalog must not tokenize
+   * any corpus document, which is the deterministic form of the old
+   * wall-clock "warm cost collapses" microbench assertion.
+   */
+  get documentTokenMissesForTest(): number {
+    return this.#documentTokenMisses;
+  }
+
+  /**
    * Corpus stats for a candidate set, memoized across queries.
    *
    * Bit-identical to the uncached path: `buildStats` still runs over the same
@@ -190,6 +202,7 @@ export class SearchEngine {
   #documentTokens(record: ActionRecord, generation: number): string[] {
     const cached = this.#tokensCache.get(record.id);
     if (cached && cached.generation === generation) return cached.tokens;
+    this.#documentTokenMisses += 1;
     const tokens = documentTokens(record);
     this.#tokensCache.set(record.id, { generation, tokens });
     return tokens;
