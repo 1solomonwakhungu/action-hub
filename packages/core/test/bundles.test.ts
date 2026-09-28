@@ -5,6 +5,7 @@ import { BundleRegistry } from "../dist/bundles/bundles.js";
 import { Catalog } from "../dist/catalog/catalog.js";
 import type { Bundle, ServerConfig } from "../dist/types.js";
 import { FakeClient, makeFactory } from "./fakes.ts";
+import { testActionHub } from "./test-hub.ts";
 
 const sampleBundles: Bundle[] = [
   {
@@ -102,7 +103,7 @@ test("BundleRegistry resolves actions across serverIds and actionIds", () => {
 test("ActionHub loads bundle and calculates token savings", async () => {
   const clients = buildClients();
   const { factory } = makeFactory(clients);
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers,
     bundles: sampleBundles,
     clientFactory: factory,

@@ -22,6 +22,7 @@ import type {
   TextMapSetter,
 } from "../dist/index.js";
 import { FakeClient, makeFactory } from "./fakes.ts";
+import { testActionHub } from "./test-hub.ts";
 
 interface RecordedSpan {
   name: string;
@@ -161,7 +162,7 @@ function buildTestHub(tracer: InMemoryTestTracer, overrides: Partial<Constructor
   const clients = buildClients();
   const { factory, activations } = makeFactory(clients);
   const testServers: ServerConfig[] = servers.map((s) => ({ ...s, transport: { ...s.transport } as ServerConfig["transport"] }));
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: testServers,
     clientFactory: factory,
     tracer,
@@ -175,7 +176,7 @@ test("no-op default: works normally without configured tracer or SDK", async () 
   const clients = buildClients();
   const { factory } = makeFactory(clients);
   const testServers: ServerConfig[] = servers.map((s) => ({ ...s, transport: { ...s.transport } as ServerConfig["transport"] }));
-  const hub = new ActionHub({ servers: testServers, clientFactory: factory });
+  const hub = testActionHub({  servers: testServers, clientFactory: factory });
   await hub.indexAll();
 
   const hits = await hub.search("pull request");

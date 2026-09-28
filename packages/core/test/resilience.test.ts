@@ -7,6 +7,7 @@ import type { ServerConfig } from "../dist/types.js";
 import { FakeClient, makeFactory } from "./fakes.ts";
 import { ActionHub } from "../dist/action-hub.js";
 import type { McpClient } from "../dist/types.js";
+import { testActionHub } from "./test-hub.ts";
 
 class FakeClock {
   nowMs = 1_000_000;
@@ -687,7 +688,7 @@ test("execute-time connection errors trip the breaker without waiting for the he
       throw e;
     });
   };
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [server("dead")],
     clientFactory: factory,
     resilience: {
@@ -720,7 +721,7 @@ test("execute-time connection errors trip the breaker without waiting for the he
   const textyClient = new FakeClient([
     { name: "chatty", description: "fails with text", inputSchema: { type: "object" } },
   ], () => { throw new Error("Not connected to Slack workspace. Authenticate this integration first."); });
-  const texty = new ActionHub({
+  const texty = testActionHub({
     servers: [server("chatty")],
     clientFactory: makeFactory({ chatty: textyClient }).factory,
     resilience: {
@@ -748,7 +749,7 @@ test("execute-time connection errors trip the breaker without waiting for the he
   const erroringClient = new FakeClient([
     { name: "flaky", description: "returns isError", inputSchema: { type: "object" } },
   ], () => ({ isError: true, content: [{ type: "text", text: "nope" }] }));
-  const live = new ActionHub({
+  const live = testActionHub({
     servers: [server("live")],
     clientFactory: makeFactory({ live: erroringClient }).factory,
     resilience: {
@@ -785,7 +786,7 @@ test("activation deadline: a never-initializing server cannot gate startup", asy
     });
   const healthy = (): McpClient =>
     new FakeClient([{ name: "do_thing", description: "d", inputSchema: { type: "object" } }]);
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [
       { id: "dead", transport: { type: "stdio", command: "x" }, trust: "trusted", timeoutMs: 500 },
       { id: "ok1", transport: { type: "stdio", command: "x" }, trust: "trusted" },
@@ -812,7 +813,7 @@ test("activation deadline: a never-initializing server cannot gate startup", asy
 
 test("a slow-but-within-deadline server still activates", async () => {
   const clock = new FakeClock();
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [{ id: "slow", transport: { type: "stdio", command: "x" }, trust: "trusted", timeoutMs: 1_000 }],
     clientFactory: async () => {
       await new Promise((r) => setTimeout(r, 50)); // real 50ms, well within deadline
@@ -1141,7 +1142,7 @@ test("a live ToolError whose text says 'timed out after' is a tool error, not an
     throw new ToolError("remote job timed out after 1 retry");
   };
   const { factory } = makeFactory({ toolexe: client });
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [{ id: "toolexe", transport: { type: "stdio", command: "x" }, trust: "trusted", executeTimeoutThreshold: 2 }],
     clientFactory: factory,
     resilience: { heartbeat: { enabled: false } },

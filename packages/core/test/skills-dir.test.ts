@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { ActionHub } from "../dist/action-hub.js";
 import { discoverSkillsFromDirectory } from "../dist/discovery/auto-discovery.js";
 import type { SkillConfig } from "../dist/types.js";
+import { testActionHub } from "./test-hub.ts";
 
 test("a SKILL.md in a skills directory is discoverable, searchable, and loadable", async () => {
   const dir = await mkdtemp(join(tmpdir(), "skills-dir-"));
@@ -33,7 +34,7 @@ test("a SKILL.md in a skills directory is discoverable, searchable, and loadable
   assert.equal(skills[0]?.trust, "trusted");
 
   // Same mapping createHubRuntime uses for migrated config skills.
-  const hub = new ActionHub({ clientFactory: async () => { throw new Error("not used"); } });
+  const hub = testActionHub({  clientFactory: async () => { throw new Error("not used"); } });
   hub.registerSkills(
     skills.map((s) => ({
       id: s.id,
@@ -67,7 +68,7 @@ test("skills discovered from a directory carry the body as instructions on load"
 
   const skills: SkillConfig[] = await discoverSkillsFromDirectory(dir);
   assert.equal(skills.length, 1);
-  const hub = new ActionHub({ clientFactory: async () => { throw new Error("not used"); } });
+  const hub = testActionHub({  clientFactory: async () => { throw new Error("not used"); } });
   hub.registerSkills(
     skills.map((s) => ({
       id: s.id,
