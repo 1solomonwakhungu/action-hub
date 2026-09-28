@@ -8,8 +8,9 @@ import { test } from "node:test";
 import { resolve } from "node:path";
 import { writeFileSync, readFileSync, rmSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { ActionHub, type ServerConfig } from "@action-hub/core";
+import type { ServerConfig } from "@action-hub/core";
 import { createSdkClientFactory } from "../dist/client-factory.js";
+import { testActionHub } from "./test-hub.ts";
 
 const HERE = import.meta.dirname;
 const REPO = resolve(HERE, "..", "..", "..");
@@ -92,7 +93,7 @@ function pidAlive(pid: number): boolean {
 test("never-initializing stdio child: indexAll completes at the deadline, child reaped", async () => {
   const scratch = mkdtempSync(`${tmpdir()}/f27-`);
   let closed = false;
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [deadConfig({ F16_PID_FILE: resolve(scratch, "pid") }), liveConfig()],
     clientFactory: createSdkClientFactory(),
     resilience: { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false } },
@@ -142,7 +143,7 @@ test("hub.close() before the deadline aborts the in-flight activation and reaps 
   // at 10s the deadline cannot realistically fire before the local close()
   // returns, so "the rejection is abort-caused, not deadline-caused" is a
   // stable ordering assertion.
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [deadConfig({ F16_PID_FILE: resolve(scratch, "pid") }, 10_000)],
     clientFactory: createSdkClientFactory(),
     resilience: { failureThreshold: 3, cooldownMs: 3_000, heartbeat: { enabled: false } },

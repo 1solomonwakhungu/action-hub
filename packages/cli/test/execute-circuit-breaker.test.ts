@@ -4,9 +4,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { resolve } from "node:path";
-import { ActionHub } from "@action-hub/core";
 import { createSdkClientFactory } from "../dist/client-factory.js";
 import type { ServerConfig } from "@action-hub/core";
+import { testActionHub } from "./test-hub.ts";
 
 const SERVER_SCRIPT = resolve(import.meta.dirname, "fixtures", "f16-server.mjs");
 const CWD = resolve(import.meta.dirname, "..", "..", "..");
@@ -23,7 +23,7 @@ function makeHub(mode: string, threshold = 3) {
     },
     trust: "trusted",
   };
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [config],
     clientFactory: createSdkClientFactory(),
     resilience: { failureThreshold: threshold, cooldownMs: 3_000, heartbeat: { enabled: false } },

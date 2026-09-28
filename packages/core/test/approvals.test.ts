@@ -5,6 +5,7 @@ import { ApprovalRegistry, fingerprintArguments } from "../dist/permissions/appr
 import { PermissionPolicy } from "../dist/permissions/policy.js";
 import type { ServerConfig } from "../dist/types.js";
 import { FakeClient, makeFactory } from "./fakes.ts";
+import { testActionHub } from "./test-hub.ts";
 
 const servers: ServerConfig[] = [
   { id: "github", transport: { type: "stdio", command: "gh-mcp" }, trust: "trusted" },
@@ -49,7 +50,7 @@ function buildClients() {
 function buildHub(overrides: Partial<ConstructorParameters<typeof ActionHub>[0]> = {}) {
   const clients = buildClients();
   const { factory, activations } = makeFactory(clients);
-  const hub = new ActionHub({ servers, clientFactory: factory, ...overrides });
+  const hub = testActionHub({  servers, clientFactory: factory, ...overrides });
   return { hub, clients, activations };
 }
 
@@ -213,7 +214,7 @@ test("lowering the auto-approve floor stops gating untrusted servers", async () 
 test("a deny-listed tool cannot be approved", async () => {
   const clients = buildClients();
   const { factory } = makeFactory(clients);
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [servers[0]!, { ...servers[1]!, denyTools: ["post_message"] }],
     clientFactory: factory,
   });
@@ -271,7 +272,7 @@ test("the policy denies a deny-listed tool outright, never gating it", () => {
 test("a blocked server cannot be approved", async () => {
   const clients = buildClients();
   const { factory } = makeFactory(clients);
-  const hub = new ActionHub({
+  const hub = testActionHub({
     servers: [servers[0]!, { ...servers[1]!, trust: "blocked" }],
     clientFactory: factory,
   });
@@ -292,7 +293,7 @@ test("a token from one hub is worthless against a denying hub", async () => {
 
   const clients = buildClients();
   const { factory } = makeFactory(clients);
-  const strict = new ActionHub({
+  const strict = testActionHub({
     servers: [servers[0]!, { ...servers[1]!, trust: "blocked" }],
     clientFactory: factory,
   });

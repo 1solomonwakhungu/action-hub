@@ -64,7 +64,10 @@ function gatedYield() {
 }
 
 test("indexAll embeds cooperatively: yields between chunks and serves the event loop", async () => {
-  const PER_SERVER = 4_000;
+  // F68 suite-cost: 4000/server (8000 real WASM embeds) made this file the
+  // suite tail (~6.7 min). 1000/server keeps >8 chunk boundaries and a live
+  // heartbeat — the structural evidence this test pins — at ~1/8 the cost.
+  const PER_SERVER = 1_000;
   const yields: number[] = [];
   const { factory } = makeFactory(bigClients(PER_SERVER));
   const hub = new ActionHub({
@@ -102,8 +105,8 @@ test("indexAll embeds cooperatively: yields between chunks and serves the event 
   }
 
   assert.equal(hub.catalog.size, 2 * PER_SERVER);
-  // 8000 documents at chunk size 250 => at least 31 chunk boundaries.
-  assert.ok(yields.length >= 31, `expected >= 31 yields, got ${yields.length}`);
+  // 2000 documents at chunk size 250 => at least 7 chunk boundaries.
+  assert.ok(yields.length >= 7, `expected >= 7 yields, got ${yields.length}`);
   assert.ok(ticks > 0, "event loop heartbeat never fired during indexAll");
   // Wall-clock stall bounds live in stress/index-stall-bench.mjs (generous,
   // contention-tolerant thresholds in a dedicated perf script) after the
@@ -114,7 +117,7 @@ test("indexAll embeds cooperatively: yields between chunks and serves the event 
 });
 
 test("a search during a paused rebuild stays bounded and the event loop stays live", async () => {
-  const PER_SERVER = 2_000;
+  const PER_SERVER = 1_000;
   const gate = gatedYield();
   const { factory } = makeFactory(bigClients(PER_SERVER));
   const hub = new ActionHub({

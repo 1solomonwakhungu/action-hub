@@ -8,8 +8,9 @@ import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { ActionHub, type ServerConfig } from "@action-hub/core";
+import type { ServerConfig } from "@action-hub/core";
 import { createSdkClientFactory } from "../dist/client-factory.js";
+import { testActionHub } from "./test-hub.ts";
 
 const HERE = import.meta.dirname;
 const REPO = resolve(HERE, "..", "..", "..");
@@ -42,7 +43,7 @@ function makeHttpHub(url: string, threshold = 3) {
     transport: { type: "http", url },
     trust: "trusted",
   };
-  return new ActionHub({
+  return testActionHub({
     servers: [config],
     clientFactory: createSdkClientFactory(),
     resilience: { failureThreshold: threshold, cooldownMs: 3_000, heartbeat: { enabled: false } },

@@ -14,6 +14,7 @@ import {
   CatalogCache,
   bootstrapCatalog,
   discoverSkillsFromDirectory,
+  type ActionHubOptions,
 } from "@action-hub/core";
 import { defaultConfigPath, loadConfig } from "./config.js";
 import { createSdkClientFactory } from "./sdk-client.js";
@@ -131,7 +132,20 @@ export interface HubRuntime {
   close(): Promise<void>;
 }
 
-export async function createHubRuntime(): Promise<HubRuntime> {
+/**
+ * Optional runtime overrides (F68/F69): tests default embeddings OFF (the
+ * SQ4 default loads the WASM model and kicks a background rebuild whose
+ * bounded close-settlement can leave trailing writes — it raced the test's
+ * final rmdir with ENOTEMPTY) and can inject a CatalogCache to make the
+ * post-embedding vector write deterministic (delayed or never-settling).
+ * Omitted keys keep the production defaults.
+ */
+export interface HubRuntimeOptions {
+  embeddings?: ActionHubOptions["embeddings"];
+  cache?: CatalogCache;
+}
+
+export async function createHubRuntime(options: HubRuntimeOptions = {}): Promise<HubRuntime> {
   const configPath = defaultConfigPath();
   const config = await loadConfig(configPath);
 
@@ -141,6 +155,7 @@ export async function createHubRuntime(): Promise<HubRuntime> {
     clientFactory: createSdkClientFactory({ onWarning: warn }),
     policy: { autoApproveAtOrAbove: config.autoApproveAtOrAbove },
     approvals: { ttlMs: config.approvalTtlMs },
+    ...(options.embeddings !== undefined ? { embeddings: options.embeddings } : {}),
   });
 
   // Skills are local and cheap, so they are treated as always-live: after the
@@ -181,7 +196,7 @@ export async function createHubRuntime(): Promise<HubRuntime> {
       })),
   ];
 
-  const cache = new CatalogCache({ onWarning: warn });
+  const cache = options.cache ?? new CatalogCache({ onWarning: warn });
 
   // A warm cache makes the hub answerable immediately. The authoritative
   // re-index is DEFERRED (F23): starting it here monopolises the event loop
@@ -233,6 +248,33 @@ export async function createHubRuntime(): Promise<HubRuntime> {
       if (startedRefresh) await startedRefresh.catch(() => undefined);
       await snapshotDebouncer.dispose();
       await hub.close();
+      // F69: drain the post-embedding vector write, bounded. The persistence
+      // stays off the startup critical path, but shutdown must not outlive it
+      // — a pending cache.json.tmp rename racing the host's temp-dir cleanup
+      // produced real post-close ENOENTs. The write promise never rejects
+      // (failures surface via onWarning); on a timeout the non-settlement is
+      // surfaced the same way, not swallowed, and the losing timer is
+      // CLEARED so close() leaves no dangling handle.
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          bootstrap.vectorsWritten().then(() => {
+            settled = true;
+          }),
+          new Promise<void>((done) => {
+            // NOT unref'd: this deadline is real shutdown work. An unref'd
+            // timer lets a quiet process exit before the bound fires (the
+            // standalone blocked-write test showed the loop draining first).
+            timer = setTimeout(done, 2_000);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (!settled) {
+        warn("post-embedding cache write did not settle within 2s of close()");
+      }
     },
   };
 }
