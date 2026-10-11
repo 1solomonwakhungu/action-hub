@@ -97,7 +97,7 @@
       </div>
       <div class="principles">
         <article>{{icon:shield-check}}<h3>Original schemas</h3><p>Load upstream JSON Schema on demand. Validate against that schema before dispatch.</p></article>
-        <article>{{icon:zap}}<h3>Lazy activation</h3><p>Downstream servers are not spawned or authenticated until an action is executed.</p></article>
+        <article>{{icon:zap}}<h3>Lazy activation</h3><p>Cold catalog indexing and refresh contact configured downstream servers to call <code>listTools</code> before execution. After indexing, runtime connections stay inactive until an action is executed.</p></article>
         <article>{{icon:versions}}<h3>Cache-stable surface</h3><p>One fixed definition; no emitted <code>tools/list_changed</code> notification. Schemas arrive as results.</p></article>
       </div>
     </section>

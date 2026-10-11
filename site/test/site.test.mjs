@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, access, cp, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { readFile, access, cp, mkdtemp, mkdir, rm, symlink } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 const dist = new URL('../dist/', import.meta.url);
 const html = await readFile(new URL('index.html', dist), 'utf8');
@@ -30,8 +31,12 @@ test('source-backed limitations and evaluation distinctions stay visible', () =>
     'list_servers', 'Pinned bundles', 'not the shipped default',
     'metric to track, not an existing measured result',
     'current fixture has 121 rows',
+    'Cold catalog indexing and refresh contact configured downstream servers',
+    'call <code>listTools</code> before execution',
+    'After indexing, runtime connections stay inactive',
     'hutsonlabs', 'QuanTradin', 'BC_MARO',
   ]) assert.ok(html.includes(phrase), phrase);
+  assert.ok(!html.includes('not spawned or authenticated until'));
   assert.ok(!html.includes('\u2014'), 'No em dashes in site prose');
   assert.ok(html.includes('old.reddit.com/r/mcp/comments/1x2u6sb/'));
 });
@@ -56,8 +61,17 @@ test('site builds from a filesystem path containing spaces', async () => {
     for (const path of ['build.mjs', 'package.json', 'index.html', 'src', 'public']) {
       await cp(new URL(path, site), join(temporary, path), { recursive: true });
     }
-    await symlink(fileURLToPath(new URL('../../node_modules', import.meta.url)),
-      join(temporary, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    const manifest = JSON.parse(await readFile(new URL('package.json', site), 'utf8'));
+    assert.ok(manifest.devDependencies.esbuild, 'Site must declare its build dependency');
+    const require = createRequire(import.meta.url);
+    for (const name of Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })) {
+      const target = join(temporary, 'node_modules', name);
+      await mkdir(dirname(target), { recursive: true });
+      const modules = require.resolve.paths(name).find(path =>
+        existsSync(join(path, name, 'package.json')));
+      await symlink(join(modules, name), target,
+        process.platform === 'win32' ? 'junction' : 'dir');
+    }
     await promisify(execFile)(process.execPath, [join(temporary, 'build.mjs')]);
     await access(join(temporary, 'dist', 'assets', 'site.js'));
   } finally {
