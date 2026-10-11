@@ -28,6 +28,14 @@ export interface ServerConfig {
   id: string;
   /** Human-readable name shown in the capability manager. */
   displayName?: string;
+  /**
+   * One-line operator description of what the server covers ("Jira Cloud for
+   * the payments team"). Surfaced verbatim in the compressed server
+   * directory (`ActionHub#serverDirectory`, the `list_servers` operation) so
+   * a model facing a vague request can tell which integration owns it.
+   * Never indexed for ranking.
+   */
+  description?: string;
   /** Transport used to reach the downstream server. */
   transport: StdioTransport | HttpTransport;
   /** Defaults to "untrusted" when omitted. */

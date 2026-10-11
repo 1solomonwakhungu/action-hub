@@ -14,6 +14,7 @@ Load/performance bench and orchestration for the stress fleet. Contract:
 | `stress/gen-tools.mjs` | builder-4 | 10,000 tools across 44 servers + queries |
 | `stress/fake-mcp-server.mjs`, `stress/make-config.mjs` | builder-2 | fake MCP fleet + config writer |
 | `stress/eval-retrieval.mjs`, `stress/eval-retrieval.test.mjs` | builder-6 | search quality at scale: retrieval rank, abstention replay (`--abstention-threshold=<0..1>`, default 0.8) and execution success as three separate metrics; `--warm-embeddings` awaits the embedding index before the gate runs; `node --test stress/eval-retrieval.test.mjs` for the fixture and metric unit tests |
+| `stress/goal-only-gate.mjs` | search-quality | goal-only recall gate (30 realistic rows, own floors) |
 | `stress/chaos.mjs` | builder-8 | crash/hang/slow-start scenarios |
 | `stress/harness-e2e.mjs` | builder-9 | pi harness entrypoint e2e |
 | `stress/cli-scale.mjs` | builder-3 | CLI surface scale |
@@ -57,6 +58,43 @@ Every script prints a machine-readable JSON summary as its last stdout line
 and writes it to `stress/.generated/results/<script-name>.json`;
 `bench-load.mjs` writes its results into
 `stress/.generated/results/summary.md`.
+
+### Goal-only recall gate
+
+```bash
+node stress/gen-tools.mjs && node stress/gen-skills.mjs   # binding corpus (fail closed otherwise)
+node stress/goal-only-gate.mjs                            # keyword + hashed, ~10 s
+node stress/goal-only-gate.mjs --engines keyword,hashed,embeddings --fails   # production wiring, ~10 min
+node --test stress/goal-only-gate.test.mjs                # pure-function unit tests
+```
+
+`goal-only-gate.mjs` scores the 30 `goal-only` rows of
+`stress/fixtures/realistic-queries.json` (intent stated without the gold tool's
+verb; the lowest-scoring subtype) against the binding generated corpus, per
+engine and independently of `eval-retrieval.mjs`, which folds them into
+"hard". Each engine gets recall@1/5/10, MRR@10, per-row ranks with their
+tune/held split membership, the held-out subset's own metrics, and a pass/fail
+against committed floors (`GOAL_ONLY_FLOORS`, one query below the measured
+value). Measured 2026-10-11 at the commit that added the gate:
+
+| engine | recall@1 | recall@5 | recall@10 | MRR@10 | held-out recall@5 |
+|---|---:|---:|---:|---:|---:|
+| keyword (BM25 + synonyms) | 0.267 | 0.433 | 0.533 | 0.349 | 0.462 |
+| hashed (LocalSemanticIndex blend) | 0.133 | 0.267 | 0.333 | 0.181 | 0.462 |
+| embeddings (MiniLM + RRF, production default) | 0.400 | 0.533 | 0.567 | 0.454 | 0.538 |
+
+The held-out column is the 13 rows of `split-held.json`. The embeddings
+engine built its 15K-record index in about 10 minutes on the cloud runner,
+which is why it is opt-in.
+
+Two readings worth keeping: the hashed blend is BELOW pure BM25 on this band
+at 15K records (the semantic channel pulls toward entity-sharing distractors),
+and the production embeddings engine is the only one above 50% recall@5. The
+misses are verb paraphrases the synonym table does not bridge ("take back" for
+revoke, "fire it off again" for resend, "let ... through" for unlock) and
+entity paraphrases ("spending plan" for budget), not server confusion: 29 of
+the 30 golds live on one server. Raise the floors in the same commit that
+improves them.
 
 ## Isolation (contract hard rules)
 

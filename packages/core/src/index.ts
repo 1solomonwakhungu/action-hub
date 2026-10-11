@@ -12,6 +12,12 @@ export { bootstrapCatalog } from "./catalog/bootstrap.js";
 export type { BootstrapOptions, BootstrapResult } from "./catalog/bootstrap.js";
 export { SearchEngine, tokenize, DEFAULT_SEMANTIC_WEIGHT } from "./search/search.js";
 export type { SemanticScorer } from "./search/search.js";
+export { buildServerDirectory, clampDirectoryKeywords, DEFAULT_DIRECTORY_KEYWORDS, MAX_DIRECTORY_KEYWORDS } from "./search/server-directory.js";
+export type {
+  ServerDirectoryEntry,
+  ServerDirectoryMetadata,
+  ServerDirectoryOptions,
+} from "./search/server-directory.js";
 export { LocalSemanticIndex, createLocalSemanticScorer } from "./search/semantic.js";
 export type { LocalSemanticOptions, SemanticIndexStats } from "./search/semantic.js";
 export { EmbeddingSemanticIndex, EMBEDDING_BACKEND, EMBEDDING_DIMS, EMBEDDING_MODEL_ID } from "./search/embeddings.js";
