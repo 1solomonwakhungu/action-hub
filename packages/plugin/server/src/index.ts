@@ -67,12 +67,14 @@ Always follow three steps in order:
 
 Never execute an action you have not loaded in this conversation; argument names cannot be reliably guessed from an action name.
 
+If the request is vague or you do not know which integration owns it, call list_servers first. It returns a compressed index of the connected servers and the domain words each one covers; then search with those words or restrict the search with server_id.
+
 Some actions are gated. If execute returns status "approval_required", it did NOT run. Show the user the server, action, and arguments, ask them to confirm, and only if they agree repeat the identical execute call with approval_token set to the returned token. The token is single-use, expires quickly, and is only valid for those exact arguments. Never approve on the user's behalf.`;
 
 const inputShape = {
   operation: z
-    .enum(["search", "load", "execute", "load_bundle", "search_bundles"])
-    .describe("search finds candidates, load returns one action's schema, execute runs it, load_bundle loads a compound bundle of actions"),
+    .enum(["search", "load", "execute", "load_bundle", "search_bundles", "list_servers"])
+    .describe("search finds candidates, load returns one action's schema, execute runs it, load_bundle loads a compound bundle of actions, list_servers returns a compressed index of connected servers and their domain words"),
   query: z
     .string()
     .optional()
@@ -472,7 +474,7 @@ export async function runServer(): Promise<void> {
 }
 
 type ToolInput = {
-  operation: "search" | "load" | "execute" | "load_bundle" | "search_bundles";
+  operation: "search" | "load" | "execute" | "load_bundle" | "search_bundles" | "list_servers";
   query?: string;
   action_id?: string;
   bundle_id?: string;
@@ -538,13 +540,21 @@ async function dispatch(
                   score: Math.round((hits[0].semantic ?? hits[0].score ?? 0) * 1000) / 1000,
                 }
               : null,
-            hint: "No action scored above the confidence threshold and no bundle matched. Rephrase with the exact tool or domain name, or ask the user how to proceed.",
+            hint: "No action scored above the confidence threshold and no bundle matched. Rephrase with the exact tool or domain name (see servers), or ask the user how to proceed.",
+            // Domain awareness (r/mcp follow-up 4): the compact directory
+            // rides along so the agent can re-aim at a server without a
+            // second round trip. Bounded: one short line per server, at most
+            // COMPACT_DIRECTORY_MAX_SERVERS rows.
+            ...compactDirectory(hub),
           };
         }
       }
       return {
         ok: true,
         count: hits.length,
+        // An empty hit list is the other "I do not know which integration"
+        // moment: hand over the compact directory instead of a bare [].
+        ...(hits.length === 0 && matchingBundles.length === 0 ? compactDirectory(hub) : {}),
         results: hits.map((hit) => ({
           action_id: hit.id,
           name: hardenText(hit.name, SEARCH_SUMMARY_MAX_BYTES),
@@ -567,6 +577,30 @@ async function dispatch(
             ? "You can directly call execute with the action_id and arguments."
             : "Call load with an action_id to get its argument schema, or execute directly if you already have the schema."
           : undefined,
+      };
+    }
+
+    case "list_servers": {
+      // Compressed domain/server awareness (r/mcp follow-up 4). Loaded as a
+      // tool RESULT on demand, so the single fixed action_hub tool and its
+      // description stay cache-stable: nothing about the catalog leaks into
+      // the tool definition and no list_changed is ever emitted.
+      const servers = hub.serverDirectory();
+      return {
+        ok: true,
+        count: servers.length,
+        servers: servers.map((entry) => ({
+          server: entry.serverId,
+          ...(entry.displayName ? { display_name: hardenText(entry.displayName, SEARCH_SUMMARY_MAX_BYTES) } : {}),
+          ...(entry.description ? { description: hardenText(entry.description, SEARCH_SUMMARY_MAX_BYTES) } : {}),
+          actions: entry.actionCount,
+          kinds: entry.kinds,
+          keywords: entry.keywords.map((keyword) => hardenText(keyword, DIRECTORY_KEYWORD_MAX_BYTES)),
+        })),
+        next:
+          servers.length > 0
+            ? "Pick the server whose domain words fit the task, then search with those words or pass its id as server_id."
+            : "No servers are indexed yet. Search will return nothing until a server is configured and indexed.",
       };
     }
 
@@ -661,6 +695,50 @@ async function dispatch(
       };
     }
   }
+}
+
+/** Keywords come from the tokenizer (letters, digits, emoji), so this cap is a guard, not a budget. */
+const DIRECTORY_KEYWORD_MAX_BYTES = 64;
+/** Keywords per server in the directory that rides along on abstention and empty-result responses. */
+const COMPACT_DIRECTORY_KEYWORDS = 4;
+/**
+ * Upper bound on servers in the ride-along directory. The abstention and
+ * empty-page responses are supposed to stay small; past this many servers
+ * the list is cut (in id order) and `servers_truncated` points the agent at
+ * list_servers for the full set. 64 rows of four short words is about 4 KB
+ * pretty-printed.
+ */
+const COMPACT_DIRECTORY_MAX_SERVERS = 64;
+
+interface CompactDirectory {
+  servers: Array<{ server: string; keywords: string[] }>;
+  servers_truncated?: { shown: number; total: number; next: string };
+}
+
+/**
+ * The directory in its smallest useful form (server id + a few domain words)
+ * for responses that already carry a hint. The full entry set, with display
+ * names and descriptions, is one list_servers call away. Returned as a
+ * partial payload so the truncation marker only appears when it applies.
+ */
+function compactDirectory(hub: ActionHub): CompactDirectory {
+  const entries = hub.serverDirectory({ keywordsPerServer: COMPACT_DIRECTORY_KEYWORDS });
+  const servers = entries.slice(0, COMPACT_DIRECTORY_MAX_SERVERS).map((entry) => ({
+    server: entry.serverId,
+    keywords: entry.keywords.map((keyword) => hardenText(keyword, DIRECTORY_KEYWORD_MAX_BYTES)),
+  }));
+  return {
+    servers,
+    ...(entries.length > servers.length
+      ? {
+          servers_truncated: {
+            shown: servers.length,
+            total: entries.length,
+            next: "Call list_servers for the full directory.",
+          },
+        }
+      : {}),
+  };
 }
 
 function requireActionId(input: ToolInput, operation: string): string {

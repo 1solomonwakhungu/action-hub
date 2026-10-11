@@ -44,6 +44,18 @@ Narrow when you already know the source:
 { "operation": "search", "query": "assign issue", "server_id": "linear", "limit": 5 }
 ```
 
+**Vague request, unknown owner?** Ask for the compressed server directory
+first. It lists every connected server with its action count and the domain
+words it covers, in one short tool result:
+
+```json
+{ "operation": "list_servers" }
+```
+
+Pick the server whose words fit the task, then search with those words or
+pass its id as `server_id`. The same compact list rides along on an empty or
+abstained search, so you never have to guess which integration exists.
+
 ### 2. Load
 
 ```json
