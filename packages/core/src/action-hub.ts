@@ -3,6 +3,11 @@ import { CATALOG_CACHE_VERSION, type PersistedCatalog } from "./catalog/persiste
 import { BundleRegistry, type Bundle } from "./bundles/bundles.js";
 import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
+import {
+  buildServerDirectory,
+  type ServerDirectoryEntry,
+  type ServerDirectoryMetadata,
+} from "./search/server-directory.js";
 import { EmbeddingSemanticIndex, type EmbeddingIndexOptions, type PersistedEmbeddings } from "./search/embeddings.js";
 import { ConnectionManager, type ConnectionManagerOptions } from "./servers/connection-manager.js";
 import { PermissionPolicy, isToolPermitted, type PolicyOptions } from "./permissions/policy.js";
@@ -134,6 +139,8 @@ const DEFAULT_EXECUTION_TIMEOUT_MS = 30_000;
  */
 export class ActionHub {
   readonly #catalog = new Catalog();
+  /** Memoized server directory, keyed by catalog generation and keyword count. */
+  #directory?: { generation: number; keywords: number | undefined; entries: ServerDirectoryEntry[] };
   readonly #bundles: BundleRegistry;
   readonly #search: SearchEngine;
   readonly #connections: ConnectionManager;
@@ -662,6 +669,38 @@ export class ActionHub {
   /** Searches available capability bundles. */
   searchBundles(query: string): Bundle[] {
     return this.#bundles.search(query);
+  }
+
+  /**
+   * Compressed domain/server awareness: one entry per server with its action
+   * count, the config's display name and description, and its most
+   * distinctive domain words. Cheap enough to return as a tool result on
+   * every vague ask; memoized until the catalog changes. Entries are
+   * returned fresh (copied) so callers cannot mutate the memo.
+   */
+  serverDirectory(options: { keywordsPerServer?: number } = {}): ServerDirectoryEntry[] {
+    const generation = this.#catalog.generation;
+    const keywords = options.keywordsPerServer;
+    if (!this.#directory || this.#directory.generation !== generation || this.#directory.keywords !== keywords) {
+      const metadata = new Map<string, ServerDirectoryMetadata>();
+      for (const config of this.#connections.configs()) {
+        if (config.displayName === undefined && config.description === undefined) continue;
+        metadata.set(config.id, {
+          ...(config.displayName !== undefined ? { displayName: config.displayName } : {}),
+          ...(config.description !== undefined ? { description: config.description } : {}),
+        });
+      }
+      this.#directory = {
+        generation,
+        keywords,
+        entries: buildServerDirectory(this.#catalog.all(), { keywordsPerServer: keywords, metadata }),
+      };
+    }
+    return this.#directory.entries.map((entry) => ({
+      ...entry,
+      kinds: [...entry.kinds],
+      keywords: [...entry.keywords],
+    }));
   }
 
   /**

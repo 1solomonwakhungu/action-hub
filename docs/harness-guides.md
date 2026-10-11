@@ -290,6 +290,48 @@ any harness from any machine with the checkout:
 authenticated local socket. Each connection gets its own MCP session; the
 catalog, connection pool, and auth are shared process-wide.
 
+## Domain awareness for vague asks (`list_servers`)
+
+A goal-only request ("straighten out that messy contact record") gives the
+ranker little to match and gives the model no idea which integration owns
+it. Rather than growing the tool description (which must stay static so hosts
+can cache it), the hub serves a compressed server directory as a tool result:
+
+```json
+{ "operation": "list_servers" }
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "servers": [
+    { "server": "jira", "display_name": "Jira Cloud", "description": "Tickets for the payments team",
+      "actions": 42, "kinds": ["tool"], "keywords": ["ticket", "sprint", "board", "epic", "transition", "comment", "assignee", "project"] },
+    { "server": "s3", "actions": 12, "kinds": ["tool"], "keywords": ["bucket", "object", "storage", "upload", "prefix", "region", "lifecycle", "acl"] }
+  ],
+  "next": "Pick the server whose domain words fit the task, then search with those words or pass its id as server_id."
+}
+```
+
+- `keywords` are chosen per server by coverage times a server-level IDF, so
+  words every server shares (API boilerplate, generic verbs) sink and each
+  server's own domain vocabulary rises. The server id's own tokens are
+  omitted. Measured on the 44-server stress corpus: 8 keywords per server
+  is about 6.7 KB (roughly 1.7K tokens) and builds in about 250 ms, memoized
+  until the catalog changes.
+- `display_name` and `description` come from the server config
+  (`servers[].displayName`, `servers[].description`); set `description` to
+  a one-line statement of what the server covers for the best effect. Both
+  are redacted and capped like every other echoed field.
+- The compact form (`server` plus four keywords) also rides along on the two
+  "nothing confident" responses: an abstention (`abstained: true`) and an
+  empty result page, so the agent can re-aim without another round trip.
+  A search that returns hits is unchanged.
+- The static tool description tells the model when to use it: on a vague
+  request, call `list_servers` first, then search with the domain words or
+  restrict with `server_id`.
+
 ## No-confident-match abstention (search)
 
 By default `action_hub` search always returns its hits, even when nothing in
