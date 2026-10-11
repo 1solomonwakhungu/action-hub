@@ -1,0 +1,18 @@
+{
+  "name": "@action-hub/site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Static Action Hub explainer for GitHub Pages",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@formkit/auto-animate": "0.10.0",
+    "@primer/octicons": "19.40.0"
+  }
+}

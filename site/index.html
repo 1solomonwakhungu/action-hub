@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Action Hub · One tool. A searchable capability layer.</title>
+  <meta name="description" content="Explore Action Hub: one fixed MCP tool, search-load-execute routing, lazy activation, and an honest look at context costs, discovery, and approval tradeoffs.">
+  <link rel="canonical" href="https://1solomonwakhungu.github.io/action-hub/">
+  <meta property="og:title" content="Action Hub · One tool. A searchable capability layer.">
+  <meta property="og:description" content="Keep the interface small. Put the capability catalog behind search. Explore the architecture and its tradeoffs.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://1solomonwakhungu.github.io/action-hub/">
+  <meta property="og:image" content="https://1solomonwakhungu.github.io/action-hub/social.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Action Hub: many capabilities, one fixed MCP tool">
+  <link rel="icon" type="image/svg+xml" href="/action-hub/favicon.svg">
+  <link rel="stylesheet" href="/action-hub/assets/site.css">
+  <script type="module" src="/action-hub/assets/site.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="header wrap">
+    <a class="brand" href="#main" aria-label="Action Hub home"><span class="brand-mark">{{icon:workflow}}</span> Action Hub</a>
+    <nav aria-label="Main navigation">
+      <a href="#architecture">How it works</a>
+      <a href="#design-notes">Design notes</a>
+      <a class="repo-link" href="https://github.com/1solomonwakhungu/action-hub">{{icon:mark-github}} <span>GitHub</span> {{icon:arrow-up-right}}</a>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="status-dot"></span> OPEN SOURCE / MCP CAPABILITY LAYER</p>
+        <h1 id="hero-title">More capability.<br><span>Less context.</span></h1>
+        <p class="lede">Your agent doesn’t need the entire tool catalog in its prompt. It needs a good way to find the right action.</p>
+        <p class="hero-description">Action Hub puts MCP servers and skills behind one fixed tool. Search for a capability, load its schema, execute when ready.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/1solomonwakhungu/action-hub">{{icon:mark-github}} Explore the repository {{icon:arrow-up-right}}</a>
+          <a class="button secondary" href="#install">Get started {{icon:arrow-right}}</a>
+        </div>
+        <p class="micro">Host-neutral core. Original upstream schemas. MIT licensed.</p>
+      </div>
+      <div class="hero-art">
+        <div class="art-label"><span>THE INTERFACE STAYS SMALL</span><span>01 / OVERVIEW</span></div>
+        <svg class="hub-diagram" viewBox="0 0 520 410" role="img" aria-labelledby="hub-title hub-desc">
+          <title id="hub-title">Many capabilities, one host-visible tool</title>
+          <desc id="hub-desc">An MCP host connects to the fixed action_hub tool. Action Hub routes to an indexed catalog of GitHub, Slack, Linear, other MCP servers, and skills.</desc>
+          <defs><pattern id="dots" width="20" height="20" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#30363d"/></pattern><linearGradient id="hub-glow"><stop stop-color="#58a6ff" stop-opacity=".18"/><stop offset="1" stop-color="#58a6ff" stop-opacity=".02"/></linearGradient></defs>
+          <rect width="520" height="410" fill="url(#dots)"/>
+          <path d="M260 92V140M260 234V279M72 279H448M72 279V310M166 279V310M260 279V310M354 279V310M448 279V310" fill="none" stroke="#484f58" stroke-width="2"/>
+          <path d="M260 92V140M260 234V279H72V310" fill="none" stroke="#58a6ff" stroke-width="2"/>
+          <rect x="168" y="42" width="184" height="50" rx="8" fill="#161b22" stroke="#484f58"/>
+          <text x="260" y="73" text-anchor="middle" fill="#e6edf3" font-size="15">Any MCP host</text>
+          <rect x="137" y="140" width="246" height="94" rx="12" fill="#0d1117" stroke="#58a6ff"/>
+          <rect x="138" y="141" width="244" height="92" rx="12" fill="url(#hub-glow)"/>
+          <text x="260" y="177" text-anchor="middle" fill="#e6edf3" font-family="monospace" font-size="23">action_hub</text>
+          <text x="260" y="205" text-anchor="middle" fill="#8b949e" font-size="12">ONE FIXED TOOL DEFINITION</text>
+          <g fill="#161b22" stroke="#30363d"><rect x="30" y="310" width="84" height="45" rx="6"/><rect x="124" y="310" width="84" height="45" rx="6"/><rect x="218" y="310" width="84" height="45" rx="6"/><rect x="312" y="310" width="84" height="45" rx="6"/><rect x="406" y="310" width="84" height="45" rx="6"/></g>
+          <g fill="#e6edf3" text-anchor="middle" font-size="13"><text x="72" y="338">GitHub</text><text x="166" y="338">Slack</text><text x="260" y="338">Linear</text><text x="354" y="338">MCP …</text><text x="448" y="338">Skills</text></g>
+          <text x="260" y="392" text-anchor="middle" fill="#8b949e" font-size="12">INDEXED CATALOG / LAZY DOWNSTREAM ACTIVATION</text>
+        </svg>
+        <p class="art-caption"><span class="status-dot"></span> The catalog can change. The tool definition doesn’t.</p>
+      </div>
+    </section>
+
+    <section class="economics wrap" aria-labelledby="context-title">
+      <div><p class="eyebrow">01 / CONTEXT ECONOMICS</p><h2 id="context-title">Don’t broadcast.<br>Retrieve.</h2><p>In an eager setup, tool schemas occupy context whether the task needs them or not. Action Hub keeps the catalog outside the fixed tool definition.</p></div>
+      <div class="context-comparison">
+        <div class="comparison-row"><div><span class="comparison-label">Eager MCP · 20 servers</span><strong>~90k <small>tokens</small></strong></div><div class="bar eager"></div></div>
+        <div class="comparison-row"><div><span class="comparison-label">Action Hub · fixed baseline</span><strong class="green">~600 <small>tokens</small></strong></div><div class="bar lean"></div></div>
+        <p class="source-note">Illustrative project figures from the <a href="https://github.com/1solomonwakhungu/action-hub#the-problem">README</a> and <a href="https://github.com/1solomonwakhungu/action-hub#context-economics">context economics</a>, not universal MCP guarantees or a total session cost. Search results and loaded schemas still consume conversation tokens. Bars are schematic, not to scale.</p>
+      </div>
+    </section>
+
+    <section id="architecture" class="section wrap" aria-labelledby="architecture-title">
+      <div class="section-heading"><div><p class="eyebrow">02 / THE ROUTING LOOP</p><h2 id="architecture-title">One entry point.<br>Three deliberate steps.</h2></div><a class="text-link" href="https://github.com/1solomonwakhungu/action-hub/blob/main/docs/architecture.md">Read the architecture {{icon:arrow-up-right}}</a></div>
+      <div class="flow-layout">
+        <div class="flow-controls" role="group" aria-label="Explore the routing steps">
+          <button type="button" data-step="0" aria-pressed="true" aria-controls="step-detail"><span class="step-number">01</span><span><strong>search</strong><small>Rank the relevant actions</small></span>{{icon:search}}</button>
+          <div class="step-connector" aria-hidden="true"></div>
+          <button type="button" data-step="1" aria-pressed="false" aria-controls="step-detail"><span class="step-number">02</span><span><strong>load</strong><small>Fetch the original schema</small></span>{{icon:code}}</button>
+          <div class="step-connector" aria-hidden="true"></div>
+          <button type="button" data-step="2" aria-pressed="false" aria-controls="step-detail"><span class="step-number">03</span><span><strong>execute</strong><small>Validate and route the call</small></span>{{icon:play}}</button>
+        </div>
+        <div class="flow-detail">
+          <div id="step-detail" aria-live="polite" aria-atomic="true"><span class="eyebrow">01 / SEARCH</span><h3>Find the capability, not the schema.</h3><p>Hybrid lexical + semantic retrieval returns ranked action IDs and concise descriptions. Discovery does not activate the downstream server.</p></div>
+          <div class="code-label">HOST-VISIBLE TOOL / SIMPLIFIED REQUEST SHAPE</div>
+          <pre><code>{
+  <span class="code-key">"operation"</span>: <span class="code-string">"search | load | execute"</span>,
+  <span class="code-key">"query"</span>: <span class="code-string">"..."</span>,
+  <span class="code-key">"action_id"</span>: <span class="code-string">"..."</span>,
+  <span class="code-key">"arguments"</span>: {}
+}</code></pre>
+        </div>
+      </div>
+      <div class="principles">
+        <article>{{icon:shield-check}}<h3>Original schemas</h3><p>Load upstream JSON Schema on demand. Validate against that schema before dispatch.</p></article>
+        <article>{{icon:zap}}<h3>Lazy activation</h3><p>Downstream servers are not spawned or authenticated until an action is executed.</p></article>
+        <article>{{icon:versions}}<h3>Cache-stable surface</h3><p>One fixed definition; no emitted <code>tools/list_changed</code> notification. Schemas arrive as results.</p></article>
+      </div>
+    </section>
+
+    <section id="design-notes" class="notes-section" aria-labelledby="notes-title">
+      <div class="wrap section">
+        <div class="section-heading"><div><p class="eyebrow amber">03 / DESIGN NOTES &amp; OPEN QUESTIONS</p><h2 id="notes-title">A smaller surface.<br>Not a free lunch.</h2></div><p class="heading-aside">The architecture moves complexity. It doesn’t eliminate it. These are real tradeoffs raised in the community discussion.</p></div>
+        <article class="design-note">
+          <div class="note-index">01</div><div class="note-body"><span class="tag">APPROVAL VISIBILITY</span><h3>One tool can hide the action that matters.</h3><p><strong>hutsonlabs’ concern, paraphrased:</strong> a host that only sees <code>action_hub</code> may not expose the downstream action in its normal approval UI. A single entry point is not a substitute for legible consent.</p><p><strong>Current binding:</strong> approval tokens are bound to the action and exact arguments via a canonical argument hash. They are single-use and expire after five minutes by default. The lifetime is configurable, capped at one hour. See the <a href="https://github.com/1solomonwakhungu/action-hub/blob/main/docs/architecture.md#approval">approval design</a>.</p><p class="caveat"><strong>Visibility gap:</strong> the execute span does <em>not yet</em> expose the argument hash or upstream version. Approval binding exists; those telemetry fields do not. This site does not promise a shipped fix.</p><a class="text-link" href="https://github.com/1solomonwakhungu/action-hub/blob/main/docs/telemetry.md">Inspect the telemetry contract {{icon:arrow-up-right}}</a></div>
+          <figure class="approval-figure">
+            <svg viewBox="0 0 360 260" role="img" aria-labelledby="approval-title approval-desc">
+              <title id="approval-title">Approval bound to action and exact arguments</title><desc id="approval-desc">The action ID and canonical argument hash bind a five-minute, single-use approval token. Execute telemetry does not yet expose argument hash or upstream version.</desc>
+              <g fill="#0d1117" stroke="#484f58"><rect x="15" y="15" width="150" height="48" rx="6"/><rect x="195" y="15" width="150" height="48" rx="6"/><rect x="55" y="108" width="250" height="68" rx="8" stroke="#d29922"/></g>
+              <g fill="#e6edf3" text-anchor="middle" font-size="13"><text x="90" y="44">action_id</text><text x="270" y="36">canonical hash</text><text x="270" y="53" fill="#8b949e" font-size="11">of exact arguments</text><text x="180" y="136">Bound approval token</text><text x="180" y="158" fill="#d29922" font-size="12">SINGLE USE · 5 MIN DEFAULT</text></g>
+              <path d="M90 63V85H180V108M270 63V85H180M180 176V200" fill="none" stroke="#d29922" stroke-width="1.5"/>
+              <circle cx="180" cy="205" r="4" fill="#d29922"/>
+              <text x="180" y="236" text-anchor="middle" fill="#8b949e" font-size="12">Binding ≠ host or trace visibility</text>
+            </svg><figcaption>Consent must be specific, even when the interface is small.</figcaption>
+          </figure>
+        </article>
+        <article class="design-note">
+          <div class="note-index">02</div><div class="note-body"><span class="tag">DISCOVERY QUALITY</span><h3>“Help me with this” is a hard search query.</h3><p><strong>QuanTradin’s concern, paraphrased:</strong> search-first discovery can miss capabilities when a task is vague or goal-only rather than phrased in tool vocabulary.</p><p><strong>Current mitigations:</strong> the compressed <code>list_servers</code> helper exposes the connected integrations and domain words. Pinned bundles can keep known task capabilities close at hand. The 30 goal-only queries are gated separately so aggregate improvements cannot hide this weak spot.</p><p class="caveat"><strong>Proposed tradeoff, not the shipped default:</strong> put a tiny static capability index in the stable system prompt to give the model a starting map.</p></div><aside class="eval-card"><span class="eyebrow">RETRIEVAL EVALUATION</span><strong>120 <small>documented realistic queries</small></strong><p>README breakdown:<br>40 paraphrase · 30 goal-only<br>20 near-duplicate · 15 multi<br>15 no-match</p><p>Source check, 2026-10-11: the current fixture has 121 rows, including 16 multi rows. The documented headline and fixture differ by one.</p><div class="eval-divider"></div><strong>30 <small>separately gated</small></strong><p>Goal-only rows, per engine. A regression guard, not a claim of perfect discovery.</p><a href="https://github.com/1solomonwakhungu/action-hub/blob/main/stress/fixtures/realistic-queries.json">Query fixture {{icon:arrow-up-right}}</a><a href="https://github.com/1solomonwakhungu/action-hub/blob/main/stress/goal-only-gate.mjs">Goal-only gate {{icon:arrow-up-right}}</a></aside>
+        </article>
+        <article class="design-note">
+          <div class="note-index">03</div><div class="note-body"><span class="tag">THE REAL TOKEN BUDGET</span><h3>A map has a cost. So does a wrong turn.</h3><p><strong>BC_MARO’s tradeoff, paraphrased:</strong> a tiny static capability index in a stable system prompt may help discovery, but adds permanent token overhead.</p><p>False-positive searches and repeated discovery can erase the savings from a small baseline. <strong>False-positive search cost is a metric to track, not an existing measured result.</strong> Evaluate the whole path to a useful action, not just the initial tool definition.</p></div><aside class="question-card">{{icon:meter}}<h4>The question to measure</h4><p>How many tokens does it take to reach the <em>right</em> action, including failed searches and loaded schemas?</p><span class="tag">OPEN MEASUREMENT QUESTION</span></aside>
+        </article>
+        <a class="discussion-link" href="https://old.reddit.com/r/mcp/comments/1x2u6sb/i_got_tired_of_mcp_tool_schemas_eating_my_context/">{{icon:comment-discussion}} Read the original community discussion {{icon:arrow-up-right}}</a>
+      </div>
+    </section>
+
+    <section id="install" class="section wrap" aria-labelledby="install-title">
+      <div class="section-heading"><div><p class="eyebrow">04 / GET STARTED</p><h2 id="install-title">Try the capability layer.<br>Keep your MCP host.</h2></div><p class="heading-aside">A standalone binary includes the runtime, CLI, and MCP server. Or build from source with Node.js 20.11+.</p></div>
+      <div class="install-grid">
+        <div class="install-card"><div class="card-heading"><h3>macOS / Linux</h3><button id="copy-install" class="copy-button" type="button" hidden aria-label="Copy Homebrew install commands">{{icon:copy}} Copy</button></div><pre><code id="install-command">brew tap 1solomonwakhungu/tap
+brew install action-hub</code></pre><p id="copy-status" class="micro" role="status"></p><h3>Windows</h3><pre><code>winget install SolomonWakhungu.ActionHub</code></pre><p>Prefer a binary download? Use the <a href="https://github.com/1solomonwakhungu/action-hub/releases/latest">latest release</a> and verify <code>SHA256SUMS.txt</code>.</p></div>
+        <div class="setup-steps"><div><span class="step-number">1</span><p><strong>Configure your downstream servers.</strong> Start with <a href="https://github.com/1solomonwakhungu/action-hub/blob/main/config/servers.example.json"><code>config/servers.example.json</code></a> and copy it to <code>config/servers.json</code> in a source checkout.</p></div><div><span class="step-number">2</span><p><strong>Register one MCP server in your host.</strong> Point your host configuration at the installed binary:</p></div><pre><code>{
+  "command": "action-hub",
+  "args": ["start"]
+}</code></pre><a class="text-link" href="https://github.com/1solomonwakhungu/action-hub#shared-daemon-mode">Multiple hosts? See shared daemon mode {{icon:arrow-up-right}}</a></div>
+      </div>
+      <details class="source-install"><summary>Build from source <span>Node.js 20.11+ {{icon:code}}</span></summary><pre><code>git clone https://github.com/1solomonwakhungu/action-hub.git
+cd action-hub
+npm install
+npm run build
+npm test</code></pre><a href="https://github.com/1solomonwakhungu/action-hub#getting-started">Full getting-started guide {{icon:arrow-up-right}}</a></details>
+    </section>
+    <section class="closing wrap"><div><p class="eyebrow">BUILT IN THE OPEN</p><h2>Inspect the code.<br>Challenge the tradeoffs.</h2><p>Early development. Read the implementation and roadmap before relying on a capability.</p></div><div class="closing-links"><a class="button primary" href="https://github.com/1solomonwakhungu/action-hub">{{icon:mark-github}} View Action Hub on GitHub {{icon:arrow-up-right}}</a><a class="text-link" href="https://github.com/1solomonwakhungu/action-hub/blob/main/docs/roadmap.md">Implementation &amp; roadmap {{icon:arrow-up-right}}</a></div></section>
+  </main>
+  <footer class="wrap"><a class="brand" href="#main">{{icon:workflow}} Action Hub</a><p>A searchable capability layer, not another agent harness.</p><a href="https://github.com/1solomonwakhungu/action-hub/blob/main/LICENSE">MIT license {{icon:arrow-up-right}}</a></footer>
+</body>
+</html>
