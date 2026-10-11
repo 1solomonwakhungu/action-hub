@@ -4,7 +4,7 @@
 
 Action Hub replaces the eager capability surface of a typical MCP setup with a lazy, searchable one. An agent can reach 100,000 actions while its permanent context holds only a single tool schema.
 
-**Explainer microsite:** [GitHub Pages project URL](https://1solomonwakhungu.github.io/action-hub/), to be activated upon merge. For deployment, set **Settings → Pages → Build and deployment → Source → GitHub Actions**. The dedicated Pages workflow publishes `site/dist` from `main`; this link is not a claim of a verified live deployment.
+**Explainer microsite:** [Visit the live Action Hub site](https://1solomonwakhungu.github.io/action-hub/). It is published from `site/dist` by the [GitHub Pages workflow](.github/workflows/pages.yml) on `main`.
 
 To build and test the site locally after installing workspace dependencies, run `npm test --workspace @action-hub/site`. Static output is in `site/dist`, with asset URLs rooted at `/action-hub/`.
 
