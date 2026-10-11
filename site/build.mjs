@@ -1,5 +1,6 @@
 import { build } from 'esbuild';
 import { readFile, writeFile, mkdir, cp, rm } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import octicons from '@primer/octicons';
 
 const root = new URL('./', import.meta.url);
@@ -7,10 +8,10 @@ const dist = new URL('dist/', root);
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 await build({
-  entryPoints: [new URL('src/main.js', root).pathname],
+  entryPoints: [fileURLToPath(new URL('src/main.js', root))],
   bundle: true,
   minify: true,
-  outdir: dist.pathname,
+  outdir: fileURLToPath(dist),
   entryNames: 'assets/site',
   target: ['es2020'],
 });

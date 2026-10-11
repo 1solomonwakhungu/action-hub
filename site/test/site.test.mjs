@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, access } from 'node:fs/promises';
+import { readFile, access, cp, mkdtemp, rm, symlink } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const dist = new URL('../dist/', import.meta.url);
 const html = await readFile(new URL('index.html', dist), 'utf8');
@@ -42,4 +47,20 @@ test('accessible interactions have static fallbacks and reduced-motion support',
   assert.ok(js.includes('prefers-reduced-motion'));
   const css = await readFile(new URL('assets/site.css', dist), 'utf8');
   assert.ok(css.includes('prefers-reduced-motion'));
+});
+
+test('site builds from a filesystem path containing spaces', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'action hub site '));
+  try {
+    const site = new URL('../', import.meta.url);
+    for (const path of ['build.mjs', 'package.json', 'index.html', 'src', 'public']) {
+      await cp(new URL(path, site), join(temporary, path), { recursive: true });
+    }
+    await symlink(fileURLToPath(new URL('../../node_modules', import.meta.url)),
+      join(temporary, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
+    await promisify(execFile)(process.execPath, [join(temporary, 'build.mjs')]);
+    await access(join(temporary, 'dist', 'assets', 'site.js'));
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 });
