@@ -18,6 +18,7 @@ Load/performance bench and orchestration for the stress fleet. Contract:
 | `stress/chaos.mjs` | builder-8 | crash/hang/slow-start scenarios |
 | `stress/harness-e2e.mjs` | builder-9 | pi harness entrypoint e2e |
 | `stress/cli-scale.mjs` | builder-3 | CLI surface scale |
+| `stress/abstention-threshold.mjs`, `stress/abstention-threshold.test.mjs`, `stress/fixtures/no-match-queries.json` | abstention-docs | held-out calibration of the search abstention gate (both semantic channels); negative fixture; unit tests for the pure parts |
 
 Generated data lives in `stress/.generated/` (gitignored). Only scripts and
 this README are committed.
@@ -27,6 +28,16 @@ this README are committed.
 ```bash
 npm run build                     # CLI must be built; bench drives dist/index.js
 node stress/bench-load.mjs --scale small   # small fallback fixtures
+```
+
+Abstention calibration (needs the generated corpus; the first embeddings run
+embeds 15K documents in WASM and takes minutes, later runs hydrate the
+persisted vectors from `stress/.generated/abstention-vectors.json`):
+
+```bash
+node stress/gen-tools.mjs && node stress/gen-skills.mjs
+node stress/abstention-threshold.mjs --semantic both   # or embeddings | hashed (own artifact name per channel)
+node --test stress/abstention-threshold.test.mjs       # pure parts + fixture
 ```
 
 `bench-load.mjs` measures, per scale:
