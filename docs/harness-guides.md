@@ -330,6 +330,47 @@ the user how to proceed instead of picking a near-miss action. When the flag
 is off, treat a search whose top hits share only loose words with the query
 the same way — the response gives you no confidence signal by itself.
 
+## Loaded schemas after compaction
+
+Action Hub keeps the host's prompt cache stable by exposing one fixed tool
+and returning argument schemas as tool results (README, "Cache-stable by
+design"). The cost of that choice is that a loaded schema is conversation
+history, not a tool definition the host holds on to. Harnesses that compact
+long sessions (Claude Code's context compaction, Codex, custom agent loops
+that summarize older turns) can drop or summarize a `load` result while the
+model still remembers having loaded the action.
+
+What the hub guarantees regardless:
+
+- **A stale guess cannot reach a downstream server.** `execute` validates
+  every call against the verbatim upstream schema before dispatch. Argument
+  names and required fields are not recoverable from an action id, so a call
+  built from a remembered schema fails locally with `Invalid arguments: ...`
+  and nothing runs. The right reaction is to `load` again, not to guess
+  again.
+- **Re-loading is cheap.** One `load` round trip returns about 2.9 KB
+  (roughly 730 tokens) for a full-scale schema; see the token-cost finding in
+  `stress/README.md`. For a single confident candidate, `search` with
+  `limit: 1` and `include_schema: true` returns the candidate and its schema
+  in one call.
+
+Guidance for host authors and for anyone writing a system prompt around the
+hub:
+
+1. If your compaction keeps tool results, keep `action_hub` `load` results
+   (and `include_schema` search results) verbatim. If it keeps a summary,
+   have the summary say that previously loaded schemas were removed.
+2. Tell the model what "loaded in this conversation" means: the schema text
+   is in the current context. After a compaction, `load` again before
+   `execute`. The `next` hint on a search response ("execute directly if you
+   already have the schema") uses the same meaning of "have".
+3. Do not pin schemas into the system prompt or the tool definition to work
+   around compaction. That reintroduces the per-turn cost the hub exists to
+   remove and changes the cached prefix.
+4. Treat `Invalid arguments` after a compaction as the signal it is: reload
+   and retry once. A second validation failure means the wrong action was
+   chosen, so search again.
+
 ## Raw MCP clients
 
 If you hand-roll an MCP client instead of using an SDK, three framing

@@ -69,6 +69,36 @@ Servers are activated lazily. A server is not spawned or authenticated until one
 | Cost of an unused integration | Full schema, every turn | Zero |
 | Marginal cost of server #101 | Linear growth | Constant |
 
+### Cache-stable by design
+
+Hosts that cache the prompt prefix (Anthropic prompt caching, OpenAI cached
+prompts, and the equivalents inside Claude Code, Cursor, and Codex) key that
+cache on the tool definitions sent at the start of the session. Any change to
+the tool list invalidates the prefix on every later turn. Action Hub is built
+so that never happens:
+
+- **One fixed tool.** The server registers `action_hub` once, before the
+  transport connects. Its name, description, and input schema are the same
+  bytes on turn one and turn four hundred, and `tools/list` is a single page
+  with no cursor.
+- **No `tools/list_changed`.** The catalog underneath changes (warm-start
+  re-index, a server added, a skill removed), but the tool surface does not,
+  so the server never emits the notification and the host never has to
+  refetch and re-cache its tools.
+- **Schemas are tool results.** `load` (and `search` with
+  `include_schema: true`) return the upstream JSON Schema inside the tool
+  result. A schema costs tokens only on the turn it is fetched and lives in
+  the conversation, not in the cached prefix.
+
+`packages/plugin/server/test/cache-stable.test.ts` pins all three against the
+real MCP client path.
+
+The flip side is that a loaded schema is conversation history. Hosts that
+compact or summarize history can drop it while the model still remembers
+having loaded the action. See
+[Loaded schemas after compaction](docs/harness-guides.md#loaded-schemas-after-compaction)
+for what the hub guarantees in that case and what to tell the model.
+
 ## Architecture
 
 The project is split into two layers, and the boundary between them is load-bearing.
