@@ -290,6 +290,52 @@ any harness from any machine with the checkout:
 authenticated local socket. Each connection gets its own MCP session; the
 catalog, connection pool, and auth are shared process-wide.
 
+## Domain awareness for vague asks (`list_servers`)
+
+A goal-only request ("straighten out that messy contact record") gives the
+ranker little to match and gives the model no idea which integration owns
+it. Rather than growing the tool description (which must stay static so hosts
+can cache it), the hub serves a compressed server directory as a tool result:
+
+```json
+{ "operation": "list_servers" }
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "servers": [
+    { "server": "jira", "display_name": "Jira Cloud", "description": "Tickets for the payments team",
+      "actions": 42, "kinds": ["tool"], "keywords": ["ticket", "sprint", "board", "epic", "transition", "comment", "assignee", "project"] },
+    { "server": "s3", "actions": 12, "kinds": ["tool"], "keywords": ["bucket", "object", "storage", "upload", "prefix", "region", "lifecycle", "acl"] }
+  ],
+  "next": "Pick the server whose domain words fit the task, then search with those words or pass its id as server_id."
+}
+```
+
+- `keywords` are chosen per server by coverage times a server-level IDF, so
+  words every server shares (API boilerplate, generic verbs) sink and each
+  server's own domain vocabulary rises. The server id's own tokens are
+  omitted. Keyword ties break in code-point order, so the same catalog gives
+  the same directory on every host. Measured on the 44-server stress corpus
+  (15,000 records): 8 keywords per server is about 6.5 KB of compact JSON
+  (roughly 1.6K tokens; the pretty-printed tool result is about twice that)
+  and builds in well under a second, memoized until the catalog changes.
+- `display_name` and `description` come from the server config
+  (`servers[].displayName`, `servers[].description`); set `description` to
+  a one-line statement of what the server covers for the best effect. Both
+  are redacted and capped like every other echoed field.
+- The compact form (`server` plus four keywords) also rides along on the two
+  "nothing confident" responses: an abstention (`abstained: true`) and an
+  empty result page, so the agent can re-aim without another round trip.
+  It is capped at 64 servers (in id order); past that the response carries
+  `servers_truncated: { shown, total, next }` and `list_servers` has the
+  full set. A search that returns hits is unchanged.
+- The static tool description tells the model when to use it: on a vague
+  request, call `list_servers` first, then search with the domain words or
+  restrict with `server_id`.
+
 ## No-confident-match abstention (search)
 
 By default `action_hub` search always returns its hits, even when nothing in
@@ -310,8 +356,10 @@ An optional flag makes the search say so instead:
 - `enabled` (default **false**): when true, a search whose top hit scores
   below `threshold` returns an abstention response instead of hits:
   `{ ok, count: 0, results: [], abstained: true, reason: "no_confident_match",
-  threshold, closestMatch: { id, score } | null, hint }` (the query itself
-  is deliberately not echoed — every echoed field carries an output budget).
+  threshold, closestMatch: { id, score } | null, hint, servers: [{ server,
+  keywords }] }` (the query itself is deliberately not echoed — every echoed
+  field carries an output budget; `servers` is the compact server directory
+  described under `list_servers`, capped at 64 rows).
 - `threshold` (default 0.8, clamped to [0, 1]): compared against the top
   hit's raw semantic score (`hits[0].semantic`), which is the MiniLM cosine
   under the default embeddings channel and the hashed-index cosine under the
@@ -323,6 +371,15 @@ An optional flag makes the search say so instead:
 
 The response shape is additive: clients that only read `count`/`results`
 see an ordinary empty result.
+
+**How an agent should react to `abstained: true`:** do not call a tool on a
+guess. First try one rephrased search using an exact tool or domain name
+(the `closestMatch.id` is a good starting point, and the `servers` list on
+the same response names each server's domain words, so a second attempt can
+narrow with `server_id`); if that also abstains, ask
+the user how to proceed instead of picking a near-miss action. When the flag
+is off, treat a search whose top hits share only loose words with the query
+the same way — the response gives you no confidence signal by itself.
 
 ### Calibration (2026-10-11, held-out)
 
@@ -400,13 +457,6 @@ Reproduce: `node stress/gen-tools.mjs && node stress/gen-skills.mjs && node
 stress/abstention-threshold.mjs --semantic both`. The summary lands in
 `stress/.generated/results/abstention-threshold.json` and every row's gate
 input, rank, and top hit in the sibling `.detail.json` for audit.
-
-**How an agent should react to `abstained: true`:** do not call a tool on a
-guess. First try one rephrased search using an exact tool or domain name
-(the `closestMatch.id` is a good starting point); if that also abstains, ask
-the user how to proceed instead of picking a near-miss action. When the flag
-is off, treat a search whose top hits share only loose words with the query
-the same way — the response gives you no confidence signal by itself.
 
 ## Loaded schemas after compaction
 

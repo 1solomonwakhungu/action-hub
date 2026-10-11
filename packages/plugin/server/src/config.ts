@@ -163,6 +163,7 @@ function parseServerFields(
   return {
     id,
     displayName: typeof entry["displayName"] === "string" ? entry["displayName"] : undefined,
+    description: typeof entry["description"] === "string" ? entry["description"] : undefined,
     transport,
     trust: isTrust(trust) ? trust : "untrusted",
     enabled: entry["enabled"] === undefined ? true : entry["enabled"] !== false,
