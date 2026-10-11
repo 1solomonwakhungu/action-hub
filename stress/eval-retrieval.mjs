@@ -12,22 +12,55 @@
  * warmup pass, context token cost per response, definition-token savings.
  * Reported by difficulty (exact|paraphrase|hard), subtype, and kind.
  *
+ * Three distinct outcome metrics (r/mcp follow-up, item 1): every engine run
+ * reports RETRIEVAL RANK (the recall/MRR family above), ABSTENTION (the
+ * server's documented no-confident-match rule, docs/harness-guides.md,
+ * replayed on the raw per-query confidence at the documented default
+ * threshold 0.8, overridable with --abstention-threshold=<0..1>) and
+ * SUCCESSFUL EXECUTION (the top-1 pick is executed through the REAL
+ * ActionHub.execute path, policy + argument validation + dispatch, with the
+ * arguments the gold tool's schema calls for; success means the GOLD ran and
+ * returned ok). They are scored independently and never folded into one
+ * number: the execution probe runs unconditionally (it does not consult the
+ * abstention rule), so a query can rank its gold first and still fail
+ * execution, or abstain correctly without ranking anything. The derived
+ * `gatedByAbstention` view shows what an agent honoring the rule would get.
+ * Headline block: `threeMetrics`.
+ *
+ * Execution is side-effect free by construction: every server in the eval is
+ * an in-process fake whose callTool returns a canned acknowledgement. No
+ * external MCP server, process, or destructive tool is ever invoked.
+ *
+ * Incompatible-argument near-duplicates (r/mcp follow-up, item 3): the
+ * synthetic catalog carries, next to each archive_X / delete_X / export_X,
+ * a same-server twin (archive_X_by_id, delete_X_by_id, export_X_report)
+ * whose name and description are confusable but whose argument shape is
+ * incompatible both ways (required keys the other lacks, and
+ * additionalProperties:false on every schema). A wrong pick between twins
+ * therefore surfaces as a LOUD execution failure (hub-side
+ * validation_failed), while a wrong pick between same-shape rivals
+ * (archive_X vs delete_X) surfaces as a SILENT wrong-tool execution. The
+ * execution block reports the two classes separately.
+ *
  * Gates (reported honestly): recall@5 .90/.80/.65, recall@10 .95/.90/.80,
  * MRR@10 .80/.65/.45 (exact/paraphrase/hard); Sufficiency@10 >= .75;
  * no-match FP <= 5%; warm p95 <= 100 ms at 15K; token savings >= 95%.
+ * Abstention and execution are reported, not gated (no contract target yet).
  *
  * Data: stress/.generated manifests + query files when the generators have
  * landed; otherwise deterministic self-fixtures in contract format.
  *
  * Output: JSON summary as the LAST stdout line, also written to
  * stress/.generated/results/eval-retrieval.json.
+ *
+ * Unit tests: stress/eval-retrieval.test.mjs imports this module (nothing
+ * runs at import time; the harness runner is guarded by the argv[1] check).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import * as os from "node:os";
-import { join, resolve, relative, isAbsolute } from "node:path";
-import { fileURLToPath } from "node:url";
-import { ActionHub, createLocalSemanticScorer, parseSkillContent } from "../packages/core/dist/index.js";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { ActionHub, createLocalSemanticScorer, parseSkillContent, validateArguments } from "../packages/core/dist/index.js";
 import { createSandbox, assertIsolated, main as harnessMain } from "./lib/harness.mjs";
 
 // ---- isolation (ISOLATION.md checklist, rev 21:27Z + reviewer-2 rework) ------
@@ -40,7 +73,27 @@ const GENERATED = join(STRESS_DIR, ".generated");
 const RESULTS_DIR = join(GENERATED, "results");
 const ARGV = new Set(process.argv.slice(2));
 const QUICK = ARGV.has("--quick");
+// Await the embedding rebuild before scoring the engine-comparison and gate
+// runs (the runs that carry abstention + execution). Off by default: warming
+// costs roughly 35 ms per catalog entry on a CPU host. The sweep, skills
+// and realistic sections keep the historical cold-build behaviour either way.
+const WARM = ARGV.has("--warm-embeddings");
 const SEED = 0x5eed;
+// Abstention replay threshold: the server's documented default
+// (docs/harness-guides.md, packages/plugin/server/src/config.ts). Parsed
+// inside runEval so a malformed flag fails closed through the harness.
+const ABSTENTION_THRESHOLD_DEFAULT = 0.8;
+const ABSTENTION_FLAG = "--abstention-threshold";
+function parseAbstentionThreshold(argv) {
+  const raw = [...argv].find((a) => a === ABSTENTION_FLAG || a.startsWith(`${ABSTENTION_FLAG}=`));
+  if (raw === undefined) return ABSTENTION_THRESHOLD_DEFAULT;
+  const value = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : "";
+  const n = Number(value);
+  if (value.trim() === "" || !Number.isFinite(n) || n < 0 || n > 1) {
+    throw new Error(`${ABSTENTION_FLAG} requires a number in [0, 1] (got ${JSON.stringify(value)})`);
+  }
+  return n;
+}
 const PREFIXES = [100, 1000, 5000, 10000, 15000];
 const GATES = {
   recallAt5: { exact: 0.9, paraphrase: 0.8, hard: 0.65 },
@@ -94,7 +147,75 @@ const DOMAINS = [
   "sales", "compliance",
 ];
 
-/** 15 domains x 60 objects x 15 verbs = 13,500 tools on 30 servers. */
+/**
+ * Incompatible-argument twin families (r/mcp follow-up, item 3). Each base
+ * verb gets a same-server twin whose name and description are confusable
+ * with the base tool but whose argument shape is incompatible BOTH ways:
+ * the twin requires keys the base schema rejects (additionalProperties is
+ * false everywhere) and rejects the base's filter/limit keys. A wrong pick
+ * inside a twin pair cannot execute silently; it fails hub-side validation.
+ */
+const TWIN_FAMILIES = [
+  {
+    baseVerb: "archive",
+    suffix: "_by_id",
+    describe: (object, domain) => `Archive specific ${object} by id in the ${domain} workspace. Takes an explicit id list and an optional reason; no filters or pagination.`,
+    schema: () => ({
+      type: "object",
+      required: ["ids"],
+      properties: {
+        ids: { type: "array", description: "Ids of the records to archive", items: { type: "string" }, minItems: 1 },
+        reason: { type: "string", description: "Why these records are archived" },
+      },
+      additionalProperties: false,
+    }),
+  },
+  {
+    baseVerb: "delete",
+    suffix: "_by_id",
+    describe: (object, domain) => `Delete specific ${object} by id in the ${domain} workspace. Takes an explicit id list and an optional reason; no filters or pagination.`,
+    schema: () => ({
+      type: "object",
+      required: ["ids"],
+      properties: {
+        ids: { type: "array", description: "Ids of the records to delete", items: { type: "string" }, minItems: 1 },
+        reason: { type: "string", description: "Why these records are deleted" },
+      },
+      additionalProperties: false,
+    }),
+  },
+  {
+    baseVerb: "export",
+    suffix: "_report",
+    describe: (object, domain) => `Export a formatted ${object} report in the ${domain} workspace. Requires an output format and a date range; no filters or pagination.`,
+    schema: () => ({
+      type: "object",
+      required: ["format", "range"],
+      properties: {
+        format: { type: "string", description: "Output format", enum: ["csv", "pdf"] },
+        range: {
+          type: "object",
+          description: "Reporting period",
+          required: ["from", "to"],
+          properties: {
+            from: { type: "string", description: "Start date (YYYY-MM-DD)" },
+            to: { type: "string", description: "End date (YYYY-MM-DD)" },
+          },
+          additionalProperties: false,
+        },
+      },
+      additionalProperties: false,
+    }),
+  },
+];
+const twinNameFor = (family, object) => `${family.baseVerb}_${object}${family.suffix}`;
+const isTwinName = (name) => TWIN_FAMILIES.some((f) => name.startsWith(`${f.baseVerb}_`) && name.endsWith(f.suffix));
+
+/**
+ * 15 domains x 61 objects x (15 verbs + 3 twins) = 16,470 tools on 30
+ * servers. Every schema pins additionalProperties:false, matching the
+ * generated corpus, so a wrong pick is only silent when the shapes agree.
+ */
 function syntheticCatalog(domainCount = DOMAINS.length) {
   const servers = [];
   for (const domain of DOMAINS.slice(0, domainCount)) servers.push(`${domain}-main`, `${domain}-mirror`);
@@ -103,11 +224,12 @@ function syntheticCatalog(domainCount = DOMAINS.length) {
     type: "object",
     properties: {
       filter: { type: "string", description: "Filter text" },
-      limit: { type: "integer", description: "Max rows to return" },
+      limit: { type: "integer", description: "Max rows to return", minimum: 1, maximum: 500 },
       ...(verb === "create" || verb === "update" || verb === "merge"
         ? { payload: { type: "object", description: "Fields to write" } }
         : {}),
     },
+    additionalProperties: false,
   });
   for (const domain of DOMAINS.slice(0, domainCount)) {
     for (const object of OBJECTS) {
@@ -120,10 +242,121 @@ function syntheticCatalog(domainCount = DOMAINS.length) {
           inputSchema: schemaFor(verb),
           annotations: DESTRUCTIVE.has(verb) ? { destructiveHint: true } : { readOnlyHint: true },
         });
+        const family = TWIN_FAMILIES.find((f) => f.baseVerb === verb);
+        if (family) {
+          tools.push({
+            serverId,
+            name: twinNameFor(family, object),
+            description: family.describe(object.replace(/_/g, " "), domain),
+            inputSchema: family.schema(),
+            annotations: DESTRUCTIVE.has(verb) ? { destructiveHint: true } : { readOnlyHint: true },
+          });
+        }
       }
     }
   }
   return { servers, tools };
+}
+
+/**
+ * Fail-closed fixture check: for every twin pair, the gold-shaped arguments
+ * of one side must be REJECTED by the other side's schema. Run on the
+ * synthetic catalog before any engine is built; a twin that accepts its
+ * base's arguments would turn a loud failure back into a silent one.
+ */
+function assertTwinsIncompatible(catalogTools) {
+  const byKey = new Map(catalogTools.map((t) => [`${t.serverId}:${t.name}`, t]));
+  let pairs = 0;
+  const problems = [];
+  for (const t of catalogTools) {
+    const family = TWIN_FAMILIES.find((f) => t.name.startsWith(`${f.baseVerb}_`) && t.name.endsWith(f.suffix));
+    if (!family) continue;
+    const baseName = t.name.slice(0, -family.suffix.length);
+    const base = byKey.get(`${t.serverId}:${baseName}`);
+    if (!base) { problems.push(`twin ${t.serverId}:${t.name} has no base tool`); continue; }
+    pairs += 1;
+    const baseArgs = intendedArgs(base.inputSchema);
+    const twinArgs = intendedArgs(t.inputSchema);
+    if (!validateArguments(base.inputSchema, baseArgs).valid) problems.push(`base ${base.name} rejects its own intended args`);
+    if (!validateArguments(t.inputSchema, twinArgs).valid) problems.push(`twin ${t.name} rejects its own intended args`);
+    if (validateArguments(t.inputSchema, baseArgs).valid) problems.push(`twin ${t.name} ACCEPTS base-shaped args (not incompatible)`);
+    if (validateArguments(base.inputSchema, twinArgs).valid) problems.push(`base ${base.name} ACCEPTS twin-shaped args (not incompatible)`);
+    if (problems.length > 20) break;
+  }
+  if (problems.length > 0) throw new Error(`twin fixture check failed:\n- ${problems.join("\n- ")}`);
+  return pairs;
+}
+
+// ---- intended arguments (deterministic, schema-faithful) ----------------------
+/**
+ * The arguments an agent acting on the GOLD tool would send: every declared
+ * property filled with a schema-valid value (enum member, bounded number,
+ * non-empty array, nested object with its required keys). Deterministic by
+ * construction (no RNG); the same schema always yields the same arguments.
+ * A property whose constraints cannot be satisfied is omitted unless it is
+ * required, in which case the control execution reports it (controlFailed).
+ */
+const PROBE_MAX_PROPERTIES = 8;
+function intendedArgs(schema, depth = 0) {
+  const out = {};
+  if (!schema || typeof schema !== "object") return out;
+  const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const keys = [...new Set([...required, ...Object.keys(props)])].slice(0, Math.max(PROBE_MAX_PROPERTIES, required.length));
+  for (const key of keys) {
+    const value = probeValue(props[key], key, depth);
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+function probeValue(prop, key, depth) {
+  if (!prop || typeof prop !== "object") return `probe-${key}`;
+  if (Array.isArray(prop.enum) && prop.enum.length > 0) return prop.enum[0];
+  if (prop.const !== undefined) return prop.const;
+  const type = Array.isArray(prop.type) ? prop.type[0] : prop.type;
+  switch (type) {
+    case "string": {
+      if (typeof prop.pattern === "string") {
+        // A handful of canned candidates; the first that matches wins.
+        let re = null;
+        try { re = new RegExp(prop.pattern); } catch { re = null; }
+        if (re) {
+          for (const c of ["2026-01-01", "probe", "probe-1", "a", "1", "probe@example.com", "https://example.com"]) {
+            if (re.test(c)) return c;
+          }
+          return undefined;
+        }
+      }
+      const min = typeof prop.minLength === "number" ? prop.minLength : 0;
+      const max = typeof prop.maxLength === "number" ? prop.maxLength : Infinity;
+      let s = `probe-${key}`;
+      if (s.length < min) s = s.padEnd(min, "x");
+      if (s.length > max) s = s.slice(0, max);
+      return s.length >= min ? s : undefined;
+    }
+    case "integer":
+    case "number": {
+      const min = typeof prop.minimum === "number" ? prop.minimum : null;
+      const max = typeof prop.maximum === "number" ? prop.maximum : null;
+      let n = 1;
+      if (min !== null && n < min) n = min;
+      if (max !== null && n > max) n = max;
+      if (type === "integer") n = Math.ceil(n);
+      if ((min !== null && n < min) || (max !== null && n > max)) return undefined;
+      return n;
+    }
+    case "boolean": return true;
+    case "array": {
+      const minItems = typeof prop.minItems === "number" ? prop.minItems : 0;
+      const count = Math.max(1, minItems);
+      const item = probeValue(prop.items, key, depth + 1);
+      return Array.from({ length: count }, (_, i) => (typeof item === "string" ? `${item}-${i + 1}` : item));
+    }
+    case "object": return depth < 4 ? intendedArgs(prop, depth + 1) : {};
+    case "null": return null;
+    default:
+      return prop.properties ? (depth < 4 ? intendedArgs(prop, depth + 1) : {}) : `probe-${key}`;
+  }
 }
 
 /**
@@ -197,14 +430,16 @@ const SELF_SKILLS = [
 });
 
 
-function selfQueries() {
-  const domains = QUICK ? DOMAINS.slice(0, 2) : DOMAINS;
-  const objects = QUICK ? OBJECTS.slice(0, 30) : OBJECTS;
+function selfQueries(catalogTools = tools, quick = QUICK) {
+  const domains = quick ? DOMAINS.slice(0, 2) : DOMAINS;
+  const objects = quick ? OBJECTS.slice(0, 30) : OBJECTS;
   const queries = [];
   const push = (q) => queries.push(q);
   const findTool = (domain, verb, object) =>
-    tools.find((t) => t.serverId === `${domain}-main` && t.name === `${verb}_${object}`) ??
-    tools.find((t) => t.serverId === `${domain}-mirror` && t.name === `${verb}_${object}`);
+    catalogTools.find((t) => t.serverId === `${domain}-main` && t.name === `${verb}_${object}`) ??
+    catalogTools.find((t) => t.serverId === `${domain}-mirror` && t.name === `${verb}_${object}`);
+  const findTwin = (domain, family, object) =>
+    catalogTools.find((t) => t.serverId === `${domain}-main` && t.name === twinNameFor(family, object));
   const pick = (i, arr) => arr[i % arr.length];
 
   // exact (20%): the tool name itself; a few typos sprinkled in
@@ -262,6 +497,32 @@ function selfQueries() {
       const tool = findTool(domain, "archive", object);
       if (!tool) continue;
       push({ query: `${domain} ${object.replace(/_/g, " ")} cleanup`, expected: `${tool.serverId}:${tool.name}`, difficulty: "hard", subtype: "near-duplicate" });
+    }
+  }
+
+  // near-duplicate, incompatible-argument twins (item 3): the gold is the
+  // TWIN (archive_X_by_id / delete_X_by_id / export_X_report) and the row
+  // carries the intended arguments explicitly, in the twin's shape. If the
+  // engine picks the same-shape base tool instead, hub-side validation
+  // rejects those arguments: the wrong pick is a loud execution failure, not
+  // only a rank loss. The base-gold rows above exercise the mirror case (a
+  // twin pick with base-shaped filter/limit arguments).
+  for (let i = 0; i < ndCount; i++) {
+    // Stride 7 keeps the (object, family) pairs distinct for both the quick
+    // (30 objects, 8 rows) and the full (61 objects, 15 rows) object sets.
+    const object = pick(i * 7 + 4, objects);
+    const domain = pick(i + 1, domains);
+    const obj = object.replace(/_/g, " ");
+    const family = TWIN_FAMILIES[i % TWIN_FAMILIES.length];
+    const twin = findTwin(domain, family, object);
+    if (!twin) continue;
+    const row = { expected: `${twin.serverId}:${twin.name}`, difficulty: "hard", subtype: "near-duplicate" };
+    if (family.baseVerb === "archive") {
+      push({ ...row, query: `archive these specific ${obj} by id in ${domain}`, args: { ids: [`${object}-1041`, `${object}-1042`], reason: "stale" } });
+    } else if (family.baseVerb === "delete") {
+      push({ ...row, query: `delete the ${domain} ${obj} with these ids`, args: { ids: [`${object}-2201`], reason: "duplicate" } });
+    } else {
+      push({ ...row, query: `export a csv report of ${obj} for ${domain} last quarter`, args: { format: "csv", range: { from: "2026-07-01", to: "2026-09-30" } } });
     }
   }
 
@@ -352,7 +613,15 @@ function groupTools(tools) {
 }
 
 // ---- evaluation -----------------------------------------------------------------
-async function buildEngine(name, manifests, skills) {
+/**
+ * Builds one engine. `warm: true` awaits ActionHub.semanticReady() so the
+ * blend engine is scored on a WARM embedding index. Default off: the eval
+ * historically searched the blend engine while its embedding rebuild was
+ * still in flight (embeddedDocs 0, every hit's raw semantic score 0, blend
+ * ranking identical to keyword). The returned `embedding` block records
+ * which state was measured so no number is reported without its state.
+ */
+async function buildEngine(name, manifests, skills, { warm = false } = {}) {
   const t0 = performance.now();
   const hub = new ActionHub({
     clientFactory: async (config) => {
@@ -360,7 +629,14 @@ async function buildEngine(name, manifests, skills) {
       const list = m ? m.tools : [];
       return {
         async listTools() { return list; },
-        async callTool(n) { throw new Error(`fake client does not execute "${n}"`); },
+        // Side-effect free in-process fake (execution probe): acknowledges a
+        // call to a tool it advertises and refuses anything else. Nothing is
+        // read, written, spawned, or sent; destructive annotations are
+        // irrelevant here because no real tool is ever reached.
+        async callTool(name, args) {
+          if (!list.some((t) => t.name === name)) throw new Error(`fake server "${config.id}" has no tool "${name}"`);
+          return { content: [{ type: "text", text: `${config.id}:${name} acknowledged ${Object.keys(args ?? {}).length} argument(s)` }] };
+        },
         async close() {},
       };
     },
@@ -379,7 +655,23 @@ async function buildEngine(name, manifests, skills) {
   });
   await hub.indexAll();
   if (skills.length > 0) hub.replaceSkills(skills);
-  return { hub, buildMs: performance.now() - t0 };
+  const indexMs = performance.now() - t0;
+  let warmMs = null;
+  if (warm) {
+    const w0 = performance.now();
+    await hub.semanticReady();
+    warmMs = Number((performance.now() - w0).toFixed(0));
+  }
+  const embeddedDocs = hub.embeddedDocs ?? 0;
+  const embedding = {
+    // "n/a": the engine has no embedding index (keyword, injected scorer);
+    // "warm": vectors present for the catalog; "cold": rebuild still in flight.
+    state: name === "blend" ? (embeddedDocs > 0 ? "warm" : "cold") : "n/a",
+    embeddedDocs,
+    awaited: warm,
+    warmMs,
+  };
+  return { hub, buildMs: indexMs, embedding };
 }
 
 const ENGINE_NAMES = ["keyword", "blend", "scorer"];
@@ -390,7 +682,92 @@ const ENGINE_DESC = {
   scorer: "createLocalSemanticScorer injected as the scorer",
 };
 
-async function warmAndTime(hub, queries) {
+// ---- abstention replay (server rule, docs/harness-guides.md) ------------------
+/**
+ * Mirrors the plugin server's no-confident-match gate on the raw hub hits:
+ * confidence is the top hit's raw semantic score when the channel is active,
+ * else its fused score; abstain when there are no hits or the confidence is
+ * below the threshold. The eval has no bundles, so the server's bundle veto
+ * never fires here (noted in the report). This is a REPLAY on the core
+ * search result, scored whether or not a deployment enables the flag.
+ */
+function abstentionDecision(hits, threshold) {
+  const top = hits[0];
+  const basis = top === undefined ? "none" : typeof top.semantic === "number" ? "semantic" : "score";
+  const confidence = top === undefined ? 0 : (typeof top.semantic === "number" ? top.semantic : (top.score ?? 0));
+  return { abstained: hits.length === 0 || confidence < threshold, confidence, basis };
+}
+const ABSTENTION_RULE = "abstain when no hits or top-1 confidence (raw semantic score when present, else fused score) < threshold; bundle veto not applicable (eval has no bundles)";
+
+// ---- execution probe -----------------------------------------------------------
+// Unconditional outcomes (the probe always executes the top-1 pick, so this
+// metric is independent of the abstention rule); the gated view adds
+// "abstained" for rows the abstention rule would have stopped.
+const EXECUTION_OUTCOMES = ["success", "wrongToolExecuted", "wrongToolRejected", "goldFailed", "noResult", "controlFailed"];
+const GATED_EXECUTION_OUTCOMES = [...EXECUTION_OUTCOMES, "abstained"];
+
+function classifyFailure(error) {
+  const msg = String(error ?? "");
+  if (msg.startsWith("Invalid arguments")) return "validation";
+  if (msg.includes("is a skill and must be loaded")) return "skill";
+  if (msg.startsWith("Unknown action")) return "unknownAction";
+  if (/denied|blocked|disabled/i.test(msg)) return "policy";
+  return "downstream";
+}
+
+/**
+ * Pure classification of one probe (unit-tested): what happened when the
+ * top-1 pick was executed with the gold's intended arguments.
+ *   success            gold was picked and ran ok (the ONLY success)
+ *   wrongToolExecuted  a non-gold pick ran ok: silent misfire (worst case)
+ *   wrongToolRejected  a non-gold pick failed loudly (validation, skill,
+ *                      policy, or server rejection)
+ *   goldFailed         gold picked but execution failed (fixture or hub bug)
+ *   noResult           search returned nothing; nothing executed
+ *   controlFailed      the gold itself refused its intended args (not scored)
+ * The gated view (gateOutcome) adds:
+ *   abstained          the abstention rule would have stopped the agent
+ *                      before executing; the unconditional outcome is kept
+ */
+function classifyExecution({ gold, pick, result, control }) {
+  if (control && control.ok !== true) {
+    return { outcome: "controlFailed", pick: pick ?? null, failureClass: classifyFailure(control.error), error: control.error ?? null };
+  }
+  if (!pick) return { outcome: "noResult", pick: null };
+  if (pick === gold) {
+    return result?.ok === true
+      ? { outcome: "success", pick }
+      : { outcome: "goldFailed", pick, failureClass: classifyFailure(result?.error), error: result?.error ?? null };
+  }
+  if (result?.approval) return { outcome: "wrongToolRejected", pick, failureClass: "approval", error: result.error ?? "approval required" };
+  return result?.ok === true
+    ? { outcome: "wrongToolExecuted", pick }
+    : { outcome: "wrongToolRejected", pick, failureClass: classifyFailure(result?.error), error: result?.error ?? null };
+}
+
+/** Gated view of one probe: what an agent honoring the abstention rule would have seen. */
+function gateOutcome(outcome, abstained) {
+  return abstained && outcome !== "controlFailed" ? "abstained" : outcome;
+}
+
+/**
+ * Runs the probe for one row through the REAL hub API: load the gold's
+ * schema, derive (or take) the intended arguments, run a control execution
+ * of the gold, then execute the top-1 pick with those same arguments. The
+ * probe is UNCONDITIONAL (it does not consult the abstention rule) so the
+ * execution metric stays independent of the abstention metric; the gated
+ * view is derived afterwards from the same row. The result cache is bypassed
+ * so the control call can never answer the probe.
+ */
+async function executeProbe(hub, { gold, pick, args }) {
+  const schema = hub.load(gold).inputSchema ?? {};
+  const intended = args && typeof args === "object" ? args : intendedArgs(schema);
+  const control = await hub.execute(gold, intended, { noCache: true });
+  const result = control.ok === true && pick ? await hub.execute(pick, intended, { noCache: true }) : null;
+  return { ...classifyExecution({ gold, pick, result, control }), args: intended };
+}
+
+async function warmAndTime(hub, queries, { abstentionThreshold = ABSTENTION_THRESHOLD_DEFAULT, execute = true } = {}) {
   const withTimeout = (promise, ms, label) => {
     let timer;
     const timeout = new Promise((_, reject) => {
@@ -408,13 +785,22 @@ async function warmAndTime(hub, queries) {
     const golds = goldsOf(q);
     const ids = hits.map((h) => h.id);
     const goldRanks = golds.map((g) => (ids.includes(g) ? ids.indexOf(g) + 1 : null));
+    const kind = golds.length > 1 ? "multi" : golds[0] && golds[0].startsWith("skill:") ? "skill" : "tool";
+    const abstention = abstentionDecision(hits, abstentionThreshold);
+    // Execution is scored on single-gold TOOL rows only: a skill cannot be
+    // executed, and a multi row has no single intended call.
+    const eligible = execute && kind === "tool" && golds.length === 1;
+    const probe = eligible
+      ? await withTimeout(executeProbe(hub, { gold: golds[0], pick: ids[0] ?? null, args: q.args }), 30_000, `execute "${q.query.slice(0, 40)}"`)
+      : null;
+    const execution = probe ? { ...probe, gatedOutcome: gateOutcome(probe.outcome, abstention.abstained) } : null;
     rows.push({
       query: q.query,
       expected: q.expected ?? null,
       expectedAll: golds.length > 1 ? golds : undefined,
       difficulty: q.difficulty,
       subtype: q.subtype,
-      kind: golds.length > 1 ? "multi" : golds[0] && golds[0].startsWith("skill:") ? "skill" : "tool",
+      kind,
       goldRanks,
       firstGoldRank: golds.length ? Math.min(...golds.map((g, i) => (goldRanks[i] ?? Infinity))) : null,
       top1: ids[0] ?? null,
@@ -422,9 +808,85 @@ async function warmAndTime(hub, queries) {
       top1Score: hits[0]?.score ?? 0,
       top3: hits.slice(0, 3).map((h) => ({ id: h.id, name: h.name, score: Number((h.score ?? 0).toFixed(4)) })),
       responseTokens: tokens(JSON.stringify(hits)),
+      abstained: abstention.abstained,
+      confidence: Number(abstention.confidence.toFixed(4)),
+      confidenceBasis: abstention.basis,
+      execution,
     });
   }
   return { rows, latencies };
+}
+
+/** Abstention block: true abstentions on no-match rows vs false abstentions on matched rows. */
+function abstentionMetrics(rows, threshold) {
+  const noMatch = rows.filter((r) => r.expected === null && !r.expectedAll);
+  const matched = rows.filter((r) => r.expected !== null || (r.expectedAll?.length ?? 0) > 0);
+  const abstainedNoMatch = noMatch.filter((r) => r.abstained === true).length;
+  const abstainedMatched = matched.filter((r) => r.abstained === true).length;
+  const withHits = rows.filter((r) => r.confidenceBasis && r.confidenceBasis !== "none");
+  const confidences = withHits.map((r) => r.confidence);
+  return {
+    threshold,
+    rule: ABSTENTION_RULE,
+    // The scale the threshold was compared against. Raw semantic scores are
+    // cosines in [0,1]; the fused-score fallback is on whatever scale the
+    // engine emits (the keyword engine's lexical-only hub reports
+    // unnormalized BM25, so at a [0,1] threshold it abstains only on empty
+    // results). Reported so no rate is read without its scale.
+    top1ConfidenceRange: confidences.length
+      ? { min: Number(Math.min(...confidences).toFixed(4)), max: Number(Math.max(...confidences).toFixed(4)), median: Number(percentileOf(confidences, 50).toFixed(4)) }
+      : null,
+    noMatchCount: noMatch.length,
+    noMatchAbstained: abstainedNoMatch,
+    noMatchAbstainRate: noMatch.length ? abstainedNoMatch / noMatch.length : null,
+    matchedCount: matched.length,
+    matchedAbstained: abstainedMatched,
+    falseAbstainRate: matched.length ? abstainedMatched / matched.length : null,
+    overallAbstainRate: rows.length ? rows.filter((r) => r.abstained === true).length / rows.length : null,
+    confidenceBasis: countBy(rows, (r) => r.confidenceBasis ?? "n/a"),
+  };
+}
+
+/**
+ * Execution block: successful execution of the GOLD, with the failure
+ * classes kept apart. The headline rates are UNCONDITIONAL (every eligible
+ * row's top-1 pick was executed, whatever the abstention rule said), so this
+ * metric is independent of the abstention metric. `gatedByAbstention` is the
+ * derived view an agent honoring the rule would have seen.
+ */
+function executionMetrics(rows) {
+  const probed = rows.filter((r) => r.execution);
+  const outcomes = Object.fromEntries(EXECUTION_OUTCOMES.map((o) => [o, 0]));
+  const gated = Object.fromEntries(GATED_EXECUTION_OUTCOMES.map((o) => [o, 0]));
+  const failureClasses = {};
+  for (const r of probed) {
+    outcomes[r.execution.outcome] = (outcomes[r.execution.outcome] ?? 0) + 1;
+    const g = r.execution.gatedOutcome ?? r.execution.outcome;
+    gated[g] = (gated[g] ?? 0) + 1;
+    if (r.execution.failureClass) failureClasses[r.execution.failureClass] = (failureClasses[r.execution.failureClass] ?? 0) + 1;
+  }
+  const scored = probed.length - outcomes.controlFailed;
+  const attempted = outcomes.success + outcomes.wrongToolExecuted + outcomes.wrongToolRejected + outcomes.goldFailed;
+  return {
+    definition: "success = the top-1 pick IS the gold and ActionHub.execute returned ok with the gold's intended arguments; rates are over scored rows (single-gold tool rows whose control execution of the gold succeeded); unconditional of the abstention rule",
+    probedCount: probed.length,
+    scoredCount: scored,
+    attemptedCount: attempted,
+    successCount: outcomes.success,
+    successRate: scored ? outcomes.success / scored : null,
+    wrongToolExecutedRate: scored ? outcomes.wrongToolExecuted / scored : null,
+    wrongToolRejectedRate: scored ? outcomes.wrongToolRejected / scored : null,
+    outcomes,
+    failureClasses,
+    gatedByAbstention: {
+      definition: "same rows, but a row the abstention rule stops counts as abstained (no execution); what an agent honoring the rule would get",
+      successRate: scored ? gated.success / scored : null,
+      abstainedCount: gated.abstained,
+      wrongToolExecutedRate: scored ? gated.wrongToolExecuted / scored : null,
+      wrongToolRejectedRate: scored ? gated.wrongToolRejected / scored : null,
+      outcomes: gated,
+    },
+  };
 }
 
 const mean = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
@@ -509,10 +971,51 @@ function percentileSelfTest() {
     try { validateGeneratedCorpus({ ...vbase, queries: bad, skillQueries: [], expectCounts: false }); } catch { threw = true; }
     eq(threw, true, `validator must reject malformed row: ${JSON.stringify(bad)}`);
   }
+  // Intended arguments (item 1): accepted on a single-gold tool row, rejected
+  // when malformed or on a row that has nothing to execute.
+  validateGeneratedCorpus({ ...vbase, queries: [{ query: "q", expected: "a:tool", subtype: "exact", difficulty: "exact", args: { ids: ["x"] } }], skillQueries: [], expectCounts: false });
+  for (const bad of [
+    [{ query: "q", expected: "a:tool", subtype: "exact", difficulty: "exact", args: ["not", "an", "object"] }],
+    [{ query: "q", expected: "a:tool", subtype: "exact", difficulty: "exact", args: null }],
+    [{ query: "q", expected: null, subtype: "no-match", difficulty: "hard", args: {} }],
+    [{ query: "q", expected: null, expectedAll: ["a", "b"], subtype: "multi", difficulty: "hard", args: {} }],
+  ]) {
+    let threw = false;
+    try { validateGeneratedCorpus({ ...vbase, queries: bad, skillQueries: [], expectCounts: false }); } catch { threw = true; }
+    eq(threw, true, `validator must reject malformed args row: ${JSON.stringify(bad)}`);
+  }
+  // Abstention replay rule (item 1): raw semantic first, fused score fallback.
+  eq(abstentionDecision([], 0.8).abstained, true, "no hits abstains");
+  eq(abstentionDecision([{ id: "a", score: 0.95, semantic: 0.3 }], 0.8).abstained, true, "semantic below threshold abstains even with a high fused score");
+  eq(abstentionDecision([{ id: "a", score: 0.2, semantic: 0.9 }], 0.8).abstained, false, "semantic above threshold answers");
+  eq(abstentionDecision([{ id: "a", score: 0.85 }], 0.8).basis, "score", "fused score is the fallback basis");
+  eq(abstentionDecision([{ id: "a", score: 0.85 }], 0.8).abstained, false, "fused score above threshold answers");
+  eq(abstentionDecision([{ id: "a", score: 0.8 }], 0.8).abstained, false, "threshold is inclusive (score >= threshold answers)");
+  // Execution classification (item 1 + 3): the outcomes are disjoint and the
+  // gated view only ever adds "abstained" on top of the unconditional one.
+  const ok = { ok: true }, bad = { ok: false, error: "Invalid arguments: arguments.ids: required property is missing" };
+  eq(classifyExecution({ gold: "g", pick: "g", result: ok, control: ok }).outcome, "success", "gold picked and ran");
+  eq(classifyExecution({ gold: "g", pick: "w", result: ok, control: ok }).outcome, "wrongToolExecuted", "wrong pick ran silently");
+  const loud = classifyExecution({ gold: "g", pick: "w", result: bad, control: ok });
+  eq(loud.outcome, "wrongToolRejected", "wrong pick rejected loudly");
+  eq(loud.failureClass, "validation", "validation failure class");
+  eq(classifyExecution({ gold: "g", pick: "g", result: bad, control: ok }).outcome, "goldFailed", "gold picked but failed");
+  eq(classifyExecution({ gold: "g", pick: null, result: null, control: ok }).outcome, "noResult", "empty search");
+  eq(classifyExecution({ gold: "g", pick: "g", result: null, control: bad }).outcome, "controlFailed", "gold refused its own intended args");
+  eq(gateOutcome("success", true), "abstained", "gate stops a would-be success");
+  eq(gateOutcome("wrongToolExecuted", false), "wrongToolExecuted", "gate off keeps the outcome");
+  eq(gateOutcome("controlFailed", true), "controlFailed", "a broken control stays unscored under the gate");
+  // Intended-argument builder is deterministic and schema-valid on every twin schema.
+  for (const family of TWIN_FAMILIES) {
+    const schema = family.schema();
+    const a = intendedArgs(schema), b = intendedArgs(schema);
+    eq(JSON.stringify(a), JSON.stringify(b), `intendedArgs deterministic for ${family.baseVerb}${family.suffix}`);
+    eq(validateArguments(schema, a).valid, true, `intendedArgs valid for ${family.baseVerb}${family.suffix}`);
+  }
   console.error("[eval-retrieval] validator self-test passed");
 }
 
-function scoreEngine(rows, latencies, fpThreshold) {
+function scoreEngine(rows, latencies, { abstentionThreshold = ABSTENTION_THRESHOLD_DEFAULT } = {}) {
   const matched = rows.filter((r) => r.expected !== null || (r.expectedAll?.length ?? 0) > 0);
   const noMatch = rows.filter((r) => r.expected === null && !r.expectedAll);
   const multi = matched.filter((r) => (r.expectedAll?.length ?? 0) > 1);
@@ -607,6 +1110,11 @@ function scoreEngine(rows, latencies, fpThreshold) {
       maxMs: Number(Math.max(...lat, 0).toFixed(2)),
     },
     responseTokensMean: Math.round(mean(rows.map((r) => r.responseTokens))),
+    // Three distinct outcome metrics (item 1): the recall/MRR family above is
+    // RETRIEVAL RANK; these two blocks are ABSTENTION and SUCCESSFUL
+    // EXECUTION. None is derived from another.
+    abstention: abstentionMetrics(rows, abstentionThreshold),
+    execution: executionMetrics(rows),
     byDifficulty,
     bySubtype: mapValues(bySubtype, (rs) => coreMetrics(rs)),
     byKind,
@@ -634,6 +1142,27 @@ function coreMetrics(rows) {
     out.completenessAt10 = mean(multi.map((r) =>
       safeDiv(r.expectedAll.filter((g, i) => r.goldRanks[i] !== null && r.goldRanks[i] <= 10).length, r.expectedAll.length)));
     out.sufficiencyAt10 = mean(multi.map((r) => (r.expectedAll.every((g, i) => r.goldRanks[i] !== null && r.goldRanks[i] <= 10) ? 1 : 0)));
+  }
+  // Abstention and execution per subset (only when the rows carry them), so
+  // the by-subtype table shows e.g. how near-duplicate wrong picks fail.
+  if (rows.some((r) => typeof r.abstained === "boolean")) {
+    const abstainedMatched = matched.filter((r) => r.abstained === true).length;
+    const noMatch = rows.filter((r) => r.expected === null && !r.expectedAll);
+    out.abstention = {
+      matchedAbstained: abstainedMatched,
+      falseAbstainRate: matched.length ? abstainedMatched / matched.length : null,
+      noMatchAbstained: noMatch.filter((r) => r.abstained === true).length,
+      noMatchAbstainRate: noMatch.length ? noMatch.filter((r) => r.abstained === true).length / noMatch.length : null,
+    };
+  }
+  if (rows.some((r) => r.execution)) {
+    const ex = executionMetrics(rows);
+    out.execution = {
+      scoredCount: ex.scoredCount, successRate: ex.successRate,
+      wrongToolExecutedRate: ex.wrongToolExecutedRate, wrongToolRejectedRate: ex.wrongToolRejectedRate,
+      outcomes: ex.outcomes, failureClasses: ex.failureClasses,
+      gatedByAbstention: { successRate: ex.gatedByAbstention.successRate, abstainedCount: ex.gatedByAbstention.abstainedCount },
+    };
   }
   return out;
 }
@@ -713,6 +1242,15 @@ function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idM
       // F52: single-gold rows require a NON-NULL string expected — the old
       // hasExpected accepted expected=null and let a goldless row pass.
       if (q.subtype !== "multi" && q.subtype !== "no-match" && !(typeof q.expected === "string" && q.expected.length > 0 && !hasExpectedAll)) { errors.push(`${q.subtype} row must have a non-empty single gold and no expectedAll: ${String(q.query).slice(0, 60)}`); break; }
+      // Optional intended arguments for the execution probe (item 1): when a
+      // row carries them they must be a plain object, and only a single-gold
+      // tool row can carry them (a skill cannot be executed, a multi row has
+      // no single intended call, a no-match row has nothing to execute).
+      if (q.args !== undefined) {
+        const plain = q.args !== null && typeof q.args === "object" && !Array.isArray(q.args);
+        if (!plain) { errors.push(`args must be a plain object when present: ${String(q.query).slice(0, 60)}`); break; }
+        if (q.subtype === "multi" || q.subtype === "no-match" || String(q.expected).startsWith("skill:")) { errors.push(`args only allowed on single-gold tool rows: ${String(q.query).slice(0, 60)}`); break; }
+      }
     }
   }
   const uniqueQueries = new Set(queries.map((q) => q.query));
@@ -721,9 +1259,13 @@ function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idM
 }
 
 async function runEval() {
+  // Fail closed on a malformed flag before any corpus work (eval CLI contract).
+  const abstentionThreshold = parseAbstentionThreshold(ARGV);
+  const scoreOpts = { abstentionThreshold };
 
   // --- corpus ------------------------------------------------------------------
   let manifests, skills, queries, skillQueries = null, mode = "self-fixtures";
+  let twinPairs = 0;
   const generated = loadGenerated();
   const idMismatches = generated?.idMismatches ?? 0;
   if (generated) {
@@ -737,10 +1279,13 @@ async function runEval() {
     console.error(`[eval-retrieval] using generated corpus: ${manifests.length} servers, ${skills.length} skills, ${queries.length} queries`);
   } else {
     ({ tools } = syntheticCatalog(QUICK ? 2 : DOMAINS.length));
+    // Fail closed if any twin pair is not argument-incompatible both ways
+    // (item 3): the loud-failure property is a fixture invariant.
+    twinPairs = assertTwinsIncompatible(tools);
     manifests = groupTools(tools);
     skills = QUICK ? syntheticSkillPool(30) : syntheticSkillPool(1500);
-    queries = selfQueries();
-    console.error(`[eval-retrieval] no generated corpus found; using self-fixtures (${tools.length} tools, ${skills.length} skills, ${queries.length} queries)`);
+    queries = selfQueries(tools);
+    console.error(`[eval-retrieval] no generated corpus found; using self-fixtures (${tools.length} tools incl. ${twinPairs} incompatible-argument twin pairs, ${skills.length} skills, ${queries.length} queries)`);
   }
   // --quick: smoke run, subsample queries deterministically (noted in output)
   if (QUICK && queries.length > 150) {
@@ -824,15 +1369,15 @@ async function runEval() {
   const results = {};
   for (const name of ENGINE_NAMES) {
     const t0 = performance.now();
-    const { hub, buildMs } = await buildEngine(name, manifests, skills);
+    const { hub, buildMs, embedding } = await buildEngine(name, manifests, skills, { warm: WARM });
     const engineBuildMs = Number((performance.now() - t0).toFixed(0));
-    const { rows, latencies } = await warmAndTime(hub, fixedEvalSample);
-    const scored = scoreEngine(rows, latencies);
+    const { rows, latencies } = await warmAndTime(hub, fixedEvalSample, scoreOpts);
+    const scored = scoreEngine(rows, latencies, scoreOpts);
     results[name] = {
-      description: ENGINE_DESC[name], buildMs, engineBuildMs, ...scored,
+      description: ENGINE_DESC[name], buildMs, engineBuildMs, embedding, ...scored,
       querySample: { size: fixedEvalSample.length, note: "identical fixed sample for all engines" },
     };
-    console.error(`[eval-retrieval] ${name} (n=${fixedEvalSample.length}): recall@5=${scored.recallAt5?.toFixed?.(3)} mrr@10=${scored.mrrAt10?.toFixed?.(3)} p95=${scored.latency.warmP95Ms}ms`);
+    console.error(`[eval-retrieval] ${name} (n=${fixedEvalSample.length}): recall@5=${scored.recallAt5?.toFixed?.(3)} mrr@10=${scored.mrrAt10?.toFixed?.(3)} exec=${fmt(scored.execution.successRate)} abstain(no-match)=${fmt(scored.abstention.noMatchAbstainRate)} p95=${scored.latency.warmP95Ms}ms`);
     await hub.close?.();
   }
 
@@ -840,10 +1385,10 @@ async function runEval() {
   // scorer engine is not needed at full scale and is excluded from gates).
   const gateRows = {};
   for (const name of SWEEP_ENGINES) {
-    const { hub, buildMs } = await buildEngine(name, manifests, skills);
-    const { rows, latencies } = await warmAndTime(hub, queries);
-    gateRows[name] = { scored: scoreEngine(rows, latencies), rows, buildMs };
-    console.error(`[eval-retrieval] gates ${name} (n=${queries.length}): recall@5=${gateRows[name].scored.recallAt5?.toFixed?.(3)} p95=${gateRows[name].scored.latency.warmP95Ms}ms`);
+    const { hub, buildMs, embedding } = await buildEngine(name, manifests, skills, { warm: WARM });
+    const { rows, latencies } = await warmAndTime(hub, queries, scoreOpts);
+    gateRows[name] = { scored: scoreEngine(rows, latencies, scoreOpts), rows, buildMs, embedding };
+    console.error(`[eval-retrieval] gates ${name} (n=${queries.length}): recall@5=${gateRows[name].scored.recallAt5?.toFixed?.(3)} exec=${fmt(gateRows[name].scored.execution.successRate)} p95=${gateRows[name].scored.latency.warmP95Ms}ms`);
     await hub.close?.();
   }
 
@@ -859,17 +1404,17 @@ async function runEval() {
     realisticReport = { count: realistic.length, mix: countBy(realistic, (q) => q.subtype), engines: {}, gates: {} };
     for (const name of SWEEP_ENGINES) {
       const { hub } = await buildEngine(name, manifests, skills);
-      const { rows, latencies } = await warmAndTime(hub, realistic);
-      const all = scoreEngine(rows, latencies);
+      const { rows, latencies } = await warmAndTime(hub, realistic, scoreOpts);
+      const all = scoreEngine(rows, latencies, scoreOpts);
       const bySubtype = {};
       for (const st of Object.keys(realisticReport.mix)) {
         const sub = rows.filter((r) => r.subtype === st);
         if (sub.length > 0) {
-          const scored = scoreEngine(sub, latencies.filter((_, i) => rows[i].subtype === st));
-          bySubtype[st] = { n: sub.length, recallAt5: scored.recallAt5, recallAt10: scored.recallAt10, mrrAt10: scored.mrrAt10 };
+          const scored = scoreEngine(sub, latencies.filter((_, i) => rows[i].subtype === st), scoreOpts);
+          bySubtype[st] = { n: sub.length, recallAt5: scored.recallAt5, recallAt10: scored.recallAt10, mrrAt10: scored.mrrAt10, execution: scored.execution, abstention: scored.abstention };
         }
       }
-      realisticReport.engines[name] = { recallAt5: all.recallAt5, recallAt10: all.recallAt10, mrrAt10: all.mrrAt10, noMatch: all.noMatch, latency: all.latency, bySubtype };
+      realisticReport.engines[name] = { recallAt5: all.recallAt5, recallAt10: all.recallAt10, mrrAt10: all.mrrAt10, noMatch: all.noMatch, abstention: all.abstention, execution: all.execution, latency: all.latency, bySubtype };
       await hub.close?.();
     }
     console.error(`[eval-retrieval] realistic: blend r@5=${realisticReport.engines.blend.recallAt5?.toFixed(3)} mrr@10=${realisticReport.engines.blend.mrrAt10?.toFixed(3)}`);
@@ -881,11 +1426,12 @@ async function runEval() {
     skillsReport = { queryCount: skillQueries.length, mix: countBy(skillQueries, (q) => q.subtype), engines: {} };
     for (const name of SWEEP_ENGINES) {
       const { hub } = await buildEngine(name, [], skills);
-      const { rows, latencies } = await warmAndTime(hub, skillQueries);
-      const scored = scoreEngine(rows, latencies);
+      // Skills cannot be executed, so the probe is off; abstention still applies.
+      const { rows, latencies } = await warmAndTime(hub, skillQueries, { ...scoreOpts, execute: false });
+      const scored = scoreEngine(rows, latencies, scoreOpts);
       skillsReport.engines[name] = {
         recallAt5: scored.recallAt5, recallAt10: scored.recallAt10, mrrAt10: scored.mrrAt10,
-        ndcgAt10: scored.ndcgAt10, noMatch: scored.noMatch, latency: scored.latency,
+        ndcgAt10: scored.ndcgAt10, noMatch: scored.noMatch, abstention: scored.abstention, latency: scored.latency,
       };
       await hub.close?.();
     }
@@ -918,8 +1464,10 @@ async function runEval() {
     const row = { requestedSize: size, prefixSize: actualSize, toolCount: prefixManifests.reduce((s, m) => s + m.tools.length, 0), skillCount: prefixSkills.length, queriesUsed: usable.length, queriesExcluded: fixedLatencySample.length - usable.length, engines: {} };
     for (const name of SWEEP_ENGINES) {
       const { hub, buildMs } = await buildEngine(name, prefixManifests, prefixSkills);
-      const { rows, latencies } = await warmAndTime(hub, usable);
-      const scored = scoreEngine(rows, latencies);
+      // The sweep measures latency and rank against prefix sizes; the
+      // execution probe is off here (it is scored on the full-set gate runs).
+      const { rows, latencies } = await warmAndTime(hub, usable, { ...scoreOpts, execute: false });
+      const scored = scoreEngine(rows, latencies, scoreOpts);
       row.engines[name] = {
         indexBuildMs: Number(buildMs.toFixed(0)),
         matchedCount: scored.matchedCount,
@@ -974,7 +1522,20 @@ async function runEval() {
     .filter((r) => r.expected !== null || (r.expectedAll?.length ?? 0) > 0)
     .sort((a, b) => (b.firstGoldRank === Infinity ? 1 : 0) - (a.firstGoldRank === Infinity ? 1 : 0) || (b.firstGoldRank === a.firstGoldRank ? 0 : (a.firstGoldRank === Infinity ? -1 : b.firstGoldRank - a.firstGoldRank)))
     .slice(0, 20)
-    .map((r) => ({ query: r.query, expected: r.expectedAll ?? r.expected, difficulty: r.difficulty, subtype: r.subtype, kind: r.kind, top3: r.top3 }));
+    .map((r) => ({
+      query: r.query, expected: r.expectedAll ?? r.expected, difficulty: r.difficulty, subtype: r.subtype, kind: r.kind, top3: r.top3,
+      abstained: r.abstained, execution: r.execution ? { outcome: r.execution.outcome, pick: r.execution.pick, failureClass: r.execution.failureClass ?? null } : null,
+    }));
+  // Silent misfires (item 3): every wrong pick that EXECUTED. These are the
+  // rows where only rank loss would have been visible before this probe.
+  const silentMisfires = blendRows
+    .filter((r) => r.execution?.outcome === "wrongToolExecuted")
+    .slice(0, 20)
+    .map((r) => ({ query: r.query, expected: r.expected, pick: r.execution.pick, subtype: r.subtype }));
+  const loudWrongPicks = blendRows
+    .filter((r) => r.execution?.outcome === "wrongToolRejected")
+    .slice(0, 20)
+    .map((r) => ({ query: r.query, expected: r.expected, pick: r.execution.pick, subtype: r.subtype, failureClass: r.execution.failureClass, error: String(r.execution.error ?? "").slice(0, 160) }));
 
   const summary = {
     script: "eval-retrieval",
@@ -988,6 +1549,27 @@ async function runEval() {
       queriesExcludedForMissingGolds: excluded,
       queryMix: countBy(queries, (q) => q.subtype),
       skillIdMismatches: idMismatches,
+      incompatibleArgumentTwinPairs: twinPairs,
+      rowsWithExplicitArgs: queries.filter((q) => q.args !== undefined).length,
+    },
+    // HEADLINE (item 1): the three outcome metrics side by side, from the
+    // full-set blend gate run. Reported as three numbers, never combined.
+    threeMetrics: {
+      engine: "blend",
+      querySet: "full",
+      note: "retrieval rank, abstention, and successful execution are scored independently; a query can rank its gold first and still fail execution, or abstain correctly without ranking anything",
+      embedding: gateRows.blend?.embedding ?? null,
+      caveat: gateRows.blend?.embedding?.state === "cold"
+        ? "blend measured on a COLD embedding index (embeddedDocs 0): every raw semantic score is 0, so the abstention replay abstains on every query and the blend ranking equals keyword; rerun with --warm-embeddings for the warm numbers"
+        : null,
+      retrievalRank: { recallAt1: blend.recallAt1, recallAt5: blend.recallAt5, recallAt10: blend.recallAt10, mrrAt10: blend.mrrAt10, matchedCount: blend.matchedCount },
+      abstention: blend.abstention,
+      execution: blend.execution,
+      nearDuplicate: gateRows.blend?.scored.bySubtype["near-duplicate"]
+        ? { execution: gateRows.blend.scored.bySubtype["near-duplicate"].execution ?? null, recallAt1: gateRows.blend.scored.bySubtype["near-duplicate"].recallAt1 }
+        : null,
+      silentMisfires,
+      loudWrongPicks,
     },
     engines: results,
     sweep,
@@ -1027,18 +1609,30 @@ function countBy(arr, keyFn) {
   return counts;
 }
 
+// Exposed for stress/eval-retrieval.test.mjs (fixture invariants, probe
+// classification, abstention rule, metric blocks). Nothing runs at import.
+export const __test = {
+  syntheticCatalog, selfQueries, TWIN_FAMILIES, twinNameFor, isTwinName, assertTwinsIncompatible,
+  intendedArgs, abstentionDecision, classifyExecution, gateOutcome, executeProbe, buildEngine, warmAndTime, GATED_EXECUTION_OUTCOMES,
+  scoreEngine, coreMetrics, abstentionMetrics, executionMetrics, validateGeneratedCorpus,
+  parseAbstentionThreshold, percentileSelfTest, groupTools, EXECUTION_OUTCOMES, ABSTENTION_THRESHOLD_DEFAULT, OBJECTS, DOMAINS,
+};
+
 // Shared-harness failure envelope (PR 64): isolation, summary contract and
 // exit code all come from stress/lib/harness.mjs. setupIsolation, the local
 // withTimeout-guarded runner and the local write/exit logic are gone.
-harnessMain(async () => {
-  // Isolate THIS process first: every checklist env var is replaced under one
-  // fresh run root before any hub construction.
-  const sandbox = createSandbox({ prefix: "action-hub-eval-" });
-  Object.assign(process.env, sandbox.env);
-  assertIsolated(process.env, sandbox.root);
-  // Self-tests run INSIDE the harness finish path (reviewer-2 blocker 3): a
-  // self-test regression must produce the final ok:false JSON + failure
-  // artifact + nonzero exit, not a bare crash outside the contract.
-  percentileSelfTest();
-  return runEval();
-}, { resultsPath: join(RESULTS_DIR, "eval-retrieval.json") });
+// Guarded so the unit tests can import this module without running the eval.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  harnessMain(async () => {
+    // Isolate THIS process first: every checklist env var is replaced under one
+    // fresh run root before any hub construction.
+    const sandbox = createSandbox({ prefix: "action-hub-eval-" });
+    Object.assign(process.env, sandbox.env);
+    assertIsolated(process.env, sandbox.root);
+    // Self-tests run INSIDE the harness finish path (reviewer-2 blocker 3): a
+    // self-test regression must produce the final ok:false JSON + failure
+    // artifact + nonzero exit, not a bare crash outside the contract.
+    percentileSelfTest();
+    return runEval();
+  }, { resultsPath: join(RESULTS_DIR, "eval-retrieval.json") });
+}
