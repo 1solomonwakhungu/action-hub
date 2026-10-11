@@ -8,7 +8,8 @@
  *   - exactly ONE stdout line, valid JSON, ok:false
  *   - the stale artifact (pre-seeded with a sentinel) is overwritten by the
  *     failure summary (artifact parity: artifact JSON === last stdout JSON)
- * Cases: --corpus (both scripts), --split (split-eval), --passes (latency-eval).
+ * Cases: --corpus (both scripts), --split (split-eval), --passes (latency-eval),
+ * --abstention-threshold (eval-retrieval; parsed before any corpus work).
  * Correctness check (no benchmark) — does not take BENCH.lock.
  */
 import { spawnSync } from "node:child_process";
@@ -26,6 +27,7 @@ await main(async () => {
     { script: "stress/split-eval.mjs", flag: "--split", artifact: join(repoRoot, "stress", ".generated", "results", "split-eval.json") },
     { script: "stress/latency-eval.mjs", flag: "--corpus", artifact: join(repoRoot, "stress", ".generated", "results", "latency-eval.json") },
     { script: "stress/latency-eval.mjs", flag: "--passes", artifact: join(repoRoot, "stress", ".generated", "results", "latency-eval.json") },
+    { script: "stress/eval-retrieval.mjs", flag: "--abstention-threshold", artifact: join(repoRoot, "stress", ".generated", "results", "eval-retrieval.json") },
   ];
   const checks = [];
   const failures = [];
