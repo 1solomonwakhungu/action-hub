@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * stress/abstention-threshold.mjs — held-out calibration of the search
+ * stress/abstention-threshold.mjs : held-out calibration of the search
  * abstention gate (docs/harness-guides.md, "No-confident-match abstention").
  *
  * The gate in packages/plugin/server/src/index.ts abstains when the top hit's

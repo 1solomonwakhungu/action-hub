@@ -1,5 +1,5 @@
 /**
- * stress/abstention-threshold.test.mjs — unit tests for the pure parts of
+ * stress/abstention-threshold.test.mjs : unit tests for the pure parts of
  * stress/abstention-threshold.mjs and for the no-match fixture it consumes.
  * Run: node --test stress/abstention-threshold.test.mjs
  * (Imports the ESM source directly; no dist build and no generated corpus.)

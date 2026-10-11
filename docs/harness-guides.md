@@ -312,16 +312,94 @@ An optional flag makes the search say so instead:
   `{ ok, count: 0, results: [], abstained: true, reason: "no_confident_match",
   threshold, closestMatch: { id, score } | null, hint }` (the query itself
   is deliberately not echoed — every echoed field carries an output budget).
-- `threshold` (default 0.8, clamped to [0, 1]): calibrated offline on
-  disjoint rows — at 0.8 no real match was refused and 5 of the 7 held-out
-  no-match queries (71%) abstained. The calibration base is thin (12
-  negative rows in total), and scores scale with catalog size and IDF, so
-  recalibrate the threshold for your catalog before enabling the flag. A
-  query that matches a bundle never abstains: bundle discovery runs first
+- `threshold` (default 0.8, clamped to [0, 1]): compared against the top
+  hit's raw semantic score (`hits[0].semantic`), which is the MiniLM cosine
+  under the default embeddings channel and the hashed-index cosine under the
+  fallback channel; the fused ranking score is used only when no semantic
+  channel is active. **The 0.8 default is not calibrated for the current
+  production channel; see the calibration below before enabling the flag.**
+  A query that matches a bundle never abstains: bundle discovery runs first
   and its matches are returned as usual.
 
 The response shape is additive: clients that only read `count`/`results`
 see an ordinary empty result.
+
+### Calibration (2026-10-11, held-out)
+
+The original 0.8 figure ("0 of 51 real matches refused, 5 of 7 held-out
+no-match queries abstained, 12 negative rows in total") was measured before
+SQ4 on the fused blend score. The gate now reads the raw semantic cosine, so
+that figure no longer describes what enabling the flag does. The
+recalibration below was produced by `stress/abstention-threshold.mjs` on the
+binding generated corpus (44 servers / 10,000 tools / 5,000 skills) with the
+exact gate input the server uses, at the server's default page size. Rows:
+106 realistic positives (paraphrase / goal-only / near-duplicate / multi)
+and 87 negatives (the 15 realistic no-match rows plus the 72 rows in
+`stress/fixtures/no-match-queries.json`, 36 off-domain and 36 adjacent).
+Thresholds were chosen on the tune split and are reported on the held
+split only (43 positives, of which 31 had the gold in the top 10 under
+embeddings and 27 under hashed; 35 negatives). "Refused" counts a correct
+top-10 retrieval that the gate would hide.
+
+Default channel (vendored MiniLM embeddings, RRF fusion):
+
+| Threshold | Correct retrievals refused (held) | Rank-1 matches refused | No-match abstained (held) |
+| --- | ---: | ---: | ---: |
+| 0.8 (shipped) | 31 / 31 (100%) | 24 / 24 | 35 / 35 |
+| 0.4 | 5 / 31 (16%) | 3 / 24 | 35 / 35 |
+| 0.36 (tune pick) | 1 / 31 (3%) | 0 / 24 | 33 / 35 (94%): off-domain 14/14, adjacent 14/15, realistic 5/6 |
+| 0.3 | 0 / 31 | 0 / 24 | 29 / 35 (83%) |
+
+Correct held-out retrievals score 0.35 to 0.74 (median 0.53; rank-1
+matches median 0.55); no-match queries score 0 to 0.38 (median 0.07, 90th
+percentile 0.31). The two populations separate well, but at 0.8 the gate
+refuses every real match, including 183 of 183 synthetic exact-name lookups
+whose gold was in the top 10. Enabling the flag at the shipped default on
+the default channel turns search off.
+
+Fallback channel (dependency-free hashed index, blend fusion):
+
+| Threshold | Correct retrievals refused (held) | No-match abstained (held) |
+| --- | ---: | ---: |
+| 0.8 (shipped) | 5 / 27 (19%) | 34 / 35 |
+| 0.48 (largest zero-refusal) | 0 / 27 | 6 / 35 (17%) |
+
+Here the populations overlap (correct matches 0.48 to 1.0, no-match 0.37 to
+0.83), so no threshold both keeps real matches and rejects most no-match
+queries.
+
+What this means for the defaults:
+
+- **The flag stays off by default.** The decision rule in the script
+  (at most 2% of correct retrievals refused and at least 80% of no-match
+  queries abstained, on the held split of every channel, at the shipped
+  threshold) fails on both channels at 0.8. The shipped threshold is left
+  unchanged in this change; the measured operating point is documented here
+  for the owner to adopt deliberately.
+- **If you enable the flag on the default channel, set `threshold` near
+  0.36**, then re-run the script against your own catalog. That point
+  refused 1 of 31 held-out correct retrievals (3%, above the 2% bar on a
+  base of 31: "turn down that onboarding request" at 0.355) and abstained
+  on 33 of 35 no-match queries. Across all 87 negatives only four score
+  above 0.36, and they are the asks that borrow catalog vocabulary:
+  "translate the onboarding email into japanese" (0.53, nearest hit
+  `globex-email:update_onboarding`), "edit the red eye out of this photo"
+  (0.44), "track my daily step count" (0.38), and "reschedule my dentist
+  appointment to friday" (0.37).
+- **A 0.36 threshold is harmless under fallback.** If the embedding model
+  fails to load and the hub degrades to the hashed scorer, 0.36 sits below
+  every hashed score observed for both populations (minimum 0.37), so the
+  gate never fires: no benefit, but no refusals either.
+- **The held base is still thin.** 31 correct retrievals and 35 negatives
+  per channel give a few-percent resolution at best. Add rows to
+  `stress/fixtures/no-match-queries.json` (banded, validated by
+  `stress/abstention-threshold.test.mjs`) and re-run before changing any
+  default.
+
+Reproduce: `node stress/gen-tools.mjs && node stress/gen-skills.mjs && node
+stress/abstention-threshold.mjs --semantic both`. The summary lands in
+`stress/.generated/results/abstention-threshold.json` and every row's gate
+input, rank, and top hit in the sibling `.detail.json` for audit.
 
 **How an agent should react to `abstained: true`:** do not call a tool on a
 guess. First try one rephrased search using an exact tool or domain name
