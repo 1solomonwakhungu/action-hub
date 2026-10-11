@@ -47,12 +47,14 @@ export interface ServerDirectoryOptions {
 }
 
 /**
- * Eight words per server keeps a 44-server directory under about 1.5K tokens
- * while still naming two or three distinct sub-domains per server (measured on
- * the 10,000-tool stress corpus; see stress/goal-only-gate.mjs notes).
+ * Eight words per server keeps a 44-server directory at about 6.5 KB of
+ * compact JSON (roughly 1.6K tokens; a pretty-printed tool result is about
+ * twice that) while still naming the main sub-domains of most servers
+ * (measured on the 10,000-tool / 5,000-skill stress corpus; see
+ * stress/goal-only-gate.mjs notes).
  */
 export const DEFAULT_DIRECTORY_KEYWORDS = 8;
-const MAX_DIRECTORY_KEYWORDS = 32;
+export const MAX_DIRECTORY_KEYWORDS = 32;
 /** Shorter tokens are almost always noise (ids, units, articles). */
 const MIN_KEYWORD_LENGTH = 3;
 
@@ -107,7 +109,10 @@ export function buildServerDirectory(
       const idf = serverCount === 1 ? 1 : Math.log(serverCount / df);
       scored.push({ term, score: coverage * idf, coverage });
     }
-    scored.sort((a, b) => b.score - a.score || b.coverage - a.coverage || a.term.localeCompare(b.term));
+    // Code-point order for the final tie-break: localeCompare depends on the
+    // process locale (ICU), which would make the directory differ between
+    // hosts for the same catalog.
+    scored.sort((a, b) => b.score - a.score || b.coverage - a.coverage || compareCodePoints(a.term, b.term));
     const distinctive = scored.filter((item) => item.score > 0);
     const meta = options.metadata?.get(serverId);
     entries.push({
@@ -181,7 +186,19 @@ export const DIRECTORY_STOPWORDS: ReadonlySet<string> = new Set([
   "tool", "tools", "server", "servers", "skill", "skills", "api", "call", "calls", "work",
 ]);
 
-function clampKeywords(value: number | undefined): number {
+function compareCodePoints(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * Normalizes a keyword budget the way {@link buildServerDirectory} does:
+ * undefined or non-finite means the default, otherwise clamped to
+ * [0, {@link MAX_DIRECTORY_KEYWORDS}]. Exported so a memoizing caller can
+ * build once at the maximum budget and slice per request (keyword lists are
+ * prefixes of each other because the ranking is total and budget-independent).
+ */
+export function clampDirectoryKeywords(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value)) return DEFAULT_DIRECTORY_KEYWORDS;
   return Math.min(MAX_DIRECTORY_KEYWORDS, Math.max(0, Math.floor(value)));
 }
+const clampKeywords = clampDirectoryKeywords;

@@ -543,8 +543,9 @@ async function dispatch(
             hint: "No action scored above the confidence threshold and no bundle matched. Rephrase with the exact tool or domain name (see servers), or ask the user how to proceed.",
             // Domain awareness (r/mcp follow-up 4): the compact directory
             // rides along so the agent can re-aim at a server without a
-            // second round trip. Bounded: one short line per server.
-            servers: compactDirectory(hub),
+            // second round trip. Bounded: one short line per server, at most
+            // COMPACT_DIRECTORY_MAX_SERVERS rows.
+            ...compactDirectory(hub),
           };
         }
       }
@@ -553,7 +554,7 @@ async function dispatch(
         count: hits.length,
         // An empty hit list is the other "I do not know which integration"
         // moment: hand over the compact directory instead of a bare [].
-        ...(hits.length === 0 && matchingBundles.length === 0 ? { servers: compactDirectory(hub) } : {}),
+        ...(hits.length === 0 && matchingBundles.length === 0 ? compactDirectory(hub) : {}),
         results: hits.map((hit) => ({
           action_id: hit.id,
           name: hardenText(hit.name, SEARCH_SUMMARY_MAX_BYTES),
@@ -700,17 +701,44 @@ async function dispatch(
 const DIRECTORY_KEYWORD_MAX_BYTES = 64;
 /** Keywords per server in the directory that rides along on abstention and empty-result responses. */
 const COMPACT_DIRECTORY_KEYWORDS = 4;
+/**
+ * Upper bound on servers in the ride-along directory. The abstention and
+ * empty-page responses are supposed to stay small; past this many servers
+ * the list is cut (in id order) and `servers_truncated` points the agent at
+ * list_servers for the full set. 64 rows of four short words is about 4 KB
+ * pretty-printed.
+ */
+const COMPACT_DIRECTORY_MAX_SERVERS = 64;
+
+interface CompactDirectory {
+  servers: Array<{ server: string; keywords: string[] }>;
+  servers_truncated?: { shown: number; total: number; next: string };
+}
 
 /**
  * The directory in its smallest useful form (server id + a few domain words)
  * for responses that already carry a hint. The full entry set, with display
- * names and descriptions, is one list_servers call away.
+ * names and descriptions, is one list_servers call away. Returned as a
+ * partial payload so the truncation marker only appears when it applies.
  */
-function compactDirectory(hub: ActionHub): Array<{ server: string; keywords: string[] }> {
-  return hub.serverDirectory({ keywordsPerServer: COMPACT_DIRECTORY_KEYWORDS }).map((entry) => ({
+function compactDirectory(hub: ActionHub): CompactDirectory {
+  const entries = hub.serverDirectory({ keywordsPerServer: COMPACT_DIRECTORY_KEYWORDS });
+  const servers = entries.slice(0, COMPACT_DIRECTORY_MAX_SERVERS).map((entry) => ({
     server: entry.serverId,
     keywords: entry.keywords.map((keyword) => hardenText(keyword, DIRECTORY_KEYWORD_MAX_BYTES)),
   }));
+  return {
+    servers,
+    ...(entries.length > servers.length
+      ? {
+          servers_truncated: {
+            shown: servers.length,
+            total: entries.length,
+            next: "Call list_servers for the full directory.",
+          },
+        }
+      : {}),
+  };
 }
 
 function requireActionId(input: ToolInput, operation: string): string {

@@ -52,20 +52,21 @@ Your agent sees one tool. Action Hub sees everything.
 }
 ```
 
-The three operations are deliberately minimal:
+The three core operations are deliberately minimal:
 
 - **`search`** — hybrid lexical + semantic query over the indexed catalog. Returns ranked action IDs with one-line descriptions. Cheap; no schemas returned.
 - **`load`** — fetch the full JSON Schema for a specific action, on demand, only once the model has committed to using it.
 - **`execute`** — validate arguments against the original upstream schema and route the call to the owning MCP server.
 
-Two discovery helpers sit beside them: **`list_servers`** returns a compressed
+Three discovery helpers sit beside them: **`list_servers`** returns a compressed
 index of the connected servers (id, optional display name and description,
-action count, and the eight most distinctive domain words each one covers,
-about 1.7K tokens for 44 servers) so a model facing a vague, goal-only request
-can see which integrations exist before it searches or narrows with
-`server_id`; **`search_bundles`** / **`load_bundle`** discover and load
-compound workflows. Both are tool results, so the one `action_hub` tool
-definition never changes.
+action count, and the eight most distinctive domain words each one covers;
+about 6.5 KB of compact JSON, roughly 1.6K tokens, for 44 servers, or about
+twice that as a pretty-printed tool result) so a model facing a vague,
+goal-only request can see which integrations exist before it searches or
+narrows with `server_id`; **`search_bundles`** / **`load_bundle`** discover
+and load compound workflows. All three are tool results, so the one
+`action_hub` tool definition never changes.
 
 Servers are activated lazily. A server is not spawned or authenticated until one of its actions is actually executed, so a hundred configured integrations cost nothing until used.
 

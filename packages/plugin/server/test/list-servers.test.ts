@@ -107,7 +107,10 @@ test("list_servers returns one compact, hardened row per indexed server", async 
     assert.ok(!payroll.description!.includes(SECRET), "config description is redacted like every other echoed field");
     assert.equal(payroll.actions, 2);
     assert.deepEqual(payroll.kinds, ["tool"]);
-    assert.ok(payroll.keywords.includes("payroll") || payroll.keywords.includes("payslips"), `keywords: ${payroll.keywords}`);
+    // "payroll" is the server id's own token and is always excluded, so the
+    // domain word that must surface is "payslips".
+    assert.ok(payroll.keywords.includes("payslips"), `keywords: ${payroll.keywords}`);
+    assert.ok(!payroll.keywords.includes("payroll"), "server id tokens are not directory keywords");
 
     const chat = rows.find((row) => row.server === "chat")!;
     assert.equal("display_name" in chat, false, "no config metadata means no key");
@@ -173,5 +176,38 @@ test("a confident search carries no directory; the field only appears when there
     assert.equal(empty["count"], 0);
     const servers = empty["servers"] as Array<{ server: string }>;
     assert.deepEqual(servers.map((row) => row.server), ["chat", "payroll"]);
+  });
+});
+
+test("the ride-along directory is capped; list_servers still returns every server", async () => {
+  const fleet = Array.from({ length: 70 }, (_, i) => `srv${String(i).padStart(2, "0")}`);
+  const hub = new ActionHub({
+    embeddings: null,
+    clientFactory: async (config) =>
+      clientFor([{ name: `${config.id}_widget_tool`, description: `Manage ${config.id} widgets and gizmos for team ${config.id}.` }]),
+    servers: fleet.map((id) => ({ id, transport: { type: "stdio" as const, command: "fake" }, trust: "trusted" as const })),
+  });
+  const runtime: HubRuntime = {
+    hub,
+    cache: new CatalogCache(),
+    configHash: "test",
+    configPath: "/tmp/nonexistent-action-hub-config.json",
+    refreshed: Promise.resolve([]),
+    searchAbstention: { enabled: true, threshold: 0.8 },
+    startRefresh: () => Promise.resolve([]),
+  };
+  await hub.indexAll();
+  await hub.semanticReady();
+  await withClient(runtime, async (client) => {
+    const empty = await call(client, { operation: "search", query: "zzqx jabberwocky flimflam gibberish" });
+    assert.equal(empty["abstained"], true);
+    const servers = empty["servers"] as Array<{ server: string }>;
+    assert.equal(servers.length, 64, "ride-along directory is cut at 64 servers");
+    assert.deepEqual(servers.map((row) => row.server), fleet.slice(0, 64), "cut in id order");
+    assert.deepEqual(empty["servers_truncated"], { shown: 64, total: 70, next: "Call list_servers for the full directory." });
+
+    const full = await call(client, { operation: "list_servers" });
+    assert.equal(full["count"], 70);
+    assert.equal("servers_truncated" in full, false, "list_servers is never truncated");
   });
 });

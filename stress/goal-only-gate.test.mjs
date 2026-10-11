@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { __test } from "./goal-only-gate.mjs";
 
-const { selectGoalOnlyRows, rankOf, scoreRanks, checkFloors, parseEngines, GOAL_ONLY_FLOORS, GOAL_ONLY_ROWS } = __test;
+const { selectGoalOnlyRows, rankOf, scoreRanks, checkFloors, parseEngines, loadSplitMembership, GOAL_ONLY_FLOORS, GOAL_ONLY_ROWS } = __test;
 const here = fileURLToPath(new URL(".", import.meta.url));
 
 function goalRows(n = GOAL_ONLY_ROWS) {
@@ -103,4 +103,22 @@ test("parseEngines defaults to the fast engines, dedups, and rejects unknown nam
   assert.deepEqual(parseEngines("embeddings"), ["embeddings"]);
   assert.throws(() => parseEngines("bm25"), /unknown engine/);
   assert.throws(() => parseEngines(" , "), /at least one engine/);
+});
+
+test("split membership fails closed: the committed splits cover all 30 rows (17 tune, 13 held) and gaps or overlaps are fatal", () => {
+  const fixture = JSON.parse(readFileSync(join(here, "fixtures", "realistic-queries.json"), "utf8"));
+  const rows = selectGoalOnlyRows(fixture);
+  const splitOf = loadSplitMembership(rows);
+  const counts = { tune: 0, held: 0 };
+  for (const row of rows) counts[splitOf(row.query)] += 1;
+  assert.deepEqual(counts, { tune: 17, held: 13 });
+
+  const fake = (tune, held) => (name) => new Set(name === "split-tune.json" ? tune : held);
+  const two = goalRows(2);
+  assert.throws(() => loadSplitMembership(two, fake(["goal query 0"], [])), /in neither split/);
+  assert.throws(() => loadSplitMembership(two, fake(["goal query 0", "goal query 1"], ["goal query 1"])), /in both split files/);
+  assert.throws(() => loadSplitMembership(two, () => { throw new Error("boom"); }), /boom/);
+  const ok = loadSplitMembership(two, fake(["goal query 0"], ["goal query 1"]));
+  assert.equal(ok("goal query 0"), "tune");
+  assert.equal(ok("goal query 1"), "held");
 });

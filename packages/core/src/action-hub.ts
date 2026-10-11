@@ -5,6 +5,8 @@ import { SearchEngine, type SemanticScorer } from "./search/search.js";
 import { LocalSemanticIndex, type LocalSemanticOptions } from "./search/semantic.js";
 import {
   buildServerDirectory,
+  clampDirectoryKeywords,
+  MAX_DIRECTORY_KEYWORDS,
   type ServerDirectoryEntry,
   type ServerDirectoryMetadata,
 } from "./search/server-directory.js";
@@ -140,7 +142,8 @@ const DEFAULT_EXECUTION_TIMEOUT_MS = 30_000;
 export class ActionHub {
   readonly #catalog = new Catalog();
   /** Memoized server directory, keyed by catalog generation and keyword count. */
-  #directory?: { generation: number; keywords: number | undefined; entries: ServerDirectoryEntry[] };
+  /** Server directory memo, built once per catalog generation at the maximum keyword budget. */
+  #directory?: { generation: number; entries: ServerDirectoryEntry[] };
   readonly #bundles: BundleRegistry;
   readonly #search: SearchEngine;
   readonly #connections: ConnectionManager;
@@ -675,13 +678,16 @@ export class ActionHub {
    * Compressed domain/server awareness: one entry per server with its action
    * count, the config's display name and description, and its most
    * distinctive domain words. Cheap enough to return as a tool result on
-   * every vague ask; memoized until the catalog changes. Entries are
-   * returned fresh (copied) so callers cannot mutate the memo.
+   * every vague ask; memoized until the catalog changes. The memo is built
+   * once per generation at the maximum keyword budget and sliced per call,
+   * so callers with different budgets (the compact ride-along form and the
+   * full list_servers form) share one build instead of evicting each other.
+   * Entries are returned fresh (copied) so callers cannot mutate the memo.
    */
   serverDirectory(options: { keywordsPerServer?: number } = {}): ServerDirectoryEntry[] {
     const generation = this.#catalog.generation;
-    const keywords = options.keywordsPerServer;
-    if (!this.#directory || this.#directory.generation !== generation || this.#directory.keywords !== keywords) {
+    const keywords = clampDirectoryKeywords(options.keywordsPerServer);
+    if (!this.#directory || this.#directory.generation !== generation) {
       const metadata = new Map<string, ServerDirectoryMetadata>();
       for (const config of this.#connections.configs()) {
         if (config.displayName === undefined && config.description === undefined) continue;
@@ -692,14 +698,13 @@ export class ActionHub {
       }
       this.#directory = {
         generation,
-        keywords,
-        entries: buildServerDirectory(this.#catalog.all(), { keywordsPerServer: keywords, metadata }),
+        entries: buildServerDirectory(this.#catalog.all(), { keywordsPerServer: MAX_DIRECTORY_KEYWORDS, metadata }),
       };
     }
     return this.#directory.entries.map((entry) => ({
       ...entry,
       kinds: [...entry.kinds],
-      keywords: [...entry.keywords],
+      keywords: entry.keywords.slice(0, keywords),
     }));
   }
 

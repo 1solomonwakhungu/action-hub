@@ -130,18 +130,33 @@ export function parseEngines(value) {
   return [...new Set(engines)];
 }
 
-function loadSplitMembership() {
-  const read = (name) => {
-    const path = join(repoRoot, "stress", "fixtures", name);
-    try {
-      return new Set(JSON.parse(readFileSync(path, "utf8")).map((row) => row.query));
-    } catch {
-      return new Set();
-    }
-  };
-  const tune = read("split-tune.json");
-  const held = read("split-held.json");
-  return (query) => (tune.has(query) ? "tune" : held.has(query) ? "held" : "unsplit");
+/**
+ * Split membership for the 30 rows. Fails closed: a missing or unreadable
+ * split file, a row in neither split, or a row in both would silently drop
+ * the held-out block (or double count), so each is a FatalError.
+ */
+export function loadSplitMembership(rows, readSplit = defaultReadSplit) {
+  const tune = readSplit("split-tune.json");
+  const held = readSplit("split-held.json");
+  const unsplit = rows.filter((row) => !tune.has(row.query) && !held.has(row.query));
+  const both = rows.filter((row) => tune.has(row.query) && held.has(row.query));
+  if (unsplit.length > 0) throw new FatalError(`${unsplit.length} goal-only row(s) are in neither split-tune.json nor split-held.json: ${unsplit.slice(0, 3).map((r) => JSON.stringify(r.query)).join(", ")}`);
+  if (both.length > 0) throw new FatalError(`${both.length} goal-only row(s) are in both split files: ${both.slice(0, 3).map((r) => JSON.stringify(r.query)).join(", ")}`);
+  return (query) => (tune.has(query) ? "tune" : "held");
+}
+
+function defaultReadSplit(name) {
+  const path = join(repoRoot, "stress", "fixtures", name);
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new FatalError(`cannot read split file ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((row) => typeof row?.query !== "string")) {
+    throw new FatalError(`split file ${path} must be an array of rows with a string "query"`);
+  }
+  return new Set(parsed.map((row) => row.query));
 }
 
 async function buildEngine(name, catalog) {
@@ -189,7 +204,7 @@ export async function runGate({ corpusDir, fixturePath, engines, withFails }) {
   const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
   const catalogIds = new Set(catalog.all().map((record) => record.id));
   const rows = selectGoalOnlyRows(fixture, catalogIds);
-  const splitOf = loadSplitMembership();
+  const splitOf = loadSplitMembership(rows);
 
   const results = {};
   const gates = {};
@@ -230,7 +245,7 @@ export async function runGate({ corpusDir, fixturePath, engines, withFails }) {
   };
 }
 
-export const __test = { selectGoalOnlyRows, rankOf, scoreRanks, checkFloors, parseEngines, GOAL_ONLY_FLOORS, GOAL_ONLY_ROWS };
+export const __test = { selectGoalOnlyRows, rankOf, scoreRanks, checkFloors, parseEngines, loadSplitMembership, GOAL_ONLY_FLOORS, GOAL_ONLY_ROWS };
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const args = process.argv.slice(2);

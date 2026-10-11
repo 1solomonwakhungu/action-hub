@@ -12,7 +12,7 @@ export { bootstrapCatalog } from "./catalog/bootstrap.js";
 export type { BootstrapOptions, BootstrapResult } from "./catalog/bootstrap.js";
 export { SearchEngine, tokenize, DEFAULT_SEMANTIC_WEIGHT } from "./search/search.js";
 export type { SemanticScorer } from "./search/search.js";
-export { buildServerDirectory, DEFAULT_DIRECTORY_KEYWORDS } from "./search/server-directory.js";
+export { buildServerDirectory, clampDirectoryKeywords, DEFAULT_DIRECTORY_KEYWORDS, MAX_DIRECTORY_KEYWORDS } from "./search/server-directory.js";
 export type {
   ServerDirectoryEntry,
   ServerDirectoryMetadata,

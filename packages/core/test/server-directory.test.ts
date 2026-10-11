@@ -192,7 +192,13 @@ test("ActionHub.serverDirectory merges config metadata and memoizes until the ca
   assert.deepEqual(third.map((entry) => entry.serverId), ["jira", "s3", "skills"]);
   assert.deepEqual(third[2]!.kinds, ["skill"]);
 
-  // A different keyword budget is a different memo key, not a stale hit.
-  assert.equal(hub.serverDirectory({ keywordsPerServer: 1 })[0]!.keywords.length, 1);
+  // Different keyword budgets share one memo: the smaller list is a prefix
+  // of the larger one (the ranking is total and budget-independent), so the
+  // compact and full forms never evict each other.
+  const one = hub.serverDirectory({ keywordsPerServer: 1 });
+  const eight = hub.serverDirectory();
+  assert.equal(one[0]!.keywords.length, 1);
+  assert.deepEqual(one[0]!.keywords, eight[0]!.keywords.slice(0, 1));
+  assert.deepEqual(hub.serverDirectory({ keywordsPerServer: 4 })[1]!.keywords, eight[1]!.keywords.slice(0, 4));
   await hub.close();
 });
