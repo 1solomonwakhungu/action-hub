@@ -24,6 +24,7 @@ const {
   intendedArgs, abstentionDecision, classifyExecution, gateOutcome, executeProbe, buildEngine, warmAndTime, GATED_EXECUTION_OUTCOMES,
   scoreEngine, coreMetrics, abstentionMetrics, executionMetrics, validateGeneratedCorpus,
   parseAbstentionThreshold, percentileSelfTest, groupTools, EXECUTION_OUTCOMES, ABSTENTION_THRESHOLD_DEFAULT, OBJECTS,
+  nearDuplicateByGoldDirection,
 } = __test;
 
 // Two domains keep the hubs small; every test below is deterministic.
@@ -249,6 +250,13 @@ test("warmAndTime rows carry abstention and execution; scoreEngine reports three
     assert.equal(scored.execution.successCount + scored.execution.outcomes.wrongToolRejected + scored.execution.outcomes.wrongToolExecuted, 2);
     assert.ok(scored.bySubtype["near-duplicate"].execution, "by-subtype execution for near-duplicates");
     assert.equal(scored.bySubtype["no-match"].execution, undefined);
+    // Near-duplicate rows are split by gold direction: here only a twin-gold
+    // row exists, so the base-gold side is null and the twin side has n=1.
+    const dir = nearDuplicateByGoldDirection(rows);
+    assert.equal(dir.baseGold, null);
+    assert.equal(dir.twinGold.n, 1);
+    assert.equal(dir.twinGold.execution.scoredCount, 1);
+    assert.deepEqual(nearDuplicateByGoldDirection([]), { baseGold: null, twinGold: null });
 
     // The keyword engine's fused score is unnormalized BM25 (reported in the
     // block's top1ConfidenceRange), so "strict" means above every observed

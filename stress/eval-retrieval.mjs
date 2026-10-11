@@ -42,6 +42,13 @@
  * (archive_X vs delete_X) surfaces as a SILENT wrong-tool execution. The
  * execution block reports the two classes separately.
  *
+ * Self-fixture population note: the twins add twin-gold near-duplicate rows
+ * next to the pre-existing base-gold rows (same contract subtype, same
+ * "hard" difficulty), so self-fixtures-mode hard-difficulty gate numbers are
+ * NOT comparable with runs from before the twins landed. The headline
+ * nearDuplicate block reports the two gold directions separately. The
+ * generated corpus (full-generated mode) is unaffected.
+ *
  * Gates (reported honestly): recall@5 .90/.80/.65, recall@10 .95/.90/.80,
  * MRR@10 .80/.65/.45 (exact/paraphrase/hard); Sufficiency@10 >= .75;
  * no-match FP <= 5%; warm p95 <= 100 ms at 15K; token savings >= 95%.
@@ -79,9 +86,14 @@ const QUICK = ARGV.has("--quick");
 // and realistic sections keep the historical cold-build behaviour either way.
 const WARM = ARGV.has("--warm-embeddings");
 const SEED = 0x5eed;
-// Abstention replay threshold: the server's documented default
-// (docs/harness-guides.md, packages/plugin/server/src/config.ts). Parsed
-// inside runEval so a malformed flag fails closed through the harness.
+// Abstention replay threshold: mirrors DEFAULT_ABSTENTION_THRESHOLD in
+// packages/plugin/server/src/config.ts (the shipped code default; the docs
+// discuss its calibration separately and may recommend a different value for
+// the embedding channel). At 0.8 the warm blend engine abstains on most
+// matched rows (top-1 cosines mostly sit well below 0.8), so the
+// gatedByAbstention view reports near-total abstention unless the flag is
+// lowered. Parsed inside runEval so a malformed flag fails closed through
+// the harness.
 const ABSTENTION_THRESHOLD_DEFAULT = 0.8;
 const ABSTENTION_FLAG = "--abstention-threshold";
 function parseAbstentionThreshold(argv) {
@@ -1167,6 +1179,30 @@ function coreMetrics(rows) {
   return out;
 }
 
+/**
+ * Near-duplicate rows split by which side of a twin pair is the gold. A row
+ * is twin-gold when its single gold is a twin name (archive_X_by_id,
+ * delete_X_by_id, export_X_report); every other near-duplicate row is
+ * base-gold (including generated-corpus rows, which carry no twins).
+ */
+function nearDuplicateByGoldDirection(rows) {
+  const nd = rows.filter((r) => r.subtype === "near-duplicate" && typeof r.expected === "string");
+  const out = {};
+  for (const [label, subset] of [
+    ["baseGold", nd.filter((r) => !isTwinName(r.expected.split(":")[1] ?? ""))],
+    ["twinGold", nd.filter((r) => isTwinName(r.expected.split(":")[1] ?? ""))],
+  ]) {
+    if (subset.length === 0) { out[label] = null; continue; }
+    const ex = subset.some((r) => r.execution) ? executionMetrics(subset) : null;
+    out[label] = {
+      n: subset.length,
+      recallAt1: mean(subset.map((r) => (r.firstGoldRank === 1 ? 1 : 0))),
+      execution: ex ? { scoredCount: ex.scoredCount, successRate: ex.successRate, wrongToolExecutedRate: ex.wrongToolExecutedRate, wrongToolRejectedRate: ex.wrongToolRejectedRate, outcomes: ex.outcomes } : null,
+    };
+  }
+  return out;
+}
+
 function mapValues(obj, fn) {
   return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, fn(v)]));
 }
@@ -1566,7 +1602,15 @@ async function runEval() {
       abstention: blend.abstention,
       execution: blend.execution,
       nearDuplicate: gateRows.blend?.scored.bySubtype["near-duplicate"]
-        ? { execution: gateRows.blend.scored.bySubtype["near-duplicate"].execution ?? null, recallAt1: gateRows.blend.scored.bySubtype["near-duplicate"].recallAt1 }
+        ? {
+          execution: gateRows.blend.scored.bySubtype["near-duplicate"].execution ?? null,
+          recallAt1: gateRows.blend.scored.bySubtype["near-duplicate"].recallAt1,
+          // The two gold directions are different populations (base-gold rows
+          // exercise a twin pick with base-shaped args; twin-gold rows carry
+          // explicit twin-shaped args and exercise a base pick), so they are
+          // reported separately as well as combined.
+          byGoldDirection: nearDuplicateByGoldDirection(blendRows),
+        }
         : null,
       silentMisfires,
       loudWrongPicks,
@@ -1614,6 +1658,7 @@ function countBy(arr, keyFn) {
 export const __test = {
   syntheticCatalog, selfQueries, TWIN_FAMILIES, twinNameFor, isTwinName, assertTwinsIncompatible,
   intendedArgs, abstentionDecision, classifyExecution, gateOutcome, executeProbe, buildEngine, warmAndTime, GATED_EXECUTION_OUTCOMES,
+  nearDuplicateByGoldDirection,
   scoreEngine, coreMetrics, abstentionMetrics, executionMetrics, validateGeneratedCorpus,
   parseAbstentionThreshold, percentileSelfTest, groupTools, EXECUTION_OUTCOMES, ABSTENTION_THRESHOLD_DEFAULT, OBJECTS, DOMAINS,
 };

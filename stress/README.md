@@ -13,7 +13,7 @@ Load/performance bench and orchestration for the stress fleet. Contract:
 | `stress/gen-skills.mjs` | builder-1 | 5,000 skills + queries |
 | `stress/gen-tools.mjs` | builder-4 | 10,000 tools across 44 servers + queries |
 | `stress/fake-mcp-server.mjs`, `stress/make-config.mjs` | builder-2 | fake MCP fleet + config writer |
-| `stress/eval-retrieval.mjs` | builder-6 | search quality at scale |
+| `stress/eval-retrieval.mjs`, `stress/eval-retrieval.test.mjs` | builder-6 | search quality at scale: retrieval rank, abstention replay (`--abstention-threshold=<0..1>`, default 0.8) and execution success as three separate metrics; `--warm-embeddings` awaits the embedding index before the gate runs; `node --test stress/eval-retrieval.test.mjs` for the fixture and metric unit tests |
 | `stress/chaos.mjs` | builder-8 | crash/hang/slow-start scenarios |
 | `stress/harness-e2e.mjs` | builder-9 | pi harness entrypoint e2e |
 | `stress/cli-scale.mjs` | builder-3 | CLI surface scale |
