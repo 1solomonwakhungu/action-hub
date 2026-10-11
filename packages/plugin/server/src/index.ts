@@ -511,20 +511,26 @@ async function dispatch(
       // is a confident capability the flag must not hide. The echoed query
       // is deliberately omitted — every echoed field on this server carries
       // an explicit output budget, and the agent already knows its own
-      // query. Calibration (SQ1 2d, disjoint rows, self-mode 15K corpus):
-      // threshold 0.8 refused 0/51 real matches and abstained 5/7 of the
-      // 7 held-out no-match queries (71%); caveat: only 12 negative rows in
-      // total — a thin calibration base.
+      // query. Calibration: the original 0.8 figure (SQ1 2d, "0/51 real
+      // matches refused, 5/7 no-match abstained, 12 negatives") was measured
+      // on the fused blend score before SQ4 and no longer describes this
+      // gate. The held-out recalibration on the raw semantic cosine lives in
+      // stress/abstention-threshold.mjs and docs/harness-guides.md; at 0.8
+      // on the default embeddings channel it refuses every real match, so
+      // the flag stays off and the threshold must be recalibrated per
+      // catalog before enabling it.
       const matchingBundles = hub.searchBundles(input.query ?? "");
       if (abstention.enabled && matchingBundles.length === 0) {
         // Confidence keys on the RAW semantic score when the channel is
         // active (SQ4): under RRF fusion the fused `score` is rank-scale
         // (≈1/(60+rank)) and has no absolute meaning, so thresholds
         // calibrated on semantic cosines (SQ1/SQ3) would refuse every
-        // match. The hashed scorer leaves `semantic` undefined and the
-        // fused score keeps its calibrated blend scale — both scales are
-        // cosine-ish, so one threshold serves both with the documented
-        // per-catalog recalibration caveat.
+        // match. Under the hashed fallback `semantic` is the hashed-index
+        // cosine (search.ts populates it whenever a scorer returned scores);
+        // only with no semantic channel, or when the scorer failed for the
+        // query, does the fused score stand in.
+        // Both are cosine-scale, but they do not share an operating point
+        // (see the calibration in docs/harness-guides.md).
         const topScore = hits[0]?.semantic ?? hits[0]?.score ?? 0;
         if (hits.length === 0 || topScore < abstention.threshold) {
           return {
