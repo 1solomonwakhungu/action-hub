@@ -81,10 +81,11 @@ value). Measured 2026-10-11 at the commit that added the gate:
 |---|---:|---:|---:|---:|---:|
 | keyword (BM25 + synonyms) | 0.267 | 0.433 | 0.533 | 0.349 | 0.462 |
 | hashed (LocalSemanticIndex blend) | 0.133 | 0.267 | 0.333 | 0.181 | 0.462 |
-| embeddings (MiniLM + RRF, production default) | 0.400 | 0.533 | 0.567 | 0.454 | see artifact |
+| embeddings (MiniLM + RRF, production default) | 0.400 | 0.533 | 0.567 | 0.454 | 0.538 |
 
-The held-out column is the 13 rows of `split-held.json`; the embeddings
-held-out value is written to the results artifact by the opt-in run.
+The held-out column is the 13 rows of `split-held.json`. The embeddings
+engine built its 15K-record index in about 10 minutes on the cloud runner,
+which is why it is opt-in.
 
 Two readings worth keeping: the hashed blend is BELOW pure BM25 on this band
 at 15K records (the semantic channel pulls toward entity-sharing distractors),
