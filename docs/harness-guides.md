@@ -445,8 +445,9 @@ What this means for the defaults:
   appointment to friday" (0.37).
 - **A 0.36 threshold is harmless under fallback.** If the embedding model
   fails to load and the hub degrades to the hashed scorer, 0.36 sits below
-  every hashed score observed for both populations (minimum 0.37), so the
-  gate never fires: no benefit, but no refusals either.
+  every correct retrieval observed (minimum 0.49) and below all but three
+  of the 87 negatives (lowest 0.23, all tune rows), so it refuses nothing
+  and almost never abstains: no benefit, but no refusals either.
 - **The held base is still thin.** 31 correct retrievals and 35 negatives
   per channel give a few-percent resolution at best. Add rows to
   `stress/fixtures/no-match-queries.json` (banded, validated by
@@ -455,8 +456,10 @@ What this means for the defaults:
 
 Reproduce: `node stress/gen-tools.mjs && node stress/gen-skills.mjs && node
 stress/abstention-threshold.mjs --semantic both`. The summary lands in
-`stress/.generated/results/abstention-threshold.json` and every row's gate
-input, rank, and top hit in the sibling `.detail.json` for audit.
+`stress/.generated/results/abstention-threshold.json` (a single-channel run
+writes `abstention-threshold.<channel>.json` instead, so the two channels
+never overwrite each other) and every row's gate input, rank, and top hit in
+the sibling `.detail.json` for audit.
 
 ## Loaded schemas after compaction
 

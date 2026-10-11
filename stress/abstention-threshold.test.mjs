@@ -11,6 +11,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BANDS,
+  CHANNELS,
+  artifactBaseName,
   ENABLE_CRITERIA,
   MIN_NEGATIVES,
   SHIPPED_THRESHOLD,
@@ -147,4 +149,13 @@ test("enableDecision applies the criteria on every channel's held rows at the sh
   assert.match(verdict.reason, /hashed: refuses 1\/3/);
   assert.equal(verdict.threshold, SHIPPED_THRESHOLD);
   assert.deepEqual(verdict.criteria, ENABLE_CRITERIA);
+});
+
+test("single-channel runs get their own artifact name so they do not clobber each other", () => {
+  assert.deepEqual(CHANNELS, ["embeddings", "hashed"]);
+  assert.equal(artifactBaseName("both"), "abstention-threshold");
+  assert.equal(artifactBaseName(undefined), "abstention-threshold");
+  assert.equal(artifactBaseName("embeddings"), "abstention-threshold.embeddings");
+  assert.equal(artifactBaseName("hashed"), "abstention-threshold.hashed");
+  assert.equal(artifactBaseName("bogus"), "abstention-threshold");
 });

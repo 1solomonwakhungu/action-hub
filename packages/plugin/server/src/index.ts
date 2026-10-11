@@ -526,8 +526,9 @@ async function dispatch(
         // (≈1/(60+rank)) and has no absolute meaning, so thresholds
         // calibrated on semantic cosines (SQ1/SQ3) would refuse every
         // match. Under the hashed fallback `semantic` is the hashed-index
-        // cosine (search.ts populates it whenever any scorer is set); only
-        // with no semantic channel at all does the fused score stand in.
+        // cosine (search.ts populates it whenever a scorer returned scores);
+        // only with no semantic channel, or when the scorer failed for the
+        // query, does the fused score stand in.
         // Both are cosine-scale, but they do not share an operating point
         // (see the calibration in docs/harness-guides.md).
         const topScore = hits[0]?.semantic ?? hits[0]?.score ?? 0;

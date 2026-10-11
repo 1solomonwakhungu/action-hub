@@ -36,7 +36,7 @@ persisted vectors from `stress/.generated/abstention-vectors.json`):
 
 ```bash
 node stress/gen-tools.mjs && node stress/gen-skills.mjs
-node stress/abstention-threshold.mjs --semantic both   # or embeddings | hashed
+node stress/abstention-threshold.mjs --semantic both   # or embeddings | hashed (own artifact name per channel)
 node --test stress/abstention-threshold.test.mjs       # pure parts + fixture
 ```
 

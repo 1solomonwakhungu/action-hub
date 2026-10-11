@@ -44,6 +44,7 @@
  *
  * Output contract: ONE compact JSON summary as the last stdout line (shared
  * harness main()), artifact at stress/.generated/results/abstention-threshold.json
+ * (or abstention-threshold.<channel>.json for a single --semantic channel)
  * with per-row detail for audit, nonzero exit iff ok:false.
  *
  * Usage:
@@ -65,8 +66,24 @@ import { loadGeneratedCorpus } from "./lib/search-corpus.mjs";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const FIXTURES = join(repoRoot, "stress", "fixtures");
-const resultsPath = join(repoRoot, "stress", ".generated", "results", "abstention-threshold.json");
-const detailPath = join(repoRoot, "stress", ".generated", "results", "abstention-threshold.detail.json");
+export const CHANNELS = ["embeddings", "hashed"];
+/**
+ * Artifact base name for a --semantic selection. `both` (the default) owns
+ * `abstention-threshold`; a single channel gets its own suffix so running
+ * `--semantic hashed` after `--semantic embeddings` does not delete the
+ * other channel's summary (the shared harness removes resultsPath at start).
+ * Anything else falls back to the default name and is rejected inside run().
+ */
+export function artifactBaseName(semantic) {
+  return CHANNELS.includes(semantic) ? `abstention-threshold.${semantic}` : "abstention-threshold";
+}
+function flagValue(argv, name, dflt) {
+  const i = argv.indexOf(name);
+  return i === -1 || argv[i + 1] === undefined ? dflt : argv[i + 1];
+}
+const artifactBase = artifactBaseName(flagValue(process.argv.slice(2), "--semantic", "both"));
+const resultsPath = join(repoRoot, "stress", ".generated", "results", `${artifactBase}.json`);
+const detailPath = join(repoRoot, "stress", ".generated", "results", `${artifactBase}.detail.json`);
 
 /** The threshold the plugin ships in its config default (config.ts). */
 export const SHIPPED_THRESHOLD = 0.8;
@@ -360,7 +377,10 @@ async function run(args) {
     return v;
   };
   const semantic = flag("--semantic", "both");
-  const channels = semantic === "both" ? ["embeddings", "hashed"] : [semantic];
+  if (semantic !== "both" && !CHANNELS.includes(semantic)) {
+    throw new FatalError(`--semantic must be one of ${[...CHANNELS, "both"].join(", ")} (got ${JSON.stringify(semantic)})`);
+  }
+  const channels = semantic === "both" ? [...CHANNELS] : [semantic];
   const corpusDir = resolve(flag("--corpus", join(repoRoot, "stress", ".generated")));
   const fixturePath = resolve(flag("--fixture", join(FIXTURES, "no-match-queries.json")));
   const vectorsCache = resolve(flag("--vectors-cache", join(corpusDir, "abstention-vectors.json")));

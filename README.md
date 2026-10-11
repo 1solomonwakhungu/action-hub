@@ -94,7 +94,9 @@ so that never happens:
 - **No `tools/list_changed`.** The catalog underneath changes (warm-start
   re-index, a server added, a skill removed), but the tool surface does not,
   so the server never emits the notification and the host never has to
-  refetch and re-cache its tools.
+  refetch and re-cache its tools. (The SDK still advertises the
+  `tools.listChanged` capability; what is pinned is that the notification
+  is never sent.)
 - **Schemas are tool results.** `load` (and `search` with
   `include_schema: true`) return the upstream JSON Schema inside the tool
   result. A schema costs tokens only on the turn it is fetched and lives in
