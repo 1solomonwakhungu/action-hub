@@ -335,13 +335,11 @@ action-hub auth logout github-oauth
 
 Tokens are then refreshed automatically ahead of expiry and rotated in place, so no re-entry is needed. Servers using a static `Authorization` header keep working unchanged.
 
-**Known gap:** the OAuth binding is applied by the CLI's own config loader and
-client factory (`auth`, `doctor`, `list`, `test-search`) and is tested there,
-but the MCP server runtime's loader (`packages/plugin/server/src/config.ts`)
-currently drops the `auth` block from HTTP transports. A hub started by
-`action-hub start`, `serve`, or the daemon therefore connects to an OAuth
-server without the token binding. See
-[`docs/roadmap.md`](docs/roadmap.md#known-gaps).
+The same `auth` block is honoured by every entry point: the CLI commands
+(`auth`, `doctor`, `list`, `test-search`) and the server runtime behind
+`action-hub start`, `serve`, and the daemon. The runtime loader used to drop
+it; `packages/plugin/server/test/config-validation.test.ts` now pins that it
+survives.
 
 ## Scale & reliability
 
@@ -428,13 +426,13 @@ whose shipped threshold is not calibrated for the default channel); the
 Homebrew tap and winget channels (generated but never published); embeddings
 on very large catalogs (minutes to embed 15K records cold in WASM).
 
-**Known gaps:** the server runtime's config loader drops `transport.auth`
-(above); goal-only queries are the weakest retrieval band. The full list, with
-file paths, is in [`docs/roadmap.md`](docs/roadmap.md#known-gaps).
+**Known gaps:** goal-only queries are the weakest retrieval band. The full
+list, with file paths, is in [`docs/roadmap.md`](docs/roadmap.md#known-gaps).
 
-`npm test` on 2026-10-11 ran 426 tests across the four workspaces (core 293,
-server 39, CLI 90, site 4). Four fail only when run as root, because they
-simulate unreadable or unwritable paths with `chmod`, which root ignores.
+`npm test` on 2026-10-12 ran 450 tests across the four workspaces (core 303,
+server 46, CLI 97, site 4) with 0 failures. Three skip with a reason under a
+root runner, where `chmod` cannot make a path unreadable; each has a
+root-proof companion test that exercises the same branch.
 
 ## Contributing and security
 

@@ -120,14 +120,6 @@ so the claim can be checked. Nothing has been tagged or released yet (see
 Things the code does not do yet, or does only partly. These are the honest
 caveats to the list above.
 
-- **The MCP server runtime does not carry `transport.auth` through its config
-  loader.** `packages/plugin/server/src/config.ts` (`parseTransport`) keeps
-  only `type`, `url`, and `headers` for HTTP transports, so a hub started by
-  `action-hub start`, `serve`, or the daemon connects to an OAuth-configured
-  server without the token binding. The CLI's own loader passes the block
-  through, so `auth login`/`status`/`logout`, `doctor`, `list`, and
-  `test-search` do use OAuth. Core and the CLI are tested; the server runtime
-  path is not.
 - **No release has been tagged.** The release workflow, Homebrew formula, and
   winget manifests exist and are exercised in CI, but as of 2026-10-11 the
   repository has no `v*` tag and no GitHub release, so the install commands
@@ -149,9 +141,7 @@ caveats to the list above.
 Chosen from production usage and the committed evaluation results rather than
 a fixed list. Candidates, in no committed order:
 
-- Close the `transport.auth` gap in the server config loader and add a
-  runtime-path OAuth test.
-- Cut `v0.1.0` once the above is closed, so the binary channel is real.
+- Cut `v0.1.0`, so the binary channel is real.
 - Raise goal-only recall without trading away exact-name or paraphrase
   recall; raise the committed floors in the same change.
 - Recalibrate and possibly enable search abstention once the no-match fixture
