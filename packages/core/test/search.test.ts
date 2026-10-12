@@ -214,3 +214,29 @@ test("intent-bearing quantifiers keep the exact name ranked above its near-dupli
     );
   }
 });
+
+test("tokenize keeps combining marks attached to their base letter and normalizes to NFC", () => {
+  // Decomposed accents (e + U+0301) are the same word as the precomposed form.
+  assert.deepEqual(tokenize("été"), ["été"]);
+  assert.deepEqual(tokenize("créer un ticket"), tokenize("créer un ticket"));
+  // Scripts whose vowel signs never compose must not shatter into consonants.
+  assert.deepEqual(tokenize("हिन्दी संस्करण"), ["हिन्दी", "संस्करण"]);
+  assert.deepEqual(tokenize("ภาษาไทย"), ["ภาษาไทย"]);
+  // ASCII behaviour is unchanged.
+  assert.deepEqual(tokenize("createPullRequest"), ["create", "pull", "request"]);
+});
+
+test("a decomposed query finds a precomposed name (and vice versa)", async () => {
+  const catalog = new Catalog();
+  catalog.addAll([
+    record({ id: "fr:créer_ticket", name: "créer_ticket", summary: "Créer un ticket" }),
+    record({ id: "hi:हिन्दी_अनुवाद", name: "हिन्दी_अनुवाद", summary: "Translate to Hindi" }),
+    record({ id: "github:list_issues", name: "list_issues", summary: "List issues" }),
+  ]);
+  const engine = new SearchEngine(catalog);
+  const nfd = await engine.search("créer ticket");
+  assert.equal(nfd[0]?.id, "fr:créer_ticket");
+  const hindi = await engine.search("हिन्दी");
+  assert.equal(hindi[0]?.id, "hi:हिन्दी_अनुवाद");
+  assert.equal(hindi.length, 1, "a Devanagari word must not match by shared consonants");
+});
