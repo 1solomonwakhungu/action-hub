@@ -11,7 +11,7 @@ import type {
   SkillConfig,
   TrustTier,
 } from "@action-hub/core";
-import { discoverMcpServers } from "@action-hub/core";
+import { discoverMcpServers, isOAuthClientConfig } from "@action-hub/core";
 
 export interface HubConfigFile {
   servers?: unknown;
@@ -312,10 +312,21 @@ function parseTransport(value: unknown, where: string, label: string): ServerCon
     if (typeof url !== "string" || url.length === 0) {
       throw new Error(`${label}: ${where}.transport.url is required for http`);
     }
+    // The OAuth block must survive parsing: the runtime's client factory reads
+    // `transport.auth` to bind a token, so dropping it here connected
+    // OAuth-configured servers unauthenticated. A malformed block is an
+    // error rather than a silent fallback for the same reason.
+    const auth = value["auth"];
+    if (auth !== undefined && !isOAuthClientConfig(auth)) {
+      throw new Error(
+        `${label}: ${where}.transport.auth must be an OAuth 2.0 client config (type "oauth2", tokenUrl, and clientId or clientIdEnv)`,
+      );
+    }
     return {
       type: "http",
       url,
       headers: isRecord(value["headers"]) ? stringMap(value["headers"]) : undefined,
+      ...(auth !== undefined ? { auth } : {}),
     };
   }
 
