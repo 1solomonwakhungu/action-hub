@@ -188,6 +188,17 @@ async function main(): Promise<void> {
     }
   }
 
+  if (
+    parsedArgs["config"] !== undefined &&
+    (typeof parsedArgs["config"] !== "string" || parsedArgs["config"].trim() === "")
+  ) {
+    // A valueless --config was recorded as `true` and silently fell back to
+    // the default config path; never run a command against a config the
+    // user did not name.
+    console.error("Missing value for --config (usage: --config <path to servers.json>)");
+    process.exitCode = 1;
+    return;
+  }
   const configPath = typeof parsedArgs["config"] === "string" ? parsedArgs["config"] : undefined;
 
   try {
@@ -279,7 +290,15 @@ async function main(): Promise<void> {
 
       case "test-search": {
         const query = positional.join(" ");
-        const limitVal = typeof parsedArgs["limit"] === "string" ? parseInt(parsedArgs["limit"], 10) : undefined;
+        const limitRaw = parsedArgs["limit"];
+        const limitVal = typeof limitRaw === "string" ? Number(limitRaw) : undefined;
+        if (limitRaw !== undefined && (limitVal === undefined || !Number.isInteger(limitVal) || limitVal < 1)) {
+          // A non-numeric or non-positive --limit used to reach the search as
+          // NaN/0/negative and silently print "No matching tools or skills".
+          console.error(`Invalid --limit "${String(limitRaw)}": expected a positive integer`);
+          exitCode = 1;
+          break;
+        }
         const thresholdVal = typeof parsedArgs["threshold"] === "string" ? parseFloat(parsedArgs["threshold"]) : undefined;
         const serverVal = typeof parsedArgs["server"] === "string" ? parsedArgs["server"] : undefined;
 
