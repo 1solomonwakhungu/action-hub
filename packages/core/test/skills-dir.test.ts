@@ -95,15 +95,19 @@ test("colliding skill ids keep every skill: first keeps its id, later ones get a
       "utf8",
     );
   }
+  // Two unreadable-skill fixtures, one per readFile branch. The EACCES one
+  // (a loose .md with mode 0o000) only blocks reads when POSIX mode bits are
+  // enforced: uid 0 reads it anyway and Windows ignores chmod, so it is only
+  // created where it can fail. The EISDIR one (a skill directory whose SKILL.md
+  // is itself a directory) is unreadable on every platform, including for root.
+  const canLockFile = process.platform !== "win32" && process.getuid?.() !== 0;
   const locked = join(dir, "0-locked.md");
-  await writeFile(locked, "---\nname: Locked\n---\nsecret", "utf8");
-  let chmodOk = false;
-  try {
+  if (canLockFile) {
+    await writeFile(locked, "---\nname: Locked\n---\nsecret", "utf8");
     await chmod(locked, 0o000);
-    chmodOk = true;
-  } catch {
-    // e.g. running as root: the file stays readable, no EACCES to simulate.
   }
+  const notAFile = join(dir, "0-not-a-file", "SKILL.md");
+  await mkdir(notAFile, { recursive: true });
 
   const warnings: string[] = [];
   const skills = await discoverSkillsFromDirectory(dir, "custom", (m) => warnings.push(m));
@@ -123,9 +127,16 @@ test("colliding skill ids keep every skill: first keeps its id, later ones get a
     warnings.some((w) => w.includes('duplicate skill id "skill:same-skill"') && w.includes("a-dup") && w.includes("c-dup")),
   );
 
-  // An unreadable file is skipped with a warning instead of aborting the scan.
-  if (chmodOk) {
-    assert.ok(warnings.some((w) => w.includes("0-locked.md")));
+  // An unreadable skill is skipped with a warning instead of aborting the scan.
+  assert.ok(
+    warnings.some((w) => w.includes("skipping unreadable skill") && w.includes(notAFile)),
+    "EISDIR skill directory is skipped with a warning",
+  );
+  if (canLockFile) {
+    assert.ok(
+      warnings.some((w) => w.includes("skipping unreadable skill") && w.includes(locked)),
+      "EACCES skill file is skipped with a warning",
+    );
+    await chmod(locked, 0o644).catch(() => undefined);
   }
-  await chmod(locked, 0o644).catch(() => undefined);
 });

@@ -317,24 +317,67 @@ test("the cache directory and file are written with private permissions", async 
   assert.equal(dirMode, 0o700);
 });
 
-test("a write to an unwritable location returns false instead of throwing", async () => {  const dir = await mkdtemp(join(tmpdir(), "action-hub-readonly-"));
-  const nested = join(dir, "nested");
-  await mkdir(nested);
-  await chmod(nested, 0o500);
+// POSIX mode bits are advisory for uid 0 (root writes straight through a 0o500
+// directory) and a no-op on Windows, so the chmod variant proves nothing there.
+// A parent path that is a regular file is unwritable on every platform (mkdir
+// fails with EEXIST/ENOTDIR), which keeps the fail-soft contract exercised when
+// the suite runs as root. Both variants are generated for each write-failure test.
+const modeBitsBlockWrites = process.platform !== "win32" && process.getuid?.() !== 0;
 
-  const warnings: string[] = [];
-  const cache = new CatalogCache({
-    path: join(nested, "catalog.json"),
-    onWarning: (message) => warnings.push(message),
+interface UnwritableVariant {
+  label: string;
+  skip: string | false;
+  /** Whether a cold read of the target also fails (and warns), not just the write. */
+  readAlsoFails: boolean;
+  prepare(dir: string): Promise<{ target: string; restore(): Promise<void> }>;
+}
+
+const isWriteWarning = (w: string): boolean => w.startsWith("could not write catalog cache to ");
+
+const unwritableVariants: UnwritableVariant[] = [
+  {
+    label: "read-only directory, chmod 0o500",
+    skip: modeBitsBlockWrites ? false : "POSIX mode bits do not block writes for root or on Windows",
+    readAlsoFails: false, // the missing file reads as ENOENT, which is silent
+    async prepare(dir) {
+      const nested = join(dir, "nested");
+      await mkdir(nested);
+      await chmod(nested, 0o500);
+      return { target: join(nested, "catalog.json"), restore: () => chmod(nested, 0o700) };
+    },
+  },
+  {
+    label: "parent path is a regular file",
+    skip: false,
+    readAlsoFails: true, // ENOTDIR on read is reported too
+    async prepare(dir) {
+      const nested = join(dir, "nested");
+      await writeFile(nested, "not a directory", "utf8");
+      return { target: join(nested, "catalog.json"), restore: async () => undefined };
+    },
+  },
+];
+
+for (const variant of unwritableVariants) {
+  test(`a write to an unwritable location (${variant.label}) returns false instead of throwing`, { skip: variant.skip }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "action-hub-readonly-"));
+    const { target, restore } = await variant.prepare(dir);
+
+    const warnings: string[] = [];
+    const cache = new CatalogCache({
+      path: target,
+      onWarning: (message) => warnings.push(message),
+    });
+    const { hub } = buildHub();
+    await hub.indexAll();
+
+    assert.equal(await cache.write(hub.toPersisted("hash-a")), false);
+    assert.equal(warnings.length, 1);
+    assert.ok(isWriteWarning(warnings[0]!), warnings[0]);
+
+    await restore();
   });
-  const { hub } = buildHub();
-  await hub.indexAll();
-
-  assert.equal(await cache.write(hub.toPersisted("hash-a")), false);
-  assert.equal(warnings.length, 1);
-
-  await chmod(nested, 0o700);
-});
+}
 
 test("restoreCatalog rehydrates search and load without connecting", async () => {
   const path = await tempCachePath();
@@ -496,26 +539,27 @@ test("a failing background re-index leaves the cached catalog usable", async () 
   assert.ok(hits.length > 0);
 });
 
-test("a cold bootstrap that cannot write the cache still returns a catalog", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "action-hub-nowrite-"));
-  const nested = join(dir, "nested");
-  await mkdir(nested);
-  await chmod(nested, 0o500);
+for (const variant of unwritableVariants) {
+  test(`a cold bootstrap that cannot write the cache (${variant.label}) still returns a catalog`, { skip: variant.skip }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "action-hub-nowrite-"));
+    const { target, restore } = await variant.prepare(dir);
 
-  const { hub } = buildHub();
-  const warnings: string[] = [];
-  const result = await bootstrapCatalog(hub, {
-    servers,
-    path: join(nested, "catalog.json"),
-    onWarning: (message) => warnings.push(message),
+    const { hub } = buildHub();
+    const warnings: string[] = [];
+    const result = await bootstrapCatalog(hub, {
+      servers,
+      path: target,
+      onWarning: (message) => warnings.push(message),
+    });
+    await result.refreshed;
+
+    assert.equal(result.actions, 3);
+    assert.equal(warnings.filter(isWriteWarning).length, 1, warnings.join("\n"));
+    assert.equal(warnings.length, variant.readAlsoFails ? 2 : 1, warnings.join("\n"));
+
+    await restore();
   });
-  await result.refreshed;
-
-  assert.equal(result.actions, 3);
-  assert.equal(warnings.length, 1);
-
-  await chmod(nested, 0o700);
-});
+}
 
 test("a deferred warm bootstrap serves the cache and re-indexes only on startRefresh", async () => {
   const path = await tempCachePath();

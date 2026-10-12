@@ -23,18 +23,34 @@ function startHttpServer(mode: string, scratch: string): { url: string; kill: ()
     env: { ...process.env, F16_HTTP_MODE: mode, F16_HTTP_PORT: "0", F16_HTTP_ADDR_FILE: portFile, HTTP_PID_FILE: pidFile },
     stdio: ["ignore", "ignore", "inherit"],
   });
-  for (let i = 0; i < 100; i++) {
-    if (existsyncSafe(portFile)) break;
+  // The fixture publishes its port with a plain writeFileSync, so a poller can
+  // observe the file existing but still empty (truncate before write); an
+  // empty read would dial port 0 and the test would fail as "not indexed".
+  // Wait for a real port, bounded generously for a loaded host.
+  const deadline = Date.now() + 30_000;
+  let port = 0;
+  for (;;) {
+    port = readPortSafe(portFile);
+    if (port > 0) break;
+    if (Date.now() > deadline) {
+      child.kill();
+      throw new Error(`fixture HTTP server (${mode}) did not publish its port within 30s`);
+    }
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
-  const port = Number(readFileSync(portFile, "utf8"));
   return {
     url: `http://127.0.0.1:${port}/mcp`,
     kill: () => child.kill(),
   };
 }
-function existsyncSafe(p: string): boolean {
-  try { readFileSync(p); return true; } catch { return false; }
+/** The published port, or 0 while the file is missing or not yet written. */
+function readPortSafe(p: string): number {
+  try {
+    const port = Number(readFileSync(p, "utf8").trim());
+    return Number.isInteger(port) && port > 0 ? port : 0;
+  } catch {
+    return 0;
+  }
 }
 
 function makeHttpHub(url: string, threshold = 3) {
