@@ -38,7 +38,13 @@ export async function loadCliConfig(configPath?: string): Promise<CliConfig> {
 
   try {
     const text = await readFile(targetPath, "utf8");
-    raw = JSON.parse(text) as Record<string, unknown>;
+    const document: unknown = JSON.parse(text);
+    // A non-object root (array, string, number, null) must not read as an
+    // empty config: list/doctor/test-search would silently report nothing.
+    if (typeof document !== "object" || document === null || Array.isArray(document)) {
+      throw new Error("expected a JSON object at the document root");
+    }
+    raw = document as Record<string, unknown>;
     exists = true;
 
     if (Array.isArray(raw["servers"])) {

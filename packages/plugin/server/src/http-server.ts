@@ -159,7 +159,10 @@ export async function startHttpServer(options: HttpServerOptions = {}): Promise<
   });
 
   async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    // Only the path is routed on; the Host header is never consulted. Using
+    // it as the URL base made any malformed Host value (e.g. "[::1") throw
+    // out of the router and answer 500 before authentication.
+    const url = new URL(req.url ?? "/", "http://localhost");
 
     // Liveness stays unauthenticated so probes do not need the token.
     if (req.method === "GET" && url.pathname === HEALTH_PATH) {
