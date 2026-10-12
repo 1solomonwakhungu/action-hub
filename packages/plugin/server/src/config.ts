@@ -57,15 +57,28 @@ export function defaultConfigPath(): string {
  * be opened to add servers.
  */
 export async function loadConfig(path: string): Promise<HubConfig> {
-  let raw: string;
+  let raw: string | undefined;
   let parsed: HubConfigFile = {};
   try {
     raw = await readFile(path, "utf8");
-    parsed = JSON.parse(raw) as HubConfigFile;
   } catch (cause) {
     if (!isNotFound(cause)) {
       throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
     }
+  }
+  if (raw !== undefined) {
+    let document: unknown;
+    try {
+      document = JSON.parse(raw);
+    } catch (cause) {
+      throw new Error(`Failed to read Action Hub config at ${path}: ${message(cause)}`);
+    }
+    // A non-object root (array, string, number, null) would otherwise read as
+    // "no servers configured" and boot an empty hub without a word.
+    if (!isRecord(document)) {
+      throw new Error(`Action Hub config at ${path} must contain a JSON object`);
+    }
+    parsed = document as HubConfigFile;
   }
 
   const explicitServers = parseServers(parsed.servers, `Action Hub config at ${path}`);
@@ -150,7 +163,7 @@ export function parseServers(value: unknown, label: string): ServerConfig[] {
     seen.add(id);
 
     const transport = parseTransport(entry["transport"], `servers[${index}]`, label);
-    return parseServerFields(entry, id, transport);
+    return parseServerFields(entry, id, transport, `${label}: servers[${index}]`);
   });
 }
 
@@ -158,6 +171,7 @@ function parseServerFields(
   entry: Record<string, unknown>,
   id: string,
   transport: ServerConfig["transport"],
+  where: string,
 ): ServerConfig {
   const trust = entry["trust"];
   return {
@@ -167,8 +181,8 @@ function parseServerFields(
     transport,
     trust: isTrust(trust) ? trust : "untrusted",
     enabled: entry["enabled"] === undefined ? true : entry["enabled"] !== false,
-    allowTools: parseStringArray(entry["allowTools"]),
-    denyTools: parseStringArray(entry["denyTools"]),
+    allowTools: parseStringArray(entry["allowTools"], `${where}.allowTools`),
+    denyTools: parseStringArray(entry["denyTools"], `${where}.denyTools`),
     timeoutMs: parsePositiveNumber(entry["timeoutMs"]),
     circuitBreaker: parseCircuitBreaker(entry["circuitBreaker"]),
     restartBackoff: parseRestartBackoff(entry["restartBackoff"]),
@@ -234,7 +248,7 @@ export function parseSkills(value: unknown, label: string): SkillConfig[] {
     const name = typeof entry["name"] === "string" ? entry["name"] : id;
     const summary = typeof entry["summary"] === "string" ? entry["summary"] : name;
     const description = typeof entry["description"] === "string" ? entry["description"] : summary;
-    const tags = parseStringArray(entry["tags"]);
+    const tags = parseStringArray(entry["tags"], `${label}: skills[${index}].tags`);
     const trust = entry["trust"];
 
     return {
@@ -272,9 +286,9 @@ function parseBundles(value: unknown, label: string): Bundle[] {
 
     const displayName = typeof entry["displayName"] === "string" ? entry["displayName"] : id;
     const description = typeof entry["description"] === "string" ? entry["description"] : undefined;
-    const serverIds = parseStringArray(entry["serverIds"]);
-    const actionIds = parseStringArray(entry["actionIds"]);
-    const tags = parseStringArray(entry["tags"]);
+    const serverIds = parseStringArray(entry["serverIds"], `${label}: bundles[${index}].serverIds`);
+    const actionIds = parseStringArray(entry["actionIds"], `${label}: bundles[${index}].actionIds`);
+    const tags = parseStringArray(entry["tags"], `${label}: bundles[${index}].tags`);
 
     return {
       id,
@@ -301,8 +315,8 @@ function parseTransport(value: unknown, where: string, label: string): ServerCon
     return {
       type: "stdio",
       command,
-      args: parseStringArray(value["args"]) ?? [],
-      env: isRecord(value["env"]) ? stringMap(value["env"]) : undefined,
+      args: parseStringArray(value["args"], `${label}: ${where}.transport.args`) ?? [],
+      env: isRecord(value["env"]) ? stringMap(value["env"], `${label}: ${where}.transport.env`) : undefined,
       cwd: typeof value["cwd"] === "string" ? expandHome(value["cwd"]) : undefined,
     };
   }
@@ -325,7 +339,7 @@ function parseTransport(value: unknown, where: string, label: string): ServerCon
     return {
       type: "http",
       url,
-      headers: isRecord(value["headers"]) ? stringMap(value["headers"]) : undefined,
+      headers: isRecord(value["headers"]) ? stringMap(value["headers"], `${label}: ${where}.transport.headers`) : undefined,
       ...(auth !== undefined ? { auth } : {}),
     };
   }
@@ -333,15 +347,26 @@ function parseTransport(value: unknown, where: string, label: string): ServerCon
   throw new Error(`${label}: ${where}.transport.type must be "stdio" or "http"`);
 }
 
-function parseStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.filter((entry): entry is string => typeof entry === "string");
+/**
+ * A present-but-malformed list is an error, never a silent partial: dropping
+ * a numeric `args` entry changes the spawned command line, and a `denyTools`
+ * written as a string instead of an array would otherwise apply no deny list.
+ */
+function parseStringArray(value: unknown, where: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+    throw new Error(`${where} must be an array of strings`);
+  }
+  return value as string[];
 }
 
-function stringMap(value: Record<string, unknown>): Record<string, string> {
+function stringMap(value: Record<string, unknown>, where: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry === "string") out[key] = expandEnv(entry);
+    if (typeof entry !== "string") {
+      throw new Error(`${where}.${key} must be a string`);
+    }
+    out[key] = expandEnv(entry);
   }
   return out;
 }
@@ -355,7 +380,7 @@ function expandEnv(value: string): string {
 
 function expandHome(value: string): string {
   if (value === "~") return homedir();
-  if (value.startsWith("~/")) return resolve(homedir(), value.slice(2));
+  if (value.startsWith("~/")) return resolve(homedir(), expandEnv(value.slice(2)));
   return expandEnv(value);
 }
 
