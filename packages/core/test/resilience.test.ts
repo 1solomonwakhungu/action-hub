@@ -1162,3 +1162,91 @@ test("a live ToolError whose text says 'timed out after' is a tool error, not an
     await hub.close();
   }
 });
+
+test("a factory that throws synchronously does not park its rejection as the in-flight activation", async () => {
+  const clock = new FakeClock();
+  let calls = 0;
+  const manager = new ConnectionManager(
+    (): Promise<McpClient> => {
+      calls += 1;
+      throw new Error(`sync boom ${calls}`);
+    },
+    [server("sync", { circuitBreaker: { failureThreshold: 10, cooldownMs: 1_000 } })],
+    {
+      failureThreshold: 10,
+      cooldownMs: 1_000,
+      heartbeat: { enabled: false },
+      now: clock.now,
+      random: () => 0,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+  );
+
+  await assert.rejects(() => manager.activate("sync"), /sync boom 1/);
+  // The second call must reach the factory again instead of replaying the
+  // first rejection from a stale `pending` handle.
+  await assert.rejects(() => manager.activate("sync"), /sync boom 2/);
+  assert.equal(calls, 2);
+  assert.equal(manager.status("sync"), "degraded");
+
+  // The restart timer scheduled by the failure retries too.
+  await clock.advance(1_000);
+  assert.ok(calls >= 3, `restart must call the factory again (calls=${calls})`);
+
+  await manager.closeAll();
+});
+
+test("a heartbeat probe that settles after reconnect() is ignored and does not duplicate the chain", async () => {
+  const clock = new FakeClock();
+  let rejectProbe: ((cause: Error) => void) | undefined;
+  const stale: McpClient = {
+    listTools: () =>
+      new Promise((_, reject) => {
+        rejectProbe = reject;
+      }),
+    callTool: async () => "ok",
+    close: async () => {},
+  };
+  const fresh = new FakeClient([]);
+  const clients: McpClient[] = [stale, fresh];
+  const manager = new ConnectionManager(
+    async () => clients.shift()!,
+    [
+      server("hb", {
+        heartbeat: { enabled: true, intervalMs: 20, timeoutMs: 10_000 },
+        circuitBreaker: { failureThreshold: 3, cooldownMs: 1_000 },
+      }),
+    ],
+    {
+      failureThreshold: 3,
+      cooldownMs: 1_000,
+      now: clock.now,
+      random: () => 0,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    },
+  );
+
+  await manager.activate("hb");
+  await clock.advance(20); // first heartbeat: probe on the stale client is now in flight
+  assert.ok(rejectProbe, "the heartbeat probe should be pending on the first client");
+
+  await manager.reconnect("hb");
+  assert.equal(manager.status("hb"), "ready");
+
+  // The old connection's probe fails only now, after it was replaced.
+  rejectProbe!(new Error("stale probe failed"));
+  await clock.drain();
+  assert.equal(manager.status("hb"), "ready", "a stale probe must not degrade the replacement");
+  assert.equal(manager.states()[0]?.consecutiveFailures, 0);
+  assert.equal(manager.states()[0]?.error, undefined);
+
+  // Exactly one heartbeat chain survives: one probe per interval on the new client.
+  await clock.advance(20);
+  assert.equal(fresh.listCalls, 1);
+  await clock.advance(20);
+  assert.equal(fresh.listCalls, 2);
+
+  await manager.closeAll();
+});
