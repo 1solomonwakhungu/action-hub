@@ -165,21 +165,27 @@ system use the server directly and lose nothing.
 ```
 action-hub/
 ├── packages/
-│   ├── core/                 # Layer 1 — runtime-agnostic engine
+│   ├── core/                 # Layer 1 — runtime-agnostic engine (+ eval/ retrieval gate, vendor/ model)
 │   ├── cli/                  # Developer CLI + `action-hub start` (bundled into the binary)
 │   └── plugin/               # Layer 2 — plugin bundle for MCP hosts
 │       └── server/           #   meta-MCP server (also run in-process by the CLI)
-├── .github/
-│   └── workflows/            # CI and standalone-binary release automation
-├── scripts/                  # esbuild + Node SEA binary build and packaging
+├── site/                     # Explainer microsite, published to GitHub Pages
+├── stress/                   # Fleet-scale stress, chaos, and retrieval-quality suite
+├── scripts/                  # esbuild + Node SEA binary build, smoke test, packaging
 ├── packaging/                # generated Homebrew / winget manifests
 ├── config/
 │   └── servers.example.json
 ├── docs/
 │   ├── architecture.md
+│   ├── harness-guides.md
 │   ├── releasing.md
 │   ├── roadmap.md
-│   └── harness-guides.md
+│   └── telemetry.md
+├── .github/
+│   ├── workflows/            # CI, Pages deploy, standalone-binary release
+│   └── ISSUE_TEMPLATE/, PULL_REQUEST_TEMPLATE.md
+├── test-isolation.mjs        # preload that keeps every test away from real user state
+├── CONTRIBUTING.md · SECURITY.md · CHANGELOG.md
 └── README.md
 ```
 
@@ -209,9 +215,17 @@ The `stress/` generators emit two kinds of retrieval-evaluation data:
 
 ## Install
 
-Action Hub ships as a **standalone, zero-dependency binary** — the Node runtime,
-the developer CLI, and the MCP server in one executable. No system
+Action Hub is built as a **standalone, zero-dependency binary** — the Node
+runtime, the developer CLI, and the MCP server in one executable. No system
 Node install is required to run it.
+
+> **No release has been published yet.** As of 2026-10-11 the repository has no
+> `v*` tag and no GitHub release, so the Homebrew, winget, and direct-download
+> commands below do not resolve to anything. They describe what the release
+> pipeline in [`.github/workflows/release.yml`](.github/workflows/release.yml)
+> produces, and that pipeline is exercised on every push by CI's binary smoke
+> job. Until the first tag, build from source (next section) or run
+> `npm run dist` locally to produce the binary for your own machine.
 
 ### Homebrew (macOS, Linux)
 
@@ -260,10 +274,26 @@ git clone https://github.com/1solomonwakhungu/action-hub.git
 cd action-hub
 npm install
 npm run build
-npm test
+npm run typecheck
+npm test            # builds first; tests import from dist/
+npm run eval        # retrieval-quality gate, fails if the committed baseline is breached
+node packages/cli/dist/index.js --help
 ```
 
-Configure downstream servers in `config/servers.example.json`, then copy it to `config/servers.json`.
+Copy `config/servers.example.json` to `~/.config/action-hub/servers.json` and
+edit it. That path is the default for every command and for the MCP server;
+override it with `ACTION_HUB_CONFIG=<path>` or `--config <path>`. The example
+file shows a static-header HTTP server, several OAuth 2.0 servers (disabled),
+and stdio servers with per-server heartbeat, circuit-breaker, restart-backoff,
+heap-cap, and deny-list settings; every key is documented on `ServerConfig` in
+`packages/core/src/types.ts`. `action-hub import --write` or
+`action-hub migrate --type all --write` can populate the file from harness
+configs you already have, and `action-hub doctor` checks the result.
+
+Then register the server with your harness: `action-hub harness <target>`
+prints the snippet, `action-hub harness <target> install --write` writes it.
+Manual snippets for every supported harness are in
+[`docs/harness-guides.md`](docs/harness-guides.md).
 
 ### Shared daemon mode
 
@@ -305,6 +335,14 @@ action-hub auth logout github-oauth
 
 Tokens are then refreshed automatically ahead of expiry and rotated in place, so no re-entry is needed. Servers using a static `Authorization` header keep working unchanged.
 
+**Known gap:** the OAuth binding is applied by the CLI's own config loader and
+client factory (`auth`, `doctor`, `list`, `test-search`) and is tested there,
+but the MCP server runtime's loader (`packages/plugin/server/src/config.ts`)
+currently drops the `auth` block from HTTP transports. A hub started by
+`action-hub start`, `serve`, or the daemon therefore connects to an OAuth
+server without the token binding. See
+[`docs/roadmap.md`](docs/roadmap.md#known-gaps).
+
 ## Scale & reliability
 
 Tested at fleet scale: **44 MCP servers / 10,000 tools / 5,000 skills**.
@@ -326,7 +364,7 @@ pre-#63/#68 run (#47 evidence, `205aaf6`) measured 85 RPS served / 13.7%
 failures at the extreme ramp and ~0.8% in the 10–40 RPS band. Treat the
 ramp numbers as worst-case saturation, not steady-state SLAs.
 
-Reliability behaviors shipped in the current release:
+Reliability behaviors on `main` (PR numbers refer to this repository):
 
 - **Large piped output is never truncated** (#53): the CLI flushes pending
   stdout before exiting, because `process.exit()` silently drops writes beyond
@@ -370,7 +408,40 @@ timeouts verified against real harnesses.
 
 ## Status
 
-Early development. The interfaces described above are the target design; see [`docs/roadmap.md`](docs/roadmap.md) for what is implemented versus planned.
+Pre-release, version `0.1.0` in every workspace, no tag or GitHub release yet
+(as of 2026-10-11; 96 merged pull requests). Everything described above is
+implemented on `main` and covered by tests, with the gaps listed below; it is
+not yet battle-tested by users other than the maintainer.
+
+**Shipped and tested:** the `action_hub` tool with `search`, `load`, `execute`,
+`list_servers`, `search_bundles`, and `load_bundle`; stdio, loopback HTTP, and
+shared-daemon transports; lazy activation, circuit breakers, activation
+deadlines, heartbeats, restart backoff; trust tiers and the approval-token
+flow; the on-disk catalog cache with deferred refresh; the idempotent-read
+result cache; BM25 + verb-synonym + local MiniLM embedding search with
+committed retrieval floors; OAuth 2.0 in core and the CLI; OpenTelemetry
+spans; the developer CLI; the Node SEA binary build; the fleet-scale stress
+suite.
+
+**Experimental or off by default:** search abstention (`search.abstention`,
+whose shipped threshold is not calibrated for the default channel); the
+Homebrew tap and winget channels (generated but never published); embeddings
+on very large catalogs (minutes to embed 15K records cold in WASM).
+
+**Known gaps:** the server runtime's config loader drops `transport.auth`
+(above); goal-only queries are the weakest retrieval band. The full list, with
+file paths, is in [`docs/roadmap.md`](docs/roadmap.md#known-gaps).
+
+`npm test` on 2026-10-11 ran 426 tests across the four workspaces (core 293,
+server 39, CLI 90, site 4). Four fail only when run as root, because they
+simulate unreadable or unwritable paths with `chmod`, which root ignores.
+
+## Contributing and security
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) covers the build, the test conventions,
+and the retrieval gates every search change must pass. Report security issues
+privately as described in [`SECURITY.md`](SECURITY.md). Notable changes are
+tracked in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Design principles
 

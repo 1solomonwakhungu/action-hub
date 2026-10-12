@@ -1,0 +1,65 @@
+name: Bug report
+description: Something Action Hub does that does not match what the docs or the code say it should do.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Security problems (approval bypass, token leakage, daemon auth) should go through
+        [a private security advisory](https://github.com/1solomonwakhungu/action-hub/security/advisories/new) instead, see `SECURITY.md`.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `action-hub --version`, or `git rev-parse --short HEAD` of your checkout.
+      placeholder: "0.1.0 @ 0146f5c"
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: How the hub was running
+      options:
+        - action-hub start (foreground stdio)
+        - action-hub serve (HTTP)
+        - action-hub daemon + connect
+        - packages/plugin/server/dist/index.js directly
+        - CLI command only (doctor, list, test-search, import, migrate, auth, harness)
+        - Library use of @action-hub/core
+        - Standalone binary
+    validations:
+      required: true
+  - type: input
+    id: harness
+    attributes:
+      label: Harness and OS
+      placeholder: "Claude Code 1.x on macOS 15 / Node 22.9"
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The config (secrets removed), the downstream server or fake you used, and the exact `action_hub` calls or CLI commands.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: Quote the README or `docs/` statement you expected to hold, if there is one.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: Output, error text, or MCP response. Redact tokens and `Authorization` headers.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`action-hub doctor` output"
+      description: Optional but usually decisive for connectivity problems.
+      render: shell

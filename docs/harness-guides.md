@@ -82,7 +82,7 @@ claude mcp add action-hub -- node <ABSOLUTE_PATH_TO_ACTION_HUB>/packages/plugin/
 ```
 
 This writes the server into `~/.claude.json`. Restart Claude Code, then check
-that the Action Hub tools appear.
+that the single `action_hub` tool appears.
 
 ## Claude Desktop
 
