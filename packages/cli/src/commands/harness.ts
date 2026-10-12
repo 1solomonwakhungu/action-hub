@@ -1,4 +1,5 @@
-import { mkdir, readFile, realpathSync, writeFile, copyFile } from "node:fs";
+import { mkdir, readFile, realpathSync, writeFile, copyFile, realpath, rename, stat, chmod, rm } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -9,6 +10,38 @@ const copyFileP = promisify(copyFile);
 const mkdirP = promisify(mkdir);
 const readFileP = promisify(readFile);
 const writeFileP = promisify(writeFile);
+const realpathP = promisify(realpath);
+const renameP = promisify(rename);
+const statP = promisify(stat);
+const chmodP = promisify(chmod);
+const rmP = promisify(rm);
+
+/**
+ * Replaces a harness config atomically: the new bytes go to a sibling temp
+ * file that is renamed over the target, so a crash mid-write can never leave
+ * a truncated (unparseable) config behind — the harness would then refuse to
+ * start at all. Writes THROUGH a symlinked config (dotfiles setups) by
+ * renaming over its resolved target, and keeps the existing file's mode.
+ */
+async function replaceFileAtomic(filePath: string, content: string): Promise<void> {
+  let target = filePath;
+  let mode: number | undefined;
+  try {
+    target = await realpathP(filePath);
+    mode = (await statP(target)).mode & 0o777;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+  }
+  const tempPath = `${target}.${randomUUID()}.tmp`;
+  try {
+    await writeFileP(tempPath, content, "utf8");
+    if (mode !== undefined) await chmodP(tempPath, mode);
+    await renameP(tempPath, target);
+  } catch (err) {
+    await rmP(tempPath, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
 
 /**
  * `action-hub harness` — connect any AI harness (Claude Code, Claude Desktop,
@@ -412,7 +445,7 @@ async function installJson(
 
   await backupFile(filePath);
   await mkdirP(dirname(filePath), { recursive: true });
-  await writeFileP(filePath, JSON.stringify(updated, null, 2) + "\n", "utf8");
+  await replaceFileAtomic(filePath, JSON.stringify(updated, null, 2) + "\n");
   return filePath;
 }
 
@@ -426,7 +459,7 @@ async function installToml(
   await backupFile(filePath);
   await mkdirP(dirname(filePath), { recursive: true });
   // NOTE: smol-toml stringify drops comments — the .bak keeps the original.
-  await writeFileP(filePath, tomlStringify(updated) + "\n", "utf8");
+  await replaceFileAtomic(filePath, tomlStringify(updated) + "\n");
   return filePath;
 }
 
