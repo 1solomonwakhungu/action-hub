@@ -161,8 +161,10 @@ between an untrusted server and a real side effect.
 
 ## Handling results
 
-`execute` returns `{ ok, content, error, duration_ms }`, or an
-`approval_required` envelope. On `ok: false`, read the response before retrying:
+`execute` returns `{ ok, action_id, content, error, duration_ms, cached }`, or
+an `approval_required` envelope. `cached: true` means a repeated read-only call
+was answered from the hub's short-lived result cache without contacting the
+server. On `ok: false`, read the response before retrying:
 
 | Response | What it means | What to do |
 | --- | --- | --- |

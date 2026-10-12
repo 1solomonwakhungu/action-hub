@@ -1,27 +1,36 @@
-# Action Hub stress & bench (S4)
+# Action Hub stress & bench
 
-Load/performance bench and orchestration for the stress fleet. Contract:
-`/tmp/action-hub-stress/CONTRACT.md` (binding; intake-owned).
+Load/performance bench, chaos, scale, and retrieval-quality evaluation for a
+synthetic fleet of 44 MCP servers / 10,000 tools / 5,000 skills. The scripts
+were written against a shared isolation and output contract
+(`CONTRACT.md`, referenced in several script headers); that document lived
+outside the repository and is not committed, so the rules it imposed are
+restated here under [Isolation](#isolation-contract-hard-rules).
 
-## Files (one owner per file)
+## Files
 
-| Path | Owner | What |
-|---|---|---|
-| `stress/bench-load.mjs` | builder-5 | load & perf bench (this packet) |
-| `bench-load.mjs` | builder-5 | load & perf bench (in-process/stdio/daemon/cache) |
-| `stress/README.md` | builder-5 | this file |
-| `stress/gen-skills.mjs` | builder-1 | 5,000 skills + queries |
-| `stress/gen-tools.mjs` | builder-4 | 10,000 tools across 44 servers + queries |
-| `stress/fake-mcp-server.mjs`, `stress/make-config.mjs` | builder-2 | fake MCP fleet + config writer |
-| `stress/eval-retrieval.mjs`, `stress/eval-retrieval.test.mjs` | builder-6 | search quality at scale: retrieval rank, abstention replay (`--abstention-threshold=<0..1>`, default 0.8) and execution success as three separate metrics; `--warm-embeddings` awaits the embedding index before the gate runs; `node --test stress/eval-retrieval.test.mjs` for the fixture and metric unit tests |
-| `stress/goal-only-gate.mjs` | search-quality | goal-only recall gate (30 realistic rows, own floors) |
-| `stress/chaos.mjs` | builder-8 | crash/hang/slow-start scenarios |
-| `stress/harness-e2e.mjs` | builder-9 | pi harness entrypoint e2e |
-| `stress/cli-scale.mjs` | builder-3 | CLI surface scale |
-| `stress/abstention-threshold.mjs`, `stress/abstention-threshold.test.mjs`, `stress/fixtures/no-match-queries.json` | abstention-docs | held-out calibration of the search abstention gate (both semantic channels); negative fixture; unit tests for the pure parts |
+| Path | What |
+|---|---|
+| `bench-load.mjs` | load & perf bench (in-process / stdio / HTTP / daemon / cache), writes `summary.md` |
+| `gen-skills.mjs` | 5,000 generated skills + queries |
+| `gen-tools.mjs` | 10,000 generated tools across 44 servers + queries |
+| `fake-mcp-server.mjs`, `fake-mcp-server.check.mjs`, `make-config.mjs` | fake MCP fleet (per-tool latency / error / size / crash-after behaviour), its regression suite, and the config writer |
+| `eval-retrieval.mjs`, `eval-retrieval.test.mjs` | search quality at scale: retrieval rank, abstention replay (`--abstention-threshold=<0..1>`, default 0.8) and execution success as three separate metrics; `--warm-embeddings` awaits the embedding index before the gate runs; `node --test stress/eval-retrieval.test.mjs` for the fixture and metric unit tests |
+| `goal-only-gate.mjs`, `goal-only-gate.test.mjs` | goal-only recall gate (30 realistic rows, own per-engine floors) |
+| `split-eval.mjs`, `latency-eval.mjs`, `eval-cli-selftest.mjs` | deterministic eval over the tune/held query splits; production-shaped search latency; CLI-contract regressions for both evaluators |
+| `tune-embeddings.mjs` | embedding/fusion variant sweep on the tune split only |
+| `abstention-threshold.mjs`, `abstention-threshold.test.mjs`, `fixtures/no-match-queries.json` | held-out calibration of the search abstention gate (both semantic channels); negative fixture; unit tests for the pure parts |
+| `validate-realistic-queries.mjs`, `fixtures/realistic-queries.json`, `fixtures/split-tune.json`, `fixtures/split-held.json` | hand-written natural-language fixture, its validator, and the deterministic 60/40 split |
+| `chaos.mjs` | crash / hang / slow-start / oversized-response scenarios against 44 fake servers |
+| `index-stall-bench.mjs` | event-loop stall bound for the cooperative semantic reindex |
+| `adversarial.mjs`, `adversarial-SAMPLE.md` | hostile catalog content (~300 entries): crash, index time, output bloat |
+| `harness-e2e.mjs` | real harness CLIs (pi, Codex, Claude Code, OpenCode) against an isolated hub |
+| `cli-scale.mjs`, `cli-scale.test.mjs` | every CLI command at scale: wall time and output size |
+| `lib/` | shared harness: isolation env builder, process-group runner, interrupt-safe `main()`, corpus loader, anchor fixtures |
+| `external/` | k6 load profile, fuzzer, spec/conformance suites, Inspector smoke (see `external/README.md`) |
 
-Generated data lives in `stress/.generated/` (gitignored). Only scripts and
-this README are committed.
+Generated data lives in `stress/.generated/` (gitignored). Only scripts,
+fixtures, and this README are committed.
 
 ## Run
 
@@ -54,8 +63,10 @@ node --test stress/abstention-threshold.test.mjs       # pure parts + fixture
   errorRate-0 tools with schema-valid arguments).
 - **cache behaviour**: repeated identical read-only calls vs distinct-args
   calls of the same zero-latency tool (median repeat vs median distinct, plus
-  speedup). Indirect by necessity: the dispatch layer drops
-  `ExecuteResult.cached` (flagged finding), so the flag cannot be read.
+  speedup). The bench still measures this indirectly through latency: it was
+  written when the dispatch layer dropped `ExecuteResult.cached`. Since #68
+  (`f53adbc`) the `action_hub` execute response carries `cached: true`, but
+  the bench has not been updated to read it.
 - **token cost** of search(10) and load responses (~4 chars/token estimate).
 - **memory**: RSS sampled over the hub's recursive child tree every 250ms.
   Headline is `peakSimultaneousTreeRssKb` (sum across the tree within a single
@@ -109,9 +120,16 @@ improves them.
 
 ## Isolation (contract hard rules)
 
-Every spawned process gets: temp `HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`,
-`ACTION_HUB_CONFIG`, `ACTION_HUB_SKILLS_DIR`, `PI_CODING_AGENT_DIR`; stress
-configs set `autoDiscover: false`. No network, no LLM calls, deterministic.
+Every spawned process gets a fresh run root for the full checklist in
+`test-isolation.mjs` (`ISOLATION_CHECKLIST`): `HOME`, `USERPROFILE`,
+`APPDATA`, `LOCALAPPDATA`, the `XDG_*` dirs, `ACTION_HUB_CONFIG`,
+`ACTION_HUB_CACHE`, `ACTION_HUB_SKILLS_DIR`, `ACTION_HUB_DAEMON_DIR`,
+`ACTION_HUB_CREDENTIALS`, `ACTION_HUB_CONTROL`, `PI_CODING_AGENT_DIR`,
+`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, and the OS temp location. Stress configs
+set `autoDiscover: false`. No network, no LLM calls, deterministic. Every
+script prints one machine-readable JSON summary as its last stdout line and
+writes the same object under `stress/.generated/results/`. Never point any of
+these scripts at a real config or cache.
 
 ## Findings so far (full-scale: 44 servers, 10,000 tools, 5,000 skills)
 
@@ -131,8 +149,10 @@ and re-run before/after any optimization.
    restore path pays less than at small scale (~50% there). The bench gate
    is scale-aware (small: warm must be ≥20% faster; full: ≥15%) and treats
    this band as advisory — a full-scale rerun can flag while staying green.
-3. **`action_hub` execute response still drops `ExecuteResult.cached`** —
-   the bench measures cache effect indirectly via repeat-vs-distinct latency.
+3. **Cache effect is measured indirectly** via repeat-vs-distinct latency.
+   When this finding was first recorded the execute response dropped
+   `ExecuteResult.cached`; #68 (`f53adbc`) fixed that and the response now
+   carries `cached: true`, but the bench methodology is unchanged.
    Corrected methodology (PR 101 rework): the distinct baseline now uses 100
    PROVABLY unique schema-valid arg sets (cardinality asserted and reported
    as `distinctArgSets` in the summary); the first rework iteration silently
