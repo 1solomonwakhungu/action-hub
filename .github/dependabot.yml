@@ -1,0 +1,32 @@
+# Dependabot configuration.
+# Keeps the npm dependency tree and pinned GitHub Actions current so that
+# transitive advisories (like the express/proxy-addr/qs chain pulled in by
+# @modelcontextprotocol/sdk) get surfaced as PRs instead of lingering.
+version: 2
+updates:
+  # npm: the root lockfile covers all workspaces (packages/*, site).
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Batch semver-compatible bumps into a single PR; majors stay separate
+      # so breaking changes (zod 4, typescript 7, esbuild 0.28, etc.) are
+      # reviewed one at a time.
+      npm-minor-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "chore(deps)"
+
+  # GitHub Actions: workflows pin actions by full SHA with a version comment;
+  # Dependabot updates both the SHA and the comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
