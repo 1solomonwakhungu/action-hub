@@ -28,15 +28,17 @@ talks to downstream servers only through the `McpClient` interface:
 
 ```ts
 interface McpClient {
-  listTools(): Promise<Array<{ name; description?; inputSchema? }>>;
-  callTool(name, args): Promise<unknown>;
+  listTools(options?): Promise<Array<{ name; description?; inputSchema?; annotations? }>>;
+  callTool(name, args, options?): Promise<unknown>;
   close(): Promise<void>;
 }
 ```
 
-That interface is four lines long on purpose. It is the entire contract between
-the engine and the outside world, which is why the test suite can drive the
-whole system with in-memory fakes and no subprocesses.
+That interface is three methods on purpose (`options` carries propagated trace
+headers; `annotations` carries the upstream `readOnlyHint` the result cache
+keys on). It is the entire contract between the engine and the outside world,
+which is why the test suite can drive the whole system with in-memory fakes
+and no subprocesses. The full signature is in `packages/core/src/types.ts`.
 
 Layer 2 supplies one implementation of that interface (`sdk-client.ts`, backed
 by `@modelcontextprotocol/sdk`) and one presentation of the façade (the
@@ -75,24 +77,49 @@ Name tokens are inserted three times. An exact name match is a far stronger
 intent signal than a keyword collision in a description, and triplication is a
 cheap, explainable way to encode that without a separate scoring stage.
 
-`tokenize()` splits on punctuation *and* camelCase boundaries, so
-`createPullRequest`, `create_pull_request`, and "create a pull request" all
-reduce to the same terms. Downstream servers are wildly inconsistent about
-naming, and the index should not care.
+`tokenize()` splits on punctuation *and* camelCase boundaries and is
+unicode-aware, so `createPullRequest`, `create_pull_request`, and "create a
+pull request" all reduce to the same terms. Downstream servers are wildly
+inconsistent about naming, and the index should not care.
 
-A `SemanticScorer` is blended rather than substituted:
+Three query-side additions sit on top of BM25 (`search.ts`, `synonyms.ts`):
+
+- **Stopwords** (`QUERY_STOPWORDS`) are dropped from the query and from the
+  record name it is compared against. On the document side, each action's
+  token stream is capped at `MAX_DOCUMENT_TOKENS` (2048) so one verbose
+  description cannot dominate the corpus statistics.
+- **Verb synonyms** (`VERB_SYNONYMS`, `VERB_PHRASES`) expand common action
+  verbs to their catalog-canonical equivalents ("turn off" → `disable`).
+  Expanded terms are down-weighted relative to literal terms, so an exact
+  match always outranks a synonym-only match, and the semantic channel sees
+  only the literal query. The table was built on the tune split of the
+  realistic fixture and never on the held-out split.
+- **Exact-name invariant**: when the query's tokens spell an existing action's
+  name, expansion is skipped and that action is moved to first place after
+  ranking, as a reorder rather than a score boost, so the `[0, 1]` score
+  contract is unchanged.
+
+A `SemanticScorer` is fused with the lexical ranking rather than substituted
+for it. Two fusion modes exist (`setFusion()`):
 
 ```
-score = (1 - w) · (s / (1 + s)) + w · semantic     w = 0.4
+blend:  score = (1 - w) · (s / (1 + s)) + w · semantic          w = 0.2
+rrf:    score = 1 / (60 + lexRank) + w / (60 + semRank)         w = 0.2
 ```
 
-The lexical score is squashed into `[0, 1)` before blending so the two signals
-are commensurate, and the weight is deliberately below 0.5 so a weak or
-misconfigured embedding model degrades results instead of destroying them.
-Tune it with `setSemanticWeight()`; `0` disables the semantic signal entirely.
+`blend` squashes the lexical score into `[0, 1)` so the two signals are
+commensurate; it is what the hashed fallback uses. `rrf` (reciprocal-rank
+fusion) is scale-free and is what the default embedding scorer uses, because
+MiniLM cosines and BM25's saturation curve do not share a scale. In both modes
+the weight (`DEFAULT_SEMANTIC_WEIGHT = 0.2`, tunable with
+`setSemanticWeight()`; `0` disables the semantic signal) was chosen by a sweep
+over the labelled eval set: it maximised overall and paraphrase recall@1 while
+holding exact recall@1 at 100%. Under RRF the fused `score` is rank-scale and
+has no absolute meaning; confidence signals such as abstention read the raw
+`semantic` field on each hit instead.
 
 If the scorer throws, rejects, or returns anything other than a numeric array
-of the right shape, the blend is skipped and the query falls back to pure BM25.
+of the right shape, fusion is skipped and the query falls back to pure BM25.
 Retrieval never fails because of the semantic layer.
 
 ### The local semantic index
