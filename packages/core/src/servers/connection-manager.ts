@@ -131,6 +131,19 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5_000;
  * and are rethrown unmarked; everything else thrown by callTool is tagged as
  * a transport failure (Not connected, EPIPE, closed stdio, ...).
  */
+/** Calls the factory, turning a synchronous throw into a rejection. */
+function invokeFactory(
+  factory: McpClientFactory,
+  config: ServerConfig,
+  signal: AbortSignal,
+): Promise<McpClient> {
+  try {
+    return Promise.resolve(factory(config, { signal }));
+  } catch (cause) {
+    return Promise.reject(cause);
+  }
+}
+
 function tagTransportFailures(client: McpClient): McpClient {
   return {
     listTools: (options) => client.listTools(options),
@@ -495,7 +508,12 @@ export class ConnectionManager {
     };
     const pending = (async (): Promise<McpClient> => {
       try {
-        const client = await this.#factory(config, { signal: controller.signal });
+        // A factory that throws synchronously must fail on the same async
+        // path as a rejected connect: a synchronous throw would run the catch
+        // below BEFORE `entry.pending` is assigned, leaving the rejected
+        // promise parked as the in-flight activation forever (every later
+        // activate() returned it without ever calling the factory again).
+        const client = await invokeFactory(this.#factory, config, controller.signal);
         clearDeadline();
         if (this.#closed || entry.generation !== generation || entry.manualShutdown || entry.config.enabled === false) {
           try {
@@ -774,9 +792,15 @@ export class ConnectionManager {
     const options = this.#heartbeatOptions(entry);
     if (!options.enabled) return;
 
+    // The chain is bound to the connection it was started for: a probe that
+    // settles after reconnect()/deactivate() replaced the connection must not
+    // report against the new one, nor re-arm a second chain beside the one
+    // the new activation started.
+    const generation = entry.generation;
     const tick = (): void => {
       entry.heartbeatTimer = this.#setTimeout(() => {
-        void this.#heartbeatOnce(entry).finally(() => {
+        void this.#heartbeatOnce(entry, generation).finally(() => {
+          if (entry.generation !== generation) return;
           if (entry.client && !entry.manualShutdown && !this.#closed) tick();
         });
       }, options.intervalMs);
@@ -791,15 +815,20 @@ export class ConnectionManager {
     }
   }
 
-  async #heartbeatOnce(entry: Entry): Promise<void> {
+  async #heartbeatOnce(entry: Entry, generation: number): Promise<void> {
     if (!entry.client || entry.manualShutdown || this.#closed || entry.config.enabled === false) return;
+    if (entry.generation !== generation) return;
     try {
       const start = this.#now();
       await this.#probe(entry, entry.client);
+      if (entry.generation !== generation) return;
       const latencyMs = Math.max(0, this.#now() - start);
       this.recordSuccess(entry.config.id, latencyMs);
       entry.lastHeartbeatAt = this.#now();
     } catch (cause) {
+      // The connection this probe belonged to is gone; its outcome says
+      // nothing about the replacement.
+      if (entry.generation !== generation) return;
       const error = cause instanceof Error ? cause.message : String(cause);
       this.recordFailure(entry.config.id, error);
       if (this.#circuitState(entry) === "open") {
