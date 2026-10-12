@@ -12,12 +12,13 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const dir = resolve(new URL("..", import.meta.url).pathname);
 
 // A REAL fixture once (no seam): sub-runners need a config path.
-const tmp = mkdtempSync(join("/tmp", "fault-seam-"));
+const tmp = mkdtempSync(join(tmpdir(), "fault-seam-"));
 const gen = spawnSync(process.execPath, [join(dir, "make-fixture.mjs")], {
   encoding: "utf8", timeout: 120_000,
 });

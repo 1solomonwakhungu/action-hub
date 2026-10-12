@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -139,22 +139,64 @@ test("harness install updates the action-hub entry in place and writes a .bak", 
   });
 });
 
-test("harness install fails closed on unreadable config (no mutation, exit 1)", async () => {
-  await withTempHome(async (home) => {
-    const cfg = join(home, ".cursor", "mcp.json");
-    await mkdir(join(home, ".cursor"), { recursive: true });
-    await writeFile(cfg, JSON.stringify({ mcpServers: { other: { command: "keep" } } }));
-    await chmod(cfg, 0o200); // owner-write-only: read fails with EACCES
+// POSIX mode bits are advisory for uid 0 (CAP_DAC_OVERRIDE lets root read a
+// 0o200 file) and a no-op on Windows, so chmod cannot produce EACCES there.
+// The EISDIR test below exercises the same fail-closed branch on every platform.
+const modeBitsBlockReads = process.platform !== "win32" && process.getuid?.() !== 0;
 
-    const exitCode = await harnessCommand("cursor", { mode: "install", write: true });
-    await chmod(cfg, 0o600);
-    assert.equal(exitCode, 1, "exit 1 on unreadable config");
-    const raw = await readFile(cfg, "utf8");
-    assert.deepEqual(
-      JSON.parse(raw),
-      { mcpServers: { other: { command: "keep" } } },
-      "file unchanged",
-    );
+test(
+  "harness install fails closed on unreadable config (EACCES; no mutation, exit 1)",
+  {
+    skip: modeBitsBlockReads
+      ? false
+      : "POSIX mode bits do not block reads for root or on Windows; covered by the EISDIR test",
+  },
+  async () => {
+    await withTempHome(async (home) => {
+      const cfg = join(home, ".cursor", "mcp.json");
+      await mkdir(join(home, ".cursor"), { recursive: true });
+      await writeFile(cfg, JSON.stringify({ mcpServers: { other: { command: "keep" } } }));
+      await chmod(cfg, 0o200); // owner-write-only: read fails with EACCES
+
+      let exitCode: number | undefined;
+      const { stderr } = await captureOutput(async () => {
+        exitCode = await harnessCommand("cursor", { mode: "install", write: true });
+      });
+      await chmod(cfg, 0o600);
+      assert.equal(exitCode, 1, "exit 1 on unreadable config");
+      assert.match(stderr, /EACCES/, "the read error is surfaced");
+      assert.match(stderr, /config left untouched/);
+      const raw = await readFile(cfg, "utf8");
+      assert.deepEqual(
+        JSON.parse(raw),
+        { mcpServers: { other: { command: "keep" } } },
+        "file unchanged",
+      );
+      const files = await readdir(join(home, ".cursor"));
+      assert.ok(!files.some((f) => f.startsWith("mcp.json.bak-")), "no .bak written");
+    });
+  },
+);
+
+test("harness install fails closed when the config path is a directory (EISDIR; no mutation, exit 1)", async () => {
+  await withTempHome(async (home) => {
+    // A directory where the config file is expected is unreadable as a file on
+    // every platform, including for root — unlike mode bits, which uid 0 bypasses.
+    const cfg = join(home, ".cursor", "mcp.json");
+    await mkdir(cfg, { recursive: true });
+    await writeFile(join(cfg, "sentinel"), "keep");
+
+    let exitCode: number | undefined;
+    const { stderr } = await captureOutput(async () => {
+      exitCode = await harnessCommand("cursor", { mode: "install", write: true });
+    });
+    assert.equal(exitCode, 1, "exit 1 when the config path cannot be read as a file");
+    assert.match(stderr, /EISDIR/, "the read error is surfaced");
+    assert.match(stderr, /config left untouched/);
+    assert.ok((await stat(cfg)).isDirectory(), "directory still in place");
+    assert.equal(await readFile(join(cfg, "sentinel"), "utf8"), "keep", "contents untouched");
+    const files = await readdir(join(home, ".cursor"));
+    assert.deepEqual(files, ["mcp.json"], "nothing else written (no .bak, no replacement)");
   });
 });
 
