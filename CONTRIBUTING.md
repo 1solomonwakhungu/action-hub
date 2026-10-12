@@ -38,10 +38,11 @@ temp location at a fresh per-process directory. Tests therefore cannot read or
 write your real config, cache, credentials, or harness settings, and you do
 not need to clean anything up afterwards.
 
-Running the suite **as root** makes four tests fail (three in core, one in
-the CLI). They simulate unreadable or unwritable paths with `chmod`, which
-root ignores. Run as an ordinary user, or treat those four as known
-environment failures.
+The suite is green under a root runner too. Tests that simulate unreadable
+or unwritable paths with `chmod` skip with a reason when mode bits are not
+enforced (root, Windows) and exercise the same fail-closed branch through a
+companion fixture that is unreadable everywhere (a directory where a file is
+expected), so nothing is silently untested in a container.
 
 ## Workspace layout
 

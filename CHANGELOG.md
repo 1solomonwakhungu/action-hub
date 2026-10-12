@@ -56,9 +56,16 @@ the README cites by number. PR numbers link to this repository.
   compaction (#105). Explainer microsite deployed to GitHub Pages (#106).
 - **Community files.** `CONTRIBUTING.md`, `SECURITY.md`, this changelog, a
   pull request template, and bug-report / feature-request issue forms.
+- **Supply chain.** Dependabot (weekly npm and GitHub Actions updates, minor
+  and patch bumps grouped) and a CodeQL workflow for JavaScript/TypeScript.
 
 ### Changed
 
+- `@modelcontextprotocol/sdk` raised to `^1.32.1` in the CLI and server
+  workspaces. 1.30.x was flagged by GHSA-6qxp-vccf-f47h (OAuth client could
+  send credentials to an attacker-chosen authorization server) and was the
+  only path to every other production advisory (`proxy-addr`, `qs`,
+  `ip-address`, `fast-uri`, `hono`); `npm audit --omit=dev` is clean.
 - Harness-neutral naming: `packages/plugin` and `@action-hub/mcp-server`
   replace the Copilot-specific names; the capability-manager canvas was
   removed (#55).
@@ -76,6 +83,38 @@ the README cites by number. PR numbers link to this repository.
 
 ### Fixed
 
+- The server runtime's config loader now carries an HTTP transport's OAuth
+  `auth` block through, so `action-hub start`, `serve`, and the daemon bind
+  tokens the same way the CLI commands already did. A malformed block is
+  rejected instead of silently connecting unauthenticated.
+- Config loading fails closed on malformed shapes: a non-object JSON root, or
+  a present-but-malformed `args`, `env`, `headers`, `allowTools`,
+  `denyTools`, `tags`, `serverIds`, or `actionIds`, is an error naming the
+  field instead of a partially loaded config (a string `denyTools` used to
+  disable the deny list). `${VAR}` now expands inside `~/`-prefixed paths.
+- Argument validation: `additionalProperties: false` applies when
+  `properties` is absent and respects `patternProperties`; `Object.prototype`
+  names (`constructor`, `__proto__`, `toString`) are neither supplied nor
+  declared properties; type unions such as `["string", "null"]` are enforced;
+  string lengths count code points; `pattern` compiles in unicode mode with a
+  legacy fallback.
+- Connection manager: a client factory that throws synchronously no longer
+  parks its rejection as the in-flight activation forever; a heartbeat probe
+  that settles after `reconnect()` is ignored instead of being charged to the
+  new connection and doubling the heartbeat chain.
+- Tokenizer keeps combining marks and NFC-normalizes, so accented and
+  Devanagari text no longer matches on consonant fragments. Eval baseline
+  unchanged.
+- Loopback HTTP server routes on the request path only; a malformed `Host`
+  header no longer yields a 500 before authentication.
+- CLI rejects a valueless `--config` and a non-numeric or non-positive
+  `--limit` with exit 1 instead of ignoring them.
+- `harness install` writes host configs atomically (sibling temp file plus
+  rename, mode preserved, symlinked dotfiles written through).
+- Tests that simulate unreadable or unwritable paths with `chmod` skip with a
+  reason under a root runner and gain root-proof companion fixtures, so the
+  suite is green in containers; the HTTP circuit-breaker test no longer dials
+  port 0 on a half-written port file.
 - Malformed stdio JSON-RPC frames are answered (`-32600` / `-32700`) instead
   of dropped (#89).
 - Deterministic winner-path identity check and exit-event grace in the CLI
@@ -94,8 +133,3 @@ the README cites by number. PR numbers link to this repository.
 - `STATUS.md`. Its status content moved to the README "Status" section and
   `docs/roadmap.md`; its development notes moved to `CONTRIBUTING.md`.
 
-### Known gaps
-
-- The MCP server runtime's config loader does not carry `transport.auth`
-  through for HTTP transports, so OAuth is applied by the CLI paths but not by
-  `action-hub start`, `serve`, or the daemon. See `docs/roadmap.md`.
