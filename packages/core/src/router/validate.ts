@@ -9,10 +9,12 @@ export interface ValidationResult {
  * Validates arguments against the upstream JSON Schema.
  *
  * This covers the subset of JSON Schema that MCP tool definitions actually
- * use in practice: object shape, required properties, primitive types, enums,
- * numeric and length bounds, arrays, and nested objects. Anything unrecognized
- * is passed through rather than rejected — Action Hub's job is to catch
- * obvious model mistakes early, not to re-litigate the upstream contract.
+ * use in practice: object shape, required properties, primitive types and
+ * type unions (`["string", "null"]`), enums, numeric and length bounds,
+ * arrays, and nested objects. Anything unrecognized — `$ref`, `oneOf` /
+ * `anyOf` / `allOf`, `const`, formats — is passed through rather than
+ * rejected (fail open) — Action Hub's job is to catch obvious model mistakes
+ * early, not to re-litigate the upstream contract.
  */
 export function validateArguments(schema: JsonSchema | undefined, args: unknown): ValidationResult {
   if (!schema || Object.keys(schema).length === 0) {
@@ -24,20 +26,38 @@ export function validateArguments(schema: JsonSchema | undefined, args: unknown)
 }
 
 function validateNode(schema: JsonSchema, value: unknown, path: string, errors: string[]): void {
-  const type = schema["type"];
+  const declared = schema["type"];
+  // `type` may be a union (`["string", "null"]` is the common nullable form).
+  // A union is resolved to the member the value matches, so the rest of the
+  // checks run against a concrete type instead of being skipped.
+  const union = Array.isArray(declared)
+    ? declared.filter((candidate): candidate is string => typeof candidate === "string")
+    : undefined;
 
   if (value === undefined || value === null) {
     // Presence is enforced by the parent's `required` list; a null here is
     // only an error when the schema names a concrete type.
-    if (typeof type === "string" && type !== "null" && value === null) {
-      errors.push(`${path}: expected ${type}, received null`);
+    if (typeof declared === "string" && declared !== "null" && value === null) {
+      errors.push(`${path}: expected ${declared}, received null`);
+    } else if (union && union.length > 0 && !union.includes("null") && value === null) {
+      errors.push(`${path}: expected ${union.join(" | ")}, received null`);
     }
     return;
   }
 
-  if (typeof type === "string" && !matchesType(type, value)) {
-    errors.push(`${path}: expected ${type}, received ${describe(value)}`);
-    return;
+  let type: string | undefined;
+  if (typeof declared === "string") {
+    type = declared;
+    if (!matchesType(type, value)) {
+      errors.push(`${path}: expected ${type}, received ${describe(value)}`);
+      return;
+    }
+  } else if (union && union.length > 0) {
+    type = union.find((candidate) => matchesType(candidate, value));
+    if (type === undefined) {
+      errors.push(`${path}: expected ${union.join(" | ")}, received ${describe(value)}`);
+      return;
+    }
   }
 
   const enumValues = schema["enum"];
@@ -68,10 +88,13 @@ function validateObject(schema: JsonSchema, value: unknown, path: string, errors
     return;
   }
 
+  // Own-property lookups throughout: arguments arrive as plain objects, so a
+  // bare `value[key]` / `key in` would see `constructor`, `toString`, ... on
+  // Object.prototype and mistake them for supplied (or declared) properties.
   const required = schema["required"];
   if (Array.isArray(required)) {
     for (const key of required) {
-      if (typeof key === "string" && value[key] === undefined) {
+      if (typeof key === "string" && !hasOwnValue(value, key)) {
         errors.push(`${path}.${key}: required property is missing`);
       }
     }
@@ -80,20 +103,38 @@ function validateObject(schema: JsonSchema, value: unknown, path: string, errors
   const properties = schema["properties"];
   if (isPlainObject(properties)) {
     for (const [key, child] of Object.entries(properties)) {
-      if (value[key] === undefined) continue;
+      if (!hasOwnValue(value, key)) continue;
       if (isPlainObject(child)) {
         validateNode(child as JsonSchema, value[key], `${path}.${key}`, errors);
       }
     }
+  }
 
-    if (schema["additionalProperties"] === false) {
-      for (const key of Object.keys(value)) {
-        if (!(key in properties)) {
-          errors.push(`${path}.${key}: unexpected property`);
-        }
-      }
+  // `additionalProperties: false` applies whether or not `properties` is
+  // declared (no `properties` means no property is allowed), and never to a
+  // key that `patternProperties` accepts.
+  if (schema["additionalProperties"] === false) {
+    const patterns = compilePatternProperties(schema["patternProperties"]);
+    for (const key of Object.keys(value)) {
+      if (isPlainObject(properties) && Object.hasOwn(properties, key)) continue;
+      if (patterns.some((pattern) => pattern.test(key))) continue;
+      errors.push(`${path}.${key}: unexpected property`);
     }
   }
+}
+
+function hasOwnValue(value: Record<string, unknown>, key: string): boolean {
+  return Object.hasOwn(value, key) && value[key] !== undefined;
+}
+
+function compilePatternProperties(patternProperties: unknown): RegExp[] {
+  if (!isPlainObject(patternProperties)) return [];
+  const compiled: RegExp[] = [];
+  for (const pattern of Object.keys(patternProperties)) {
+    const regex = compilePattern(pattern);
+    if (regex) compiled.push(regex);
+  }
+  return compiled;
 }
 
 function validateArray(schema: JsonSchema, value: unknown[], path: string, errors: string[]): void {
@@ -125,25 +166,47 @@ function validateNumber(schema: JsonSchema, value: number, path: string, errors:
 }
 
 function validateString(schema: JsonSchema, value: string, path: string, errors: string[]): void {
+  // JSON Schema measures string length in Unicode code points, not UTF-16
+  // code units: a single emoji is one character.
+  const length = codePointLength(value);
   const minLength = schema["minLength"];
-  if (typeof minLength === "number" && value.length < minLength) {
+  if (typeof minLength === "number" && length < minLength) {
     errors.push(`${path}: must be at least ${minLength} character(s)`);
   }
   const maxLength = schema["maxLength"];
-  if (typeof maxLength === "number" && value.length > maxLength) {
+  if (typeof maxLength === "number" && length > maxLength) {
     errors.push(`${path}: must be at most ${maxLength} character(s)`);
   }
   const pattern = schema["pattern"];
   if (typeof pattern === "string") {
-    let regex: RegExp | undefined;
-    try {
-      regex = new RegExp(pattern);
-    } catch {
-      // An upstream schema with an invalid pattern should not fail the call.
-      regex = undefined;
-    }
+    const regex = compilePattern(pattern);
     if (regex && !regex.test(value)) {
       errors.push(`${path}: must match pattern ${pattern}`);
+    }
+  }
+}
+
+function codePointLength(value: string): number {
+  let length = 0;
+  for (const _ of value) length += 1;
+  return length;
+}
+
+/**
+ * JSON Schema patterns are ECMA-262 regular expressions interpreted in
+ * Unicode mode, so `\p{L}` is a property escape rather than the literal text
+ * "p{L}". Patterns that are only valid without the flag (legacy identity
+ * escapes) fall back to the default mode. An upstream schema with an invalid
+ * pattern should not fail the call.
+ */
+function compilePattern(pattern: string): RegExp | undefined {
+  try {
+    return new RegExp(pattern, "u");
+  } catch {
+    try {
+      return new RegExp(pattern);
+    } catch {
+      return undefined;
     }
   }
 }

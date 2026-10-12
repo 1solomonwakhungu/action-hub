@@ -493,13 +493,19 @@ export const MAX_DOCUMENT_TOKENS = 2048;
  * phantom tokens. Emoji (Extended_Pictographic, general category So) are kept
  * as tokens so an emoji-named tool like `deploy_🚀_rocket` is findable by the
  * emoji itself.
+ *
+ * Text is NFC-normalized first and combining marks (general category M) stay
+ * attached to their base letter: without that, a decomposed "é" split into
+ * "e" + nothing, and scripts whose vowel signs never compose (Devanagari,
+ * Bengali, Thai, ...) shattered into one token per consonant.
  */
 export function tokenize(text: string): string[] {
   if (!text) return [];
   return text
+    .normalize("NFC")
     .replace(/[\p{Cf}\p{Cc}\p{Zs}\p{Zl}\p{Zp}]/gu, " ")
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .split(/[^\p{L}\p{N}\p{Extended_Pictographic}]+/u)
+    .split(/[^\p{L}\p{M}\p{N}\p{Extended_Pictographic}]+/u)
     .filter((token) => token.length > 0)
     .map((token) => token.toLowerCase());
 }
