@@ -1,0 +1,46 @@
+name: Feature request
+description: Propose a change to the hub, the CLI, the search ranking, or a new harness integration.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check `docs/roadmap.md` first: it lists what is implemented, the known gaps, and what is explicitly out of scope
+        (forking a host app, reinterpreting upstream schemas, a spec-complete JSON Schema validator).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you are trying to do with an agent and an MCP fleet, and where Action Hub gets in the way or falls short today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you would change. For search changes, say which query band (exact, paraphrase, goal-only, no-match) should improve and which must not regress.
+    validations:
+      required: true
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Where it lives
+      options:
+        - packages/core (runtime-agnostic engine)
+        - packages/plugin/server (meta-MCP server, transports, daemon)
+        - packages/cli
+        - stress / evaluation
+        - docs / site
+        - Not sure
+  - type: textarea
+    id: design
+    attributes:
+      label: Design constraints it must respect
+      description: |
+        The ones that usually matter: the core never imports a host harness; search never returns schemas; the `action_hub`
+        tool definition never changes (prompt-cache stability); unused capability costs zero. Say which apply and how the change keeps them.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

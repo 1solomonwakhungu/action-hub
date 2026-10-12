@@ -38,13 +38,22 @@ release matrix. Building an unsupported target fails loudly in
 ```bash
 npm ci
 npm run dist          # build workspaces -> bundle -> host SEA binary
-npm run smoke:binary  # --version, --help, `list`, and a real MCP handshake
+npm run smoke:binary  # --version, --help, `list`, a real MCP handshake, the
+                      # embeddings self-test, licenses, and the anchor-loss
+                      # regression (scripts/smoke-test.mjs + anchor-loss-regression.mjs)
 ```
 
 Outputs land in `dist-bin/`. `npm run checksums` writes a `sha256sum -c`
 compatible `dist-bin/SHA256SUMS.txt`.
 
 ## Cutting a release
+
+No release has been cut yet: as of 2026-10-11 the repository has no `v*` tag
+and no GitHub release, so the Homebrew, winget, and direct-download paths in
+the README describe what this workflow produces, not something that can be
+installed today. The workflow itself is exercised on every push by the
+`binary-smoke` job in `ci.yml` (build, bundle, SEA binary, smoke test on all
+three operating systems).
 
 1. Bump the version in `packages/cli/package.json` **and**
    `packages/cli/src/version.ts` (a unit test enforces they match), plus the
@@ -72,7 +81,9 @@ verifies its SHA-256. To publish it to a tap, set a `HOMEBREW_TAP_TOKEN`
 repository secret (a PAT with `contents:write` on `1solomonwakhungu/homebrew-tap`).
 When present, the release workflow commits the regenerated formula to that tap.
 Without the secret the step is skipped — the formula is still attached to the
-release, and users can `brew install --formula ./action-hub.rb`.
+release, and users can `brew install --formula ./action-hub.rb`. Whether the
+tap repository exists yet has not been verified from this repository; until a
+release is published the `brew tap` command below has nothing to install.
 
 ```bash
 brew tap 1solomonwakhungu/tap
