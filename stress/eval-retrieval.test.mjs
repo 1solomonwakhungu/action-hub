@@ -23,7 +23,7 @@ const {
   syntheticCatalog, selfQueries, TWIN_FAMILIES, twinNameFor, isTwinName, assertTwinsIncompatible,
   intendedArgs, abstentionDecision, classifyExecution, gateOutcome, executeProbe, buildEngine, warmAndTime, GATED_EXECUTION_OUTCOMES,
   scoreEngine, coreMetrics, abstentionMetrics, executionMetrics, validateGeneratedCorpus,
-  parseAbstentionThreshold, percentileSelfTest, groupTools, EXECUTION_OUTCOMES, ABSTENTION_THRESHOLD_DEFAULT, OBJECTS,
+  parseAbstentionThreshold, parseQueryRewrite, percentileSelfTest, groupTools, EXECUTION_OUTCOMES, ABSTENTION_THRESHOLD_DEFAULT, OBJECTS,
   nearDuplicateByGoldDirection,
 } = __test;
 
@@ -141,6 +141,15 @@ test("--abstention-threshold parses a number in [0,1] and fails closed otherwise
   assert.equal(parseAbstentionThreshold(new Set(["--quick", "--abstention-threshold=0"])), 0);
   for (const bad of ["--abstention-threshold", "--abstention-threshold=", "--abstention-threshold=abc", "--abstention-threshold=1.5", "--abstention-threshold=-0.1"]) {
     assert.throws(() => parseAbstentionThreshold(new Set([bad])), /requires a number in \[0, 1\]/, bad);
+  }
+});
+
+test("--query-rewrite is off when absent, accepts append|fuse, and fails closed otherwise", () => {
+  assert.equal(parseQueryRewrite(new Set([])), undefined);
+  assert.equal(parseQueryRewrite(new Set(["--query-rewrite=append"])), "append");
+  assert.equal(parseQueryRewrite(new Set(["--quick", "--query-rewrite=fuse"])), "fuse");
+  for (const bad of ["--query-rewrite", "--query-rewrite=", "--query-rewrite=off", "--query-rewrite=llm"]) {
+    assert.throws(() => parseQueryRewrite(new Set([bad])), /requires one of append, fuse/, bad);
   }
 });
 

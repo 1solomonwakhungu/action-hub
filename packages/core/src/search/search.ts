@@ -1,6 +1,13 @@
 import type { ActionRecord, SearchHit, SearchOptions } from "../types.js";
 import type { Catalog } from "../catalog/catalog.js";
-import { expandQuery, type WeightedTerm } from "./synonyms.js";
+import { expandQuery, VERB_PHRASES, VERB_SYNONYMS, type WeightedTerm } from "./synonyms.js";
+import {
+  catalogVerbs,
+  REWRITE_FUSION_DEPTH,
+  REWRITE_FUSION_WEIGHT,
+  rewriteGoalQuery,
+  type QueryRewriteMode,
+} from "./query-rewrite.js";
 
 const DEFAULT_LIMIT = 10;
 
@@ -36,6 +43,8 @@ export class SearchEngine {
   #documentTokenMisses = 0;
   #fullStats?: { generation: number; stats: CorpusStats };
   #tokensGeneration = -1;
+  /** Catalog verb vocabulary for the opt-in goal-query rewrite, per generation. */
+  #verbs?: { generation: number; verbs: Set<string> };
 
   constructor(catalog: Catalog) {
     this.#catalog = catalog;
@@ -79,6 +88,60 @@ export class SearchEngine {
   }
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchHit[]> {
+    const mode = options.queryRewrite;
+    if (mode === "append" || mode === "fuse") return this.#searchRewritten(query, options, mode);
+    return this.#searchOnce(query, options);
+  }
+
+  /**
+   * Opt-in goal-query rewrite (query-rewrite.ts). The raw query is always
+   * searched: "append" adds the implied catalog verbs to it, "fuse" runs it
+   * alongside the tool-ish rewrite and fuses the two rankings with the raw one
+   * weighted higher. A query that rewrites to nothing, or that spells an
+   * existing action name exactly, takes the unchanged single-pass path.
+   */
+  async #searchRewritten(query: string, options: SearchOptions, mode: QueryRewriteMode): Promise<SearchHit[]> {
+    const base: SearchOptions = { ...options, queryRewrite: undefined };
+    this.#invalidateIfChanged();
+    const literalTokens = tokenize(query).filter((term) => !QUERY_STOPWORDS.has(term));
+    if (this.#exactRecord(literalTokens, this.#catalog.filter(base))) return this.#searchOnce(query, base);
+    const rewrite = rewriteGoalQuery(query, this.#catalogVerbs(), {
+      tokenize,
+      stopwords: QUERY_STOPWORDS,
+      phrases: VERB_PHRASES,
+      synonyms: VERB_SYNONYMS,
+    });
+    if (!rewrite) return this.#searchOnce(query, base);
+    if (mode === "append") return this.#searchOnce(rewrite.appendedQuery, base);
+
+    const limit = options.limit ?? DEFAULT_LIMIT;
+    const depth = Math.max(limit, REWRITE_FUSION_DEPTH);
+    const raw = await this.#searchOnce(query, { ...base, limit: depth });
+    const rewritten = await this.#searchOnce(rewrite.toolQuery, { ...base, limit: depth });
+    return fuseRankings(raw, rewritten, REWRITE_FUSION_WEIGHT).slice(0, limit);
+  }
+
+  #catalogVerbs(): Set<string> {
+    const generation = this.#catalog.generation;
+    if (this.#verbs?.generation !== generation) {
+      this.#verbs = { generation, verbs: catalogVerbs(this.#catalog.all(), tokenize) };
+    }
+    return this.#verbs.verbs;
+  }
+
+  /** The candidate whose stopword-filtered name tokens equal the query's, if any. */
+  #exactRecord(literalTokens: readonly string[], candidates: readonly ActionRecord[]): ActionRecord | undefined {
+    if (literalTokens.length === 0) return undefined;
+    const literalKey = literalTokens.join(" ");
+    return candidates.find(
+      (record) =>
+        tokenize(record.name)
+          .filter((term) => !QUERY_STOPWORDS.has(term))
+          .join(" ") === literalKey,
+    );
+  }
+
+  async #searchOnce(query: string, options: SearchOptions): Promise<SearchHit[]> {
     // Invalidate the memoized corpus work BEFORE any early return: otherwise
     // a generation change followed by an empty-candidate or empty-query
     // search would retain the stale memo indefinitely (37 MiB at 15k docs).
@@ -92,21 +155,12 @@ export class SearchEngine {
     // user is doing exact-name lookup — expansion is skipped entirely so
     // synonym noise can never demote the exact match.
     const literalTokens = tokenize(query).filter((term) => !QUERY_STOPWORDS.has(term));
-    const literalKey = literalTokens.join(" ");
     // Symmetric comparison (SQ2-R4 review): BOTH sides are filtered with the
     // same QUERY_STOPWORDS. Filtering only the query side made a stopword-
     // bearing exact name ("delete the user") never equal its own query
     // ("delete user"), so the short-circuit was missed and synonym noise
     // ("remove ...") could demote the exact match.
-    const exactRecord =
-      literalTokens.length > 0
-        ? candidates.find(
-            (record) =>
-              tokenize(record.name)
-                .filter((term) => !QUERY_STOPWORDS.has(term))
-                .join(" ") === literalKey,
-          )
-        : undefined;
+    const exactRecord = this.#exactRecord(literalTokens, candidates);
     const exactNameHit = exactRecord !== undefined;
     const { terms, literalCount } = expandQuery(
       query,
@@ -372,6 +426,28 @@ function rrfFuse(
     const score = (lex !== undefined ? 1 / (k + lex) : 0) + (sem !== undefined ? weight / (k + sem) : 0);
     return { record: entry.record, score };
   });
+}
+
+/**
+ * Reciprocal-rank fusion of the raw-query ranking with the rewrite ranking
+ * ("fuse" mode). Every hit keeps the raw pass's hit object when the raw pass
+ * found it, so its `semantic` confidence stays the raw query's; a hit only
+ * the rewrite found carries the rewrite's confidence. The fused score
+ * replaces `score` (small, positive, within [0, 1]; ties break by id).
+ */
+function fuseRankings(raw: SearchHit[], rewritten: SearchHit[], rewriteWeight: number): SearchHit[] {
+  const k = 60;
+  const fused = new Map<string, { hit: SearchHit; score: number }>();
+  raw.forEach((hit, i) => fused.set(hit.id, { hit, score: 1 / (k + i + 1) }));
+  rewritten.forEach((hit, i) => {
+    const contribution = rewriteWeight / (k + i + 1);
+    const entry = fused.get(hit.id);
+    if (entry) entry.score += contribution;
+    else fused.set(hit.id, { hit, score: contribution });
+  });
+  return [...fused.values()]
+    .sort((a, b) => b.score - a.score || a.hit.id.localeCompare(b.hit.id))
+    .map(({ hit, score }) => ({ ...hit, score: Number(score.toFixed(6)) }));
 }
 
 function blend(lexicalScore: number, semanticScore: number, weight: number): number {

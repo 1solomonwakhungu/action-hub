@@ -191,6 +191,15 @@ export interface SearchOptions {
    * shows fewer no-match false positives without a recall regression.
    */
   minScoreRatio?: number;
+  /**
+   * Opt-in goal-query rewrite (experimental, off by default). The raw query
+   * is always searched; "append" adds the catalog verbs the query implies,
+   * "fuse" also searches a tool-ish rewrite and fuses the two rankings with
+   * the raw one weighted higher. See search/query-rewrite.ts and the
+   * stress/README.md "Goal-query rewrite experiment" section for measured
+   * effects before turning it on.
+   */
+  queryRewrite?: "append" | "fuse";
 }
 
 /** Returned by `load`; this is the only path that exposes a full schema. */

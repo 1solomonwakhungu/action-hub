@@ -106,6 +106,20 @@ function parseAbstentionThreshold(argv) {
   }
   return n;
 }
+// Opt-in goal-query rewrite (SearchOptions.queryRewrite, experimental): every
+// hub.search in the eval carries the mode, so the gates and the abstention
+// replay are measured with the rewrite on. Absent means production default.
+const QUERY_REWRITE_FLAG = "--query-rewrite";
+const QUERY_REWRITE_MODES = ["append", "fuse"];
+function parseQueryRewrite(argv) {
+  const raw = [...argv].find((a) => a === QUERY_REWRITE_FLAG || a.startsWith(`${QUERY_REWRITE_FLAG}=`));
+  if (raw === undefined) return undefined;
+  const value = raw.includes("=") ? raw.slice(raw.indexOf("=") + 1) : "";
+  if (!QUERY_REWRITE_MODES.includes(value)) {
+    throw new Error(`${QUERY_REWRITE_FLAG} requires one of ${QUERY_REWRITE_MODES.join(", ")} (got ${JSON.stringify(value)})`);
+  }
+  return value;
+}
 const PREFIXES = [100, 1000, 5000, 10000, 15000];
 const GATES = {
   recallAt5: { exact: 0.9, paraphrase: 0.8, hard: 0.65 },
@@ -779,7 +793,8 @@ async function executeProbe(hub, { gold, pick, args }) {
   return { ...classifyExecution({ gold, pick, result, control }), args: intended };
 }
 
-async function warmAndTime(hub, queries, { abstentionThreshold = ABSTENTION_THRESHOLD_DEFAULT, execute = true } = {}) {
+async function warmAndTime(hub, queries, { abstentionThreshold = ABSTENTION_THRESHOLD_DEFAULT, execute = true, queryRewrite } = {}) {
+  const searchOptions = queryRewrite ? { limit: 20, queryRewrite } : { limit: 20 };
   const withTimeout = (promise, ms, label) => {
     let timer;
     const timeout = new Promise((_, reject) => {
@@ -787,12 +802,12 @@ async function warmAndTime(hub, queries, { abstentionThreshold = ABSTENTION_THRE
     });
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
   };
-  for (const q of queries) await withTimeout(hub.search(q.query, { limit: 20 }), 30_000, `warmup "${q.query.slice(0, 40)}"`);
+  for (const q of queries) await withTimeout(hub.search(q.query, searchOptions), 30_000, `warmup "${q.query.slice(0, 40)}"`);
   const rows = [];
   const latencies = [];
   for (const q of queries) {
     const t0 = performance.now();
-    const hits = await withTimeout(hub.search(q.query, { limit: 20 }), 30_000, `search "${q.query.slice(0, 40)}"`);
+    const hits = await withTimeout(hub.search(q.query, searchOptions), 30_000, `search "${q.query.slice(0, 40)}"`);
     latencies.push(performance.now() - t0);
     const golds = goldsOf(q);
     const ids = hits.map((h) => h.id);
@@ -1297,7 +1312,8 @@ function validateGeneratedCorpus({ manifests, skills, queries, skillQueries, idM
 async function runEval() {
   // Fail closed on a malformed flag before any corpus work (eval CLI contract).
   const abstentionThreshold = parseAbstentionThreshold(ARGV);
-  const scoreOpts = { abstentionThreshold };
+  const queryRewrite = parseQueryRewrite(ARGV);
+  const scoreOpts = { abstentionThreshold, queryRewrite };
 
   // --- corpus ------------------------------------------------------------------
   let manifests, skills, queries, skillQueries = null, mode = "self-fixtures";
@@ -1576,6 +1592,7 @@ async function runEval() {
   const summary = {
     script: "eval-retrieval",
     mode,
+    queryRewrite: queryRewrite ?? "off",
     corpus: {
       servers: manifests.length,
       tools: manifests.reduce((s, m) => s + m.tools.length, 0),
@@ -1660,7 +1677,7 @@ export const __test = {
   intendedArgs, abstentionDecision, classifyExecution, gateOutcome, executeProbe, buildEngine, warmAndTime, GATED_EXECUTION_OUTCOMES,
   nearDuplicateByGoldDirection,
   scoreEngine, coreMetrics, abstentionMetrics, executionMetrics, validateGeneratedCorpus,
-  parseAbstentionThreshold, percentileSelfTest, groupTools, EXECUTION_OUTCOMES, ABSTENTION_THRESHOLD_DEFAULT, OBJECTS, DOMAINS,
+  parseAbstentionThreshold, parseQueryRewrite, percentileSelfTest, groupTools, EXECUTION_OUTCOMES, ABSTENTION_THRESHOLD_DEFAULT, OBJECTS, DOMAINS,
 };
 
 // Shared-harness failure envelope (PR 64): isolation, summary contract and
