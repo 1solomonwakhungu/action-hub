@@ -163,8 +163,8 @@ result cache (every call uses `noCache: true`).
 
 **Known selection gap.** Selection passes for the 10 gated phrasings only;
 it is not a paraphrase benchmark. Revenue synonyms that do not contain the
-word "revenue" lose to the same-shape `get_net_income_as_of` decoy. The eval
-reports this as a non-gated `selectionProbes` block (8 phrasings from review,
+word "revenue" often lose to the same-shape `get_net_income_as_of` decoy. The
+eval reports this as a non-gated `selectionProbes` block (8 phrasings from review,
 in `stress/fixtures/asof-revenue.json`). At the commit that added it, 5 of 8
 picked `get_net_income_as_of` on both engines: "top line" in two word orders,
 "sales as of", "sales ... point in time", and "turnover as known on". Keyword

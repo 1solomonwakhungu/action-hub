@@ -141,7 +141,7 @@
       "expect": { "status": "error" }
     }
   ],
-  "selectionProbesNote": "NOT gated. Search-only phrasings from review (revenue synonyms without the word 'revenue'). The eval reports each probe's top-1 per engine so the known misfire class stays visible; promote a probe to a gated row once ranking routes it correctly.",
+  "selectionProbesNote": "NOT gated. Search-only phrasings from review: seven revenue synonyms without the word 'revenue', plus revenue-before-amendment, which does contain it and serves as a positive control. The eval reports each probe's top-1 per engine so the known misfire class stays visible; promote a probe to a gated row once ranking routes it correctly.",
   "selectionProbes": [
     { "id": "topline-originally-reported", "query": "ACME top line as originally reported at end of January 2025" },
     { "id": "topline-as-of", "query": "ACME top line as of January 31, 2025" },

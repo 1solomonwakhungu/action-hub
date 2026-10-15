@@ -323,7 +323,7 @@ export async function runEval({ fixturePath = DEFAULT_FIXTURE, engines = Object.
     script: "eval-asof-execution",
     fixture: { path: relative(REPO_ROOT, fixturePath), year: fixture.year, asOfRule: fixture.asOfRule, gold: `${fixture.serverId}:${fixture.goldTool}`, rows: fixture.rows.length },
     graded: "Action Hub routing only: selection, load, argument fidelity, result fidelity, no-data distinctness",
-    notGraded: "finance parsing, as-of computation (owned by the fixture server), live upstream data, LLM argument extraction",
+    notGraded: "finance parsing, as-of computation (owned by the fixture server), live upstream data, LLM argument extraction, approval gate (fixture server is trusted), result cache (noCache: true)",
     engines: engineResults,
     graderControls: { pass: controlsPass, cases: controls },
     ok: Object.values(engineResults).every((e) => e.pass) && controlsPass,
