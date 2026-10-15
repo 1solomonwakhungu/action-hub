@@ -139,13 +139,13 @@ name, takes the unchanged single raw pass. The plugin server builds its
 
 **Leakage control.** `synonyms.ts` documents the SQ2 tables as chosen on the
 tune split, but 23 of 35 phrases and 67 of 95 single-verb entries occur in no
-tune-split query, so nothing shows they were validated on tune. `append-tuneonly` reruns `append`
-with only the 12 phrases and 28 verbs that some tune query exercises. Read its
-held column as the leakage-safe number. (The baseline gate prints every row, so
-the held query texts were visible while this was built. That is why the
-rewriter has no hand-written entries of its own.) No LLM rewriter was measured:
-no Anthropic API key was available in the environment, and nothing below
-estimates one.
+tune-split query, so nothing shows they were validated on tune.
+`append-tuneonly` reruns `append` with only the 12 phrases and 28 verbs that
+some tune query exercises. Read its held column as the leakage-safe number.
+(The baseline gate prints every row, so the held query texts were visible
+while this was built. That is why the rewriter has no hand-written entries of
+its own.) No LLM rewriter was measured: no Anthropic API key was available in
+the environment, and nothing below estimates one.
 
 Goal-only rows (30; held = the 13 rows of `split-held.json`), measured
 2026-10-15 on the binding corpus:
@@ -193,6 +193,7 @@ Abstention side effect, on the 87 no-match negatives (15 realistic + 72 in
 |---|---|---:|---:|---:|---:|
 | hashed | off | 3/87 | 77/87 | 0/10 | 0.642 |
 | hashed | append | 0/87 | 75/87 | 0/16 | 0.663 |
+| hashed | fuse | 3/87 | 77/87 | 1/14 | 0.639 |
 | embeddings (default) | off | 83/87 | 87/87 | 1/17 | 0.146 |
 | embeddings (default) | append | 83/87 | 87/87 | 1/17 | 0.149 |
 | embeddings (default) | fuse | 83/87 | 87/87 | 1/17 | 0.146 |
