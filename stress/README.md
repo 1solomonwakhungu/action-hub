@@ -130,15 +130,18 @@ goes through `search` (top-1 pick), `load` and `execute` on a real
 `ActionHub` whose client is the CLI's SDK client factory, talking JSON-RPC
 over stdio to `stress/asof-fixture-server.mjs`:
 
-1. **Selection**: the natural-language query picks `get_revenue_as_of`, not a
-   decoy. `get_latest_revenue` takes no cutoff and has an incompatible
-   argument shape, so picking it fails loudly at validation.
-   `get_net_income_as_of` has the same shape, so picking it would run
-   silently; result fidelity catches that.
+1. **Selection**: the natural-language query's top-1 hit in the 4-tool
+   fixture catalog (one server) is `get_revenue_as_of`, not a decoy.
+   `get_latest_revenue` takes no cutoff and has an incompatible argument
+   shape, so picking it fails loudly at validation. `get_net_income_as_of`
+   has the same shape, so picking it would run silently; result fidelity
+   catches that. A 10/10 here says nothing about selection in a large
+   multi-server catalog.
 2. **Load**: the loaded schema accepts every argument the row carries.
 3. **Argument fidelity**: the fixture echoes the arguments it received, and
-   they must deep-equal what was passed to `execute`. The cutoff string must
-   arrive unchanged.
+   they must deep-equal the row's fixture arguments. `execute` gets a copy,
+   so a hub that rewrote the caller's object in place would still fail. The
+   cutoff string must arrive unchanged.
 4. **Result fidelity**: status, value and source filing ID come back exactly
    as the fixture produced them.
 5. **No-data distinctness**: a pre-history cutoff yields `ok: true`, status
@@ -155,12 +158,24 @@ row cannot come from a vacuous check.
 **What is not graded**: finance parsing, the as-of computation itself (the
 fixture server owns it), live upstream data, and how an LLM turns the
 question into arguments (each row's arguments are fixed in the fixture).
-Selection covers 10 phrasings and is not a paraphrase benchmark. One phrasing
-we tried and left out, "ACME top line as originally reported at end of
-January 2025", picks `get_net_income_as_of` on both engines; the grader
-controls show that misfire would fail result fidelity rather than pass
-silently. Offline: no network, no API keys; the only spawned process is the
-local fixture server.
+Also not covered: the approval gate (the fixture server is `trusted`) and the
+result cache (every call uses `noCache: true`).
+
+**Known selection gap.** Selection passes for the 10 gated phrasings only;
+it is not a paraphrase benchmark. Revenue synonyms that do not contain the
+word "revenue" lose to the same-shape `get_net_income_as_of` decoy. The eval
+reports this as a non-gated `selectionProbes` block (8 phrasings from review,
+in `stress/fixtures/asof-revenue.json`). At the commit that added it, 5 of 8
+picked `get_net_income_as_of` on both engines: "top line" in two word orders,
+"sales as of", "sales ... point in time", and "turnover as known on". Keyword
+returned nothing for "turnover at 2025-01-31"; blend picked the gold. The
+eval would fail any of these rows on result fidelity, but Action Hub itself
+does not catch the misfire: in real use the agent receives net income with
+`status: "ok"` and no signal that the wrong tool ran. Promote a probe to a
+gated row once ranking routes it correctly.
+
+Offline: no network, no API keys; the only spawned process is the local
+fixture server.
 
 ## Isolation (contract hard rules)
 

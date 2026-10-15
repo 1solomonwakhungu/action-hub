@@ -140,5 +140,16 @@
       "args": { "entity": "NOSUCHCO", "asOf": "2025-01-31" },
       "expect": { "status": "error" }
     }
+  ],
+  "selectionProbesNote": "NOT gated. Search-only phrasings from review (revenue synonyms without the word 'revenue'). The eval reports each probe's top-1 per engine so the known misfire class stays visible; promote a probe to a gated row once ranking routes it correctly.",
+  "selectionProbes": [
+    { "id": "topline-originally-reported", "query": "ACME top line as originally reported at end of January 2025" },
+    { "id": "topline-as-of", "query": "ACME top line as of January 31, 2025" },
+    { "id": "topline-question", "query": "what was ACME's top line on January 31, 2025" },
+    { "id": "sales-as-of", "query": "ACME sales as of Jan 31 2025" },
+    { "id": "sales-point-in-time", "query": "ACME sales on 2025-01-31, point in time" },
+    { "id": "turnover-as-known", "query": "ACME turnover as known on 31 Jan 2025" },
+    { "id": "turnover-at", "query": "ACME turnover at 2025-01-31" },
+    { "id": "revenue-before-amendment", "query": "ACME's reported revenue before the amendment" }
   ]
 }

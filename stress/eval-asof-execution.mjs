@@ -37,6 +37,9 @@
  * LLM's argument extraction). Engines: keyword (pure BM25) and the shipped
  * default blend with the vendored embedding index awaited warm.
  *
+ * Selection probes (NOT gated): extra phrasings from review are searched and
+ * their top-1 reported per engine, so the known misfire class stays visible.
+ *
  * Grader controls: the same grader is run against deliberate misfires (each
  * decoy executed with the rows' arguments, or with arguments it accepts) and
  * must FAIL every one, so a passing row cannot come from a vacuous check.
@@ -48,7 +51,7 @@
  */
 
 import { isDeepStrictEqual } from "node:util";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ActionHub } from "../packages/core/dist/index.js";
 import { createSdkClientFactory } from "../packages/cli/dist/client-factory.js";
@@ -56,6 +59,7 @@ import { DEFAULT_FIXTURE, loadFixture } from "./asof-fixture-server.mjs";
 import { createSandbox, assertIsolated, main as harnessMain } from "./lib/harness.mjs";
 
 const STRESS_DIR = resolve(fileURLToPath(import.meta.url), "..");
+const REPO_ROOT = resolve(STRESS_DIR, "..");
 const SERVER_SCRIPT = join(STRESS_DIR, "asof-fixture-server.mjs");
 const RESULTS_PATH = join(STRESS_DIR, ".generated", "results", "eval-asof-execution.json");
 
@@ -185,7 +189,7 @@ export function gradeRow({ fixture, row, pick, loaded, outcome }) {
 
   const noDataDistinct = expect.status === "no_data"
     ? {
-      pass: outcome.kind === "payload" && status === "no_data" && payload.value === null && typeof payload.value !== "number",
+      pass: outcome.kind === "payload" && status === "no_data" && payload.value === null,
       notZero: payload?.value !== 0,
       notError: outcome.kind !== "error",
       notEmpty: outcome.kind !== "empty" && outcome.kind !== "unparseable",
@@ -205,7 +209,9 @@ export async function runRow(hub, fixture, row) {
   let outcome = { kind: "error", message: "no search result; nothing executed", payload: null };
   if (pick !== null) {
     loaded = hub.load(pick);
-    outcome = readOutcome(await hub.execute(pick, row.args, { noCache: true }));
+    // execute gets a copy: grading compares the upstream echo against the
+    // untouched fixture args, so an in-place rewrite by the hub is visible.
+    outcome = readOutcome(await hub.execute(pick, structuredClone(row.args), { noCache: true }));
   }
   const graded = gradeRow({ fixture, row, pick, loaded, outcome });
   const misfire = pick !== null && !graded.checks.selection.pass
@@ -245,7 +251,7 @@ export async function graderControls(hub, fixture) {
   const out = [];
   for (const c of cases) {
     const loaded = hub.load(c.pick);
-    const outcome = readOutcome(await hub.execute(c.pick, c.args, { noCache: true }));
+    const outcome = readOutcome(await hub.execute(c.pick, structuredClone(c.args), { noCache: true }));
     // Graded against the jan31 row: the misfire answers a different question.
     const graded = gradeRow({ fixture, row: { ...row, args: c.args }, pick: c.pick, loaded, outcome });
     const failedChecks = Object.entries(graded.checks).filter(([, v]) => v && !v.pass).map(([k]) => k);
@@ -264,6 +270,21 @@ export async function graderControls(hub, fixture) {
     });
   }
   return out;
+}
+
+/**
+ * Non-gated selection probes: search only, top-1 per phrasing. Reported so
+ * the known misfire class (revenue synonyms losing to the same-shape
+ * net-income tool) stays reproducible; never feeds `pass`.
+ */
+export async function selectionProbes(hub, fixture) {
+  const gold = `${fixture.serverId}:${fixture.goldTool}`;
+  const items = [];
+  for (const p of fixture.selectionProbes ?? []) {
+    const top1 = (await hub.search(p.query, { limit: 1 }))[0]?.id ?? null;
+    items.push({ id: p.id, query: p.query, top1, gold: top1 === gold });
+  }
+  return { gated: false, pickedGold: items.filter((i) => i.gold).length, of: items.length, items };
 }
 
 export async function runEval({ fixturePath = DEFAULT_FIXTURE, engines = Object.keys(ENGINES) } = {}) {
@@ -290,6 +311,7 @@ export async function runEval({ fixturePath = DEFAULT_FIXTURE, engines = Object.
         distinctness: dist,
         pass: rows.every((r) => r.pass) && dist.pass,
         rows,
+        selectionProbes: await selectionProbes(hub, fixture),
       };
       if (controls === null) controls = await graderControls(hub, fixture);
     } finally {
@@ -299,7 +321,7 @@ export async function runEval({ fixturePath = DEFAULT_FIXTURE, engines = Object.
   const controlsPass = controls !== null && controls.every((c) => c.pass);
   return {
     script: "eval-asof-execution",
-    fixture: { path: fixturePath.slice(fixturePath.indexOf("stress")), year: fixture.year, asOfRule: fixture.asOfRule, gold: `${fixture.serverId}:${fixture.goldTool}`, rows: fixture.rows.length },
+    fixture: { path: relative(REPO_ROOT, fixturePath), year: fixture.year, asOfRule: fixture.asOfRule, gold: `${fixture.serverId}:${fixture.goldTool}`, rows: fixture.rows.length },
     graded: "Action Hub routing only: selection, load, argument fidelity, result fidelity, no-data distinctness",
     notGraded: "finance parsing, as-of computation (owned by the fixture server), live upstream data, LLM argument extraction",
     engines: engineResults,
@@ -319,6 +341,9 @@ export function formatTable(summary) {
       const c = r.checks;
       lines.push(`  ${r.id.padEnd(30)}${mark(c.selection)} ${mark(c.load)} ${mark(c.argumentFidelity)} ${mark(c.resultFidelity)}  ${mark(c.noDataDistinct)} ${r.status}${r.misfire ? ` (misfire: ${r.misfire}, pick ${r.checks.selection.pick})` : ""}`);
     }
+    const sp = e.selectionProbes;
+    lines.push(`  selection probes (NOT gated): ${sp.pickedGold}/${sp.of} pick the gold`);
+    for (const p of sp.items) lines.push(`    ${p.id.padEnd(28)}${p.gold ? "gold   " : "MISS   "}${p.top1 ?? "(no result)"}`);
   }
   lines.push(`[grader controls] ${summary.graderControls.pass ? "pass" : "FAIL"}: ${summary.graderControls.cases.map((c) => `${c.name} ${c.graderRejected ? "rejected" : "ACCEPTED"} (${c.failedChecks.join(",") || "none"})`).join("; ")}`);
   lines.push(`[eval-asof-execution] ok=${summary.ok}`);

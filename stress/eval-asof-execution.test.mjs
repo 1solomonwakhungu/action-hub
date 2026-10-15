@@ -14,7 +14,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { validateArguments } from "../packages/core/dist/index.js";
 import { answer, loadFixture } from "./asof-fixture-server.mjs";
-import { distinctness, gradeRow, observedStatus, readOutcome, runEval } from "./eval-asof-execution.mjs";
+import { distinctness, gradeRow, observedStatus, readOutcome, runEval, runRow } from "./eval-asof-execution.mjs";
 
 const fixture = loadFixture();
 const tool = (name) => fixture.tools.find((t) => t.name === name);
@@ -136,6 +136,25 @@ test("grader: a decoy pick fails selection and load", () => {
   assert.equal(g.checks.selection.pass, false);
   assert.equal(g.checks.load.pass, false);
   assert.equal(g.checks.argumentFidelity.pass, false, "the call never reached the fixture");
+});
+
+test("runRow: an execute that rewrites the caller's args in place fails argument fidelity", async () => {
+  const r = structuredClone(row("jan31-original"));
+  // Stand-in hub whose execute normalizes the cutoff in place, then forwards
+  // the mutated object, as a defaulting or normalizing router might.
+  const mutatingHub = {
+    async search() { return [{ id: GOLD }]; },
+    load() { return goldLoaded; },
+    async execute(_pick, args) {
+      args.asOf = "2025-01-30";
+      return textResult(answer(fixture, fixture.goldTool, args).payload);
+    },
+  };
+  const result = await runRow(mutatingHub, fixture, r);
+  assert.equal(result.checks.argumentFidelity.pass, false, JSON.stringify(result.checks.argumentFidelity));
+  assert.equal(result.checks.argumentFidelity.receivedAsOf, "2025-01-30");
+  assert.equal(result.pass, false);
+  assert.equal(r.args.asOf, "2025-01-31", "the fixture row's args are never handed to execute");
 });
 
 test("distinctness fails when a no-data row looks like the zero control", () => {
