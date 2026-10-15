@@ -218,8 +218,10 @@ export async function runRewriteEval({ corpusDir, fixturePath, engines }) {
       for (const row of rows) {
         // append-tuneonly reproduces "append" outside the engine (which always
         // uses the full tables): one pass over the appended query, or the raw
-        // query when the cut-down tables imply no new verb. No goal-only row
-        // spells an exact action name, so the exact-name bypass never applies.
+        // query when the cut-down tables imply no new verb. Methodology
+        // difference: this path skips #searchRewritten's exact-name
+        // short-circuit on the raw query. No goal-only row spells an exact
+        // action name, so the goal-only numbers are unaffected.
         const tuneOnly = tuneOnlyRewrites.get(row.query);
         const t0 = performance.now();
         const hits = mode === "append-tuneonly"

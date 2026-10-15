@@ -8,7 +8,10 @@
  * - the catalog's own verb vocabulary: the first name token of every tool
  *   record (`reopen` from `reopen_incident_beta`), and
  * - the existing SQ2 verb tables in synonyms.ts (VERB_PHRASES and
- *   VERB_SYNONYMS), which were built on the tune split only.
+ *   VERB_SYNONYMS). synonyms.ts documents them as chosen on the tune split,
+ *   but most entries are exercised by no tune query, so that cannot be
+ *   confirmed; see the leakage note in stress/README.md ("Goal-query rewrite
+ *   experiment") before reading any held-out gain as clean.
  *
  * It differs from SQ2 expansion in two ways, which is exactly what the
  * experiment measures: the emitted verbs are restricted to verbs the catalog
@@ -34,9 +37,11 @@ export const MAX_REWRITE_VERBS = 3;
 
 /**
  * Weight of the rewrite ranking relative to the raw ranking (raw = 1) in
- * "fuse" mode. Fixed a priori, not swept: the rewrite is a guess about
- * intent, so it may break ties and lift a buried gold but should not outvote
- * the user's own words. Changing it needs a tune-split-only sweep.
+ * "fuse" mode. Fixed a priori, not swept. Raw is weighted higher, but under
+ * RRF (k = 60) that does NOT keep the raw top hit on top: a hit at raw rank r
+ * and rewrite rank 1 scores 1/(60+r) + 0.5/61, which beats a raw rank-1 hit
+ * absent from the rewrite list (1/61) for every r up to 61, i.e. anywhere in
+ * the depth-50 raw window. Changing it needs a tune-split-only sweep.
  */
 export const REWRITE_FUSION_WEIGHT = 0.5;
 

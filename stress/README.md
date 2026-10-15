@@ -137,9 +137,9 @@ A query that implies no new catalog verb, or that spells an existing action
 name, takes the unchanged single raw pass. The plugin server builds its
 `SearchOptions` field by field, so agents cannot turn the rewrite on.
 
-**Leakage control.** The SQ2 tables were built on the tune split, but 23 of 35
-phrases and 67 of 95 single-verb entries occur in no tune-split query, so
-nothing shows they were validated on tune. `append-tuneonly` reruns `append`
+**Leakage control.** `synonyms.ts` documents the SQ2 tables as chosen on the
+tune split, but 23 of 35 phrases and 67 of 95 single-verb entries occur in no
+tune-split query, so nothing shows they were validated on tune. `append-tuneonly` reruns `append`
 with only the 12 phrases and 28 verbs that some tune query exercises. Read its
 held column as the leakage-safe number. (The baseline gate prints every row, so
 the held query texts were visible while this was built. That is why the
@@ -197,6 +197,11 @@ Abstention side effect, on the 87 no-match negatives (15 realistic + 72 in
 | embeddings (default) | append | 83/87 | 87/87 | 1/17 | 0.149 |
 | embeddings (default) | fuse | 83/87 | 87/87 | 1/17 | 0.146 |
 
+On hashed, `append` makes abstention worse: at the shipped 0.8 threshold 2
+more negatives come back as confident hits (77 to 75 of 87 abstained), at 0.36
+the last 3 abstentions disappear (3 to 0), and the mean negative gate input
+rises from .642 to .663. On embeddings it changes nothing measurable.
+
 `fuse` replaces each hit's `score` with the fused rank score (about 0.02), which
 is what the abstention rule reads when no semantic channel is active. On a
 keyword-only hub with abstention enabled, `fuse` would therefore refuse almost
@@ -225,19 +230,26 @@ at base; this experiment neither causes nor fixes them. The generated
 paraphrase rows are built from gen-tools' own verb synonym list, which overlaps
 the SQ2 tables, so treat the generated paraphrase gain as optimistic.
 
-**Verdict.** Raw-preserving rewriting into catalog verbs clearly helps the
-lexical and hashed engines on goal-only asks, and part of that gain survives
-the leakage audit (keyword held recall@5 .462 to .538, hashed overall .267 to
-.433). On the production embeddings engine it is a wash: recall@5 is unchanged,
+**Verdict.** The held-out evidence for the lexical and hashed engines is a
+weak positive signal, not a clear win. Counted on the 13 held rows at
+recall@5: with the full tables, `append` gains 2 rows on keyword (6 to 8) and
+1 on hashed (6 to 7); with the leakage-safe tune-only tables, 1 row on keyword
+(6 to 7) and 0 on hashed (6 to 6). The large hashed overall gain (.267 to .433
+under tune-only tables) is entirely on tune rows (2 to 7 of 17), which are
+in-sample for tables cut down to what tune rows exercise, so it is not
+evidence that survives the leakage audit. On the production embeddings engine
+it is a wash: recall@5 is unchanged,
 MRR moves by one rank-1 flip, and the leakage-safe variant loses one row at
 recall@5 while staying flat on the held rows. The misses the gate
 section names stay misses: "take back" for revoke and "let ... through" for
 unlock get no rewrite at all (no table entry covers them), and "spending
 plan" for budget is an entity paraphrase that a verb rewrite cannot reach (that
 row gains `approve` and still misses). The default stays off.
-`append` is the mode worth revisiting for the hashed fallback channel, but the
-next step is a lexicon grown on tune rows only. No more table entries should be
-added on the strength of these 30 rows.
+If `append` is revisited for the hashed fallback channel, it has to be
+rechecked against abstention as well as recall, because on hashed it lets 2
+more no-match negatives through at the shipped threshold. The next step would
+be a lexicon grown on tune rows only and judged on held rows. No more table
+entries should be added on the strength of these 30 rows.
 
 ## Isolation (contract hard rules)
 
