@@ -19,6 +19,7 @@ Load/performance bench and orchestration for the stress fleet. Contract:
 | `stress/harness-e2e.mjs` | builder-9 | pi harness entrypoint e2e |
 | `stress/cli-scale.mjs` | builder-3 | CLI surface scale |
 | `stress/abstention-threshold.mjs`, `stress/abstention-threshold.test.mjs`, `stress/fixtures/no-match-queries.json` | abstention-docs | held-out calibration of the search abstention gate (both semantic channels); negative fixture; unit tests for the pure parts |
+| `stress/eval-asof-execution.mjs`, `stress/eval-asof-execution.test.mjs`, `stress/asof-fixture-server.mjs`, `stress/fixtures/asof-revenue.json` | execution-eval | fixture-backed as-of revenue execution eval (search, load, execute over a real stdio MCP fixture server); the test file runs under root `npm test` |
 
 Generated data lives in `stress/.generated/` (gitignored). Only scripts and
 this README are committed.
@@ -106,6 +107,75 @@ revoke, "fire it off again" for resend, "let ... through" for unlock) and
 entity paraphrases ("spending plan" for budget), not server confusion: 29 of
 the 30 golds live on one server. Raise the floors in the same commit that
 improves them.
+
+### As-of execution eval
+
+```bash
+npm run build
+node stress/eval-asof-execution.mjs                                        # ~1 s, both engines
+node --import ./test-isolation.mjs --test stress/eval-asof-execution.test.mjs   # also part of root npm test
+```
+
+A fixture-backed answer to the r/mcp request for an execution eval with a
+point-in-time question. The scenario is pinned to 2025 and never reads the
+clock: filing A, accepted 2025-01-10, reports revenue 100; amendment B,
+accepted 2025-02-10, reports 110. A query as of 2025-01-31 must come back as
+100 with A's ID; a cutoff on or after 2025-02-10 as 110 with B's ID; a cutoff
+before 2025-01-10 as an explicit `no_data` result. A second company genuinely
+reports revenue 0, and an unknown company is a tool error, so the eval can
+check that "no data", "zero" and "error" look different to the agent.
+
+**What is graded** is Action Hub's part of the path only. Each of the 10 rows
+goes through `search` (top-1 pick), `load` and `execute` on a real
+`ActionHub` whose client is the CLI's SDK client factory, talking JSON-RPC
+over stdio to `stress/asof-fixture-server.mjs`:
+
+1. **Selection**: the natural-language query's top-1 hit in the 4-tool
+   fixture catalog (one server) is `get_revenue_as_of`, not a decoy.
+   `get_latest_revenue` takes no cutoff and has an incompatible argument
+   shape, so picking it fails loudly at validation. `get_net_income_as_of`
+   has the same shape, so picking it would run silently; result fidelity
+   catches that. A 10/10 here says nothing about selection in a large
+   multi-server catalog.
+2. **Load**: the loaded schema accepts every argument the row carries.
+3. **Argument fidelity**: the fixture echoes the arguments it received, and
+   they must deep-equal the row's fixture arguments. `execute` gets a copy,
+   so a hub that rewrote the caller's object in place would still fail. The
+   cutoff string must arrive unchanged.
+4. **Result fidelity**: status, value and source filing ID come back exactly
+   as the fixture produced them.
+5. **No-data distinctness**: a pre-history cutoff yields `ok: true`, status
+   `no_data` and value `null`. Zero, an error, an empty result or unparseable
+   text all fail this check, and a cross-row check requires the no-data rows
+   to differ from the zero and error controls.
+
+Rows run on two engines: pure BM25, and the shipped default blend with the
+vendored embedding index awaited warm. Grader controls then execute the
+decoys deliberately (with the as-of arguments, or with arguments they accept)
+and require a check other than selection to reject each one, so a passing
+row cannot come from a vacuous check.
+
+**What is not graded**: finance parsing, the as-of computation itself (the
+fixture server owns it), live upstream data, and how an LLM turns the
+question into arguments (each row's arguments are fixed in the fixture).
+Also not covered: the approval gate (the fixture server is `trusted`) and the
+result cache (every call uses `noCache: true`).
+
+**Known selection gap.** Selection passes for the 10 gated phrasings only;
+it is not a paraphrase benchmark. Revenue synonyms that do not contain the
+word "revenue" often lose to the same-shape `get_net_income_as_of` decoy. The
+eval reports this as a non-gated `selectionProbes` block (8 phrasings from review,
+in `stress/fixtures/asof-revenue.json`). At the commit that added it, 5 of 8
+picked `get_net_income_as_of` on both engines: "top line" in two word orders,
+"sales as of", "sales ... point in time", and "turnover as known on". Keyword
+returned nothing for "turnover at 2025-01-31"; blend picked the gold. The
+eval would fail any of these rows on result fidelity, but Action Hub itself
+does not catch the misfire: in real use the agent receives net income with
+`status: "ok"` and no signal that the wrong tool ran. Promote a probe to a
+gated row once ranking routes it correctly.
+
+Offline: no network, no API keys; the only spawned process is the local
+fixture server.
 
 ## Isolation (contract hard rules)
 

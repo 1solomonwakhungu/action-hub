@@ -206,6 +206,16 @@ The `stress/` generators emit two kinds of retrieval-evaluation data:
   embeddings, measured 2026-10-11), so a ranking change that trades them away
   for a better aggregate fails this gate rather than hiding in "hard". See
   `stress/README.md` for the full table.
+- **The as-of execution eval** (`stress/eval-asof-execution.mjs`, part of
+  `npm test`) runs one point-in-time revenue scenario end to end through
+  search, load and execute against a deterministic fixture server. It grades
+  Action Hub's routing: tool choice for 10 fixed phrasings in a 4-tool
+  catalog, the cutoff date reaching the upstream unchanged, value and source
+  filing ID coming back intact, and "no data" staying distinct from zero. It
+  does not parse finance data or touch live data; the fixture server owns the
+  as-of logic. Revenue synonyms such as "top line" and "sales" still route to
+  `get_net_income_as_of` on both engines, and in real use that misfire reaches
+  the agent as a plausible `ok` answer; see `stress/README.md`.
 
 ## Install
 
