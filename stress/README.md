@@ -19,6 +19,7 @@ Load/performance bench and orchestration for the stress fleet. Contract:
 | `stress/harness-e2e.mjs` | builder-9 | pi harness entrypoint e2e |
 | `stress/cli-scale.mjs` | builder-3 | CLI surface scale |
 | `stress/abstention-threshold.mjs`, `stress/abstention-threshold.test.mjs`, `stress/fixtures/no-match-queries.json` | abstention-docs | held-out calibration of the search abstention gate (both semantic channels); negative fixture; unit tests for the pure parts |
+| `stress/goal-query-rewrite.mjs`, `stress/goal-query-rewrite.test.mjs` | query-rewrite | before/after eval of the opt-in goal-query rewrite (`SearchOptions.queryRewrite`); eval-retrieval takes the same switch as `--query-rewrite=<append\|fuse>` |
 
 Generated data lives in `stress/.generated/` (gitignored). Only scripts and
 this README are committed.
@@ -106,6 +107,137 @@ revoke, "fire it off again" for resend, "let ... through" for unlock) and
 entity paraphrases ("spending plan" for budget), not server confusion: 29 of
 the 30 golds live on one server. Raise the floors in the same commit that
 improves them.
+
+
+### Goal-query rewrite experiment (opt-in, off by default)
+
+```bash
+node stress/goal-query-rewrite.mjs                                   # keyword + hashed, ~15 s
+node stress/goal-query-rewrite.mjs --engines keyword,hashed,embeddings   # ~13 min (embedding index build)
+node stress/eval-retrieval.mjs --query-rewrite=append                # full eval with the rewrite on
+node --test stress/goal-query-rewrite.test.mjs
+```
+
+Question (r/mcp thread 1x2u6sb): does rewriting a goal-style ask ("turn down
+that onboarding request") into tool-ish verbs ("reject onboarding request")
+help retrieval? `packages/core/src/search/query-rewrite.ts` answers it with a
+deterministic rewriter that adds no new lexicon: it maps the query through the
+existing SQ2 verb tables (`synonyms.ts`) and keeps only verbs the catalog's own
+tool names use (72 verbs on the binding corpus). The raw query is never
+replaced. `SearchOptions.queryRewrite` selects:
+
+- `append`: one pass over the raw query plus the implied catalog verbs, so the
+  verbs count at full weight and reach the semantic channel (SQ2 expansion
+  alone adds them at half weight, BM25 only).
+- `fuse`: a raw pass and a tool-ish rewrite pass (depth 50 each), rank-fused
+  with the rewrite at weight 0.5. Weight and depth were fixed before measuring
+  and never swept.
+
+A query that implies no new catalog verb, or that spells an existing action
+name, takes the unchanged single raw pass. The plugin server builds its
+`SearchOptions` field by field, so agents cannot turn the rewrite on.
+
+**Leakage control.** The SQ2 tables were built on the tune split, but 23 of 35
+phrases and 67 of 95 single-verb entries occur in no tune-split query, so
+nothing shows they were validated on tune. `append-tuneonly` reruns `append`
+with only the 12 phrases and 28 verbs that some tune query exercises. Read its
+held column as the leakage-safe number. (The baseline gate prints every row, so
+the held query texts were visible while this was built. That is why the
+rewriter has no hand-written entries of its own.) No LLM rewriter was measured:
+no Anthropic API key was available in the environment, and nothing below
+estimates one.
+
+Goal-only rows (30; held = the 13 rows of `split-held.json`), measured
+2026-10-15 on the binding corpus:
+
+| engine | mode | recall@1 | recall@5 | recall@10 | MRR@10 | held recall@5 | held MRR@10 | improved / regressed |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| keyword | off | 0.267 | 0.433 | 0.533 | 0.349 | 0.462 | 0.396 | |
+| keyword | append | 0.467 | 0.500 | 0.567 | 0.488 | 0.615 | 0.615 | 7 / 1 |
+| keyword | fuse | 0.367 | 0.467 | 0.567 | 0.420 | 0.538 | 0.460 | 6 / 0 |
+| keyword | append-tuneonly | 0.400 | 0.467 | 0.567 | 0.442 | 0.538 | 0.511 | 5 / 1 |
+| hashed | off | 0.133 | 0.267 | 0.333 | 0.181 | 0.462 | 0.301 | |
+| hashed | append | 0.400 | 0.467 | 0.533 | 0.435 | 0.538 | 0.551 | 14 / 0 |
+| hashed | fuse | 0.200 | 0.400 | 0.467 | 0.298 | 0.462 | 0.434 | 11 / 0 |
+| hashed | append-tuneonly | 0.300 | 0.433 | 0.467 | 0.351 | 0.462 | 0.359 | 10 / 0 |
+| embeddings (default) | off | 0.400 | 0.533 | 0.567 | 0.454 | 0.538 | 0.470 | |
+| embeddings (default) | append | 0.433 | 0.533 | 0.567 | 0.472 | 0.615 | 0.558 | 5 / 3 |
+| embeddings (default) | fuse | 0.433 | 0.533 | 0.567 | 0.470 | 0.538 | 0.509 | 2 / 1 |
+| embeddings (default) | append-tuneonly | 0.400 | 0.500 | 0.567 | 0.451 | 0.538 | 0.509 | 3 / 3 |
+
+Per-row ranks for the production engine (embeddings), off to append:
+improved "confirm the audience invite went through" 9 to 4, "trim the dead
+nodes from the cluster map" miss to 47, "turn on the churn tracking" 2 to 1,
+"turn down that onboarding request" 2 to 1, "hold the warehouse sync until
+monday" 14 to 11; regressed "side-by-side the usage numbers for both months"
+4 to 6, "the timesheet bounced, fire it off again" 32 to 44, "adjust the
+contract wording" 1 to 2; 22 unchanged. The full per-row lists for every
+engine and mode are in the JSON artifact.
+
+Cost per goal-only query (30 rows, 23 of which rewrite to something):
+
+| mode | search passes (30 rows) | added query tokens (30 rows) | median ms keyword / hashed / embeddings |
+|---|---:|---:|---|
+| off | 30 | 0 | 26.0 / 47.2 / 30.9 |
+| append | 30 | 31 | 38.5 / 49.3 / 39.8 |
+| fuse | 53 | 104 | 71.1 / 77.9 / 65.4 |
+
+Wall times are from one run on a shared machine with other agents active, so
+treat them as rough; the pass count is the deterministic cost. `fuse` roughly
+doubles search work on every rewritten query.
+
+Abstention side effect, on the 87 no-match negatives (15 realistic + 72 in
+`no-match-queries.json`) and the goal-only golds in the top 10:
+
+| engine | mode | negatives abstained @0.36 | @0.8 (shipped) | golds refused @0.36 | mean negative gate input |
+|---|---|---:|---:|---:|---:|
+| hashed | off | 3/87 | 77/87 | 0/10 | 0.642 |
+| hashed | append | 0/87 | 75/87 | 0/16 | 0.663 |
+| embeddings (default) | off | 83/87 | 87/87 | 1/17 | 0.146 |
+| embeddings (default) | append | 83/87 | 87/87 | 1/17 | 0.149 |
+| embeddings (default) | fuse | 83/87 | 87/87 | 1/17 | 0.146 |
+
+`fuse` replaces each hit's `score` with the fused rank score (about 0.02), which
+is what the abstention rule reads when no semantic channel is active. On a
+keyword-only hub with abstention enabled, `fuse` would therefore refuse almost
+every query (16 of 17 golds in the keyword run). That alone rules `fuse` out
+as a default without further work.
+
+Full eval-retrieval (generated 1,500 + realistic 121, default wiring, which
+measures blend on a cold embedding index and so equals keyword there):
+
+| metric | base 0146f5c | off | append | fuse |
+|---|---:|---:|---:|---:|
+| contract gates passing | 2/13 | 2/13 | 2/13 | 2/13 |
+| headline recall@1 / @5 / MRR@10 | .208 / .386 / .286 | .208 / .386 / .286 | .248 / .412 / .325 | .228 / .398 / .305 |
+| headline execution success | .225 | .225 | .262 | .245 |
+| exact recall@5 | .897 | .897 | .897 | .897 |
+| paraphrase recall@5 | .410 | .410 | .443 | .437 |
+| hard recall@5 | .192 | .192 | .225 | .203 |
+| sufficiency@10 | .247 | .247 | .333 | .247 |
+| no-match FP (any hit) | .280 | .280 | .280 | .280 |
+| realistic recall@5 / MRR@10 | .657 / .572 | .657 / .572 | .695 / .630 | .686 / .596 |
+| realistic near-duplicate / multi recall@5 | .950 / .854 | .950 / .854 | .950 / .854 | .950 / .854 |
+
+Base and off agree on every non-timing field (the one difference is warm p95,
+32 vs 67 ms, both under the 100 ms gate). The 11 failing gates fail identically
+at base; this experiment neither causes nor fixes them. The generated
+paraphrase rows are built from gen-tools' own verb synonym list, which overlaps
+the SQ2 tables, so treat the generated paraphrase gain as optimistic.
+
+**Verdict.** Raw-preserving rewriting into catalog verbs clearly helps the
+lexical and hashed engines on goal-only asks, and part of that gain survives
+the leakage audit (keyword held recall@5 .462 to .538, hashed overall .267 to
+.433). On the production embeddings engine it is a wash: recall@5 is unchanged,
+MRR moves by one rank-1 flip, and the leakage-safe variant loses one row at
+recall@5 while staying flat on the held rows. The misses the gate
+section names stay misses: "take back" for revoke and "let ... through" for
+unlock get no rewrite at all (no table entry covers them), and "spending
+plan" for budget is an entity paraphrase that a verb rewrite cannot reach (that
+row gains `approve` and still misses). The default stays off.
+`append` is the mode worth revisiting for the hashed fallback channel, but the
+next step is a lexicon grown on tune rows only. No more table entries should be
+added on the strength of these 30 rows.
 
 ## Isolation (contract hard rules)
 

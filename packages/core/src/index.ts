@@ -13,6 +13,8 @@ export type { BootstrapOptions, BootstrapResult } from "./catalog/bootstrap.js";
 export { SearchEngine, tokenize, DEFAULT_SEMANTIC_WEIGHT } from "./search/search.js";
 export type { SemanticScorer } from "./search/search.js";
 export { buildServerDirectory, clampDirectoryKeywords, DEFAULT_DIRECTORY_KEYWORDS, MAX_DIRECTORY_KEYWORDS } from "./search/server-directory.js";
+export { catalogVerbs, rewriteGoalQuery, MAX_REWRITE_VERBS, REWRITE_FUSION_DEPTH, REWRITE_FUSION_WEIGHT } from "./search/query-rewrite.js";
+export type { GoalQueryRewrite, QueryRewriteMode } from "./search/query-rewrite.js";
 export type {
   ServerDirectoryEntry,
   ServerDirectoryMetadata,

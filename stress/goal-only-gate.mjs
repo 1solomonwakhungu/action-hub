@@ -159,7 +159,7 @@ function defaultReadSplit(name) {
   return new Set(parsed.map((row) => row.query));
 }
 
-async function buildEngine(name, catalog) {
+export async function buildEngine(name, catalog) {
   const { SearchEngine } = await import(join(repoRoot, "packages", "core", "dist", "search", "search.js"));
   const engine = new SearchEngine(catalog);
   const t0 = performance.now();
@@ -179,7 +179,8 @@ async function buildEngine(name, catalog) {
   return { engine, buildMs: Math.round(performance.now() - t0) };
 }
 
-export async function runGate({ corpusDir, fixturePath, engines, withFails }) {
+/** Builds the binding-corpus catalog exactly as the gate scores it. */
+export async function buildCorpusCatalog(corpusDir) {
   const { Catalog } = await import(join(repoRoot, "packages", "core", "dist", "catalog", "catalog.js"));
   const { tools, skills, counts } = loadGeneratedCorpus(corpusDir);
   const catalog = new Catalog();
@@ -200,7 +201,11 @@ export async function runGate({ corpusDir, fixturePath, engines, withFails }) {
   for (const { entry, name, desc, body } of skills) {
     catalog.add({ id: `skill:${entry}`, kind: "skill", serverId: "skills", name, summary: desc.slice(0, 160), description: body, tags: [], trust: "untrusted" });
   }
+  return { catalog, counts };
+}
 
+export async function runGate({ corpusDir, fixturePath, engines, withFails }) {
+  const { catalog, counts } = await buildCorpusCatalog(corpusDir);
   const fixture = JSON.parse(readFileSync(fixturePath, "utf8"));
   const catalogIds = new Set(catalog.all().map((record) => record.id));
   const rows = selectGoalOnlyRows(fixture, catalogIds);
