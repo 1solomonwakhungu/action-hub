@@ -24,7 +24,7 @@ the binary itself and there is no separate `node` to spawn.
 | OS      | Arch  | Artifact                        | Build runner       |
 | ------- | ----- | ------------------------------- | ------------------ |
 | macOS   | arm64 | `action-hub-macos-arm64`        | `macos-14`         |
-| macOS   | x64   | `action-hub-macos-x64`          | `macos-13`         |
+| macOS   | x64   | `action-hub-macos-x64`          | `macos-15-intel`   |
 | Linux   | x64   | `action-hub-linux-x64`          | `ubuntu-24.04`     |
 | Linux   | arm64 | `action-hub-linux-arm64`        | `ubuntu-24.04-arm` |
 | Windows | x64   | `action-hub-windows-x64.exe`    | `windows-latest`   |
@@ -46,17 +46,51 @@ compatible `dist-bin/SHA256SUMS.txt`.
 
 ## Cutting a release
 
-1. Bump the version in `packages/cli/package.json` **and**
-   `packages/cli/src/version.ts` (a unit test enforces they match), plus the
-   other workspace manifests if desired.
-2. Commit, then tag: `git tag v0.1.0 && git push origin v0.1.0`.
-3. The [`Release`](../.github/workflows/release.yml) workflow builds every
-   target, smoke-tests each binary, generates checksums plus the Homebrew and
-   winget manifests, and creates a GitHub release with all assets attached.
+Releases are automated with
+[release-please](https://github.com/googleapis/release-please) in manifest
+mode ([`release-please-config.json`](../release-please-config.json),
+[`.release-please-manifest.json`](../.release-please-manifest.json)).
 
-The workflow also triggers on `release: published` and `workflow_dispatch`
-(with a `tag` input) for manual re-runs. Third-party actions are pinned to
-immutable commit SHAs.
+1. Merge conventional commits (`feat:`, `fix:`, `feat!:` ...) to `main` as
+   usual.
+2. The [`Release Please`](../.github/workflows/release-please.yml) workflow
+   keeps one release PR open (`chore: release main`). It bumps the versions of
+   `@action-hub/cli`, `@action-hub/core` and `@action-hub/mcp-server` in
+   lockstep (the `linked-versions` plugin), updates each package's
+   `CHANGELOG.md`, the root `package-lock.json`, the plugin manifest
+   (`packages/plugin/plugin.json`) and every source line annotated with
+   `x-release-please-version` (for example `packages/cli/src/version.ts`).
+3. Merging the release PR creates the tags and GitHub releases:
+   `v<version>` for the CLI (the product release), plus `core-v<version>` and
+   `mcp-server-v<version>`. The `v*` release is marked as latest so the
+   README's `releases/latest/download/...` links keep pointing at the binaries.
+4. The same run calls the [`Release`](../.github/workflows/release.yml)
+   workflow with the `v*` tag. It builds every target, smoke-tests each binary,
+   generates checksums plus the Homebrew and winget manifests, and attaches
+   them to the existing release.
+5. If the `NPM_TOKEN` secret is set, the `npm-publish` job publishes the
+   packages (see [npm](#npm)). Without it the job logs a notice and skips.
+
+Before 1.0, `feat:` bumps the minor version and breaking changes also bump the
+minor (`bump-minor-pre-major`). To force a version, add `Release-As: x.y.z` to
+a commit body.
+
+### One-time repository settings
+
+- **Settings -> Actions -> General -> Workflow permissions**: enable *Allow
+  GitHub Actions to create and approve pull requests*. Without it
+  release-please cannot open the release PR with `GITHUB_TOKEN`.
+- Pull requests and tags created with `GITHUB_TOKEN` do not trigger other
+  workflows, so CI does not run on the release PR automatically. Close and
+  reopen the PR to run CI on it. The binary build is invoked directly by the
+  release-please workflow, so it does not depend on the tag push event.
+
+### Manual re-runs
+
+`release.yml` still triggers on a manually pushed `v*` tag, on `release:
+published`, and on `workflow_dispatch` (with a `tag` input), and checks out the
+requested tag. Use these to rebuild assets for an existing release. Third-party
+actions are pinned to immutable commit SHAs.
 
 ### Release assets
 
@@ -101,10 +135,22 @@ submission is merged.
 
 ## npm
 
-npm distribution is unchanged. The `@action-hub/cli` package still exposes the
-`action-hub` bin via `dist/index.js`, and the meta-MCP server via
-`@action-hub/mcp-server`. The standalone binaries are an additional channel,
-not a replacement.
+The `@action-hub/cli` package exposes the `action-hub` bin via
+`dist/index.js`, and the meta-MCP server via `@action-hub/mcp-server`. The
+standalone binaries are an additional channel, not a replacement.
+
+`scripts/publish-npm.mjs` publishes the packages listed in
+`release-please-config.json` in dependency order, with npm provenance. It is
+safe to re-run: it skips a package that
+
+- is marked `"private": true`,
+- depends on a private workspace package, or on one through a `*` range
+  (the published package would not install), or
+- already has that exact version on the registry.
+
+Today `@action-hub/core` and `@action-hub/mcp-server` are private, so the CLI
+is skipped as well until they are made public. Preview what would happen with
+`npm run build && node scripts/publish-npm.mjs --dry-run`.
 
 ## Third-party license notice (SQ4)
 

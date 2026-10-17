@@ -1,0 +1,101 @@
+name: Release Please
+
+# Keeps a release PR open on main with the next version bump and CHANGELOGs
+# (release-please manifest mode, see release-please-config.json). Merging that
+# PR tags the release, creates the GitHub releases, builds and attaches the
+# standalone binaries via release.yml, and publishes to npm when NPM_TOKEN is
+# configured. See docs/releasing.md.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR / tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write # release-please creates and applies the autorelease labels
+      pull-requests: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      cli_release_created: ${{ steps.release.outputs['packages/cli--release_created'] }}
+      cli_tag: ${{ steps.release.outputs['packages/cli--tag_name'] }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - name: Mark the CLI release as latest
+        # core-v* and mcp-server-v* releases are created in the same run; the
+        # README's releases/latest/download links must resolve to the v* release
+        # that carries the binaries.
+        if: ${{ steps.release.outputs['packages/cli--release_created'] == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs['packages/cli--tag_name'] }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+
+  binaries:
+    name: Build and attach binaries
+    needs: release-please
+    if: ${{ needs.release-please.outputs.cli_release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.cli_tag }}
+    secrets: inherit
+
+  npm-publish:
+    name: Publish to npm
+    needs: release-please
+    if: ${{ needs.release-please.outputs.releases_created == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - name: Check for NPM_TOKEN
+        id: gate
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN secret is not set; skipping npm publish."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Checkout
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Setup Node
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - name: Install dependencies
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        run: npm ci
+      - name: Build workspaces
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        run: npm run build
+      - name: Publish packages
+        if: ${{ steps.gate.outputs.enabled == 'true' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node scripts/publish-npm.mjs --provenance
