@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write # release-please creates and applies the autorelease labels
       pull-requests: write
     outputs:
       releases_created: ${{ steps.release.outputs.releases_created }}
