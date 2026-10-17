@@ -1,6 +1,6 @@
 # Status
 
-Last updated: 2026-10-16 (covers `main` through `0071fb2`, #107)
+Last updated: 2026-10-17 (covers `main` through `fd47602`, #111)
 
 ## Where things stand
 
@@ -10,8 +10,12 @@ servers and skills through search, load, and execute. It ships as npm
 workspaces, standalone binaries, a shared daemon, and an HTTP transport. An
 explainer site is live on GitHub Pages.
 
-Nothing has been released yet. There are no tags or GitHub releases, and
-every package is still at `0.1.0`.
+`v0.1.0` is the first release (2026-10-17), cut by release-please. The
+[GitHub release](https://github.com/1solomonwakhungu/action-hub/releases/tag/v0.1.0)
+carries binaries for macOS (arm64, x64), Linux (x64, arm64), and Windows (x64),
+plus `SHA256SUMS.txt`, the Homebrew formula, winget manifests, and
+`THIRD_PARTY_LICENSES.txt`. `core-v0.1.0` and `mcp-server-v0.1.0` were tagged
+alongside it. Nothing is on npm yet.
 
 **Verified on `main` (local run, Node 22):**
 
@@ -23,7 +27,7 @@ every package is still at `0.1.0`.
 
 ## What shipped since 2026-08-26
 
-98 commits, merged PRs #12 to #107. Numbers below are PRs or the issues
+100 commits, merged PRs #12 to #111. Numbers below are PRs or the issues
 they closed.
 
 **Product surface (2026-08-28 to 2026-09-09)**
@@ -105,15 +109,22 @@ they closed.
   design and compaction guidance (#105)
 - Explainer microsite deployed to GitHub Pages from `site/dist` (#106)
 
+**Release (2026-10-17)**
+
+- release-please in manifest mode with linked versions for cli, core, and
+  mcp-server; the release workflow builds and attaches binaries to the
+  `v*` release (#109)
+- First release `v0.1.0` (#111)
+
 ## Next
 
-1. **Release automation.** release-please in manifest mode is in review in
-   #109. After it merges, enable *Allow GitHub
-   Actions to create and approve pull requests* in the repository settings,
-   then merge the first release PR to cut `v0.1.0`. npm publishing stays off
-   until an `NPM_TOKEN` secret exists, the `@action-hub` npm scope is
-   created, and `@action-hub/core` and `@action-hub/mcp-server` stop being
-   private. See `docs/releasing.md`.
+1. **npm publishing.** Release automation is live (#109): release-please
+   keeps a `chore: release main` PR open, and merging it tags, builds, and
+   attaches the binaries. The npm job publishes nothing until an `NPM_TOKEN`
+   secret exists, the `@action-hub` npm scope is created, and
+   `@action-hub/core` and `@action-hub/mcp-server` stop being private. CI does
+   not run on the release PR automatically; close and reopen it first. See
+   `docs/releasing.md`.
 2. **Editor extensions (#20, open).** One-click extensions for VS Code,
    Cursor, and JetBrains. Each would register Action Hub as the meta-MCP
    provider, auto-detect existing MCP configs, show daemon status (indexed
