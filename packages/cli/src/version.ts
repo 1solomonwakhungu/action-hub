@@ -6,4 +6,4 @@
  * single-file executable (there is no `package.json` on disk next to the
  * binary), so the value is inlined here and a unit test asserts the two match.
  */
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.0"; // x-release-please-version
