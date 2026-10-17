@@ -1,0 +1,54 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "node",
+  "bump-minor-pre-major": true,
+  "include-v-in-tag": true,
+  "initial-version": "0.1.0",
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance Improvements" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "refactor", "section": "Code Refactoring" },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "build", "section": "Build System", "hidden": true },
+    { "type": "ci", "section": "Continuous Integration", "hidden": true },
+    { "type": "chore", "section": "Miscellaneous Chores", "hidden": true }
+  ],
+  "packages": {
+    "packages/cli": {
+      "component": "cli",
+      "package-name": "@action-hub/cli",
+      "include-component-in-tag": false,
+      "extra-files": [
+        { "type": "generic", "path": "src/version.ts" },
+        { "type": "generic", "path": "src/client-factory.ts" }
+      ]
+    },
+    "packages/core": {
+      "component": "core",
+      "package-name": "@action-hub/core",
+      "extra-files": [
+        { "type": "generic", "path": "src/telemetry/index.ts" }
+      ]
+    },
+    "packages/plugin/server": {
+      "component": "mcp-server",
+      "package-name": "@action-hub/mcp-server",
+      "extra-files": [
+        { "type": "generic", "path": "src/index.ts" },
+        { "type": "generic", "path": "src/sdk-client.ts" },
+        { "type": "json", "path": "/packages/plugin/plugin.json", "jsonpath": "$.version" }
+      ]
+    }
+  },
+  "plugins": [
+    { "type": "node-workspace", "merge": false },
+    {
+      "type": "linked-versions",
+      "groupName": "action-hub",
+      "components": ["cli", "core", "mcp-server"]
+    }
+  ]
+}

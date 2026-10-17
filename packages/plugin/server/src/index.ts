@@ -284,7 +284,7 @@ export async function createHubRuntime(options: HubRuntimeOptions = {}): Promise
 export { startHttpServer, HUB_HTTP_TOKEN_ENV_VAR, type HttpServerOptions, type HttpServerHandle } from "./http-server.js";
 
 export function createMcpServer(runtime: HubRuntime): McpServer {
-  const server = new McpServer({ name: "action-hub", version: "0.1.0" });
+  const server = new McpServer({ name: "action-hub", version: "0.1.0" }); // x-release-please-version
 
   // F23 rework: the authoritative re-index starts only after the server has
   // actually HANDLED an initialize handshake — `server.connect` merely
