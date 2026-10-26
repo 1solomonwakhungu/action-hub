@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.1](https://github.com/1solomonwakhungu/action-hub/compare/mcp-server-v0.1.0...mcp-server-v0.1.1) (2026-10-26)
+
+
+### Miscellaneous Chores
+
+* **mcp-server:** Synchronize action-hub versions
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @action-hub/core bumped from 0.1.0 to 0.1.1
+
 ## 0.1.0 (2026-10-17)
 
 

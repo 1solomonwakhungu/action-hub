@@ -21,7 +21,7 @@ import {
   type TokenStore,
 } from "@action-hub/core";
 
-const CLIENT_INFO = { name: "action-hub-cli", version: "0.1.0" } as const; // x-release-please-version
+const CLIENT_INFO = { name: "action-hub-cli", version: "0.1.1" } as const; // x-release-please-version
 
 export interface SdkClientFactoryOptions {
   /**

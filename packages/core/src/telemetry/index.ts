@@ -161,7 +161,7 @@ export class ActionHubTelemetry {
     }
 
     const name = options?.tracerName ?? "@action-hub/core";
-    const version = options?.tracerVersion ?? "0.1.0"; // x-release-please-version
+    const version = options?.tracerVersion ?? "0.1.1"; // x-release-please-version
 
     if (options?.tracerProvider) {
       this.tracer = options.tracerProvider.getTracer(name, version);

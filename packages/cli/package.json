@@ -1,6 +1,6 @@
 {
   "name": "@action-hub/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Developer CLI for Action Hub",
   "type": "module",
   "license": "MIT",
@@ -18,8 +18,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@action-hub/mcp-server": "0.1.0",
-    "@action-hub/core": "0.1.0",
+    "@action-hub/mcp-server": "0.1.1",
+    "@action-hub/core": "0.1.1",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@opentelemetry/api": "^1.9.0",
     "smol-toml": "^1.9.0"

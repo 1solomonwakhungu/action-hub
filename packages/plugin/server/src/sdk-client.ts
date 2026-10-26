@@ -19,7 +19,7 @@ import {
 } from "@action-hub/core";
 import { McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-const CLIENT_INFO = { name: "action-hub", version: "0.1.0" } as const; // x-release-please-version
+const CLIENT_INFO = { name: "action-hub", version: "0.1.1" } as const; // x-release-please-version
 
 export interface SdkClientFactoryOptions {
   /** Credential persistence. Defaults to the shared mode-0600 credential file. */
