@@ -599,7 +599,10 @@ export class ActionHub {
           name: record.name,
           summary: record.summary,
           description: record.description,
-          inputSchema: record.inputSchema ?? {},
+          // A copy, not the record's own schema: the returned object is host-
+          // facing, and a mutation through it would corrupt the exact schema
+          // execute-time validation runs against.
+          inputSchema: record.inputSchema ? structuredClone(record.inputSchema) : {},
           trust: record.trust,
         };
       },
@@ -636,7 +639,7 @@ export class ActionHub {
           name: record.name,
           summary: record.summary,
           description: record.description,
-          inputSchema: record.inputSchema ?? {},
+          inputSchema: record.inputSchema ? structuredClone(record.inputSchema) : {},
           trust: record.trust,
         }));
 
