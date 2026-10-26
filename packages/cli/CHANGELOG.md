@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.1](https://github.com/1solomonwakhungu/action-hub/compare/v0.1.0...v0.1.1) (2026-10-26)
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @action-hub/mcp-server bumped from 0.1.0 to 0.1.1
+    * @action-hub/core bumped from 0.1.0 to 0.1.1
+
 ## 0.1.0 (2026-10-17)
 
 

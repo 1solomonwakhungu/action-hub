@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/1solomonwakhungu/action-hub/compare/core-v0.1.0...core-v0.1.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **core:** isolate returned schemas and test MCP routing end to end ([#113](https://github.com/1solomonwakhungu/action-hub/issues/113)) ([dd5ffc2](https://github.com/1solomonwakhungu/action-hub/commit/dd5ffc2f361c9eca5f4925c2996ec8ab5caa8d46))
+
 ## 0.1.0 (2026-10-17)
 
 
