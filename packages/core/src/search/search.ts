@@ -390,7 +390,10 @@ function toHit(record: ActionRecord, score: number, includeSchema = false, seman
     summary: record.summary,
     score: Number(score.toFixed(6)),
     ...(semantic !== undefined ? { semantic: Number(semantic.toFixed(4)) } : {}),
-    ...(includeSchema && record.inputSchema ? { inputSchema: record.inputSchema } : {}),
+    // A copy, not the record's own schema: a search hit is host-facing, and a
+    // mutation through it would corrupt the schema execute-time validation
+    // runs against (same contract as load()).
+    ...(includeSchema && record.inputSchema ? { inputSchema: structuredClone(record.inputSchema) } : {}),
   };
 }
 
