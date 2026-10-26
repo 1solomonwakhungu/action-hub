@@ -161,7 +161,7 @@ test("an upstream server dying between index and execute fails the call and leav
   assert.ok(hits.some((hit) => hit.id === "slack:post_message"));
   const failed = await hub.execute("slack:post_message", { text: "hi" });
   assert.equal(failed.ok, false);
-  assert.match(failed.error ?? "", /slack-mcp exited|Connection failed|No fake client|Unknown|error/);
+  assert.match(failed.error ?? "", /slack-mcp exited/);
 
   // The failure is recorded and isolated: the healthy server keeps working.
   const last = hub.history()[hub.history().length - 1];
@@ -205,4 +205,40 @@ test("search with includeSchema also hands out a copy", async () => {
   assert.equal(result.ok, false);
   assert.match(result.error ?? "", /required property is missing/);
   assert.equal(clients.github.calls.length, 0);
+});
+
+test("the schema handed out by loadBundle is also a copy: mutating it cannot disable validation", async () => {
+  const clients = buildClients();
+  const { factory } = makeFactory(clients);
+  const hub = testActionHub({
+    servers,
+    clientFactory: factory,
+    bundles: [
+      {
+        id: "github:pr",
+        displayName: "PR Tools",
+        description: "Pull request tooling",
+        actionIds: ["github:create_pull_request"],
+        tags: ["github"],
+      },
+    ],
+  });
+  await hub.indexAll();
+
+  const bundle = hub.loadBundle("github:pr");
+  const bundled = bundle.actions.find((action) => action.id === "github:create_pull_request");
+  assert.ok(bundled, "the bundle must resolve the pull-request action");
+  const schema = bundled.inputSchema as Record<string, unknown>;
+  delete schema["required"];
+
+  const result = await hub.execute("github:create_pull_request", { draft: true });
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /required property is missing/);
+  assert.equal(clients.github.calls.length, 0, "invalid args must never reach the server");
+
+  // The catalog record is unchanged: a fresh bundle load still carries it.
+  const fresh = hub.loadBundle("github:pr");
+  const freshAction = fresh.actions.find((action) => action.id === "github:create_pull_request");
+  assert.ok(freshAction);
+  assert.deepEqual(freshAction.inputSchema["required"], ["title"]);
 });
