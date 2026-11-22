@@ -2,10 +2,37 @@
   "name": "@action-hub/cli",
   "version": "0.1.0",
   "description": "Developer CLI for Action Hub",
+  "mcpName": "io.github.1solomonwakhungu/action-hub",
   "type": "module",
   "license": "MIT",
+  "homepage": "https://1solomonwakhungu.github.io/action-hub/",
+  "bugs": {
+    "url": "https://github.com/1solomonwakhungu/action-hub/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1solomonwakhungu/action-hub.git",
+    "directory": "packages/cli"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "mcp-aggregator",
+    "ai-agents",
+    "claude-code",
+    "cursor",
+    "codex",
+    "tool-search",
+    "semantic-search",
+    "context-engineering",
+    "skills"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
-    "action-hub": "./dist/index.js"
+    "action-hub": "dist/index.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

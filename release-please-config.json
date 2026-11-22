@@ -23,7 +23,9 @@
       "include-component-in-tag": false,
       "extra-files": [
         { "type": "generic", "path": "src/version.ts" },
-        { "type": "generic", "path": "src/client-factory.ts" }
+        { "type": "generic", "path": "src/client-factory.ts" },
+        { "type": "json", "path": "/server.json", "jsonpath": "$.version" },
+        { "type": "json", "path": "/server.json", "jsonpath": "$.packages[0].version" }
       ]
     },
     "packages/core": {
