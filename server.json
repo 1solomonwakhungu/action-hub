@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.1solomonwakhungu/action-hub",
+  "title": "Action Hub",
+  "description": "One cache-stable MCP tool with offline semantic search and shared daemon for MCP servers and skills",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/1solomonwakhungu/action-hub",
+    "source": "github"
+  },
+  "websiteUrl": "https://1solomonwakhungu.github.io/action-hub/",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@action-hub/cli",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "start",
+          "isRequired": true,
+          "description": "Start Action Hub in foreground stdio MCP server mode"
+        }
+      ]
+    }
+  ]
+}

@@ -1,9 +1,34 @@
 {
   "name": "@action-hub/mcp-server",
   "version": "0.1.0",
-  "private": true,
   "description": "Meta-MCP server exposing the Action Hub catalog to any MCP host as a single tool",
   "license": "MIT",
+  "homepage": "https://1solomonwakhungu.github.io/action-hub/",
+  "bugs": {
+    "url": "https://github.com/1solomonwakhungu/action-hub/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1solomonwakhungu/action-hub.git",
+    "directory": "packages/plugin/server"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "mcp-aggregator",
+    "ai-agents",
+    "claude-code",
+    "cursor",
+    "codex",
+    "tool-search",
+    "semantic-search",
+    "context-engineering",
+    "skills"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,7 +42,7 @@
     "dist"
   ],
   "bin": {
-    "action-hub-mcp": "./dist/index.js"
+    "action-hub-mcp": "dist/index.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
