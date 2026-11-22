@@ -27,7 +27,7 @@ test('source-backed limitations and evaluation distinctions stay visible', () =>
   for (const phrase of [
     'Illustrative project figures', 'not universal MCP guarantees',
     'single-use and expire after five minutes', 'canonical argument hash',
-    'not yet', 'argument hash or upstream version', '30 goal-only queries',
+    'not yet', 'action_hub.approval.args_sha256', 'upstream server version is <em>not yet</em> emitted', '30 goal-only queries',
     'list_servers', 'Pinned bundles', 'not the shipped default',
     'metric to track, not an existing measured result',
     'current fixture has 121 rows',
