@@ -58,7 +58,8 @@ mode ([`release-please-config.json`](../release-please-config.json),
    `@action-hub/cli`, `@action-hub/core` and `@action-hub/mcp-server` in
    lockstep (the `linked-versions` plugin), updates each package's
    `CHANGELOG.md`, the root `package-lock.json`, the plugin manifest
-   (`packages/plugin/plugin.json`) and every source line annotated with
+   (`packages/plugin/plugin.json`), the Official MCP Registry manifest
+   (`server.json`), and every source line annotated with
    `x-release-please-version` (for example `packages/cli/src/version.ts`).
 3. Merging the release PR creates the tags and GitHub releases:
    `v<version>` for the CLI (the product release), plus `core-v<version>` and
@@ -148,9 +149,29 @@ safe to re-run: it skips a package that
   (the published package would not install), or
 - already has that exact version on the registry.
 
-Today `@action-hub/core` and `@action-hub/mcp-server` are private, so the CLI
-is skipped as well until they are made public. Preview what would happen with
+`@action-hub/core`, `@action-hub/mcp-server`, and `@action-hub/cli` are all
+public (`"publishConfig": { "access": "public" }`) and ready to publish via
+`scripts/publish-npm.mjs` once the `@action-hub` scope exists on npm and the
+`NPM_TOKEN` repository secret is configured. Preview what would happen with
 `npm run build && node scripts/publish-npm.mjs --dry-run`.
+
+## Official MCP Registry
+
+The root [`server.json`](../server.json) manifest registers Action Hub as
+`io.github.1solomonwakhungu/action-hub` in the
+[Official MCP Registry](https://registry.modelcontextprotocol.io/), pointing to
+the `@action-hub/cli` npm package (which carries the matching `mcpName` field
+for npm ownership verification) with `start` as its stdio positional argument.
+
+`release-please` keeps `server.json` (`$.version` and `$.packages[0].version`)
+in sync with `@action-hub/cli` on every release. Once a release is live on npm,
+publish the updated registry entry with the official
+[`mcp-publisher`](https://github.com/modelcontextprotocol/registry) CLI:
+
+```bash
+mcp-publisher login github
+mcp-publisher publish
+```
 
 ## Third-party license notice (SQ4)
 
