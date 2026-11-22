@@ -55,8 +55,11 @@ node --test stress/abstention-threshold.test.mjs       # pure parts + fixture
   errorRate-0 tools with schema-valid arguments).
 - **cache behaviour**: repeated identical read-only calls vs distinct-args
   calls of the same zero-latency tool (median repeat vs median distinct, plus
-  speedup). Indirect by necessity: the dispatch layer drops
-  `ExecuteResult.cached` (flagged finding), so the flag cannot be read.
+  speedup). Historically measured indirectly because the dispatch layer used
+  to drop `ExecuteResult.cached`; `packages/plugin/server/src/index.ts` now
+  forwards `cached: result.cached === true` in the `action_hub` execute
+  response, while `bench-load.mjs` keeps the repeat-vs-distinct latency probe
+  for cross-run continuity.
 - **token cost** of search(10) and load responses (~4 chars/token estimate).
 - **memory**: RSS sampled over the hub's recursive child tree every 250ms.
   Headline is `peakSimultaneousTreeRssKb` (sum across the tree within a single
@@ -201,16 +204,19 @@ and re-run before/after any optimization.
    restore path pays less than at small scale (~50% there). The bench gate
    is scale-aware (small: warm must be ≥20% faster; full: ≥15%) and treats
    this band as advisory — a full-scale rerun can flag while staying green.
-3. **`action_hub` execute response still drops `ExecuteResult.cached`** —
-   the bench measures cache effect indirectly via repeat-vs-distinct latency.
-   Corrected methodology (PR 101 rework): the distinct baseline now uses 100
-   PROVABLY unique schema-valid arg sets (cardinality asserted and reported
-   as `distinctArgSets` in the summary); the first rework iteration silently
-   measured only 2 unique sets (a boolean-only schema) and its ratios were
-   invalid. Corrected full-scale result: speedup http ~0.75, stdio ~1.6 —
-   the cache's full-scale benefit is marginal and noisy in both directions;
-   small scale (~1.2-2.2×) remains the cleaner signal. Do not cite the
-   pre-PR-101 full-scale cache ratios.
+3. **`action_hub` execute response now forwards `ExecuteResult.cached`
+   (`cached: result.cached === true`)** in
+   `packages/plugin/server/src/index.ts`. Historical methodology note: the
+   PR 101 benchmark measured cache effect indirectly via repeat-vs-distinct
+   latency because the dispatch layer previously dropped
+   `ExecuteResult.cached`. Under the corrected methodology (PR 101 rework),
+   the distinct baseline uses 100 PROVABLY unique schema-valid arg sets
+   (cardinality asserted and reported as `distinctArgSets` in the summary);
+   the first rework iteration silently measured only 2 unique sets (a
+   boolean-only schema) and its ratios were invalid. Corrected full-scale
+   result: speedup http ~0.75, stdio ~1.6 — the cache's full-scale benefit
+   is marginal and noisy in both directions; small scale (~1.2-2.2×) remains
+   the cleaner signal. Do not cite the pre-PR-101 full-scale cache ratios.
 4. **Daemon `start` passes at fleet scale** (PR 58 rerun: the daemon
    contract passes at full scale — 20/20 clients connect and complete
    searches, 0 errors). Current behavior: `daemon.ts` caps start at an

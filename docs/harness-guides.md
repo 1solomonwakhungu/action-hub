@@ -264,7 +264,13 @@ If the CLI is on your `PATH` (for example, installed via npm):
 action-hub daemon start
 ```
 
-Then set the command in each harness config to `action-hub connect`:
+For supported harnesses, you can wire up shared-daemon mode automatically instead of editing config files by hand:
+
+```bash
+action-hub harness <target> install --daemon --write
+```
+
+Or configure the harness manually by setting the command in each harness config to `action-hub connect`:
 
 ```json
 {
@@ -347,7 +353,7 @@ An optional flag makes the search say so instead:
   "search": {
     "abstention": {
       "enabled": false,
-      "threshold": 0.8
+      "threshold": 0.36
     }
   }
 }
@@ -360,12 +366,13 @@ An optional flag makes the search say so instead:
   keywords }] }` (the query itself is deliberately not echoed — every echoed
   field carries an output budget; `servers` is the compact server directory
   described under `list_servers`, capped at 64 rows).
-- `threshold` (default 0.8, clamped to [0, 1]): compared against the top
+- `threshold` (default **0.36**, clamped to [0, 1]): compared against the top
   hit's raw semantic score (`hits[0].semantic`), which is the MiniLM cosine
   under the default embeddings channel and the hashed-index cosine under the
   fallback channel; the fused ranking score is used only when no semantic
-  channel is active. **The 0.8 default is not calibrated for the current
-  production channel; see the calibration below before enabling the flag.**
+  channel is active. **0.36 is the MiniLM-calibrated default (replacing the
+  legacy pre-SQ4 0.8 default); still check the calibration below and re-run
+  against your own catalog before enabling `enabled: true`.**
   A query that matches a bundle never abstains: bundle discovery runs first
   and its matches are returned as usual.
 
@@ -402,23 +409,23 @@ Default channel (vendored MiniLM embeddings, RRF fusion):
 
 | Threshold | Correct retrievals refused (held) | Rank-1 matches refused | No-match abstained (held) |
 | --- | ---: | ---: | ---: |
-| 0.8 (shipped) | 31 / 31 (100%) | 24 / 24 | 35 / 35 |
+| 0.8 (legacy pre-SQ4 default) | 31 / 31 (100%) | 24 / 24 | 35 / 35 |
 | 0.4 | 5 / 31 (16%) | 3 / 24 | 35 / 35 |
-| 0.36 (tune pick) | 1 / 31 (3%) | 0 / 24 | 33 / 35 (94%): off-domain 14/14, adjacent 14/15, realistic 5/6 |
+| 0.36 (shipped default, tune pick) | 1 / 31 (3%) | 0 / 24 | 33 / 35 (94%): off-domain 14/14, adjacent 14/15, realistic 5/6 |
 | 0.3 | 0 / 31 | 0 / 24 | 29 / 35 (83%) |
 
 Correct held-out retrievals score 0.35 to 0.74 (median 0.53; rank-1
 matches median 0.55); no-match queries score 0 to 0.38 (median 0.07, 90th
-percentile 0.31). The two populations separate well, but at 0.8 the gate
-refuses every real match, including 183 of 183 synthetic exact-name lookups
-whose gold was in the top 10. Enabling the flag at the shipped default on
-the default channel turns search off.
+percentile 0.31). The two populations separate well, but at the legacy 0.8
+default the gate refused every real match, including 183 of 183 synthetic
+exact-name lookups whose gold was in the top 10 — enabling the flag at 0.8
+on the default channel turned search off.
 
 Fallback channel (dependency-free hashed index, blend fusion):
 
 | Threshold | Correct retrievals refused (held) | No-match abstained (held) |
 | --- | ---: | ---: |
-| 0.8 (shipped) | 5 / 27 (19%) | 34 / 35 |
+| 0.8 (legacy pre-SQ4 default) | 5 / 27 (19%) | 34 / 35 |
 | 0.48 (largest zero-refusal) | 0 / 27 | 6 / 35 (17%) |
 
 Here the populations overlap (correct matches 0.48 to 1.0, no-match 0.37 to
@@ -427,22 +434,22 @@ queries.
 
 What this means for the defaults:
 
-- **The flag stays off by default.** The decision rule in the script
-  (at most 2% of correct retrievals refused and at least 80% of no-match
-  queries abstained, on the held split of every channel, at the shipped
-  threshold) fails on both channels at 0.8. The shipped threshold is left
-  unchanged in this change; the measured operating point is documented here
-  for the owner to adopt deliberately.
-- **If you enable the flag on the default channel, set `threshold` near
-  0.36**, then re-run the script against your own catalog. That point
-  refused 1 of 31 held-out correct retrievals (3%, above the 2% bar on a
-  base of 31: "turn down that onboarding request" at 0.355) and abstained
-  on 33 of 35 no-match queries. Across all 87 negatives only four score
-  above 0.36, and they are the asks that borrow catalog vocabulary:
-  "translate the onboarding email into japanese" (0.53, nearest hit
-  `globex-email:update_onboarding`), "edit the red eye out of this photo"
-  (0.44), "track my daily step count" (0.38), and "reschedule my dentist
-  appointment to friday" (0.37).
+- **The flag stays off by default (`enabled: false`), while `threshold` now
+  ships at `0.36`.** The decision rule in the script (at most 2% of correct
+  retrievals refused and at least 80% of no-match queries abstained, on the
+  held split of every channel) is not met across both channels, so abstention
+  remains opt-in. Recalibrating the shipped default from the legacy pre-SQ4
+  `0.8` to `0.36` ensures opting in works sensibly on the default MiniLM
+  channel instead of refusing every real match.
+- **Re-run the script against your own catalog before enabling.** On the
+  held-out MiniLM split, `0.36` refused 1 of 31 held-out correct retrievals
+  (3%, above the 2% bar on a base of 31: "turn down that onboarding request"
+  at 0.355), refused 0 of 24 rank-1 matches, and abstained on 33 of 35
+  no-match queries. Across all 87 negatives only four score above 0.36, and
+  they are the asks that borrow catalog vocabulary: "translate the onboarding
+  email into japanese" (0.53, nearest hit `globex-email:update_onboarding`),
+  "edit the red eye out of this photo" (0.44), "track my daily step count"
+  (0.38), and "reschedule my dentist appointment to friday" (0.37).
 - **A 0.36 threshold is harmless under fallback.** If the embedding model
   fails to load and the hub degrades to the hashed scorer, 0.36 sits below
   every correct retrieval observed (minimum 0.49) and below all but three
@@ -451,8 +458,8 @@ What this means for the defaults:
 - **The held base is still thin.** 31 correct retrievals and 35 negatives
   per channel give a few-percent resolution at best. Add rows to
   `stress/fixtures/no-match-queries.json` (banded, validated by
-  `stress/abstention-threshold.test.mjs`) and re-run before changing any
-  default.
+  `stress/abstention-threshold.test.mjs`) and re-run before enabling
+  abstention by default or further tuning the threshold.
 
 Reproduce: `node stress/gen-tools.mjs && node stress/gen-skills.mjs && node
 stress/abstention-threshold.mjs --semantic both`. The summary lands in

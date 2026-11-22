@@ -16,7 +16,7 @@ import {
   discoverSkillsFromDirectory,
   type ActionHubOptions,
 } from "@action-hub/core";
-import { defaultConfigPath, loadConfig } from "./config.js";
+import { DEFAULT_ABSTENTION_THRESHOLD, defaultConfigPath, loadConfig } from "./config.js";
 import { createSdkClientFactory } from "./sdk-client.js";
 import { warn, writeSnapshot, SnapshotDebouncer } from "./snapshot.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
@@ -491,7 +491,10 @@ async function dispatch(
   configHash: string,
   cache: CatalogCache,
   snapshots?: Pick<SnapshotDebouncer, "markDirty" | "flush">,
-  abstention: { enabled: boolean; threshold: number } = { enabled: false, threshold: 0.8 },
+  abstention: { enabled: boolean; threshold: number } = {
+    enabled: false,
+    threshold: DEFAULT_ABSTENTION_THRESHOLD,
+  },
 ): Promise<unknown> {
   switch (input.operation) {
     case "search": {
@@ -511,14 +514,13 @@ async function dispatch(
       // is a confident capability the flag must not hide. The echoed query
       // is deliberately omitted — every echoed field on this server carries
       // an explicit output budget, and the agent already knows its own
-      // query. Calibration: the original 0.8 figure (SQ1 2d, "0/51 real
-      // matches refused, 5/7 no-match abstained, 12 negatives") was measured
-      // on the fused blend score before SQ4 and no longer describes this
-      // gate. The held-out recalibration on the raw semantic cosine lives in
-      // stress/abstention-threshold.mjs and docs/harness-guides.md; at 0.8
-      // on the default embeddings channel it refuses every real match, so
-      // the flag stays off and the threshold must be recalibrated per
-      // catalog before enabling it.
+      // query. Calibration: the legacy pre-SQ4 0.8 figure (measured on the
+      // fused blend score) refused 31/31 real matches on the MiniLM cosine
+      // channel. Held-out recalibration (`stress/abstention-threshold.mjs`
+      // and `docs/harness-guides.md`) selected 0.36 as the shipped default
+      // (30/31 real matches retained, 33/35 no-match queries abstained, and
+      // harmless under the hashed fallback); the flag remains default-off so
+      // operators can calibrate against their own catalog before opting in.
       const matchingBundles = hub.searchBundles(input.query ?? "");
       if (abstention.enabled && matchingBundles.length === 0) {
         // Confidence keys on the RAW semantic score when the channel is

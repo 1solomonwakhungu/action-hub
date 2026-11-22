@@ -4,6 +4,7 @@ import {
   ActionHub,
   ACTION_HUB_ATTRIBUTES,
   SpanStatusCode,
+  fingerprintArguments,
   trace,
   context,
   propagation,
@@ -298,6 +299,7 @@ test("instrumentation: execute - success outcome sets status ok and records safe
   assert.equal("title" in span.attributes, false);
   assert.equal("args" in span.attributes, false);
   assert.equal("Telemetry Support" in Object.values(span.attributes), false);
+  assert.equal(span.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], undefined);
 });
 
 test("instrumentation: execute - policy rejection outcome sets rejected status and reason", async () => {
@@ -330,6 +332,9 @@ test("instrumentation: execute - approval-required outcome sets approval attribu
   const { hub } = buildTestHub(tracer);
   await hub.indexAll();
 
+  const expectedArgsSha = fingerprintArguments({ channel: "dev" });
+  assert.match(expectedArgsSha, /^[0-9a-f]{64}$/);
+
   // First call: approval required
   tracer.spans.length = 0;
   const result1 = await hub.execute("slack:post_message", { channel: "dev" });
@@ -344,6 +349,7 @@ test("instrumentation: execute - approval-required outcome sets approval attribu
   assert.equal(span1.attributes[ACTION_HUB_ATTRIBUTES.STATUS], "approval_required");
   assert.equal(span1.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS], "required");
   assert.equal(span1.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_REQUIRED], true);
+  assert.equal(span1.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], expectedArgsSha);
   assert.equal(span1.attributes[ACTION_HUB_ATTRIBUTES.ERROR_CODE], "approval_required");
 
   // Second call with approval token: approved execution succeeds
@@ -363,6 +369,7 @@ test("instrumentation: execute - approval-required outcome sets approval attribu
   assert.equal(span2.attributes[ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS], "success");
   assert.equal(span2.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS], "approved");
   assert.equal(span2.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_HAS_TOKEN], true);
+  assert.equal(span2.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], expectedArgsSha);
 
   // Third call with already consumed token: approval rejected
   tracer.spans.length = 0;
@@ -379,7 +386,82 @@ test("instrumentation: execute - approval-required outcome sets approval attribu
   assert.equal(span3.endCount, 1);
   assert.equal(span3.attributes[ACTION_HUB_ATTRIBUTES.EXECUTION_STATUS], "rejected");
   assert.equal(span3.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS], "rejected");
+  assert.equal(span3.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], expectedArgsSha);
   assert.equal(span3.attributes[ACTION_HUB_ATTRIBUTES.ERROR_CODE], "approval_rejected");
+});
+
+test("instrumentation: execute - approval.args_sha256 is canonical, covers mismatches, and leaks no raw values", async () => {
+  const tracer = new InMemoryTestTracer();
+  const { hub } = buildTestHub(tracer);
+  await hub.indexAll();
+
+  const secretValue = "sk-live-super-secret-value-999";
+  const originalArgs = { channel: "dev", text: secretValue, meta: { b: 2, a: 1 } };
+  const reorderedArgs = { meta: { a: 1, b: 2 }, text: secretValue, channel: "dev" };
+  const expectedOriginalSha = fingerprintArguments(originalArgs);
+  assert.match(expectedOriginalSha, /^[0-9a-f]{64}$/);
+
+  // 1. Approval-required call records canonical SHA-256 without raw values
+  tracer.spans.length = 0;
+  const req = await hub.execute("slack:post_message", originalArgs);
+  assert.equal(req.ok, false);
+  assert.ok(req.approval?.approvalToken);
+
+  const reqSpan = tracer.spans.find((s) => s.name === "action_hub.execute");
+  assert.ok(reqSpan);
+  assert.equal(reqSpan.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], expectedOriginalSha);
+  assert.equal(JSON.stringify(reqSpan.attributes).includes(secretValue), false);
+
+  // 2. Approved call with reordered keys produces the exact same SHA-256
+  tracer.spans.length = 0;
+  const approved = await hub.execute("slack:post_message", reorderedArgs, {
+    approvalToken: req.approval.approvalToken,
+  });
+  assert.equal(approved.ok, true);
+
+  const approvedSpan = tracer.spans.find((s) => s.name === "action_hub.execute");
+  assert.ok(approvedSpan);
+  assert.equal(approvedSpan.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS], "approved");
+  assert.equal(approvedSpan.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], expectedOriginalSha);
+  assert.equal(JSON.stringify(approvedSpan.attributes).includes(secretValue), false);
+
+  // 3. Rejected call with mismatched arguments records SHA-256 of the attempted args
+  const req2 = await hub.execute("slack:post_message", originalArgs);
+  assert.ok(req2.approval?.approvalToken);
+
+  const tamperedSecret = "sk-live-tampered-secret-000";
+  const attemptedArgs = { channel: "prod", text: tamperedSecret };
+  const expectedAttemptedSha = fingerprintArguments(attemptedArgs);
+  assert.notEqual(expectedAttemptedSha, expectedOriginalSha);
+
+  tracer.spans.length = 0;
+  const rejected = await hub.execute("slack:post_message", attemptedArgs, {
+    approvalToken: req2.approval.approvalToken,
+  });
+  assert.equal(rejected.ok, false);
+
+  const rejectedSpan = tracer.spans.find((s) => s.name === "action_hub.execute");
+  assert.ok(rejectedSpan);
+  assert.equal(rejectedSpan.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS], "rejected");
+  assert.equal(rejectedSpan.attributes[ACTION_HUB_ATTRIBUTES.ERROR_CODE], "approval_rejected");
+  assert.equal(rejectedSpan.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], expectedAttemptedSha);
+  assert.equal(JSON.stringify(rejectedSpan.attributes).includes(tamperedSecret), false);
+  assert.equal(JSON.stringify(rejectedSpan.attributes).includes(secretValue), false);
+
+  // 4. Fail-closed denyOnApprovalRequired path also records args_sha256 without raw values
+  const denyTracer = new InMemoryTestTracer();
+  const { hub: denyHub } = buildTestHub(denyTracer, { denyOnApprovalRequired: true });
+  await denyHub.indexAll();
+
+  denyTracer.spans.length = 0;
+  const denied = await denyHub.execute("slack:post_message", originalArgs);
+  assert.equal(denied.ok, false);
+
+  const deniedSpan = denyTracer.spans.find((s) => s.name === "action_hub.execute");
+  assert.ok(deniedSpan);
+  assert.equal(deniedSpan.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_STATUS], "required");
+  assert.equal(deniedSpan.attributes[ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256], expectedOriginalSha);
+  assert.equal(JSON.stringify(deniedSpan.attributes).includes(secretValue), false);
 });
 
 test("instrumentation: execute - timeout outcome sets timed_out status and error code", async () => {
