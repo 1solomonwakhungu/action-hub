@@ -3,7 +3,7 @@
   "name": "io.github.1solomonwakhungu/action-hub",
   "title": "Action Hub",
   "description": "One cache-stable MCP tool with offline semantic search and shared daemon for MCP servers and skills",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "repository": {
     "url": "https://github.com/1solomonwakhungu/action-hub",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "identifier": "@action-hub/cli",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "transport": {
         "type": "stdio"
       },
