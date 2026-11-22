@@ -421,3 +421,143 @@ test("pi agent-dir resolution mirrors pi getAgentDir/normalizePath", async () =>
     }
   });
 });
+
+test("harness --daemon emits connect in export mode across JSON and TOML targets with stderr note", async () => {
+  await withTempHome(async () => {
+    const jsonTargets: Array<{ target: string; serversKey: string }> = [
+      { target: "claude-code", serversKey: "mcpServers" },
+      { target: "cursor", serversKey: "mcpServers" },
+      { target: "vscode", serversKey: "servers" },
+    ];
+    for (const { target, serversKey } of jsonTargets) {
+      const { stdout, stderr } = await captureOutput(() =>
+        harnessCommand(target, { mode: "export", json: true, daemon: true }),
+      );
+      const doc = JSON.parse(stdout) as Record<
+        string,
+        Record<string, { command: string; args: string[] }>
+      >;
+      const entry = doc[serversKey]?.["action-hub"];
+      assert.ok(entry, `${target}: action-hub entry present`);
+      assert.equal(entry.args.at(-1), "connect", `${target}: emits connect in daemon mode`);
+      assert.match(stderr, /action-hub daemon start/, `${target}: daemon start note on stderr`);
+    }
+
+    // OpenCode uses a single `command` array under `mcp`
+    const openCode = await captureOutput(() =>
+      harnessCommand("opencode", { mode: "export", json: true, daemon: true }),
+    );
+    const openCodeDoc = JSON.parse(openCode.stdout) as {
+      mcp?: Record<string, { type?: string; command?: string[] }>;
+    };
+    const openCodeEntry = openCodeDoc.mcp?.["action-hub"];
+    assert.ok(openCodeEntry, "opencode: action-hub entry present");
+    assert.equal(openCodeEntry.type, "local");
+    assert.equal(openCodeEntry.command?.at(-1), "connect", "opencode: command array ends with connect");
+    assert.match(openCode.stderr, /action-hub daemon start/, "opencode: daemon start note on stderr");
+
+    // Codex emits TOML
+    const codex = await captureOutput(() =>
+      harnessCommand("codex", { mode: "export", daemon: true }),
+    );
+    const tomlLines = codex.stdout
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n");
+    const codexDoc = tomlParse(tomlLines) as {
+      mcp_servers?: Record<string, { command: string; args: string[] }>;
+    };
+    assert.equal(
+      codexDoc.mcp_servers?.["action-hub"]?.args.at(-1),
+      "connect",
+      "codex: TOML export emits connect",
+    );
+    assert.match(codex.stdout, /install --write --daemon/, "codex: hint preserves --daemon");
+    assert.match(codex.stderr, /action-hub daemon start/, "codex: daemon start note on stderr");
+  });
+});
+
+test("harness --daemon writes connect in install --write mode across JSON and TOML targets", async () => {
+  await withTempHome(async (home) => {
+    // claude-code
+    const cc = await captureOutput(() =>
+      harnessCommand("claude-code", { mode: "install", write: true, daemon: true }),
+    );
+    const ccDoc = JSON.parse(await readFile(HARNESS_DEFS["claude-code"].configPath(home), "utf8")) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+    };
+    assert.equal(ccDoc.mcpServers["action-hub"]?.args.at(-1), "connect");
+    assert.match(cc.stderr, /action-hub daemon start/);
+
+    // cursor
+    const cur = await captureOutput(() =>
+      harnessCommand("cursor", { mode: "install", write: true, daemon: true }),
+    );
+    const curDoc = JSON.parse(await readFile(HARNESS_DEFS.cursor.configPath(home), "utf8")) as {
+      mcpServers: Record<string, { command: string; args: string[] }>;
+    };
+    assert.equal(curDoc.mcpServers["action-hub"]?.args.at(-1), "connect");
+    assert.match(cur.stderr, /action-hub daemon start/);
+
+    // opencode
+    const oc = await captureOutput(() =>
+      harnessCommand("opencode", { mode: "install", write: true, daemon: true }),
+    );
+    const ocDoc = JSON.parse(await readFile(HARNESS_DEFS.opencode.configPath(home), "utf8")) as {
+      mcp: Record<string, { type: string; command: string[] }>;
+    };
+    assert.equal(ocDoc.mcp["action-hub"]?.command.at(-1), "connect");
+    assert.match(oc.stderr, /action-hub daemon start/);
+
+    // vscode
+    const vs = await captureOutput(() =>
+      harnessCommand("vscode", { mode: "install", write: true, daemon: true }),
+    );
+    const vsDoc = JSON.parse(await readFile(HARNESS_DEFS.vscode.configPath(home), "utf8")) as {
+      servers: Record<string, { command: string; args: string[] }>;
+    };
+    assert.equal(vsDoc.servers["action-hub"]?.args.at(-1), "connect");
+    assert.match(vs.stderr, /action-hub daemon start/);
+
+    // codex (TOML)
+    const cx = await captureOutput(() =>
+      harnessCommand("codex", { mode: "install", write: true, daemon: true }),
+    );
+    const cxDoc = tomlParse(await readFile(HARNESS_DEFS.codex.configPath(home), "utf8")) as {
+      mcp_servers?: Record<string, { command: string; args: string[] }>;
+    };
+    assert.equal(cxDoc.mcp_servers?.["action-hub"]?.args.at(-1), "connect");
+    assert.match(cx.stderr, /action-hub daemon start/);
+  });
+});
+
+test("CLI parses harness --daemon flag in export and install modes regardless of flag position", async () => {
+  const bin = fileURLToPath(new URL("../dist/index.js", import.meta.url));
+  const tempHome = await mkdtemp(join(tmpdir(), "action-hub-harness-daemon-cli-"));
+  const env = { ...process.env, HOME: tempHome, XDG_CONFIG_HOME: join(tempHome, ".config") };
+  try {
+    // Flag before positional target
+    const exp = spawnSync(process.execPath, [bin, "harness", "--daemon", "cursor", "export", "--json"], {
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(exp.status, 0, `export failed: ${exp.stderr}`);
+    const expDoc = JSON.parse(exp.stdout) as { mcpServers: Record<string, { args: string[] }> };
+    assert.equal(expDoc.mcpServers["action-hub"]?.args.at(-1), "connect");
+    assert.match(exp.stderr, /action-hub daemon start/);
+
+    // Install codex with --daemon
+    const inst = spawnSync(process.execPath, [bin, "harness", "codex", "install", "--write", "--daemon"], {
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(inst.status, 0, `install failed: ${inst.stderr}`);
+    const codexDoc = tomlParse(await readFile(join(tempHome, ".codex", "config.toml"), "utf8")) as {
+      mcp_servers?: Record<string, { args: string[] }>;
+    };
+    assert.equal(codexDoc.mcp_servers?.["action-hub"]?.args.at(-1), "connect");
+    assert.match(inst.stderr, /action-hub daemon start/);
+  } finally {
+    await rm(tempHome, { recursive: true, force: true });
+  }
+});
