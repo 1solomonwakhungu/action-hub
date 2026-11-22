@@ -817,6 +817,13 @@ export class ActionHub {
         let approved = false;
         if (decision.requiresApproval) {
           const reason = decision.reason ?? `Server "${record.serverId}" is ${record.trust}`;
+          // Correlate approval_required, approved, and rejected execute spans
+          // with the exact canonical argument digest bound into the token,
+          // without ever attaching raw argument values.
+          span.setAttribute(
+            ACTION_HUB_ATTRIBUTES.APPROVAL_ARGS_SHA256,
+            fingerprintArguments(args),
+          );
 
           if (options.approvalToken) {
             const check = this.#approvals.consume(options.approvalToken, actionId, args);

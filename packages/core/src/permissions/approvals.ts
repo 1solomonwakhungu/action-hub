@@ -172,10 +172,12 @@ export class ApprovalRegistry {
 }
 
 /**
- * Stable, order-independent hash of an argument payload.
+ * Stable, order-independent 64-character hex SHA-256 digest of an argument payload.
  *
  * Key order is normalized so `{a, b}` and `{b, a}` approve the same call, while
- * any change to a value produces a different digest.
+ * any change to a value produces a different digest. Shared between approval
+ * token binding and the `action_hub.approval.args_sha256` OTel span attribute
+ * so both always agree without exposing raw argument values.
  */
 export function fingerprintArguments(args: Record<string, unknown>): string {
   return createHash("sha256").update(stableStringify(args)).digest("hex");

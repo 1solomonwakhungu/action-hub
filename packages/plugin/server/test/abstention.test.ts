@@ -4,7 +4,7 @@ import { ActionHub, CatalogCache } from "@action-hub/core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../dist/index.js";
-import { loadConfig } from "../dist/config.js";
+import { DEFAULT_ABSTENTION_THRESHOLD, loadConfig } from "../dist/config.js";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,9 +17,10 @@ import type { HubRuntime } from "../dist/index.js";
  * hit scores below the calibrated threshold returns an additive,
  * backward-compatible response: empty results + abstained/reason/threshold/
  * closestMatch instead of presenting low-confidence hits as facts.
- * Calibration (SQ1 2d, disjoint rows, 15K self-mode corpus): threshold 0.8
- * refused 0/51 real matches and abstained 5/7 no-match queries; caveat: only
- * 12 negative rows — a thin calibration base, hence the flag defaulting off.
+ * Held-out MiniLM calibration (2026-10-11, docs/harness-guides.md): legacy
+ * pre-SQ4 threshold 0.8 refused 31/31 real matches on the MiniLM cosine
+ * channel; recalibrated default 0.36 retains 30/31 real matches (24/24
+ * rank-1) and abstains 33/35 no-match queries, while keeping enabled=false.
  */
 
 const FAKE_CLIENT = {
@@ -82,7 +83,7 @@ async function callSearch(runtime: HubRuntime, query: string): Promise<Record<st
 }
 
 test("SQ3: the flag is OFF by default — search behaves exactly as before", async () => {
-  const runtime = buildRuntime({ enabled: false, threshold: 0.8 });
+  const runtime = buildRuntime({ enabled: false, threshold: DEFAULT_ABSTENTION_THRESHOLD });
   await runtime.hub.indexAll();
   await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
   const payload = await callSearch(runtime, "zzqx jabberwocky flimflam gibberish");
@@ -95,7 +96,7 @@ test("SQ3: the flag is OFF by default — search behaves exactly as before", asy
 });
 
 test("SQ3: flag ON — a below-threshold search abstains with an additive response", async () => {
-  const runtime = buildRuntime({ enabled: true, threshold: 0.8 });
+  const runtime = buildRuntime({ enabled: true, threshold: DEFAULT_ABSTENTION_THRESHOLD });
   await runtime.hub.indexAll();
   await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
   const payload = await callSearch(runtime, "zzqx jabberwocky flimflam gibberish");
@@ -103,7 +104,7 @@ test("SQ3: flag ON — a below-threshold search abstains with an additive respon
   assert.equal(payload["reason"], "no_confident_match");
   assert.equal(payload["count"], 0);
   assert.deepEqual(payload["results"], []);
-  assert.equal(payload["threshold"], 0.8);
+  assert.equal(payload["threshold"], DEFAULT_ABSTENTION_THRESHOLD);
   const closest = payload["closestMatch"] as { id?: string; score?: number } | null;
   assert.ok(closest && typeof closest.id === "string" && typeof closest.score === "number",
     "closestMatch preserves the near miss");
@@ -113,8 +114,18 @@ test("SQ3: flag ON — a confident match still returns results, no abstention ke
   // SQ4 recalibration: confidence keys on the RAW SEMANTIC cosine now
   // (see the abstention implementation note) — measured on this 2-tool
   // fixture: "deploy a service" 0.693, "lookup_thing" 0.357, gibberish
-  // 0.036. The threshold must be recalibrated per catalog, which is why the
-  // flag ships default-off.
+  // 0.036. At the shipped 0.36 default, natural-language matches like
+  // "deploy a service" return results; lower thresholds also admit
+  // snake_case identifiers like "lookup_thing".
+  const defaultRuntime = buildRuntime({ enabled: true, threshold: DEFAULT_ABSTENTION_THRESHOLD });
+  await defaultRuntime.hub.indexAll();
+  await defaultRuntime.hub.semanticReady();
+  const deployPayload = await callSearch(defaultRuntime, "deploy a service");
+  assert.equal(deployPayload["abstained"], undefined, "a real match must never be refused at the 0.36 default");
+  assert.ok((deployPayload["count"] as number) > 0);
+  const deployResults = deployPayload["results"] as Array<{ action_id?: string }>;
+  assert.ok(deployResults.some((r) => r.action_id === "readmod:deploy_service"));
+
   const runtime = buildRuntime({ enabled: true, threshold: 0.3 });
   await runtime.hub.indexAll();
   await runtime.hub.semanticReady(); // SQ4: vectors are embedded off the indexAll critical path
@@ -126,6 +137,7 @@ test("SQ3: flag ON — a confident match still returns results, no abstention ke
 });
 
 test("SQ3: config parsing — enabled flag, threshold clamped into [0,1], defaults", async () => {
+  assert.equal(DEFAULT_ABSTENTION_THRESHOLD, 0.36, "recalibrated MiniLM default threshold");
   const dir = await mkdtemp(join(tmpdir(), "hub-abstain-"));
   const path = join(dir, "servers.json");
   await writeFile(path, JSON.stringify({
@@ -136,10 +148,10 @@ test("SQ3: config parsing — enabled flag, threshold clamped into [0,1], defaul
   assert.deepEqual(config.searchAbstention, { enabled: true, threshold: 1 }, "threshold clamped to 1");
   await writeFile(path, JSON.stringify({ servers: [], search: { abstention: { enabled: true } } }), "utf8");
   const defaulted = await loadConfig(path);
-  assert.deepEqual(defaulted.searchAbstention, { enabled: true, threshold: 0.8 }, "calibrated default threshold");
+  assert.deepEqual(defaulted.searchAbstention, { enabled: true, threshold: 0.36 }, "calibrated default threshold");
   await writeFile(path, JSON.stringify({ servers: [] }), "utf8");
   const off = await loadConfig(path);
-  assert.deepEqual(off.searchAbstention, { enabled: false, threshold: 0.8 }, "default OFF");
+  assert.deepEqual(off.searchAbstention, { enabled: false, threshold: 0.36 }, "default OFF with calibrated threshold");
 });
 
 
