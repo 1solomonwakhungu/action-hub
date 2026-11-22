@@ -57,6 +57,7 @@ export const ACTION_HUB_ATTRIBUTES = {
   APPROVAL_HAS_TOKEN: "action_hub.approval.has_token",
   APPROVAL_STATUS: "action_hub.approval.status",
   APPROVAL_REQUIRED: "action_hub.approval.required",
+  APPROVAL_ARGS_SHA256: "action_hub.approval.args_sha256",
 
   // Errors & Rejections
   ERROR_CODE: "action_hub.error.code",
