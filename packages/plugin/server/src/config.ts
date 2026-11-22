@@ -101,13 +101,22 @@ export async function loadConfig(path: string): Promise<HubConfig> {
   };
 }
 
-const DEFAULT_ABSTENTION_THRESHOLD = 0.8;
+/**
+ * Default semantic-cosine threshold for optional search abstention.
+ *
+ * Recalibrated from the legacy pre-SQ4 value (`0.8`) using the held-out
+ * MiniLM calibration in `docs/harness-guides.md`: `0.8` refused 31/31 real
+ * matches on the default MiniLM embeddings channel, while `0.36` retained
+ * 30/31 real matches (24/24 rank-1) and abstained 33/35 no-match queries
+ * (and remains harmless under the hashed fallback).
+ */
+export const DEFAULT_ABSTENTION_THRESHOLD = 0.36;
 
 /**
- * SQ3 (F49 pt2): parse the flagged search-abstention settings. Default OFF —
- * intake decides the production default from the calibration data. The
- * threshold is clamped into [0,1] rather than rejected so a nonsense value
- * cannot stop the hub booting.
+ * SQ3 (F49 pt2): parse the flagged search-abstention settings. Default OFF
+ * (`enabled: false`) so operators opt in deliberately after checking their own
+ * catalog. The threshold is clamped into [0,1] rather than rejected so a
+ * nonsense value cannot stop the hub booting.
  */
 function parseSearchAbstention(value: {
   enabled?: unknown;

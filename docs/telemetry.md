@@ -11,7 +11,7 @@ Action Hub incorporates OpenTelemetry instrumentation across its core operations
 
 2. **Strict Privacy & Low Cardinality**  
    Span attributes capture operational health, latency, payload sizes, token savings, and error categories. They deliberately omit:
-   - Tool arguments and invocation parameters
+   - Tool arguments and invocation parameters (approval-gated executions record only a 64-char canonical SHA-256 digest via `action_hub.approval.args_sha256`)
    - Tool execution results or outputs
    - Full JSON schemas
    - Credentials, tokens, or auth headers
@@ -55,6 +55,7 @@ All attributes use the `action_hub.` namespace:
 | `action_hub.approval.status` | string | `execute` | Approval status: `none`, `required`, `approved`, or `rejected`. |
 | `action_hub.approval.required` | bool | `execute` | True if the action required interactive approval. |
 | `action_hub.approval.has_token` | bool | `execute` | True if the execution carried an approval token. |
+| `action_hub.approval.args_sha256` | string | `execute` | 64-character lowercase hex SHA-256 digest of the canonicalized arguments when an execution hits the approval gate (`required`, `approved`, or `rejected`), matching the approval token binding without recording raw argument values. |
 | `action_hub.error.code` | string | on error | Machine-readable error code (see below). |
 | `action_hub.error.reason` | string | on error | Diagnostic description of failure or policy rejection. |
 | `action_hub.error.class` | string | on error | JavaScript error constructor name. |
