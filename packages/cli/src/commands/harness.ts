@@ -30,13 +30,16 @@ const writeFileP = promisify(writeFile);
  *     the original)
  *   - `--config <path>` is exported as ACTION_HUB_CONFIG in the snippet
  *
- * The emitted server command runs this CLI itself (`action-hub start`):
+ * The emitted server command runs this CLI itself (`action-hub start`, or
+ * `action-hub connect` when `--daemon` is passed):
  *   - standalone SEA binary: command is the binary itself (process.execPath)
  *   - running under node: command is literally `node` (never an absolute
  *     node path — some harnesses spawn snippets in environments with a
- *     different/absent node) with args [<realpath of CLI entry>, start]
+ *     different/absent node) with args [<realpath of CLI entry>, start|connect]
  *   - `--node <path>` overrides the node command for GUI harnesses that
  *     cannot find node on PATH (e.g. nvm installs)
+ *   - `--daemon` emits `connect` instead of `start` so the harness proxies
+ *     to the shared background daemon (`action-hub daemon start`)
  *
  * When the snippet uses the bare `node` default (non-SEA, no `--node`), a
  * stderr note explains that node is resolved on the harness's PATH and how
@@ -72,6 +75,8 @@ export interface HarnessOptions {
   mode?: HarnessMode;
   /** Override the node command used in snippets (GUI harnesses off-PATH). */
   node?: string;
+  /** Emit `connect` instead of `start` to proxy to the shared background daemon. */
+  daemon?: boolean;
 }
 
 /** command/args pair used by most harnesses and by the TOML (codex) writer. */
@@ -95,13 +100,15 @@ interface HarnessDef {
   note?: string;
 }
 
-/** Build the command that runs this CLI's `start` subcommand. */
+/** Build the command that runs this CLI's `start` (or `connect` in daemon mode) subcommand. */
 async function cliServerEntry(
   configPath?: string,
   nodePath?: string,
+  daemon?: boolean,
 ): Promise<{ entry: ServerEntry; inSea: boolean }> {
-  // Standalone (SEA) binary: the binary itself, start.
-  // Node entrypoint: bare `node` <realpath of this CLI>, start.
+  // Standalone (SEA) binary: the binary itself, start|connect.
+  // Node entrypoint: bare `node` <realpath of this CLI>, start|connect.
+  const subcommand = daemon ? "connect" : "start";
   let sea: { isSea?: () => boolean } | undefined;
   try {
     sea = (await import("node:sea")) as { isSea?: () => boolean };
@@ -111,13 +118,13 @@ async function cliServerEntry(
   const inSea = typeof sea?.isSea === "function" && sea.isSea();
   const entry: ServerEntry = inSea
     ? // The SEA binary is the action-hub executable itself.
-      { command: process.execPath, args: ["start"] }
+      { command: process.execPath, args: [subcommand] }
     : {
         // Bare command resolved on the harness's PATH; an absolute
         // process.execPath would break when the harness env has a
         // different (or no) node install.
         command: nodePath ?? "node",
-        args: [realpathSync(process.argv[1] ?? "action-hub"), "start"],
+        args: [realpathSync(process.argv[1] ?? "action-hub"), subcommand],
       };
   if (configPath) {
     entry.env = { ACTION_HUB_CONFIG: configPath };
@@ -440,14 +447,20 @@ function fail(message: string): number {
   return 1;
 }
 
-/** Post-action stderr notes (adapter prerequisite, node PATH hint). */
+/** Post-action stderr notes (adapter prerequisite, daemon reminder, node PATH hint). */
 function printNotes(
   def: HarnessDef,
   serverEntry: ServerEntry,
   inSea: boolean,
   nodePath?: string,
+  daemon?: boolean,
 ): void {
   if (def.note) console.error(`note: ${def.note}`);
+  if (daemon) {
+    console.error(
+      `note: daemon mode connects to the shared Action Hub daemon; start it with "action-hub daemon start" before launching ${def.label}`,
+    );
+  }
   // Only the bare `node` default depends on the harness's PATH: an explicit
   // --node already pins the binary, and a SEA binary is the executable itself.
   if (!inSea && !nodePath) {
@@ -481,6 +494,7 @@ export async function harnessCommand(
   const { entry: serverEntry, inSea } = await cliServerEntry(
     options.configPath,
     options.node,
+    options.daemon,
   );
 
   if (mode === "install") {
@@ -497,7 +511,7 @@ export async function harnessCommand(
       );
     }
     console.log(`Wrote Action Hub MCP server to ${filePath} for ${def.label}.`);
-    printNotes(def, serverEntry, inSea, options.node);
+    printNotes(def, serverEntry, inSea, options.node, options.daemon);
     return 0;
   }
 
@@ -522,11 +536,12 @@ export async function harnessCommand(
     console.log(JSON.stringify(fragment, null, 2));
   }
   if (!options.json) {
+    const daemonFlag = options.daemon ? " --daemon" : "";
     console.log(
-      `\n# To write this automatically, run: action-hub harness ${target} install --write`,
+      `\n# To write this automatically, run: action-hub harness ${target} install --write${daemonFlag}`,
     );
   }
-  printNotes(def, serverEntry, inSea, options.node);
+  printNotes(def, serverEntry, inSea, options.node, options.daemon);
   return 0;
 }
 
@@ -546,6 +561,8 @@ Modes:
 
 Options:
   --write         Required for install mode; confirms in-place writes.
+  --daemon        Emit \`connect\` instead of \`start\` to proxy to the shared
+                  Action Hub daemon (run \`action-hub daemon start\` first).
   --config <path> Point the harness at a specific Action Hub config file
                   (exported as ACTION_HUB_CONFIG in the snippet).
   --node <path>   Override the node command in snippets (for GUI harnesses
@@ -556,6 +573,7 @@ Options:
 Examples:
   action-hub harness cursor                 # print Cursor's mcp.json snippet
   action-hub harness claude-code install --write
+  action-hub harness claude-code install --write --daemon
   action-hub harness codex install --write --config ~/.config/action-hub/servers.json
 `);
 }
