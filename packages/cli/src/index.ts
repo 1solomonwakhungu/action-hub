@@ -35,6 +35,7 @@ USAGE:
   action-hub <command> [options]
 
 COMMANDS:
+  init                One-command onboarding: migrate capabilities, configure a harness, and run diagnostics
   doctor              Run system diagnostics, config validation, and server connectivity checks
   licenses            Print vendored third-party provenance and license texts
   auth <action>       Manage OAuth 2.0 credentials for remote servers (login, status, logout)
@@ -53,6 +54,22 @@ OPTIONS:
   --config <path>     Path to custom Action Hub configuration file (servers.json)
   --help, -h          Show this help message
   --version, -v       Show version
+
+INIT OPTIONS:
+  --harness <target>  Configure an AI harness (claude-code, claude-desktop, cursor, codex, opencode, pi, vscode)
+  --daemon            Emit \`connect\` instead of \`start\` to use the shared background daemon
+  --source <source>   Filter migration by source (claude-desktop, cursor, vscode, copilot, agents, codex, windsurf, cline, roo-code, all)
+  --node <path>       Override the node binary path in generated harness snippets
+  --dry-run           Preview onboarding without modifying any files on disk
+  --skip-migrate      Skip capability migration
+  --skip-doctor       Skip connectivity diagnostics and indexing
+  --json              Output structured JSON summary on stdout
+
+HARNESS OPTIONS:
+  --write             Required for install mode; confirms in-place writes
+  --daemon            Emit \`connect\` instead of \`start\` to proxy to the shared daemon
+  --node <path>       Override the node command in snippets
+  --json              (export, JSON targets only) Print only the JSON fragment on stdout
 
 DAEMON:
   daemon start        Start the per-user background daemon
@@ -76,6 +93,9 @@ AUTH OPTIONS:
   --timeout <secs>    Seconds to wait for the authorization callback (default: 300)
 
 EXAMPLES:
+  action-hub init --dry-run
+  action-hub init --harness claude-code
+  action-hub init --harness codex --daemon
   action-hub doctor
   action-hub auth status
   action-hub auth login github
@@ -83,6 +103,7 @@ EXAMPLES:
   action-hub migrate --type all
   action-hub migrate --type skills --write
   action-hub import --write
+  action-hub harness cursor install --write --daemon
   action-hub test-search "create pull request" --limit 5
   action-hub list --server github
   action-hub bundle --load triage-issue
@@ -152,6 +173,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `init --help` shows the init-specific help, while bare `init` runs the wizard.
+  if (args[0] === "init" && (args.includes("--help") || args.includes("-h"))) {
+    (await import("./commands/init.js")).printInitHelp();
+    return;
+  }
+
   if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
     printHelp();
     process.exitCode = 0;
@@ -167,6 +194,19 @@ async function main(): Promise<void> {
   const command = args[0];
   const rest = args.slice(1);
 
+  // Flags that never consume a following positional argument.
+  const BOOLEAN_FLAGS = new Set([
+    "daemon",
+    "dry-run",
+    "skip-migrate",
+    "skip-doctor",
+    "write",
+    "overwrite",
+    "json",
+    "no-check",
+    "no-browser",
+  ]);
+
   // Simple CLI argument parsing
   const parsedArgs: Record<string, string | boolean> = {};
   const positional: string[] = [];
@@ -175,7 +215,7 @@ async function main(): Promise<void> {
     const arg = rest[i]!;
     if (arg.startsWith("--")) {
       const key = arg.slice(2);
-      if (i + 1 < rest.length && !rest[i + 1]!.startsWith("-")) {
+      if (!BOOLEAN_FLAGS.has(key) && i + 1 < rest.length && !rest[i + 1]!.startsWith("-")) {
         parsedArgs[key] = rest[i + 1]!;
         i++;
       } else {
@@ -193,6 +233,55 @@ async function main(): Promise<void> {
   try {
     let exitCode = 0;
     switch (command) {
+      case "init": {
+        const harnessArg = parsedArgs["harness"];
+        if (harnessArg !== undefined && (typeof harnessArg !== "string" || harnessArg.trim() === "")) {
+          console.error("Missing value for --harness (usage: action-hub init --harness <target>)");
+          exitCode = 1;
+          break;
+        }
+        const sourceArg = parsedArgs["source"];
+        const sourceVal = typeof sourceArg === "string" ? sourceArg : undefined;
+        if (sourceArg !== undefined && (typeof sourceArg !== "string" || sourceArg.trim() === "")) {
+          console.error("Missing value for --source");
+          exitCode = 1;
+          break;
+        }
+        const sourceFilter = parseSourceFilter(sourceVal, MIGRATE_SOURCE_FILTERS);
+        if (sourceVal !== undefined && sourceFilter === undefined) {
+          exitCode = 1;
+          break;
+        }
+        if (
+          parsedArgs["node"] !== undefined &&
+          (typeof parsedArgs["node"] !== "string" || parsedArgs["node"].trim() === "")
+        ) {
+          console.error("Missing value for --node (usage: --node <absolute path to node>)");
+          exitCode = 1;
+          break;
+        }
+        if (
+          parsedArgs["config"] !== undefined &&
+          (typeof parsedArgs["config"] !== "string" || parsedArgs["config"].trim() === "")
+        ) {
+          console.error("Missing value for --config (usage: --config <path>)");
+          exitCode = 1;
+          break;
+        }
+        exitCode = await (await import("./commands/init.js")).initCommand({
+          harness: typeof harnessArg === "string" ? harnessArg : undefined,
+          daemon: Boolean(parsedArgs["daemon"]),
+          source: sourceFilter,
+          configPath,
+          node: typeof parsedArgs["node"] === "string" ? parsedArgs["node"] : undefined,
+          dryRun: Boolean(parsedArgs["dry-run"]),
+          skipMigrate: Boolean(parsedArgs["skip-migrate"]),
+          skipDoctor: Boolean(parsedArgs["skip-doctor"]),
+          json: Boolean(parsedArgs["json"]),
+        });
+        break;
+      }
+
       case "licenses": {
         // Third-party provenance + license texts (SQ4 packaging round 4):
         // SEA recipients get the upstream terms from the embedded assets.
@@ -351,6 +440,7 @@ async function main(): Promise<void> {
           json: Boolean(parsedArgs["json"]),
           configPath,
           node: typeof parsedArgs["node"] === "string" ? parsedArgs["node"] : undefined,
+          daemon: Boolean(parsedArgs["daemon"]),
         });
         break;
       }
