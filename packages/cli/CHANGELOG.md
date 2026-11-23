@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0](https://github.com/1solomonwakhungu/action-hub/compare/v0.1.0...v0.2.0) (2026-11-22)
+
+
+### Features
+
+* **cli:** add action-hub init onboarding command and harness --daemon flag ([#118](https://github.com/1solomonwakhungu/action-hub/issues/118)) ([5e0d106](https://github.com/1solomonwakhungu/action-hub/commit/5e0d1063055a162b1b1d0b480f4825a0c844b020))
+* **packaging:** prepare npm packages for publishing and add MCP Registry server.json ([#115](https://github.com/1solomonwakhungu/action-hub/issues/115)) ([1eccdcf](https://github.com/1solomonwakhungu/action-hub/commit/1eccdcf33cc44769e1ea1621d34cd7af6d6fef9d))
+
+
+### Dependencies
+
+* The following workspace dependencies were updated
+  * dependencies
+    * @action-hub/mcp-server bumped from 0.1.0 to 0.2.0
+    * @action-hub/core bumped from 0.1.0 to 0.2.0
+
 ## 0.1.0 (2026-10-17)
 
 

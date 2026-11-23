@@ -1,6 +1,6 @@
 {
   "name": "@action-hub/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Runtime-agnostic capability catalog, search, and execution router for MCP servers and skills",
   "license": "MIT",
   "homepage": "https://1solomonwakhungu.github.io/action-hub/",

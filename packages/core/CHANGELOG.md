@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0](https://github.com/1solomonwakhungu/action-hub/compare/core-v0.1.0...core-v0.2.0) (2026-11-22)
+
+
+### Features
+
+* **packaging:** prepare npm packages for publishing and add MCP Registry server.json ([#115](https://github.com/1solomonwakhungu/action-hub/issues/115)) ([1eccdcf](https://github.com/1solomonwakhungu/action-hub/commit/1eccdcf33cc44769e1ea1621d34cd7af6d6fef9d))
+
+
+### Bug Fixes
+
+* **core,server:** recalibrate MiniLM abstention default to 0.36 and emit approval args_sha256 on execute spans ([#117](https://github.com/1solomonwakhungu/action-hub/issues/117)) ([6ebc8e5](https://github.com/1solomonwakhungu/action-hub/commit/6ebc8e54306ca350a9a9c4c36415a1fb0fafff9a))
+* **core:** isolate returned schemas and test MCP routing end to end ([#113](https://github.com/1solomonwakhungu/action-hub/issues/113)) ([dd5ffc2](https://github.com/1solomonwakhungu/action-hub/commit/dd5ffc2f361c9eca5f4925c2996ec8ab5caa8d46))
+
 ## 0.1.0 (2026-10-17)
 
 
